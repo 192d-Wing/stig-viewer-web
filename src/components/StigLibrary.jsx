@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import Table from "@cloudscape-design/components/table";
-import Tabs from "@cloudscape-design/components/tabs";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
 import Toggle from "@cloudscape-design/components/toggle";
@@ -16,6 +15,8 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Box from "@cloudscape-design/components/box";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
+import Pagination from "@cloudscape-design/components/pagination";
+import CollectionPreferences from "@cloudscape-design/components/collection-preferences";
 import Link from "@cloudscape-design/components/link";
 
 const BACKEND = "http://localhost:8080";
@@ -64,39 +65,6 @@ function findSuperseded(catalog) {
   return superseded;
 }
 
-/** Comparator for sortable columns */
-function comparator(col, dir) {
-  const mul = dir === "asc" ? 1 : -1;
-  return (a, b) => {
-    let av, bv;
-    switch (col) {
-      case "category":
-        av = a.category;
-        bv = b.category;
-        return mul * av.localeCompare(bv);
-      case "title":
-        av = a.title;
-        bv = b.title;
-        return mul * av.localeCompare(bv);
-      case "version":
-        av = Number(a.version || 0);
-        bv = Number(b.version || 0);
-        if (av !== bv) return mul * (av - bv);
-        return (
-          mul * (parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo))
-        );
-      case "release":
-        av = parseRelease(a.releaseInfo);
-        bv = parseRelease(b.releaseInfo);
-        return mul * (av - bv);
-      case "rules":
-        return mul * (a.ruleCount - b.ruleCount);
-      default:
-        return 0;
-    }
-  };
-}
-
 export default function StigLibrary({ onLoad, onUploadTab }) {
   const [activeTab, setActiveTab] = useState("library");
   const [catalog, setCatalog] = useState([]);
@@ -108,6 +76,12 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
   const [showSuperseded, setShowSuperseded] = useState(false);
   const [sortCol, setSortCol] = useState("title");
   const [sortDir, setSortDir] = useState("asc");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [preferences, setPreferences] = useState({
+    pageSize: 25,
+    stripedRows: true,
+    visibleContent: ["title", "version", "release", "category", "rules"],
+  });
 
   // Add-to-library form state (single STIG)
   const [addFiles, setAddFiles] = useState([]);
@@ -157,7 +131,31 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       const term = searchText.toLowerCase();
       list = list.filter((e) => e.title.toLowerCase().includes(term));
     }
-    return [...list].sort(comparator(sortCol, sortDir));
+    return [...list].sort((a, b) => {
+      const mul = sortDir === "asc" ? 1 : -1;
+      let av, bv;
+      switch (sortCol) {
+        case "category":
+          return mul * a.category.localeCompare(b.category);
+        case "title":
+          return mul * a.title.localeCompare(b.title);
+        case "version":
+          av = Number(a.version || 0);
+          bv = Number(b.version || 0);
+          if (av !== bv) return mul * (av - bv);
+          return (
+            mul * (parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo))
+          );
+        case "release":
+          return (
+            mul * (parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo))
+          );
+        case "rules":
+          return mul * (a.ruleCount - b.ruleCount);
+        default:
+          return 0;
+      }
+    });
   }, [
     catalog,
     categoryFilter,
@@ -167,6 +165,15 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     sortCol,
     sortDir,
   ]);
+
+  const pageCount = Math.max(
+    1,
+    Math.ceil(displayList.length / preferences.pageSize),
+  );
+  const paginatedItems = displayList.slice(
+    (currentPage - 1) * preferences.pageSize,
+    currentPage * preferences.pageSize,
+  );
 
   const handleLoad = useCallback(
     async (id) => {
@@ -274,22 +281,22 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     },
     {
       id: "version",
-      header: "Ver",
+      header: "Version",
       cell: (item) => item.version || "\u2014",
       sortingComparator: (a, b) => {
         const vDiff = Number(a.version || 0) - Number(b.version || 0);
         if (vDiff !== 0) return vDiff;
         return parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo);
       },
-      width: 70,
+      width: 110,
     },
     {
       id: "release",
-      header: "Rel",
+      header: "Release",
       cell: (item) => parseRelease(item.releaseInfo) || "\u2014",
       sortingComparator: (a, b) =>
         parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo),
-      width: 70,
+      width: 110,
     },
     {
       id: "category",
@@ -307,294 +314,348 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       header: "Rules",
       cell: (item) => item.ruleCount,
       sortingComparator: (a, b) => a.ruleCount - b.ruleCount,
-      width: 80,
+      width: 110,
     },
   ];
 
+  const visibleColumns = columnDefinitions.filter((c) =>
+    preferences.visibleContent.includes(c.id),
+  );
   const sortingColumn = columnDefinitions.find((c) => c.id === sortCol);
 
-  return (
-    <div style={{ maxWidth: 960, margin: "0 auto" }}>
-      <Tabs
-        activeTabId={activeTab}
-        onChange={({ detail }) => setActiveTab(detail.activeTabId)}
-        tabs={[
-          {
-            id: "library",
-            label: "STIG Library",
-            content: (
-              <SpaceBetween size="l">
-                {catalogError && (
-                  <Alert
-                    type="error"
-                    dismissible
-                    onDismiss={() => setCatalogError(null)}
+  if (activeTab === "library") {
+    return (
+      <Table
+        variant="full-page"
+        stickyHeader
+        stripedRows={preferences.stripedRows}
+        loading={catalogLoading}
+        loadingText="Connecting to backend"
+        resizableColumns
+        items={paginatedItems}
+        columnDefinitions={visibleColumns}
+        sortingColumn={sortingColumn}
+        sortingDescending={sortDir === "desc"}
+        onSortingChange={({ detail }) => {
+          setSortCol(detail.sortingColumn.id);
+          setSortDir(detail.isDescending ? "desc" : "asc");
+          setCurrentPage(1);
+        }}
+        pagination={
+          <Pagination
+            currentPageIndex={currentPage}
+            pagesCount={pageCount}
+            onChange={({ detail }) => setCurrentPage(detail.currentPageIndex)}
+          />
+        }
+        preferences={
+          <CollectionPreferences
+            title="Preferences"
+            confirmLabel="Confirm"
+            cancelLabel="Cancel"
+            preferences={preferences}
+            onConfirm={({ detail }) => {
+              setPreferences(detail);
+              setCurrentPage(1);
+            }}
+            pageSizePreference={{
+              title: "Page size",
+              options: [
+                { value: 10, label: "10 items" },
+                { value: 25, label: "25 items" },
+                { value: 50, label: "50 items" },
+                { value: 100, label: "100 items" },
+              ],
+            }}
+            stripedRowsPreference={{
+              label: "Striped rows",
+              description: "Select to add alternating shaded rows",
+            }}
+            visibleContentPreference={{
+              title: "Visible columns",
+              options: [
+                {
+                  label: "STIG properties",
+                  options: [
+                    { id: "title", label: "Title" },
+                    { id: "version", label: "Version" },
+                    { id: "release", label: "Release" },
+                    { id: "category", label: "Category" },
+                    { id: "rules", label: "Rules" },
+                  ],
+                },
+              ],
+            }}
+          />
+        }
+        header={
+          <Header
+            variant="awsui-h1-sticky"
+            counter={`(${displayList.length})`}
+            actions={
+              <SpaceBetween
+                direction="horizontal"
+                size="xs"
+                alignItems="center"
+              >
+                {supersededIds.size > 0 && (
+                  <Toggle
+                    checked={showSuperseded}
+                    onChange={({ detail }) => {
+                      setShowSuperseded(detail.checked);
+                      setCurrentPage(1);
+                    }}
                   >
-                    {catalogError}
-                  </Alert>
+                    Show superseded ({supersededIds.size})
+                  </Toggle>
                 )}
-
-                <Table
-                  variant="embedded"
-                  stickyHeader
-                  stripedRows
-                  loading={catalogLoading}
-                  loadingText="Connecting to backend"
-                  resizableColumns
-                  items={displayList}
-                  columnDefinitions={columnDefinitions}
-                  sortingColumn={sortingColumn}
-                  sortingDescending={sortDir === "desc"}
-                  onSortingChange={({ detail }) => {
-                    setSortCol(detail.sortingColumn.id);
-                    setSortDir(detail.isDescending ? "desc" : "asc");
-                  }}
-                  header={
-                    <Header
-                      counter={`(${displayList.length})`}
-                      actions={
-                        supersededIds.size > 0 ? (
-                          <Toggle
-                            checked={showSuperseded}
-                            onChange={({ detail }) =>
-                              setShowSuperseded(detail.checked)
-                            }
-                          >
-                            Show superseded ({supersededIds.size})
-                          </Toggle>
-                        ) : undefined
-                      }
-                    >
-                      STIG Library
-                    </Header>
-                  }
-                  filter={
-                    <SpaceBetween
-                      direction="horizontal"
-                      size="m"
-                      alignItems="center"
-                    >
-                      <TextFilter
-                        filteringText={searchText}
-                        onChange={({ detail }) =>
-                          setSearchText(detail.filteringText)
-                        }
-                        filteringPlaceholder="Search by title"
-                        countText={`${displayList.length} matches`}
-                      />
-                      <SegmentedControl
-                        selectedId={categoryFilter || "all"}
-                        onChange={({ detail }) =>
-                          setCategoryFilter(
-                            detail.selectedId === "all"
-                              ? null
-                              : detail.selectedId,
-                          )
-                        }
-                        options={[
-                          { text: "All", id: "all" },
-                          ...CATEGORIES.map((c) => ({ text: c, id: c })),
-                        ]}
-                      />
-                    </SpaceBetween>
-                  }
-                  empty={
-                    <Box textAlign="center" padding={{ vertical: "l" }}>
-                      {catalog.length === 0 ? (
-                        <SpaceBetween size="xs">
-                          <b>No STIGs cached yet</b>
-                          <Box>
-                            Use the{" "}
-                            <Link onFollow={() => setActiveTab("add")}>
-                              Add to Library
-                            </Link>{" "}
-                            tab to upload a STIG ZIP.
-                          </Box>
-                        </SpaceBetween>
-                      ) : (
-                        <b>No STIGs match the current filters.</b>
-                      )}
-                    </Box>
-                  }
-                />
+                <Button onClick={() => setActiveTab("add")}>
+                  Add to Library
+                </Button>
+                <Button onClick={() => setActiveTab("upload")}>
+                  Open Local File
+                </Button>
               </SpaceBetween>
-            ),
-          },
-          {
-            id: "add",
-            label: "Add to Library",
-            content: (
-              <SpaceBetween size="l">
-                <Container
-                  header={
-                    <Header
-                      variant="h2"
-                      description={
-                        <>
-                          Download a STIG ZIP from{" "}
-                          <Link
-                            href="https://public.cyber.mil/stigs/downloads/"
-                            external
-                          >
-                            public.cyber.mil
-                          </Link>
-                          , then upload it here.
-                        </>
-                      }
-                    >
-                      Add Single STIG
-                    </Header>
-                  }
-                >
-                  <form onSubmit={handleAddSubmit}>
-                    <SpaceBetween size="l">
-                      <FormField label="STIG ZIP file">
-                        <FileUpload
-                          value={addFiles}
-                          onChange={({ detail }) => setAddFiles(detail.value)}
-                          accept=".zip"
-                          constraintText="ZIP files only"
-                          i18nStrings={{
-                            uploadButtonText: () => "Choose file",
-                            dropzoneText: () => "Drop file to upload",
-                            removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
-                            limitShowFewer: "Show fewer files",
-                            limitShowMore: "Show more files",
-                            errorIconAriaLabel: "Error",
-                          }}
-                        />
-                      </FormField>
-                      <FormField label="ID" description="Slug, e.g. windows-11">
-                        <Input
-                          value={addId}
-                          onChange={({ detail }) => setAddId(detail.value)}
-                          placeholder="e.g. windows-11"
-                        />
-                      </FormField>
-                      <FormField label="Category">
-                        <Select
-                          selectedOption={
-                            CATEGORY_OPTIONS.find(
-                              (o) => o.value === addCategory,
-                            ) || CATEGORY_OPTIONS[0]
-                          }
-                          onChange={({ detail }) =>
-                            setAddCategory(detail.selectedOption.value)
-                          }
-                          options={CATEGORY_OPTIONS}
-                        />
-                      </FormField>
-                      <Button
-                        variant="primary"
-                        loading={addStatus === "loading"}
-                        disabled={addFiles.length === 0 || !addId.trim()}
-                        formAction="submit"
-                        onClick={handleAddSubmit}
-                      >
-                        Upload to Library
-                      </Button>
-                    </SpaceBetween>
-                  </form>
-                  {addStatus === "success" && addResult && (
-                    <Box margin={{ top: "l" }}>
-                      <Alert type="success">
-                        <strong>{addResult.title}</strong> added &mdash;{" "}
-                        {addResult.ruleCount} rules ({addResult.version}).{" "}
-                        <Link onFollow={() => setActiveTab("library")}>
-                          View in Library
-                        </Link>
-                      </Alert>
-                    </Box>
-                  )}
-                  {addStatus === "error" && addResult && (
-                    <Box margin={{ top: "l" }}>
-                      <Alert type="error">{addResult.error}</Alert>
-                    </Box>
-                  )}
-                </Container>
-
-                <Container
-                  header={
-                    <Header
-                      variant="h2"
-                      description={
-                        <>
-                          Download the all-in-one{" "}
-                          <strong>SRG-STIG Library</strong> bundle (~350 MB)
-                          from{" "}
-                          <Link
-                            href="https://public.cyber.mil/stigs/downloads/"
-                            external
-                          >
-                            public.cyber.mil
-                          </Link>
-                          . IDs and categories are inferred automatically.
-                        </>
-                      }
-                    >
-                      Import Library Bundle
-                    </Header>
-                  }
-                >
-                  <form onSubmit={handleLibSubmit}>
-                    <SpaceBetween size="l">
-                      <FormField label="Library bundle ZIP">
-                        <FileUpload
-                          value={libFiles}
-                          onChange={({ detail }) => setLibFiles(detail.value)}
-                          accept=".zip"
-                          constraintText="ZIP files only"
-                          i18nStrings={{
-                            uploadButtonText: () => "Choose file",
-                            dropzoneText: () => "Drop file to upload",
-                            removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
-                            limitShowFewer: "Show fewer files",
-                            limitShowMore: "Show more files",
-                            errorIconAriaLabel: "Error",
-                          }}
-                        />
-                      </FormField>
-                      <Button
-                        variant="primary"
-                        loading={libStatus === "loading"}
-                        disabled={libFiles.length === 0}
-                        formAction="submit"
-                        onClick={handleLibSubmit}
-                      >
-                        Import Library Bundle
-                      </Button>
-                    </SpaceBetween>
-                  </form>
-                  {libStatus === "success" && libResult && (
-                    <Box margin={{ top: "l" }}>
-                      <Alert type="success">
-                        Imported <strong>{libResult.imported}</strong> STIGs
-                        {libResult.errors > 0 && (
-                          <> ({libResult.errors} skipped)</>
-                        )}
-                        .{" "}
-                        <Link onFollow={() => setActiveTab("library")}>
-                          View in Library
-                        </Link>
-                      </Alert>
-                    </Box>
-                  )}
-                  {libStatus === "error" && libResult && (
-                    <Box margin={{ top: "l" }}>
-                      <Alert type="error">{libResult.error}</Alert>
-                    </Box>
-                  )}
-                </Container>
+            }
+          >
+            STIG Library
+          </Header>
+        }
+        filter={
+          <SpaceBetween direction="horizontal" size="m" alignItems="center">
+            <TextFilter
+              filteringText={searchText}
+              onChange={({ detail }) => {
+                setSearchText(detail.filteringText);
+                setCurrentPage(1);
+              }}
+              filteringPlaceholder="Search by title"
+              countText={`${displayList.length} matches`}
+            />
+            <SegmentedControl
+              selectedId={categoryFilter || "all"}
+              onChange={({ detail }) => {
+                setCategoryFilter(
+                  detail.selectedId === "all" ? null : detail.selectedId,
+                );
+                setCurrentPage(1);
+              }}
+              options={[
+                { text: "All", id: "all" },
+                ...CATEGORIES.map((c) => ({ text: c, id: c })),
+              ]}
+            />
+          </SpaceBetween>
+        }
+        empty={
+          <Box textAlign="center" padding={{ vertical: "l" }}>
+            {catalog.length === 0 ? (
+              <SpaceBetween size="xs">
+                <b>No STIGs cached yet</b>
+                <Box>
+                  Use the{" "}
+                  <Link onFollow={() => setActiveTab("add")}>
+                    Add to Library
+                  </Link>{" "}
+                  tab to upload a STIG ZIP.
+                </Box>
               </SpaceBetween>
-            ),
-          },
-          {
-            id: "upload",
-            label: "Open Local File",
-            content: <Box padding={{ vertical: "l" }}>{onUploadTab}</Box>,
-          },
-        ]}
+            ) : (
+              <b>No STIGs match the current filters.</b>
+            )}
+          </Box>
+        }
       />
+    );
+  }
+
+  // Add to Library / Open Local File views
+  return (
+    <div style={{ maxWidth: 960, margin: "0 auto", paddingTop: 24 }}>
+      <SpaceBetween size="l">
+        <Button
+          variant="link"
+          iconName="arrow-left"
+          onClick={() => setActiveTab("library")}
+        >
+          Back to Library
+        </Button>
+
+        {catalogError && (
+          <Alert
+            type="error"
+            dismissible
+            onDismiss={() => setCatalogError(null)}
+          >
+            {catalogError}
+          </Alert>
+        )}
+
+        {activeTab === "add" && (
+          <>
+            <Container
+              header={
+                <Header
+                  variant="h2"
+                  description={
+                    <>
+                      Download a STIG ZIP from{" "}
+                      <Link
+                        href="https://public.cyber.mil/stigs/downloads/"
+                        external
+                      >
+                        public.cyber.mil
+                      </Link>
+                      , then upload it here.
+                    </>
+                  }
+                >
+                  Add Single STIG
+                </Header>
+              }
+            >
+              <form onSubmit={handleAddSubmit}>
+                <SpaceBetween size="l">
+                  <FormField label="STIG ZIP file">
+                    <FileUpload
+                      value={addFiles}
+                      onChange={({ detail }) => setAddFiles(detail.value)}
+                      accept=".zip"
+                      constraintText="ZIP files only"
+                      i18nStrings={{
+                        uploadButtonText: () => "Choose file",
+                        dropzoneText: () => "Drop file to upload",
+                        removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
+                        limitShowFewer: "Show fewer files",
+                        limitShowMore: "Show more files",
+                        errorIconAriaLabel: "Error",
+                      }}
+                    />
+                  </FormField>
+                  <FormField label="ID" description="Slug, e.g. windows-11">
+                    <Input
+                      value={addId}
+                      onChange={({ detail }) => setAddId(detail.value)}
+                      placeholder="e.g. windows-11"
+                    />
+                  </FormField>
+                  <FormField label="Category">
+                    <Select
+                      selectedOption={
+                        CATEGORY_OPTIONS.find((o) => o.value === addCategory) ||
+                        CATEGORY_OPTIONS[0]
+                      }
+                      onChange={({ detail }) =>
+                        setAddCategory(detail.selectedOption.value)
+                      }
+                      options={CATEGORY_OPTIONS}
+                    />
+                  </FormField>
+                  <Button
+                    variant="primary"
+                    loading={addStatus === "loading"}
+                    disabled={addFiles.length === 0 || !addId.trim()}
+                    formAction="submit"
+                    onClick={handleAddSubmit}
+                  >
+                    Upload to Library
+                  </Button>
+                </SpaceBetween>
+              </form>
+              {addStatus === "success" && addResult && (
+                <Box margin={{ top: "l" }}>
+                  <Alert type="success">
+                    <strong>{addResult.title}</strong> added &mdash;{" "}
+                    {addResult.ruleCount} rules ({addResult.version}).{" "}
+                    <Link onFollow={() => setActiveTab("library")}>
+                      View in Library
+                    </Link>
+                  </Alert>
+                </Box>
+              )}
+              {addStatus === "error" && addResult && (
+                <Box margin={{ top: "l" }}>
+                  <Alert type="error">{addResult.error}</Alert>
+                </Box>
+              )}
+            </Container>
+
+            <Container
+              header={
+                <Header
+                  variant="h2"
+                  description={
+                    <>
+                      Download the all-in-one <strong>SRG-STIG Library</strong>{" "}
+                      bundle (~350 MB) from{" "}
+                      <Link
+                        href="https://public.cyber.mil/stigs/downloads/"
+                        external
+                      >
+                        public.cyber.mil
+                      </Link>
+                      . IDs and categories are inferred automatically.
+                    </>
+                  }
+                >
+                  Import Library Bundle
+                </Header>
+              }
+            >
+              <form onSubmit={handleLibSubmit}>
+                <SpaceBetween size="l">
+                  <FormField label="Library bundle ZIP">
+                    <FileUpload
+                      value={libFiles}
+                      onChange={({ detail }) => setLibFiles(detail.value)}
+                      accept=".zip"
+                      constraintText="ZIP files only"
+                      i18nStrings={{
+                        uploadButtonText: () => "Choose file",
+                        dropzoneText: () => "Drop file to upload",
+                        removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
+                        limitShowFewer: "Show fewer files",
+                        limitShowMore: "Show more files",
+                        errorIconAriaLabel: "Error",
+                      }}
+                    />
+                  </FormField>
+                  <Button
+                    variant="primary"
+                    loading={libStatus === "loading"}
+                    disabled={libFiles.length === 0}
+                    formAction="submit"
+                    onClick={handleLibSubmit}
+                  >
+                    Import Library Bundle
+                  </Button>
+                </SpaceBetween>
+              </form>
+              {libStatus === "success" && libResult && (
+                <Box margin={{ top: "l" }}>
+                  <Alert type="success">
+                    Imported <strong>{libResult.imported}</strong> STIGs
+                    {libResult.errors > 0 && <> ({libResult.errors} skipped)</>}
+                    .{" "}
+                    <Link onFollow={() => setActiveTab("library")}>
+                      View in Library
+                    </Link>
+                  </Alert>
+                </Box>
+              )}
+              {libStatus === "error" && libResult && (
+                <Box margin={{ top: "l" }}>
+                  <Alert type="error">{libResult.error}</Alert>
+                </Box>
+              )}
+            </Container>
+          </>
+        )}
+
+        {activeTab === "upload" && (
+          <Box padding={{ vertical: "l" }}>{onUploadTab}</Box>
+        )}
+      </SpaceBetween>
     </div>
   );
 }

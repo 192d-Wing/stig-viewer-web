@@ -177,6 +177,7 @@ export default function App() {
 
       <AppLayout
         headerSelector="#h"
+        contentType={!hasTabs ? 'table' : 'default'}
         navigationHide={!hasTabs || isDiffMode}
         navigationOpen={navOpen && hasTabs && !isDiffMode}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}
