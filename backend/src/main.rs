@@ -1,18 +1,25 @@
 mod api;
 mod config;
 mod db;
+mod db_drafts;
 mod parser;
 mod sync;
 
 use anyhow::Result;
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use api::{catalog::{get_catalog, get_health}, stig::get_stig, upload::{upload_library, upload_stig}};
+use api::{
+    auth::auth_middleware,
+    catalog::{get_catalog, get_health},
+    drafts::*,
+    stig::get_stig,
+    upload::{upload_library, upload_stig},
+};
 use config::{load_sources, Config};
 use db::init_pool;
 
@@ -67,12 +74,40 @@ async fn main() -> Result<()> {
     // Body limit applied globally at the router level (outermost layer) so it
     // takes effect before Axum's built-in 2 MB default.  500 MB covers the
     // largest DISA library bundle; all other routes are well under this.
+
+    // Draft routes — protected by auth middleware
+    let draft_routes = Router::new()
+        .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
+        .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
+        .route(
+            "/api/drafts/:id",
+            get(get_draft_handler)
+                .put(update_draft_handler)
+                .delete(delete_draft_handler),
+        )
+        .route("/api/drafts/:id/next-vuln-id", post(next_vuln_id_handler))
+        .route("/api/drafts/:id/submit", post(submit_handler))
+        .route("/api/drafts/:id/review", post(review_handler))
+        .route("/api/drafts/:id/approve", post(approve_handler))
+        .route("/api/drafts/:id/reject", post(reject_handler))
+        .route("/api/drafts/:id/revise", post(revise_handler))
+        .route(
+            "/api/drafts/:id/comments",
+            get(list_comments_handler).post(add_comment_handler),
+        )
+        .route("/api/users/me", get(get_me_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.pool.clone(),
+            auth_middleware,
+        ));
+
     let app = Router::new()
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
+        .merge(draft_routes)
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);

@@ -128,18 +128,9 @@ function cleanDescription(desc) {
     .replace(/<Documentable>.*?<\/Documentable>/gis, "")
     .replace(/<Mitigations>.*?<\/Mitigations>/gis, "")
     .replace(/<SeverityOverrideGuidance>.*?<\/SeverityOverrideGuidance>/gis, "")
-    .replace(
-      /<PotentialImpacts>.*?<\/PotentialImpacts>/gis,
-      ""
-    )
-    .replace(
-      /<ThirdPartyTools>.*?<\/ThirdPartyTools>/gis,
-      ""
-    )
-    .replace(
-      /<MitigationControl>.*?<\/MitigationControl>/gis,
-      ""
-    )
+    .replace(/<PotentialImpacts>.*?<\/PotentialImpacts>/gis, "")
+    .replace(/<ThirdPartyTools>.*?<\/ThirdPartyTools>/gis, "")
+    .replace(/<MitigationControl>.*?<\/MitigationControl>/gis, "")
     .replace(/<Responsibility>.*?<\/Responsibility>/gis, "")
     .replace(/<IAControls>.*?<\/IAControls>/gis, "")
     .replace(/<[^>]+>/g, " ")
@@ -210,7 +201,13 @@ function parseCKL(xmlText) {
     });
   }
 
-  return { title: title || "Imported Checklist", description: "", version, releaseInfo, rules };
+  return {
+    title: title || "Imported Checklist",
+    description: "",
+    version,
+    releaseInfo,
+    rules,
+  };
 }
 
 function exportCKL(stig, hostname = "", ip = "", mac = "", fqdn = "") {
@@ -294,112 +291,219 @@ function generateSampleSTIG() {
     releaseInfo: "Release: 1 Benchmark Date: 19 Feb 2026",
     rules: [
       {
-        id: "SV-1001r1_rule", stigId: "V-1001", groupId: "SRG-APP-000001",
-        title: "The application must enforce approved authorizations for logical access to information and system resources.",
+        id: "SV-1001r1_rule",
+        stigId: "V-1001",
+        groupId: "SRG-APP-000001",
+        title:
+          "The application must enforce approved authorizations for logical access to information and system resources.",
         severity: "CAT I",
-        description: "Authentication to the application must be performed using DoD PKI certificates. Applications must validate user identity via CAC/PIV before granting access to any system resources. Failure to enforce strong authentication allows unauthorized users to gain access to sensitive information.",
-        fixText: "Configure the application to require CAC/PIV authentication for all user access. Ensure the application validates the certificate chain against a trusted DoD CA. Disable all password-based authentication mechanisms.",
-        checkText: "Verify the application requires CAC/PIV for authentication.\n\nIf the application allows password-based authentication or does not validate DoD certificates, this is a finding.",
-        cciIds: ["CCI-000213"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Authentication to the application must be performed using DoD PKI certificates. Applications must validate user identity via CAC/PIV before granting access to any system resources. Failure to enforce strong authentication allows unauthorized users to gain access to sensitive information.",
+        fixText:
+          "Configure the application to require CAC/PIV authentication for all user access. Ensure the application validates the certificate chain against a trusted DoD CA. Disable all password-based authentication mechanisms.",
+        checkText:
+          "Verify the application requires CAC/PIV for authentication.\n\nIf the application allows password-based authentication or does not validate DoD certificates, this is a finding.",
+        cciIds: ["CCI-000213"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1002r1_rule", stigId: "V-1002", groupId: "SRG-APP-000002",
-        title: "The application must implement cryptographic mechanisms to protect the integrity of session tokens.",
+        id: "SV-1002r1_rule",
+        stigId: "V-1002",
+        groupId: "SRG-APP-000002",
+        title:
+          "The application must implement cryptographic mechanisms to protect the integrity of session tokens.",
         severity: "CAT I",
-        description: "Session tokens must be generated using FIPS 140-2/3 validated cryptographic modules. Tokens must have sufficient entropy to prevent prediction or brute-force attacks. Session management must include secure token storage, transmission, and invalidation mechanisms.",
-        fixText: "Configure the application to generate session tokens using FIPS-validated cryptographic modules with a minimum of 128 bits of entropy. Implement secure cookie attributes (HttpOnly, Secure, SameSite).",
-        checkText: "Review the application session management configuration.\n\nVerify session tokens are generated using FIPS-validated modules.\nVerify tokens contain at least 128 bits of entropy.\n\nIf the application does not use FIPS-validated cryptographic modules for session management, this is a finding.",
-        cciIds: ["CCI-000068"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Session tokens must be generated using FIPS 140-2/3 validated cryptographic modules. Tokens must have sufficient entropy to prevent prediction or brute-force attacks. Session management must include secure token storage, transmission, and invalidation mechanisms.",
+        fixText:
+          "Configure the application to generate session tokens using FIPS-validated cryptographic modules with a minimum of 128 bits of entropy. Implement secure cookie attributes (HttpOnly, Secure, SameSite).",
+        checkText:
+          "Review the application session management configuration.\n\nVerify session tokens are generated using FIPS-validated modules.\nVerify tokens contain at least 128 bits of entropy.\n\nIf the application does not use FIPS-validated cryptographic modules for session management, this is a finding.",
+        cciIds: ["CCI-000068"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1003r1_rule", stigId: "V-1003", groupId: "SRG-APP-000003",
-        title: "The application must use TLS 1.2 or higher for all network communications.",
+        id: "SV-1003r1_rule",
+        stigId: "V-1003",
+        groupId: "SRG-APP-000003",
+        title:
+          "The application must use TLS 1.2 or higher for all network communications.",
         severity: "CAT I",
-        description: "All data transmitted between the application and clients must be encrypted using TLS 1.2 or TLS 1.3. Legacy protocols (SSL, TLS 1.0, TLS 1.1) must be disabled. CNSA 2.0 compliant cipher suites should be preferred.",
-        fixText: "Configure the web server and application to only accept TLS 1.2 and TLS 1.3 connections. Disable all SSLv2, SSLv3, TLS 1.0, and TLS 1.1 protocols. Configure CNSA 2.0 compliant cipher suites.",
-        checkText: "Verify TLS configuration on the server.\n\nRun: nmap --script ssl-enum-ciphers -p 443 <hostname>\n\nIf TLS 1.0 or 1.1 is enabled, or if SSLv2/SSLv3 is present, this is a finding.",
-        cciIds: ["CCI-000197", "CCI-002420"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "All data transmitted between the application and clients must be encrypted using TLS 1.2 or TLS 1.3. Legacy protocols (SSL, TLS 1.0, TLS 1.1) must be disabled. CNSA 2.0 compliant cipher suites should be preferred.",
+        fixText:
+          "Configure the web server and application to only accept TLS 1.2 and TLS 1.3 connections. Disable all SSLv2, SSLv3, TLS 1.0, and TLS 1.1 protocols. Configure CNSA 2.0 compliant cipher suites.",
+        checkText:
+          "Verify TLS configuration on the server.\n\nRun: nmap --script ssl-enum-ciphers -p 443 <hostname>\n\nIf TLS 1.0 or 1.1 is enabled, or if SSLv2/SSLv3 is present, this is a finding.",
+        cciIds: ["CCI-000197", "CCI-002420"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1004r1_rule", stigId: "V-1004", groupId: "SRG-APP-000015",
+        id: "SV-1004r1_rule",
+        stigId: "V-1004",
+        groupId: "SRG-APP-000015",
         title: "The application must enforce password complexity requirements.",
         severity: "CAT II",
-        description: "When password-based authentication is used (for service accounts or emergency access), passwords must meet minimum complexity requirements: 15 characters minimum, combination of upper/lower/numeric/special characters.",
-        fixText: "Configure the application password policy to require a minimum of 15 characters with complexity requirements including uppercase, lowercase, numeric, and special characters.",
-        checkText: "Review the application password policy settings.\n\nIf password minimum length is less than 15 characters or complexity is not enforced, this is a finding.",
-        cciIds: ["CCI-000192", "CCI-000193"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "When password-based authentication is used (for service accounts or emergency access), passwords must meet minimum complexity requirements: 15 characters minimum, combination of upper/lower/numeric/special characters.",
+        fixText:
+          "Configure the application password policy to require a minimum of 15 characters with complexity requirements including uppercase, lowercase, numeric, and special characters.",
+        checkText:
+          "Review the application password policy settings.\n\nIf password minimum length is less than 15 characters or complexity is not enforced, this is a finding.",
+        cciIds: ["CCI-000192", "CCI-000193"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1005r1_rule", stigId: "V-1005", groupId: "SRG-APP-000033",
-        title: "The application must enforce approved authorizations for controlling the flow of information.",
+        id: "SV-1005r1_rule",
+        stigId: "V-1005",
+        groupId: "SRG-APP-000033",
+        title:
+          "The application must enforce approved authorizations for controlling the flow of information.",
         severity: "CAT II",
-        description: "The application must implement network segmentation and access controls consistent with the DAF macrosegmentation plan. Traffic between security zones must be filtered and logged. East-west traffic must be controlled via microsegmentation policies.",
-        fixText: "Implement network segmentation per DAF Base Area Network standards. Configure firewall rules between security zones. Enable logging for all inter-zone traffic flows. Implement microsegmentation for east-west traffic.",
-        checkText: "Review network segmentation configuration.\n\nVerify traffic between zones is filtered.\nVerify logging is enabled for inter-zone traffic.\n\nIf inter-zone traffic is not filtered or logged, this is a finding.",
-        cciIds: ["CCI-001368"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "The application must implement network segmentation and access controls consistent with the DAF macrosegmentation plan. Traffic between security zones must be filtered and logged. East-west traffic must be controlled via microsegmentation policies.",
+        fixText:
+          "Implement network segmentation per DAF Base Area Network standards. Configure firewall rules between security zones. Enable logging for all inter-zone traffic flows. Implement microsegmentation for east-west traffic.",
+        checkText:
+          "Review network segmentation configuration.\n\nVerify traffic between zones is filtered.\nVerify logging is enabled for inter-zone traffic.\n\nIf inter-zone traffic is not filtered or logged, this is a finding.",
+        cciIds: ["CCI-001368"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1006r1_rule", stigId: "V-1006", groupId: "SRG-APP-000039",
-        title: "The application must generate audit records for all account creation activities.",
+        id: "SV-1006r1_rule",
+        stigId: "V-1006",
+        groupId: "SRG-APP-000039",
+        title:
+          "The application must generate audit records for all account creation activities.",
         severity: "CAT II",
-        description: "The application must produce audit records when user accounts are created. Audit records must include the identity of the individual who created the account, the date and time, and the type of account created.",
-        fixText: "Configure the application to generate audit records for all account creation events. Ensure records include the creating user identity, timestamp, and account type.",
-        checkText: "Create a test account and verify an audit record is generated.\n\nReview audit logs for account creation entries.\n\nIf no audit record is generated for account creation, this is a finding.",
-        cciIds: ["CCI-000015"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "The application must produce audit records when user accounts are created. Audit records must include the identity of the individual who created the account, the date and time, and the type of account created.",
+        fixText:
+          "Configure the application to generate audit records for all account creation events. Ensure records include the creating user identity, timestamp, and account type.",
+        checkText:
+          "Create a test account and verify an audit record is generated.\n\nReview audit logs for account creation entries.\n\nIf no audit record is generated for account creation, this is a finding.",
+        cciIds: ["CCI-000015"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1007r1_rule", stigId: "V-1007", groupId: "SRG-APP-000065",
-        title: "The application must enforce a minimum 15-minute lock after 3 consecutive invalid login attempts.",
+        id: "SV-1007r1_rule",
+        stigId: "V-1007",
+        groupId: "SRG-APP-000065",
+        title:
+          "The application must enforce a minimum 15-minute lock after 3 consecutive invalid login attempts.",
         severity: "CAT II",
-        description: "The application must implement account lockout after 3 consecutive failed login attempts. The lockout duration must be a minimum of 15 minutes or until an administrator unlocks the account.",
-        fixText: "Configure the application to lock accounts after 3 consecutive failed login attempts for a minimum of 15 minutes.",
-        checkText: "Attempt to log in with incorrect credentials 3 times.\n\nVerify the account is locked.\nVerify the lockout duration is at least 15 minutes.\n\nIf the account is not locked after 3 failed attempts, this is a finding.",
-        cciIds: ["CCI-000044"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "The application must implement account lockout after 3 consecutive failed login attempts. The lockout duration must be a minimum of 15 minutes or until an administrator unlocks the account.",
+        fixText:
+          "Configure the application to lock accounts after 3 consecutive failed login attempts for a minimum of 15 minutes.",
+        checkText:
+          "Attempt to log in with incorrect credentials 3 times.\n\nVerify the account is locked.\nVerify the lockout duration is at least 15 minutes.\n\nIf the account is not locked after 3 failed attempts, this is a finding.",
+        cciIds: ["CCI-000044"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1008r1_rule", stigId: "V-1008", groupId: "SRG-APP-000095",
-        title: "The application must produce audit records containing sufficient information to establish what occurred.",
+        id: "SV-1008r1_rule",
+        stigId: "V-1008",
+        groupId: "SRG-APP-000095",
+        title:
+          "The application must produce audit records containing sufficient information to establish what occurred.",
         severity: "CAT II",
-        description: "Audit records must contain sufficient detail to determine the type of event, when the event occurred, the source of the event, the outcome of the event, and the identity of associated subjects/objects.",
-        fixText: "Configure application logging to include event type, timestamp, source, outcome, and user identity in all audit records. Forward logs to a centralized SIEM.",
-        checkText: "Review sample audit log entries.\n\nVerify each entry contains: event type, timestamp, source IP, outcome (success/fail), and user identity.\n\nIf any of these fields are missing, this is a finding.",
-        cciIds: ["CCI-000130", "CCI-000131", "CCI-000132"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Audit records must contain sufficient detail to determine the type of event, when the event occurred, the source of the event, the outcome of the event, and the identity of associated subjects/objects.",
+        fixText:
+          "Configure application logging to include event type, timestamp, source, outcome, and user identity in all audit records. Forward logs to a centralized SIEM.",
+        checkText:
+          "Review sample audit log entries.\n\nVerify each entry contains: event type, timestamp, source IP, outcome (success/fail), and user identity.\n\nIf any of these fields are missing, this is a finding.",
+        cciIds: ["CCI-000130", "CCI-000131", "CCI-000132"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1009r1_rule", stigId: "V-1009", groupId: "SRG-APP-000141",
-        title: "The application must implement NIST FIPS-validated cryptography for data at rest.",
+        id: "SV-1009r1_rule",
+        stigId: "V-1009",
+        groupId: "SRG-APP-000141",
+        title:
+          "The application must implement NIST FIPS-validated cryptography for data at rest.",
         severity: "CAT II",
-        description: "Data at rest must be encrypted using FIPS 140-2/3 validated cryptographic modules. AES-256 is the minimum acceptable algorithm for symmetric encryption of stored data.",
-        fixText: "Configure the application and underlying storage to use AES-256 encryption via FIPS-validated cryptographic modules for all data at rest.",
-        checkText: "Verify data-at-rest encryption configuration.\n\nCheck that FIPS mode is enabled on the OS.\nVerify the storage encryption algorithm is AES-256.\n\nIf FIPS-validated encryption is not used for data at rest, this is a finding.",
-        cciIds: ["CCI-001199"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Data at rest must be encrypted using FIPS 140-2/3 validated cryptographic modules. AES-256 is the minimum acceptable algorithm for symmetric encryption of stored data.",
+        fixText:
+          "Configure the application and underlying storage to use AES-256 encryption via FIPS-validated cryptographic modules for all data at rest.",
+        checkText:
+          "Verify data-at-rest encryption configuration.\n\nCheck that FIPS mode is enabled on the OS.\nVerify the storage encryption algorithm is AES-256.\n\nIf FIPS-validated encryption is not used for data at rest, this is a finding.",
+        cciIds: ["CCI-001199"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1010r1_rule", stigId: "V-1010", groupId: "SRG-APP-000175",
-        title: "The application must support IPv6 per DAF IPv6 transition requirements.",
+        id: "SV-1010r1_rule",
+        stigId: "V-1010",
+        groupId: "SRG-APP-000175",
+        title:
+          "The application must support IPv6 per DAF IPv6 transition requirements.",
         severity: "CAT III",
-        description: "Applications must support dual-stack or IPv6-only operation consistent with DAF network modernization initiatives. IPv6 support must include proper address handling, DNS resolution, and security controls equivalent to IPv4.",
-        fixText: "Enable IPv6 support in the application. Configure dual-stack listeners. Ensure all security controls apply equally to IPv6 traffic. Test application functionality over IPv6-only connections.",
-        checkText: "Verify the application listens on IPv6 addresses.\n\nTest application functionality over IPv6.\nVerify security controls apply to IPv6 traffic.\n\nIf the application does not support IPv6, this is a finding.",
-        cciIds: ["CCI-000366"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Applications must support dual-stack or IPv6-only operation consistent with DAF network modernization initiatives. IPv6 support must include proper address handling, DNS resolution, and security controls equivalent to IPv4.",
+        fixText:
+          "Enable IPv6 support in the application. Configure dual-stack listeners. Ensure all security controls apply equally to IPv6 traffic. Test application functionality over IPv6-only connections.",
+        checkText:
+          "Verify the application listens on IPv6 addresses.\n\nTest application functionality over IPv6.\nVerify security controls apply to IPv6 traffic.\n\nIf the application does not support IPv6, this is a finding.",
+        cciIds: ["CCI-000366"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1011r1_rule", stigId: "V-1011", groupId: "SRG-APP-000190",
-        title: "The application must terminate user sessions after 15 minutes of inactivity.",
+        id: "SV-1011r1_rule",
+        stigId: "V-1011",
+        groupId: "SRG-APP-000190",
+        title:
+          "The application must terminate user sessions after 15 minutes of inactivity.",
         severity: "CAT III",
-        description: "Inactive sessions represent a security risk. The application must automatically terminate sessions after 15 minutes of user inactivity to prevent unauthorized access from unattended workstations.",
-        fixText: "Configure session timeout to 15 minutes of inactivity. Implement both server-side session expiration and client-side timeout notification.",
-        checkText: "Log in to the application and remain idle for 15 minutes.\n\nVerify the session is terminated and the user is required to re-authenticate.\n\nIf the session remains active after 15 minutes of inactivity, this is a finding.",
-        cciIds: ["CCI-001133"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "Inactive sessions represent a security risk. The application must automatically terminate sessions after 15 minutes of user inactivity to prevent unauthorized access from unattended workstations.",
+        fixText:
+          "Configure session timeout to 15 minutes of inactivity. Implement both server-side session expiration and client-side timeout notification.",
+        checkText:
+          "Log in to the application and remain idle for 15 minutes.\n\nVerify the session is terminated and the user is required to re-authenticate.\n\nIf the session remains active after 15 minutes of inactivity, this is a finding.",
+        cciIds: ["CCI-001133"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
       {
-        id: "SV-1012r1_rule", stigId: "V-1012", groupId: "SRG-APP-000211",
-        title: "The application must display an approved DoD notice and consent banner.",
+        id: "SV-1012r1_rule",
+        stigId: "V-1012",
+        groupId: "SRG-APP-000211",
+        title:
+          "The application must display an approved DoD notice and consent banner.",
         severity: "CAT III",
-        description: "The application must display the Standard Mandatory DoD Notice and Consent Banner before granting access. The banner must require user acknowledgment before proceeding.",
-        fixText: "Configure the application to display the Standard Mandatory DoD Notice and Consent Banner at the login screen. Require the user to click 'OK' or 'I Agree' before accessing the application.",
-        checkText: "Access the application login page.\n\nVerify the DoD Notice and Consent Banner is displayed.\nVerify the user must acknowledge the banner before accessing the application.\n\nIf the banner is not displayed or acknowledgment is not required, this is a finding.",
-        cciIds: ["CCI-001384", "CCI-001385"], status: "not_reviewed", findingDetails: "", comments: "",
+        description:
+          "The application must display the Standard Mandatory DoD Notice and Consent Banner before granting access. The banner must require user acknowledgment before proceeding.",
+        fixText:
+          "Configure the application to display the Standard Mandatory DoD Notice and Consent Banner at the login screen. Require the user to click 'OK' or 'I Agree' before accessing the application.",
+        checkText:
+          "Access the application login page.\n\nVerify the DoD Notice and Consent Banner is displayed.\nVerify the user must acknowledge the banner before accessing the application.\n\nIf the banner is not displayed or acknowledgment is not required, this is a finding.",
+        cciIds: ["CCI-001384", "CCI-001385"],
+        status: "not_reviewed",
+        findingDetails: "",
+        comments: "",
       },
     ],
   };
@@ -408,7 +512,8 @@ function generateSampleSTIG() {
 // ─── Components ──────────────────────────────────────────────────────────────
 
 function StatusBadge({ status, small = false }) {
-  const opt = STATUS_OPTIONS.find((s) => s.value === status) || STATUS_OPTIONS[0];
+  const opt =
+    STATUS_OPTIONS.find((s) => s.value === status) || STATUS_OPTIONS[0];
   return (
     <span
       style={{
@@ -529,7 +634,14 @@ function AssetModal({ show, onClose, assetInfo, setAssetInfo }) {
           maxWidth: "90vw",
         }}
       >
-        <h3 style={{ color: "#e8dcc8", margin: "0 0 16px", fontSize: 16, fontWeight: 700 }}>
+        <h3
+          style={{
+            color: "#e8dcc8",
+            margin: "0 0 16px",
+            fontSize: 16,
+            fontWeight: 700,
+          }}
+        >
           Asset Information
         </h3>
         {["hostname", "ip", "mac", "fqdn"].map((field) => (
@@ -548,15 +660,17 @@ function AssetModal({ show, onClose, assetInfo, setAssetInfo }) {
               {field === "ip"
                 ? "IP Address"
                 : field === "mac"
-                ? "MAC Address"
-                : field === "fqdn"
-                ? "FQDN"
-                : "Hostname"}
+                  ? "MAC Address"
+                  : field === "fqdn"
+                    ? "FQDN"
+                    : "Hostname"}
             </label>
             <input
               type="text"
               value={assetInfo[field]}
-              onChange={(e) => setAssetInfo({ ...assetInfo, [field]: e.target.value })}
+              onChange={(e) =>
+                setAssetInfo({ ...assetInfo, [field]: e.target.value })
+              }
               style={{
                 width: "100%",
                 background: "#0f1115",
@@ -571,7 +685,14 @@ function AssetModal({ show, onClose, assetInfo, setAssetInfo }) {
             />
           </div>
         ))}
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+            marginTop: 8,
+          }}
+        >
           <button
             onClick={onClose}
             style={{
@@ -601,7 +722,12 @@ export default function STIGViewer() {
   const [severityFilter, setSeverityFilter] = useState(null);
   const [statusFilter, setStatusFilter] = useState(null);
   const [showAssetModal, setShowAssetModal] = useState(false);
-  const [assetInfo, setAssetInfo] = useState({ hostname: "", ip: "", mac: "", fqdn: "" });
+  const [assetInfo, setAssetInfo] = useState({
+    hostname: "",
+    ip: "",
+    mac: "",
+    fqdn: "",
+  });
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
   const detailRef = useRef(null);
@@ -632,12 +758,18 @@ export default function STIGViewer() {
       const file = e.dataTransfer?.files?.[0];
       if (file) handleFileLoad(file);
     },
-    [handleFileLoad]
+    [handleFileLoad],
   );
 
   const handleExport = useCallback(() => {
     if (!stig) return;
-    const xml = exportCKL(stig, assetInfo.hostname, assetInfo.ip, assetInfo.mac, assetInfo.fqdn);
+    const xml = exportCKL(
+      stig,
+      assetInfo.hostname,
+      assetInfo.ip,
+      assetInfo.mac,
+      assetInfo.fqdn,
+    );
     const blob = new Blob([xml], { type: "application/xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -647,17 +779,18 @@ export default function STIGViewer() {
     URL.revokeObjectURL(url);
   }, [stig, assetInfo]);
 
-  const updateRule = useCallback(
-    (ruleId, updates) => {
-      setStig((prev) => {
-        if (!prev) return prev;
-        const newRules = prev.rules.map((r) => (r.id === ruleId ? { ...r, ...updates } : r));
-        return { ...prev, rules: newRules };
-      });
-      setSelectedRule((prev) => (prev?.id === ruleId ? { ...prev, ...updates } : prev));
-    },
-    []
-  );
+  const updateRule = useCallback((ruleId, updates) => {
+    setStig((prev) => {
+      if (!prev) return prev;
+      const newRules = prev.rules.map((r) =>
+        r.id === ruleId ? { ...r, ...updates } : r,
+      );
+      return { ...prev, rules: newRules };
+    });
+    setSelectedRule((prev) =>
+      prev?.id === ruleId ? { ...prev, ...updates } : prev,
+    );
+  }, []);
 
   const setAllStatus = useCallback((status) => {
     setStig((prev) => {
@@ -691,13 +824,24 @@ export default function STIGViewer() {
     if (!stig) return null;
     const total = stig.rules.length;
     const bySeverity = { "CAT I": 0, "CAT II": 0, "CAT III": 0 };
-    const byStatus = { not_reviewed: 0, not_a_finding: 0, open: 0, not_applicable: 0 };
+    const byStatus = {
+      not_reviewed: 0,
+      not_a_finding: 0,
+      open: 0,
+      not_applicable: 0,
+    };
     stig.rules.forEach((r) => {
       bySeverity[r.severity] = (bySeverity[r.severity] || 0) + 1;
       byStatus[r.status] = (byStatus[r.status] || 0) + 1;
     });
     const evaluated = total - byStatus.not_reviewed;
-    return { total, bySeverity, byStatus, evaluated, pct: total ? Math.round((evaluated / total) * 100) : 0 };
+    return {
+      total,
+      bySeverity,
+      byStatus,
+      evaluated,
+      pct: total ? Math.round((evaluated / total) * 100) : 0,
+    };
   }, [stig]);
 
   useEffect(() => {
@@ -750,8 +894,17 @@ export default function STIGViewer() {
           >
             <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
               <rect width="40" height="40" rx="8" fill="#c9a227" />
-              <path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1115" />
-              <path d="M28 22l4 4-4 4" stroke="#0f1115" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path
+                d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z"
+                fill="#0f1115"
+              />
+              <path
+                d="M28 22l4 4-4 4"
+                stroke="#0f1115"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
             </svg>
             <div>
               <div
@@ -764,7 +917,7 @@ export default function STIGViewer() {
                   lineHeight: 1,
                 }}
               >
-                STIG Viewer
+                STIG Tools
               </div>
               <div
                 style={{
@@ -817,7 +970,14 @@ export default function STIGViewer() {
                 strokeLinejoin="round"
               />
             </svg>
-            <div style={{ fontSize: 15, fontWeight: 600, color: "#e8dcc8", marginBottom: 6 }}>
+            <div
+              style={{
+                fontSize: 15,
+                fontWeight: 600,
+                color: "#e8dcc8",
+                marginBottom: 6,
+              }}
+            >
               Drop STIG file or click to browse
             </div>
             <div style={{ fontSize: 12, color: "#6b7280" }}>
@@ -893,8 +1053,17 @@ export default function STIGViewer() {
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <svg width="24" height="24" viewBox="0 0 40 40" fill="none">
             <rect width="40" height="40" rx="8" fill="#c9a227" />
-            <path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1115" />
-            <path d="M28 22l4 4-4 4" stroke="#0f1115" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+            <path
+              d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z"
+              fill="#0f1115"
+            />
+            <path
+              d="M28 22l4 4-4 4"
+              stroke="#0f1115"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           </svg>
           <span
             style={{
@@ -905,7 +1074,7 @@ export default function STIGViewer() {
               letterSpacing: "-0.01em",
             }}
           >
-            STIG Viewer
+            STIG Tools
           </span>
         </div>
 
@@ -919,14 +1088,28 @@ export default function STIGViewer() {
             whiteSpace: "nowrap",
           }}
         >
-          <span style={{ color: "#c9a227", fontWeight: 700 }}>{stig.title}</span>
+          <span style={{ color: "#c9a227", fontWeight: 700 }}>
+            {stig.title}
+          </span>
           {stig.version && (
-            <span style={{ marginLeft: 8, fontFamily: "'JetBrains Mono', monospace", fontSize: 10 }}>
+            <span
+              style={{
+                marginLeft: 8,
+                fontFamily: "'JetBrains Mono', monospace",
+                fontSize: 10,
+              }}
+            >
               v{stig.version}
             </span>
           )}
           {stig.releaseInfo && (
-            <span style={{ marginLeft: 8, fontFamily: "'JetBrains Mono', monospace", fontSize: 10 }}>
+            <span
+              style={{
+                marginLeft: 8,
+                fontFamily: "'JetBrains Mono', monospace",
+                fontSize: 10,
+              }}
+            >
               {stig.releaseInfo}
             </span>
           )}
@@ -1054,7 +1237,14 @@ export default function STIGViewer() {
           >
             Evaluated
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "flex-end" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              justifyContent: "flex-end",
+            }}
+          >
             <div
               style={{
                 width: 60,
@@ -1102,7 +1292,9 @@ export default function STIGViewer() {
           }}
         >
           {/* Search */}
-          <div style={{ padding: "10px 12px", borderBottom: "1px solid #1a1d23" }}>
+          <div
+            style={{ padding: "10px 12px", borderBottom: "1px solid #1a1d23" }}
+          >
             <div style={{ position: "relative" }}>
               <svg
                 width="14"
@@ -1111,7 +1303,12 @@ export default function STIGViewer() {
                 fill="none"
                 stroke="#6b7280"
                 strokeWidth="2"
-                style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }}
+                style={{
+                  position: "absolute",
+                  left: 10,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                }}
               >
                 <circle cx="11" cy="11" r="8" />
                 <path d="M21 21l-4.35-4.35" />
@@ -1364,7 +1561,12 @@ export default function STIGViewer() {
             </div>
 
             {/* Status selector */}
-            <div style={{ padding: "16px 20px", borderBottom: "1px solid #1a1d23" }}>
+            <div
+              style={{
+                padding: "16px 20px",
+                borderBottom: "1px solid #1a1d23",
+              }}
+            >
               <div
                 style={{
                   fontSize: 11,
@@ -1381,7 +1583,9 @@ export default function STIGViewer() {
                 {STATUS_OPTIONS.map((s) => (
                   <button
                     key={s.value}
-                    onClick={() => updateRule(selectedRule.id, { status: s.value })}
+                    onClick={() =>
+                      updateRule(selectedRule.id, { status: s.value })
+                    }
                     style={{
                       padding: "7px 14px",
                       borderRadius: 5,
@@ -1390,7 +1594,9 @@ export default function STIGViewer() {
                           ? `2px solid ${s.color}`
                           : "2px solid #2a2d35",
                       background:
-                        selectedRule.status === s.value ? s.color + "20" : "#0f1115",
+                        selectedRule.status === s.value
+                          ? s.color + "20"
+                          : "#0f1115",
                       color:
                         selectedRule.status === s.value ? s.color : "#8b919a",
                       cursor: "pointer",
@@ -1437,14 +1643,19 @@ export default function STIGViewer() {
                           borderRadius: 6,
                           padding: "12px 14px",
                           whiteSpace: "pre-wrap",
-                          fontFamily: section.title === "Check Text" ? "'JetBrains Mono', monospace" : "inherit",
-                          ...(section.title === "Check Text" ? { fontSize: 12 } : {}),
+                          fontFamily:
+                            section.title === "Check Text"
+                              ? "'JetBrains Mono', monospace"
+                              : "inherit",
+                          ...(section.title === "Check Text"
+                            ? { fontSize: 12 }
+                            : {}),
                         }}
                       >
                         {section.content}
                       </div>
                     </div>
-                  )
+                  ),
               )}
 
               {/* Finding Details / Comments */}
@@ -1465,7 +1676,9 @@ export default function STIGViewer() {
                   <textarea
                     value={selectedRule[field.key]}
                     onChange={(e) =>
-                      updateRule(selectedRule.id, { [field.key]: e.target.value })
+                      updateRule(selectedRule.id, {
+                        [field.key]: e.target.value,
+                      })
                     }
                     placeholder={`Enter ${field.label.toLowerCase()}...`}
                     rows={4}

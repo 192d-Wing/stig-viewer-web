@@ -19,8 +19,7 @@ import CollectionPreferences from "@cloudscape-design/components/collection-pref
 import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
-
-const BACKEND = "http://localhost:8080";
+import { BACKEND, apiJson } from "../utils/api.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 
@@ -66,12 +65,13 @@ function findSuperseded(catalog) {
   return superseded;
 }
 
-export default function StigLibrary({ onLoad, onUploadTab }) {
+export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [activeTab, setActiveTab] = useState("library");
   const [catalog, setCatalog] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState(null);
   const [loadingId, setLoadingId] = useState(null);
+  const [draftingId, setDraftingId] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState(null);
   const [searchText, setSearchText] = useState("");
   const [showSuperseded, setShowSuperseded] = useState(false);
@@ -191,6 +191,25 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       }
     },
     [onLoad],
+  );
+
+  const handleStartDraft = useCallback(
+    async (id) => {
+      if (!onStartDraft) return;
+      setDraftingId(id);
+      try {
+        const result = await apiJson(
+          `/api/drafts/from-stig/${encodeURIComponent(id)}`,
+          "POST",
+        );
+        onStartDraft(result.id);
+      } catch (err) {
+        setCatalogError(`Failed to create draft: ${err.message}`);
+      } finally {
+        setDraftingId(null);
+      }
+    },
+    [onStartDraft],
   );
 
   const handleAddSubmit = useCallback(
@@ -317,10 +336,31 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       sortingComparator: (a, b) => a.ruleCount - b.ruleCount,
       width: 110,
     },
+    ...(onStartDraft
+      ? [
+          {
+            id: "actions",
+            header: "Actions",
+            cell: (item) => (
+              <Button
+                variant="inline-link"
+                loading={draftingId === item.id}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleStartDraft(item.id);
+                }}
+              >
+                Start Draft
+              </Button>
+            ),
+            width: 130,
+          },
+        ]
+      : []),
   ];
 
-  const visibleColumns = columnDefinitions.filter((c) =>
-    preferences.visibleContent.includes(c.id),
+  const visibleColumns = columnDefinitions.filter(
+    (c) => preferences.visibleContent.includes(c.id) || c.id === "actions",
   );
   const sortingColumn = columnDefinitions.find((c) => c.id === sortCol);
 
