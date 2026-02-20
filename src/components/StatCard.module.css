@@ -1,0 +1,39 @@
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 100px;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.card:hover {
+  border-color: var(--card-color, var(--accent));
+}
+
+.card.active {
+  background: color-mix(in srgb, var(--card-color, var(--accent)) 12%, transparent);
+  border-color: var(--card-color, var(--accent));
+}
+
+.value {
+  display: block;
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--card-color, var(--text-primary));
+}
+
+.label {
+  display: block;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  margin-top: 2px;
+}

@@ -1,0 +1,83 @@
+[[stigs]]
+id       = "windows-10"
+title    = "Windows 10 STIG"
+category = "Windows"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MS_Windows_10_V2R9_STIG.zip"
+
+[[stigs]]
+id       = "windows-11"
+title    = "Windows 11 STIG"
+category = "Windows"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MS_Windows_11_V2R2_STIG.zip"
+
+[[stigs]]
+id       = "windows-server-2019"
+title    = "Windows Server 2019 STIG"
+category = "Windows"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MS_Windows_Server_2019_V3R3_STIG.zip"
+
+[[stigs]]
+id       = "windows-server-2022"
+title    = "Windows Server 2022 STIG"
+category = "Windows"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MS_Windows_Server_2022_V2R2_STIG.zip"
+
+[[stigs]]
+id       = "rhel-8"
+title    = "Red Hat Enterprise Linux 8 STIG"
+category = "Linux"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_RHEL_8_V2R1_STIG.zip"
+
+[[stigs]]
+id       = "rhel-9"
+title    = "Red Hat Enterprise Linux 9 STIG"
+category = "Linux"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_RHEL_9_V2R2_STIG.zip"
+
+[[stigs]]
+id       = "ubuntu-2004"
+title    = "Canonical Ubuntu 20.04 LTS STIG"
+category = "Linux"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_CAN_Ubuntu_20-04_LTS_V2R1_STIG.zip"
+
+[[stigs]]
+id       = "ubuntu-2204"
+title    = "Canonical Ubuntu 22.04 LTS STIG"
+category = "Linux"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_CAN_Ubuntu_22-04_LTS_V2R2_STIG.zip"
+
+[[stigs]]
+id       = "chrome-windows"
+title    = "Google Chrome Current Windows STIG"
+category = "Browser"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_Google_Chrome_Current_Windows_V2R10_STIG.zip"
+
+[[stigs]]
+id       = "firefox"
+title    = "Mozilla Firefox STIG"
+category = "Browser"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MOZ_FireFox_V6R5_STIG.zip"
+
+[[stigs]]
+id       = "edge"
+title    = "Microsoft Edge STIG"
+category = "Browser"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_MS_Edge_V2R2_STIG.zip"
+
+[[stigs]]
+id       = "active-directory"
+title    = "Active Directory Domain STIG"
+category = "Network"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_Active_Directory_Domain_V2R14_STIG.zip"
+
+[[stigs]]
+id       = "dns"
+title    = "BIND 9.x DNS STIG"
+category = "Network"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_BIND_9-x_DNS_V2R4_STIG.zip"
+
+[[stigs]]
+id       = "cisco-ios-xe"
+title    = "Cisco IOS XE Router NDM STIG"
+category = "Network"
+url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_Cisco_IOS-XE_Router_NDM_V3R2_STIG.zip"

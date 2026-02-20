@@ -1,0 +1,189 @@
+.view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Header */
+.header {
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+}
+
+.headerInfo {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stigTitle {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.headerMeta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.headerActions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.actionBtn {
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.actionBtn:hover {
+  color: var(--text-secondary);
+  border-color: var(--text-muted);
+}
+
+.primaryBtn {
+  background: var(--accent);
+  border: none;
+  color: #000;
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+
+.primaryBtn:hover {
+  opacity: 0.9;
+}
+
+.hiddenInput {
+  display: none;
+}
+
+/* Stats bar */
+.statsBar {
+  padding: 10px 16px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border-bottom: 1px solid var(--border-light);
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: none;
+}
+
+.statsBar::-webkit-scrollbar {
+  display: none;
+}
+
+.divider {
+  width: 1px;
+  height: 36px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.progress {
+  text-align: right;
+  min-width: 80px;
+  flex-shrink: 0;
+}
+
+.progressLabel {
+  display: block;
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.progressRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.progressBar {
+  width: 60px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.progressFill.progressComplete {
+  background: var(--status-naf);
+}
+
+.progressPct {
+  font-size: 14px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--accent);
+}
+
+.progressPct.progressComplete {
+  color: var(--status-naf);
+}
+
+/* Body */
+.body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.listPane {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.2s;
+}
+
+.listPane.listPaneSplit {
+  width: 40%;
+  min-width: 280px;
+}

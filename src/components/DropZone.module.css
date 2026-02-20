@@ -1,0 +1,100 @@
+.page {
+  min-height: 100vh;
+  background: var(--bg-base);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.center {
+  text-align: center;
+  max-width: 560px;
+  width: 100%;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.appName {
+  font-size: 28px;
+  font-weight: 900;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+.appVersion {
+  font-size: 11px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  margin-top: 2px;
+}
+
+.dropZone {
+  display: block;
+  width: 100%;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-xl);
+  padding: 48px 32px;
+  background: color-mix(in srgb, var(--bg-surface) 50%, transparent);
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    background 0.2s;
+  margin-bottom: 20px;
+  color: var(--text-secondary);
+}
+
+.dropZone:hover,
+.dropZone.dragOver {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.uploadIcon {
+  margin: 0 auto 16px;
+  display: block;
+  opacity: 0.5;
+}
+
+.dropTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+.dropSub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.hiddenInput {
+  display: none;
+}
+
+.demoBtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 10px 20px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 600;
+  transition:
+    border-color 0.15s,
+    color 0.15s;
+}
+
+.demoBtn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
