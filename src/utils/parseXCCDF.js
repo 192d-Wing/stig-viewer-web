@@ -38,10 +38,11 @@ export function parseXCCDF(xmlText) {
     doc.getElementsByTagNameNS('*', 'Benchmark')[0]
   if (!benchmarkEl) throw new Error('No Benchmark element found in XCCDF')
 
-  const title =
+  const title = (
     getTextContent(benchmarkEl, 'title') ||
     getTextContent(benchmarkEl, 'Title') ||
     'Unknown STIG'
+  ).replace(/^DPMS Target /, '')
   const description =
     getTextContent(benchmarkEl, 'description') ||
     getTextContent(benchmarkEl, 'Description') ||

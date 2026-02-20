@@ -240,6 +240,8 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
 
     if title.is_empty() {
         title = "Unknown STIG".to_string();
+    } else if let Some(rest) = title.strip_prefix("DPMS Target ") {
+        title = rest.to_string();
     }
 
     Ok(StigData {
