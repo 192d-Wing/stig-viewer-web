@@ -24,7 +24,7 @@ export default function RuleList({
         <TextFilter
           filteringText={searchTerm}
           onChange={({ detail }) => onSearchChange(detail.filteringText)}
-          filteringPlaceholder="Search by ID, title, or content\u2026"
+          filteringPlaceholder="Search by ID, title, or content…"
           countText={`${rules.length} of ${allRulesCount} rules`}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>

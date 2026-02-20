@@ -267,7 +267,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
                 handleLoad(item.id);
               }}
             >
-              {loadingId === item.id ? "Loading\u2026" : item.title}
+              {loadingId === item.id ? "Loading…" : item.title}
             </Link>
             {dimmed && (
               <>
@@ -283,7 +283,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     {
       id: "version",
       header: "Version",
-      cell: (item) => item.version || "\u2014",
+      cell: (item) => item.version || "—",
       sortingComparator: (a, b) => {
         const vDiff = Number(a.version || 0) - Number(b.version || 0);
         if (vDiff !== 0) return vDiff;
@@ -294,7 +294,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     {
       id: "release",
       header: "Release",
-      cell: (item) => parseRelease(item.releaseInfo) || "\u2014",
+      cell: (item) => parseRelease(item.releaseInfo) || "—",
       sortingComparator: (a, b) =>
         parseRelease(a.releaseInfo) - parseRelease(b.releaseInfo),
       width: 110,

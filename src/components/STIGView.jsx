@@ -5,11 +5,50 @@ import { STATUS_OPTIONS } from '../constants/status.js'
 import Header from '@cloudscape-design/components/header'
 import Button from '@cloudscape-design/components/button'
 import SpaceBetween from '@cloudscape-design/components/space-between'
+import Container from '@cloudscape-design/components/container'
+import ColumnLayout from '@cloudscape-design/components/column-layout'
+import Box from '@cloudscape-design/components/box'
+import Tabs from '@cloudscape-design/components/tabs'
+import Badge from '@cloudscape-design/components/badge'
+import StatusIndicator from '@cloudscape-design/components/status-indicator'
 import ProgressBar from '@cloudscape-design/components/progress-bar'
-import StatCard from './StatCard.jsx'
+import Select from '@cloudscape-design/components/select'
+import FormField from '@cloudscape-design/components/form-field'
+import Input from '@cloudscape-design/components/input'
+import ExpandableSection from '@cloudscape-design/components/expandable-section'
+import Link from '@cloudscape-design/components/link'
 import RuleList from './RuleList.jsx'
-import AssetModal from './AssetModal.jsx'
 import POAMExportModal from './POAMExportModal.jsx'
+
+const SEVERITY_BADGE_COLOR = {
+  'CAT I': 'red',
+  'CAT II': 'blue',
+  'CAT III': 'grey',
+}
+
+const STATUS_INDICATOR_TYPE = {
+  not_reviewed: 'pending',
+  not_a_finding: 'success',
+  open: 'error',
+  not_applicable: 'stopped',
+}
+
+const SEVERITY_FILTER_OPTIONS = [
+  { label: 'All severities', value: '' },
+  ...SEVERITY_ORDER.map((s) => ({ label: s, value: s })),
+]
+
+const STATUS_FILTER_OPTIONS = [
+  { label: 'All statuses', value: '' },
+  ...STATUS_OPTIONS.map((o) => ({ label: o.label, value: o.value })),
+]
+
+const ASSET_FIELDS = [
+  { key: 'hostname', label: 'Hostname' },
+  { key: 'ip', label: 'IP Address' },
+  { key: 'mac', label: 'MAC Address' },
+  { key: 'fqdn', label: 'FQDN' },
+]
 
 export default function STIGView({
   tab,
@@ -24,7 +63,6 @@ export default function STIGView({
   const [searchTerm, setSearchTerm] = useState('')
   const [severityFilter, setSeverityFilter] = useState(null)
   const [statusFilter, setStatusFilter] = useState(null)
-  const [showAssetModal, setShowAssetModal] = useState(false)
   const [showPOAMModal, setShowPOAMModal] = useState(false)
   const fileInputRef = useRef(null)
 
@@ -76,134 +114,201 @@ export default function STIGView({
     URL.revokeObjectURL(url)
   }, [stig, assetInfo])
 
-  const clearFilters = useCallback(() => {
-    setSeverityFilter(null)
-    setStatusFilter(null)
-  }, [])
-
   const description = [
     stig.version && `v${stig.version}`,
     stig.releaseInfo,
-  ].filter(Boolean).join(' \u00b7 ')
+  ].filter(Boolean).join(' · ')
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', minHeight: 0 }}>
-      {/* Header */}
-      <div style={{ padding: '8px 16px', borderBottom: '1px solid #354150', flexShrink: 0 }}>
-        <Header
-          variant="h2"
-          description={description}
-          actions={
-            <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => setShowAssetModal(true)}>Asset Info</Button>
-              <Button onClick={() => fileInputRef.current?.click()}>Open File</Button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".xml,.ckl"
-                multiple
-                style={{ display: 'none' }}
-                aria-hidden="true"
-                tabIndex={-1}
-                onChange={(e) => {
-                  if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files)
-                }}
-              />
-              <Button onClick={() => setShowPOAMModal(true)}>Export POAM</Button>
-              <Button variant="primary" onClick={handleExportCKL}>Export .ckl</Button>
-            </SpaceBetween>
-          }
-        >
-          {stig.title}
-        </Header>
-      </div>
-
-      {/* Stats bar */}
-      <div
-        role="toolbar"
-        aria-label="Filter by severity or status"
-        style={{
-          padding: '10px 16px',
-          display: 'flex',
-          gap: 8,
-          alignItems: 'center',
-          borderBottom: '1px solid #232f3e',
-          overflowX: 'auto',
-          flexShrink: 0,
-          scrollbarWidth: 'none',
-        }}
+    <SpaceBetween size="m">
+      {/* Page header */}
+      <Header
+        variant="h2"
+        description={description}
+        actions={
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button onClick={() => fileInputRef.current?.click()}>Open File</Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xml,.ckl"
+              multiple
+              style={{ display: 'none' }}
+              aria-hidden="true"
+              tabIndex={-1}
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files)
+              }}
+            />
+            <Button onClick={() => setShowPOAMModal(true)}>Export POAM</Button>
+            <Button variant="primary" onClick={handleExportCKL}>Export .ckl</Button>
+          </SpaceBetween>
+        }
       >
-        <StatCard
-          label="Total"
-          value={stats.total}
-          color="#d1d5db"
-          onClick={clearFilters}
-          active={!severityFilter && !statusFilter}
-        />
-        <div style={{ width: 1, height: 36, background: '#354150', flexShrink: 0 }} aria-hidden="true" />
-        {SEVERITY_ORDER.map((sev) => (
-          <StatCard
-            key={sev}
-            label={sev}
-            value={stats.bySeverity[sev] ?? 0}
-            color={SEVERITY_COLORS[sev]}
-            onClick={() => {
-              setSeverityFilter(severityFilter === sev ? null : sev)
-              setStatusFilter(null)
-            }}
-            active={severityFilter === sev}
-          />
-        ))}
-        <div style={{ width: 1, height: 36, background: '#354150', flexShrink: 0 }} aria-hidden="true" />
-        {STATUS_OPTIONS.map((opt) => (
-          <StatCard
-            key={opt.value}
-            label={opt.label}
-            value={stats.byStatus[opt.value] ?? 0}
-            color={opt.color}
-            onClick={() => {
-              setStatusFilter(statusFilter === opt.value ? null : opt.value)
-              setSeverityFilter(null)
-            }}
-            active={statusFilter === opt.value}
-          />
-        ))}
-        <div style={{ flex: 1 }} />
-        <div style={{ minWidth: 120, flexShrink: 0 }}>
-          <ProgressBar
-            value={stats.pct}
-            label="Evaluated"
-            resultText={`${stats.pct}%`}
-            status={stats.pct === 100 ? 'success' : 'in-progress'}
-          />
-        </div>
-      </div>
+        {stig.title}
+      </Header>
 
-      {/* Rule list — full width, RuleDetail is in AppLayout SplitPanel */}
-      <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
-        <RuleList
-          rules={filteredRules}
-          allRulesCount={stig.rules.length}
-          selectedRuleId={selectedRuleId}
-          searchTerm={searchTerm}
-          onSearchChange={setSearchTerm}
-          onSelectRule={(rule) => onSetSelectedRule(rule?.id ?? null)}
-          onSetAllStatus={onSetAllStatus}
-        />
-      </div>
+      {/* Summary container */}
+      <Container>
+        <ColumnLayout columns={4} variant="text-grid">
+          <div>
+            <Box variant="awsui-key-label">Total Rules</Box>
+            <Box variant="awsui-value-large">{stats.total}</Box>
+          </div>
+          <div>
+            <Box variant="awsui-key-label">Evaluated</Box>
+            <ProgressBar
+              value={stats.pct}
+              resultText={`${stats.evaluated} of ${stats.total}`}
+              status={stats.pct === 100 ? 'success' : 'in-progress'}
+            />
+          </div>
+          <div>
+            <Box variant="awsui-key-label">Severity</Box>
+            <SpaceBetween direction="horizontal" size="xs">
+              {SEVERITY_ORDER.map((sev) => (
+                <Badge key={sev} color={SEVERITY_BADGE_COLOR[sev]}>
+                  {sev}: {stats.bySeverity[sev]}
+                </Badge>
+              ))}
+            </SpaceBetween>
+          </div>
+          <div>
+            <Box variant="awsui-key-label">Status</Box>
+            <SpaceBetween size="xxs">
+              {STATUS_OPTIONS.map((opt) => (
+                <StatusIndicator key={opt.value} type={STATUS_INDICATOR_TYPE[opt.value]}>
+                  {opt.label}: {stats.byStatus[opt.value]}
+                </StatusIndicator>
+              ))}
+            </SpaceBetween>
+          </div>
+        </ColumnLayout>
+      </Container>
 
-      <AssetModal
-        show={showAssetModal}
-        onClose={() => setShowAssetModal(false)}
-        assetInfo={assetInfo}
-        onUpdate={onSetAssetInfo}
+      {/* Tabs */}
+      <Tabs
+        ariaLabel="STIG details"
+        tabs={[
+          {
+            label: 'Rules',
+            id: 'rules',
+            content: (
+              <SpaceBetween size="m">
+                <SpaceBetween direction="horizontal" size="m" alignItems="end">
+                  <FormField label="Severity">
+                    <Select
+                      selectedOption={
+                        SEVERITY_FILTER_OPTIONS.find((o) => o.value === (severityFilter || '')) ||
+                        SEVERITY_FILTER_OPTIONS[0]
+                      }
+                      onChange={({ detail }) =>
+                        setSeverityFilter(detail.selectedOption.value || null)
+                      }
+                      options={SEVERITY_FILTER_OPTIONS}
+                    />
+                  </FormField>
+                  <FormField label="Status">
+                    <Select
+                      selectedOption={
+                        STATUS_FILTER_OPTIONS.find((o) => o.value === (statusFilter || '')) ||
+                        STATUS_FILTER_OPTIONS[0]
+                      }
+                      onChange={({ detail }) =>
+                        setStatusFilter(detail.selectedOption.value || null)
+                      }
+                      options={STATUS_FILTER_OPTIONS}
+                    />
+                  </FormField>
+                </SpaceBetween>
+                <div style={{ height: 'calc(100vh - 420px)', minHeight: 300 }}>
+                  <RuleList
+                    rules={filteredRules}
+                    allRulesCount={stig.rules.length}
+                    selectedRuleId={selectedRuleId}
+                    searchTerm={searchTerm}
+                    onSearchChange={setSearchTerm}
+                    onSelectRule={(rule) => onSetSelectedRule(rule?.id ?? null)}
+                    onSetAllStatus={onSetAllStatus}
+                  />
+                </div>
+              </SpaceBetween>
+            ),
+          },
+          {
+            label: 'Details',
+            id: 'details',
+            content: (
+              <Container header={<Header variant="h2">STIG Information</Header>}>
+                <ColumnLayout columns={2} variant="text-grid">
+                  <div>
+                    <Box variant="awsui-key-label">Title</Box>
+                    <div>{stig.title}</div>
+                  </div>
+                  <div>
+                    <Box variant="awsui-key-label">Version</Box>
+                    <div>{stig.version || '—'}</div>
+                  </div>
+                  <div>
+                    <Box variant="awsui-key-label">Release</Box>
+                    <div>{stig.releaseInfo?.match(/Release:\s*(\d+)/i)?.[1] || '—'}</div>
+                  </div>
+                  <div>
+                    <Box variant="awsui-key-label">Benchmark Date</Box>
+                    <div>{stig.releaseInfo?.match(/Benchmark Date:\s*(.+)/i)?.[1] || '—'}</div>
+                  </div>
+                  <div>
+                    <Box variant="awsui-key-label">Total Rules</Box>
+                    <div>{stig.rules.length}</div>
+                  </div>
+                  <div>
+                    <Box variant="awsui-key-label">DISA STIG Support</Box>
+                    <Link href="mailto:disa.stig_spt@mail.mil" external>
+                      disa.stig_spt@mail.mil
+                    </Link>
+                  </div>
+                </ColumnLayout>
+                {stig.description && (
+                  <Box margin={{ top: 'l' }}>
+                    <ExpandableSection headerText="Description" defaultExpanded>
+                      <Box variant="p" color="text-body-secondary">
+                        {stig.description}
+                      </Box>
+                    </ExpandableSection>
+                  </Box>
+                )}
+              </Container>
+            ),
+          },
+          {
+            label: 'Asset',
+            id: 'asset',
+            content: (
+              <Container header={<Header variant="h2">Asset Information</Header>}>
+                <ColumnLayout columns={2}>
+                  {ASSET_FIELDS.map(({ key, label }) => (
+                    <FormField key={key} label={label}>
+                      <Input
+                        value={assetInfo[key]}
+                        onChange={({ detail }) =>
+                          onSetAssetInfo({ ...assetInfo, [key]: detail.value })
+                        }
+                      />
+                    </FormField>
+                  ))}
+                </ColumnLayout>
+              </Container>
+            ),
+          },
+        ]}
       />
+
       <POAMExportModal
         show={showPOAMModal}
         onClose={() => setShowPOAMModal(false)}
         stig={stig}
         assetInfo={assetInfo}
       />
-    </div>
+    </SpaceBetween>
   )
 }

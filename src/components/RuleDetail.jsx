@@ -108,7 +108,7 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
               <Textarea
                 value={rule[key]}
                 onChange={({ detail }) => onUpdateRule({ [key]: detail.value })}
-                placeholder={`Enter ${label.toLowerCase()}\u2026`}
+                placeholder={`Enter ${label.toLowerCase()}…`}
                 rows={4}
               />
             </FormField>
