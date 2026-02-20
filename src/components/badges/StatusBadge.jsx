@@ -1,15 +1,10 @@
-import { STATUS_OPTIONS } from '../../constants/status.js'
-import s from './StatusBadge.module.css'
+import StatusIndicator from '@cloudscape-design/components/status-indicator'
+import { STATUS_INDICATOR_TYPE, STATUS_LABEL } from '../../constants/cloudscapeHelpers.js'
 
-export default function StatusBadge({ status, small = false }) {
-  const opt = STATUS_OPTIONS.find((o) => o.value === status) ?? STATUS_OPTIONS[0]
+export default function StatusBadge({ status }) {
   return (
-    <span
-      className={`${s.badge} ${s[status]} ${small ? s.small : ''}`}
-      aria-label={`Status: ${opt.label}`}
-    >
-      <span className={s.dot} aria-hidden="true" />
-      {opt.label}
-    </span>
+    <StatusIndicator type={STATUS_INDICATOR_TYPE[status] || 'pending'}>
+      {STATUS_LABEL[status] || status}
+    </StatusIndicator>
   )
 }

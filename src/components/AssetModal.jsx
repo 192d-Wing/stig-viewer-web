@@ -1,4 +1,8 @@
-import s from './AssetModal.module.css'
+import Modal from '@cloudscape-design/components/modal'
+import Button from '@cloudscape-design/components/button'
+import FormField from '@cloudscape-design/components/form-field'
+import Input from '@cloudscape-design/components/input'
+import SpaceBetween from '@cloudscape-design/components/space-between'
 
 const FIELDS = [
   { key: 'hostname', label: 'Hostname' },
@@ -8,39 +12,28 @@ const FIELDS = [
 ]
 
 export default function AssetModal({ show, onClose, assetInfo, onUpdate }) {
-  if (!show) return null
-
   return (
-    <div
-      className={s.backdrop}
-      onClick={onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Asset Information"
-    >
-      <div className={s.modal} onClick={(e) => e.stopPropagation()}>
-        <h2 className={s.title}>Asset Information</h2>
-        {FIELDS.map(({ key, label }) => (
-          <div key={key} className={s.field}>
-            <label htmlFor={`asset-${key}`} className={s.fieldLabel}>
-              {label}
-            </label>
-            <input
-              id={`asset-${key}`}
-              type="text"
-              value={assetInfo[key]}
-              onChange={(e) => onUpdate({ ...assetInfo, [key]: e.target.value })}
-              className={s.input}
-              autoComplete="off"
-            />
-          </div>
-        ))}
-        <div className={s.actions}>
-          <button type="button" onClick={onClose} className={s.doneBtn}>
-            Done
-          </button>
+    <Modal
+      visible={show}
+      onDismiss={onClose}
+      header="Asset Information"
+      footer={
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <Button variant="primary" onClick={onClose}>Done</Button>
         </div>
-      </div>
-    </div>
+      }
+    >
+      <SpaceBetween size="m">
+        {FIELDS.map(({ key, label }) => (
+          <FormField key={key} label={label}>
+            <Input
+              value={assetInfo[key]}
+              onChange={({ detail }) => onUpdate({ ...assetInfo, [key]: detail.value })}
+              autoComplete={false}
+            />
+          </FormField>
+        ))}
+      </SpaceBetween>
+    </Modal>
   )
 }

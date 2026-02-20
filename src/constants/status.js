@@ -1,8 +1,8 @@
 export const STATUS_OPTIONS = [
-  { value: 'not_reviewed', label: 'Not Reviewed', color: 'var(--status-nr)' },
-  { value: 'not_a_finding', label: 'Not a Finding', color: 'var(--status-naf)' },
-  { value: 'open', label: 'Open', color: 'var(--status-open)' },
-  { value: 'not_applicable', label: 'Not Applicable', color: 'var(--status-na)' },
+  { value: 'not_reviewed', label: 'Not Reviewed', color: '#8d99a8' },
+  { value: 'not_a_finding', label: 'Not a Finding', color: '#22c55e' },
+  { value: 'open', label: 'Open', color: '#ff4444' },
+  { value: 'not_applicable', label: 'Not Applicable', color: '#8b5cf6' },
 ]
 
 export const STATUS_CKL_MAP = {

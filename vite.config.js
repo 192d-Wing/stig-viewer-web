@@ -9,11 +9,12 @@ const SECURITY_HEADERS = {
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
 }
 
-// Production: fully strict, no external origins, no unsafe-inline
+// Production: fully strict, no external origins
+// Note: style-src needs 'unsafe-inline' for Cloudscape runtime style injection
 const PROD_CSP = [
   "default-src 'none'",
   "script-src 'self'",
-  "style-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
   "font-src 'self'",
   "img-src 'self' data:",
   "connect-src http://localhost:8080",
@@ -70,6 +71,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           vendor: ['react', 'react-dom'],
+          cloudscape: ['@cloudscape-design/components', '@cloudscape-design/global-styles'],
         },
       },
     },

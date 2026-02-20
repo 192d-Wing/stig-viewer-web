@@ -131,79 +131,18 @@
     U+FEFF, U+FFFD;
 }
 
-/* ── Design tokens ─────────────────────────────────────────────────────────── */
-
-:root {
-  /* Backgrounds */
-  --bg-base: #0f1115;
-  --bg-surface: #1a1d23;
-  --bg-overlay: #1a1d2360;
-
-  /* Borders */
-  --border: #2a2d35;
-  --border-light: #1a1d23;
-
-  /* Text */
-  --text-primary: #e8dcc8;
-  --text-secondary: #c5c9d2;
-  --text-muted: #8b919a;
-  --text-dim: #6b7280;
-
-  /* Brand accent */
-  --accent: #c9a227;
-  --accent-bg: #c9a22710;
-  --accent-border: #c9a22740;
-
-  /* Severity */
-  --cat1: #ff4444;
-  --cat2: #ffaa00;
-  --cat3: #44aaff;
-
-  /* Status */
-  --status-open: #ef4444;
-  --status-naf: #22c55e;
-  --status-na: #8b5cf6;
-  --status-nr: #6b7280;
-
-  /* Diff */
-  --diff-added: #22c55e;
-  --diff-removed: #ef4444;
-  --diff-changed: #f59e0b;
-
-  /* Typography */
-  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
-  --font-sans: 'Source Sans 3', 'Segoe UI', system-ui, sans-serif;
-
-  /* Radii */
-  --radius-sm: 3px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 12px;
-}
-
 /* ── Global reset ──────────────────────────────────────────────────────────── */
 
 *,
 *::before,
 *::after {
   box-sizing: border-box;
-  margin: 0;
-  padding: 0;
 }
 
 html,
 body,
 #root {
   height: 100%;
-  overflow: hidden;
-}
-
-body {
-  background: var(--bg-base);
-  color: var(--text-secondary);
-  font-family: var(--font-sans);
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
 }
 
 /* ── Scrollbar ─────────────────────────────────────────────────────────────── */
@@ -214,38 +153,14 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-base);
+  background: #0f1b2e;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: var(--radius-sm);
+  background: #354150;
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #3a3d45;
-}
-
-/* ── Focus & selection ─────────────────────────────────────────────────────── */
-
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-::selection {
-  background: var(--accent-border);
-}
-
-/* ── Form elements reset ───────────────────────────────────────────────────── */
-
-input,
-textarea,
-select,
-button {
-  font-family: inherit;
-}
-
-button {
-  cursor: pointer;
+  background: #4a5568;
 }

@@ -2,12 +2,14 @@ import { useState, useMemo, useRef, useCallback } from 'react'
 import { exportCKL } from '../utils/exportCKL.js'
 import { SEVERITY_COLORS, SEVERITY_ORDER } from '../constants/severity.js'
 import { STATUS_OPTIONS } from '../constants/status.js'
+import Header from '@cloudscape-design/components/header'
+import Button from '@cloudscape-design/components/button'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import ProgressBar from '@cloudscape-design/components/progress-bar'
 import StatCard from './StatCard.jsx'
 import RuleList from './RuleList.jsx'
-import RuleDetail from './RuleDetail.jsx'
 import AssetModal from './AssetModal.jsx'
 import POAMExportModal from './POAMExportModal.jsx'
-import s from './STIGView.module.css'
 
 export default function STIGView({
   tab,
@@ -18,10 +20,6 @@ export default function STIGView({
   onAddFiles,
 }) {
   const { stig, assetInfo, selectedRuleId } = tab
-  const selectedRule = useMemo(
-    () => stig.rules.find((r) => r.id === selectedRuleId) ?? null,
-    [stig.rules, selectedRuleId],
-  )
 
   const [searchTerm, setSearchTerm] = useState('')
   const [severityFilter, setSeverityFilter] = useState(null)
@@ -83,75 +81,72 @@ export default function STIGView({
     setStatusFilter(null)
   }, [])
 
+  const description = [
+    stig.version && `v${stig.version}`,
+    stig.releaseInfo,
+  ].filter(Boolean).join(' \u00b7 ')
+
   return (
-    <div className={s.view}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', minHeight: 0 }}>
       {/* Header */}
-      <header className={s.header}>
-        <div className={s.headerInfo}>
-          <span className={s.stigTitle}>{stig.title}</span>
-          {stig.version && (
-            <span className={s.headerMeta}>v{stig.version}</span>
-          )}
-          {stig.releaseInfo && (
-            <span className={s.headerMeta}>{stig.releaseInfo}</span>
-          )}
-        </div>
-        <div className={s.headerActions}>
-          <button
-            type="button"
-            onClick={() => setShowAssetModal(true)}
-            className={s.actionBtn}
-          >
-            Asset Info
-          </button>
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className={s.actionBtn}
-          >
-            Open File
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".xml,.ckl"
-            multiple
-            className={s.hiddenInput}
-            aria-hidden="true"
-            tabIndex={-1}
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files)
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => setShowPOAMModal(true)}
-            className={s.actionBtn}
-          >
-            Export POAM
-          </button>
-          <button type="button" onClick={handleExportCKL} className={s.primaryBtn}>
-            Export .ckl
-          </button>
-        </div>
-      </header>
+      <div style={{ padding: '8px 16px', borderBottom: '1px solid #354150', flexShrink: 0 }}>
+        <Header
+          variant="h2"
+          description={description}
+          actions={
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button onClick={() => setShowAssetModal(true)}>Asset Info</Button>
+              <Button onClick={() => fileInputRef.current?.click()}>Open File</Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xml,.ckl"
+                multiple
+                style={{ display: 'none' }}
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={(e) => {
+                  if (e.target.files && e.target.files.length > 0) onAddFiles(e.target.files)
+                }}
+              />
+              <Button onClick={() => setShowPOAMModal(true)}>Export POAM</Button>
+              <Button variant="primary" onClick={handleExportCKL}>Export .ckl</Button>
+            </SpaceBetween>
+          }
+        >
+          {stig.title}
+        </Header>
+      </div>
 
       {/* Stats bar */}
-      <div className={s.statsBar} role="toolbar" aria-label="Filter by severity or status">
+      <div
+        role="toolbar"
+        aria-label="Filter by severity or status"
+        style={{
+          padding: '10px 16px',
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          borderBottom: '1px solid #232f3e',
+          overflowX: 'auto',
+          flexShrink: 0,
+          scrollbarWidth: 'none',
+        }}
+      >
         <StatCard
           label="Total"
           value={stats.total}
-          colorVar="var(--text-primary)"
+          color="#d1d5db"
           onClick={clearFilters}
           active={!severityFilter && !statusFilter}
         />
-        <div className={s.divider} aria-hidden="true" />
+        <div style={{ width: 1, height: 36, background: '#354150', flexShrink: 0 }} aria-hidden="true" />
         {SEVERITY_ORDER.map((sev) => (
           <StatCard
             key={sev}
             label={sev}
             value={stats.bySeverity[sev] ?? 0}
-            colorVar={SEVERITY_COLORS[sev]}
+            color={SEVERITY_COLORS[sev]}
             onClick={() => {
               setSeverityFilter(severityFilter === sev ? null : sev)
               setStatusFilter(null)
@@ -159,13 +154,13 @@ export default function STIGView({
             active={severityFilter === sev}
           />
         ))}
-        <div className={s.divider} aria-hidden="true" />
+        <div style={{ width: 1, height: 36, background: '#354150', flexShrink: 0 }} aria-hidden="true" />
         {STATUS_OPTIONS.map((opt) => (
           <StatCard
             key={opt.value}
             label={opt.label}
             value={stats.byStatus[opt.value] ?? 0}
-            colorVar={opt.color}
+            color={opt.color}
             onClick={() => {
               setStatusFilter(statusFilter === opt.value ? null : opt.value)
               setSeverityFilter(null)
@@ -173,43 +168,28 @@ export default function STIGView({
             active={statusFilter === opt.value}
           />
         ))}
-        <div className={s.spacer} />
-        <div className={s.progress} aria-label={`${stats.pct}% evaluated`}>
-          <span className={s.progressLabel}>Evaluated</span>
-          <div className={s.progressRow}>
-            <div className={s.progressBar}>
-              <div
-                className={`${s.progressFill} ${stats.pct === 100 ? s.progressComplete : ''}`}
-                style={{ width: `${stats.pct}%` }}
-              />
-            </div>
-            <span className={`${s.progressPct} ${stats.pct === 100 ? s.progressComplete : ''}`}>
-              {stats.pct}%
-            </span>
-          </div>
+        <div style={{ flex: 1 }} />
+        <div style={{ minWidth: 120, flexShrink: 0 }}>
+          <ProgressBar
+            value={stats.pct}
+            label="Evaluated"
+            resultText={`${stats.pct}%`}
+            status={stats.pct === 100 ? 'success' : 'in-progress'}
+          />
         </div>
       </div>
 
-      {/* Body */}
-      <div className={s.body}>
-        <div className={`${s.listPane} ${selectedRule ? s.listPaneSplit : ''}`}>
-          <RuleList
-            rules={filteredRules}
-            allRulesCount={stig.rules.length}
-            selectedRuleId={selectedRuleId}
-            searchTerm={searchTerm}
-            onSearchChange={setSearchTerm}
-            onSelectRule={(rule) => onSetSelectedRule(rule?.id ?? null)}
-            onSetAllStatus={onSetAllStatus}
-          />
-        </div>
-        {selectedRule && (
-          <RuleDetail
-            rule={selectedRule}
-            onUpdateRule={(updates) => onUpdateRule(selectedRule.id, updates)}
-            onClose={() => onSetSelectedRule(null)}
-          />
-        )}
+      {/* Rule list — full width, RuleDetail is in AppLayout SplitPanel */}
+      <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+        <RuleList
+          rules={filteredRules}
+          allRulesCount={stig.rules.length}
+          selectedRuleId={selectedRuleId}
+          searchTerm={searchTerm}
+          onSearchChange={setSearchTerm}
+          onSelectRule={(rule) => onSetSelectedRule(rule?.id ?? null)}
+          onSetAllStatus={onSetAllStatus}
+        />
       </div>
 
       <AssetModal

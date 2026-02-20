@@ -1,13 +1,17 @@
-import { useState, useRef, useCallback } from 'react'
-import s from './DropZone.module.css'
+import { useState, useCallback } from 'react'
+import Header from '@cloudscape-design/components/header'
+import Button from '@cloudscape-design/components/button'
+import FileUpload from '@cloudscape-design/components/file-upload'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import Box from '@cloudscape-design/components/box'
 
 export default function DropZone({ onFilesLoad, onLoadSample }) {
+  const [files, setFiles] = useState([])
   const [dragOver, setDragOver] = useState(false)
-  const fileInputRef = useRef(null)
 
   const handleFiles = useCallback(
-    (files) => {
-      if (files && files.length > 0) onFilesLoad(files)
+    (fileList) => {
+      if (fileList && fileList.length > 0) onFilesLoad(fileList)
     },
     [onFilesLoad],
   )
@@ -21,78 +25,79 @@ export default function DropZone({ onFilesLoad, onLoadSample }) {
     [handleFiles],
   )
 
-  const handleDragOver = useCallback((e) => {
-    e.preventDefault()
-    setDragOver(true)
-  }, [])
-
-  const handleDragLeave = useCallback(() => setDragOver(false), [])
-
   return (
     <div
-      className={s.page}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
+      onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+      onDragLeave={() => setDragOver(false)}
       onDrop={handleDrop}
+      style={{ textAlign: 'center', maxWidth: 560, width: '100%', margin: '0 auto' }}
     >
-      <div className={s.center}>
+      <SpaceBetween size="l">
         {/* Brand */}
-        <div className={s.brand}>
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
           <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
-            <rect width="40" height="40" rx="8" fill="#c9a227" />
-            <path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1115" />
-            <path d="M28 22l4 4-4 4" stroke="#0f1115" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+            <rect width="40" height="40" rx="8" fill="#539fe5" />
+            <path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1b2e" />
+            <path d="M28 22l4 4-4 4" stroke="#0f1b2e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          <div>
-            <h1 className={s.appName}>STIG Viewer</h1>
-            <p className={s.appVersion}>WEB EDITION v3.0</p>
-          </div>
+          <Header variant="h1" description="Web Edition v3.0">
+            STIG Viewer
+          </Header>
         </div>
 
-        {/* Drop target */}
-        <button
-          type="button"
-          className={`${s.dropZone} ${dragOver ? s.dragOver : ''}`}
-          onClick={() => fileInputRef.current?.click()}
-          aria-label="Click to select STIG files, or drag and drop files here"
-        >
-          <svg
-            width="48"
-            height="48"
-            viewBox="0 0 48 48"
-            fill="none"
-            className={s.uploadIcon}
-            aria-hidden="true"
-          >
-            <path
-              d="M24 32V16m0 0l-8 8m8-8l8 8M8 36h32"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          <p className={s.dropTitle}>Drop STIG files or click to browse</p>
-          <p className={s.dropSub}>
-            Supports XCCDF (.xml) and Checklist (.ckl) · Multiple files supported
-          </p>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".xml,.ckl"
-            multiple
-            className={s.hiddenInput}
-            aria-hidden="true"
-            tabIndex={-1}
-            onChange={(e) => handleFiles(e.target.files)}
-          />
-        </button>
+        {/* File upload area */}
+        <div style={{
+          border: `2px dashed ${dragOver ? '#539fe5' : '#354150'}`,
+          borderRadius: 12,
+          padding: '48px 32px',
+          background: dragOver ? '#539fe510' : 'transparent',
+          transition: 'border-color 0.2s, background 0.2s',
+        }}>
+          <Box textAlign="center">
+            <SpaceBetween size="m">
+              <svg
+                width="48"
+                height="48"
+                viewBox="0 0 48 48"
+                fill="none"
+                style={{ margin: '0 auto', display: 'block', opacity: 0.5 }}
+                aria-hidden="true"
+              >
+                <path
+                  d="M24 32V16m0 0l-8 8m8-8l8 8M8 36h32"
+                  stroke="#8d99a8"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              <FileUpload
+                value={files}
+                onChange={({ detail }) => {
+                  setFiles(detail.value)
+                  if (detail.value.length > 0) handleFiles(detail.value)
+                }}
+                accept=".xml,.ckl"
+                multiple
+                constraintText="Supports XCCDF (.xml) and Checklist (.ckl)"
+                i18nStrings={{
+                  uploadButtonText: (e) => e ? 'Choose files' : 'Choose file',
+                  dropzoneText: (e) => e ? 'Drop files to upload' : 'Drop file to upload',
+                  removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
+                  limitShowFewer: 'Show fewer files',
+                  limitShowMore: 'Show more files',
+                  errorIconAriaLabel: 'Error',
+                }}
+              />
+            </SpaceBetween>
+          </Box>
+        </div>
 
-        {/* Demo */}
-        <button type="button" onClick={onLoadSample} className={s.demoBtn}>
+        {/* Demo button */}
+        <Button variant="link" onClick={onLoadSample}>
           Load Demo STIG
-        </button>
-      </div>
+        </Button>
+      </SpaceBetween>
     </div>
   )
 }

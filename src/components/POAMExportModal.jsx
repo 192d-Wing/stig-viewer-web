@@ -1,6 +1,11 @@
 import { useState, useCallback } from 'react'
 import { exportPOAMCSV, exportPOAMJSON } from '../utils/exportPOAM.js'
-import s from './POAMExportModal.module.css'
+import Modal from '@cloudscape-design/components/modal'
+import Button from '@cloudscape-design/components/button'
+import RadioGroup from '@cloudscape-design/components/radio-group'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import StatusIndicator from '@cloudscape-design/components/status-indicator'
+import Box from '@cloudscape-design/components/box'
 
 function downloadBlob(content, filename, mime) {
   const blob = new Blob([content], { type: mime })
@@ -28,66 +33,45 @@ export default function POAMExportModal({ show, onClose, stig, assetInfo }) {
     downloadBlob(json, `${baseName}_POAM.json`, 'application/json')
   }, [stig, assetInfo, includeNonReviewed, baseName])
 
-  if (!show) return null
-
   const openCount = stig.rules.filter((r) => r.status === 'open').length
   const pendingCount = stig.rules.filter((r) => r.status === 'not_reviewed').length
 
   return (
-    <div
-      className={s.backdrop}
-      onClick={onClose}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Export POAM"
+    <Modal
+      visible={show}
+      onDismiss={onClose}
+      header="Export POA&M"
+      footer={
+        <SpaceBetween direction="horizontal" size="xs">
+          <div style={{ flex: 1 }} />
+          <Button variant="link" onClick={onClose}>Cancel</Button>
+          <Button onClick={handleJSON}>Download JSON</Button>
+          <Button variant="primary" onClick={handleCSV}>Download CSV</Button>
+        </SpaceBetween>
+      }
     >
-      <div className={s.modal} onClick={(e) => e.stopPropagation()}>
-        <h2 className={s.title}>Export POA&amp;M</h2>
-
+      <SpaceBetween size="l">
         {/* Counts */}
-        <div className={s.counts}>
-          <span className={s.countOpen}>{openCount} Open findings</span>
-          <span className={s.countPending}>{pendingCount} Not Reviewed</span>
-        </div>
+        <SpaceBetween direction="horizontal" size="l">
+          <StatusIndicator type="error">{openCount} Open findings</StatusIndicator>
+          <StatusIndicator type="pending">{pendingCount} Not Reviewed</StatusIndicator>
+        </SpaceBetween>
 
-        {/* Scope toggle */}
-        <fieldset className={s.fieldset}>
-          <legend className={s.legend}>Scope</legend>
-          <label className={s.radioLabel}>
-            <input
-              type="radio"
-              name="poam-scope"
-              checked={!includeNonReviewed}
-              onChange={() => setIncludeNonReviewed(false)}
-              className={s.radio}
-            />
-            Open findings only ({openCount} items)
-          </label>
-          <label className={s.radioLabel}>
-            <input
-              type="radio"
-              name="poam-scope"
-              checked={includeNonReviewed}
-              onChange={() => setIncludeNonReviewed(true)}
-              className={s.radio}
-            />
-            Open + Not Reviewed ({openCount + pendingCount} items)
-          </label>
-        </fieldset>
-
-        {/* Format buttons */}
-        <div className={s.actions}>
-          <button type="button" onClick={onClose} className={s.cancelBtn}>
-            Cancel
-          </button>
-          <button type="button" onClick={handleJSON} className={s.exportBtn}>
-            Download JSON
-          </button>
-          <button type="button" onClick={handleCSV} className={s.primaryBtn}>
-            Download CSV
-          </button>
-        </div>
-      </div>
-    </div>
+        {/* Scope */}
+        <Box>
+          <Box margin={{ bottom: 'xs' }} fontSize="body-s" fontWeight="bold" color="text-label">
+            Scope
+          </Box>
+          <RadioGroup
+            value={includeNonReviewed ? 'all' : 'open'}
+            onChange={({ detail }) => setIncludeNonReviewed(detail.value === 'all')}
+            items={[
+              { value: 'open', label: `Open findings only (${openCount} items)` },
+              { value: 'all', label: `Open + Not Reviewed (${openCount + pendingCount} items)` },
+            ]}
+          />
+        </Box>
+      </SpaceBetween>
+    </Modal>
   )
 }

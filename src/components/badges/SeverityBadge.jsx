@@ -1,10 +1,6 @@
-import s from './SeverityBadge.module.css'
+import Badge from '@cloudscape-design/components/badge'
+import { SEVERITY_BADGE_COLOR } from '../../constants/cloudscapeHelpers.js'
 
 export default function SeverityBadge({ severity }) {
-  const cls = severity === 'CAT I' ? s.cat1 : severity === 'CAT II' ? s.cat2 : s.cat3
-  return (
-    <span className={`${s.badge} ${cls}`} aria-label={`Severity: ${severity}`}>
-      {severity}
-    </span>
-  )
+  return <Badge color={SEVERITY_BADGE_COLOR[severity] || 'grey'}>{severity}</Badge>
 }

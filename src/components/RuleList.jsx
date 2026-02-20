@@ -1,7 +1,10 @@
 import { useRef, useCallback } from 'react'
+import TextFilter from '@cloudscape-design/components/text-filter'
+import Button from '@cloudscape-design/components/button'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import Box from '@cloudscape-design/components/box'
 import SeverityBadge from './badges/SeverityBadge.jsx'
 import StatusBadge from './badges/StatusBadge.jsx'
-import s from './RuleList.module.css'
 
 export default function RuleList({
   rules,
@@ -12,91 +15,88 @@ export default function RuleList({
   onSelectRule,
   onSetAllStatus,
 }) {
-  const clearSearch = useCallback(() => onSearchChange(''), [onSearchChange])
   const listRef = useRef(null)
 
   return (
-    <div className={s.panel}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
       {/* Search bar */}
-      <div className={s.searchBar}>
-        <div className={s.searchWrap}>
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            className={s.searchIcon}
-            aria-hidden="true"
-          >
-            <circle cx="11" cy="11" r="8" />
-            <path d="M21 21l-4.35-4.35" />
-          </svg>
-          <input
-            type="search"
-            placeholder="Search by ID, title, or content…"
-            value={searchTerm}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className={s.searchInput}
-            aria-label="Search rules"
-          />
-          {searchTerm && (
-            <button
-              type="button"
-              onClick={clearSearch}
-              className={s.searchClear}
-              aria-label="Clear search"
-            >
-              ×
-            </button>
-          )}
-        </div>
-        <div className={s.searchMeta}>
-          <span className={s.ruleCount}>
-            {rules.length} of {allRulesCount} rules
-          </span>
-          <div className={s.bulkActions}>
-            <button
-              type="button"
-              onClick={() => onSetAllStatus('not_a_finding')}
-              className={`${s.bulkBtn} ${s.nafBtn}`}
-            >
+      <div style={{ padding: '10px 12px', borderBottom: '1px solid #232f3e', flexShrink: 0 }}>
+        <TextFilter
+          filteringText={searchTerm}
+          onChange={({ detail }) => onSearchChange(detail.filteringText)}
+          filteringPlaceholder="Search by ID, title, or content\u2026"
+          countText={`${rules.length} of ${allRulesCount} rules`}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button variant="inline-link" onClick={() => onSetAllStatus('not_a_finding')}>
               All NaF
-            </button>
-            <button
-              type="button"
-              onClick={() => onSetAllStatus('not_reviewed')}
-              className={`${s.bulkBtn} ${s.resetBtn}`}
-            >
+            </Button>
+            <Button variant="inline-link" onClick={() => onSetAllStatus('not_reviewed')}>
               Reset All
-            </button>
-          </div>
+            </Button>
+          </SpaceBetween>
         </div>
       </div>
 
       {/* Rule list */}
-      <div className={s.list} ref={listRef} role="listbox" aria-label="Rules">
+      <div ref={listRef} role="listbox" aria-label="Rules" style={{ flex: 1, overflowY: 'auto' }}>
         {rules.length === 0 ? (
-          <p className={s.empty}>No rules match the current filters</p>
+          <Box textAlign="center" padding={{ vertical: 'l' }} color="text-status-inactive">
+            No rules match the current filters
+          </Box>
         ) : (
-          rules.map((rule) => (
-            <button
-              key={rule.id}
-              type="button"
-              role="option"
-              aria-selected={selectedRuleId === rule.id}
-              onClick={() => onSelectRule(rule)}
-              className={`${s.ruleRow} ${selectedRuleId === rule.id ? s.selected : ''}`}
-            >
-              <div className={s.ruleHeader}>
-                <span className={s.stigId}>{rule.stigId}</span>
-                <SeverityBadge severity={rule.severity} />
-                <StatusBadge status={rule.status} small />
-              </div>
-              <p className={s.ruleTitle}>{rule.title}</p>
-            </button>
-          ))
+          rules.map((rule) => {
+            const isSelected = selectedRuleId === rule.id
+            return (
+              <button
+                key={rule.id}
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                onClick={() => onSelectRule(rule)}
+                style={{
+                  display: 'block',
+                  width: '100%',
+                  padding: '10px 14px',
+                  border: 'none',
+                  borderBottom: '1px solid #1a2332',
+                  borderLeft: `3px solid ${isSelected ? '#539fe5' : 'transparent'}`,
+                  background: isSelected ? '#539fe510' : 'transparent',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <span style={{
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: '#539fe5',
+                    minWidth: 65,
+                    flexShrink: 0,
+                  }}>
+                    {rule.stigId}
+                  </span>
+                  <SeverityBadge severity={rule.severity} />
+                  <StatusBadge status={rule.status} />
+                </div>
+                <p style={{
+                  fontSize: 13,
+                  color: '#d1d5db',
+                  lineHeight: 1.4,
+                  display: '-webkit-box',
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: 'vertical',
+                  overflow: 'hidden',
+                  textAlign: 'left',
+                  margin: 0,
+                }}>
+                  {rule.title}
+                </p>
+              </button>
+            )
+          })
         )}
       </div>
     </div>

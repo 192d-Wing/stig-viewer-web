@@ -1,8 +1,15 @@
 import { useRef, useEffect } from 'react'
+import Header from '@cloudscape-design/components/header'
+import Button from '@cloudscape-design/components/button'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import SegmentedControl from '@cloudscape-design/components/segmented-control'
+import ExpandableSection from '@cloudscape-design/components/expandable-section'
+import FormField from '@cloudscape-design/components/form-field'
+import Textarea from '@cloudscape-design/components/textarea'
+import Box from '@cloudscape-design/components/box'
 import SeverityBadge from './badges/SeverityBadge.jsx'
 import CCIMappingPanel from './CCIMappingPanel.jsx'
 import { STATUS_OPTIONS, FINDING_DETAILS_FIELDS } from '../constants/status.js'
-import s from './RuleDetail.module.css'
 
 const CONTENT_SECTIONS = [
   { key: 'description', label: 'Description', mono: false },
@@ -18,79 +25,95 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
   }, [rule.id])
 
   return (
-    <div className={s.panel} ref={panelRef}>
-      {/* Sticky header */}
-      <div className={s.header}>
-        <div className={s.headerRow}>
-          <div className={s.headerLeft}>
-            <span className={s.stigId}>{rule.stigId}</span>
+    <div ref={panelRef} style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      {/* Header */}
+      <div style={{
+        padding: '16px 20px',
+        borderBottom: '1px solid #232f3e',
+        position: 'sticky',
+        top: 0,
+        zIndex: 10,
+        background: '#0f1b2eee',
+        backdropFilter: 'blur(12px)',
+        flexShrink: 0,
+      }}>
+        <Header
+          variant="h2"
+          actions={
+            <Button variant="icon" iconName="close" onClick={onClose} ariaLabel="Close detail panel" />
+          }
+          description={
+            <SpaceBetween direction="horizontal" size="xs">
+              <span>Rule ID: {rule.id}</span>
+              {rule.cciIds.length > 0 && (
+                <span>CCI: {rule.cciIds.join(', ')}</span>
+              )}
+            </SpaceBetween>
+          }
+        >
+          <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+            <span>{rule.stigId}</span>
             <SeverityBadge severity={rule.severity} />
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className={s.closeBtn}
-            aria-label="Close detail panel"
-          >
-            ×
-          </button>
-        </div>
-        <h2 className={s.ruleTitle}>{rule.title}</h2>
-        <div className={s.metaRow}>
-          <span className={s.metaText}>Rule ID: {rule.id}</span>
-          {rule.cciIds.length > 0 && (
-            <span className={s.metaText}>CCI: {rule.cciIds.join(', ')}</span>
-          )}
-        </div>
+          </SpaceBetween>
+        </Header>
+        <Box margin={{ top: 'xs' }} fontSize="body-m" fontWeight="bold" color="text-body-secondary">
+          {rule.title}
+        </Box>
         {rule.cciIds.length > 0 && <CCIMappingPanel cciIds={rule.cciIds} />}
       </div>
 
       {/* Status selector */}
-      <div className={s.statusSection}>
-        <p className={s.sectionLabel}>Compliance Status</p>
-        <div className={s.statusButtons}>
-          {STATUS_OPTIONS.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              onClick={() => onUpdateRule({ status: opt.value })}
-              className={`${s.statusBtn} ${rule.status === opt.value ? s.statusBtnActive : ''}`}
-              style={{ '--status-color': opt.color }}
-              aria-pressed={rule.status === opt.value}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
+      <div style={{ padding: '16px 20px', borderBottom: '1px solid #232f3e', flexShrink: 0 }}>
+        <Box margin={{ bottom: 'xs' }} fontSize="body-s" fontWeight="bold" color="text-label">
+          Compliance Status
+        </Box>
+        <SegmentedControl
+          selectedId={rule.status}
+          onChange={({ detail }) => onUpdateRule({ status: detail.selectedId })}
+          options={STATUS_OPTIONS.map((opt) => ({
+            id: opt.value,
+            text: opt.label,
+          }))}
+        />
       </div>
 
       {/* Content sections */}
-      <div className={s.body}>
-        {CONTENT_SECTIONS.map(({ key, label, mono }) =>
-          rule[key] ? (
-            <div key={key} className={s.section}>
-              <p className={s.sectionLabel}>{label}</p>
-              <pre className={`${s.content} ${mono ? s.mono : ''}`}>{rule[key]}</pre>
-            </div>
-          ) : null,
-        )}
+      <div style={{ padding: '0 20px 24px', flex: 1 }}>
+        <SpaceBetween size="m">
+          {CONTENT_SECTIONS.map(({ key, label, mono }) =>
+            rule[key] ? (
+              <ExpandableSection key={key} headerText={label} defaultExpanded>
+                <pre style={{
+                  fontSize: mono ? 12 : 13,
+                  lineHeight: 1.65,
+                  color: '#8d99a8',
+                  background: '#0f1b2e80',
+                  border: '1px solid #354150',
+                  borderRadius: 6,
+                  padding: '12px 14px',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontFamily: mono ? "'JetBrains Mono', monospace" : 'inherit',
+                  margin: 0,
+                }}>
+                  {rule[key]}
+                </pre>
+              </ExpandableSection>
+            ) : null,
+          )}
 
-        {/* Finding details & comments */}
-        {FINDING_DETAILS_FIELDS.map(({ key, label }) => (
-          <div key={key} className={s.section}>
-            <label htmlFor={`field-${key}`} className={s.sectionLabel}>
-              {label}
-            </label>
-            <textarea
-              id={`field-${key}`}
-              value={rule[key]}
-              onChange={(e) => onUpdateRule({ [key]: e.target.value })}
-              placeholder={`Enter ${label.toLowerCase()}…`}
-              rows={4}
-              className={s.textarea}
-            />
-          </div>
-        ))}
+          {/* Finding details & comments */}
+          {FINDING_DETAILS_FIELDS.map(({ key, label }) => (
+            <FormField key={key} label={label}>
+              <Textarea
+                value={rule[key]}
+                onChange={({ detail }) => onUpdateRule({ [key]: detail.value })}
+                placeholder={`Enter ${label.toLowerCase()}\u2026`}
+                rows={4}
+              />
+            </FormField>
+          ))}
+        </SpaceBetween>
       </div>
     </div>
   )

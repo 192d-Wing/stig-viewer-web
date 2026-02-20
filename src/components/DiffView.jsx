@@ -1,7 +1,14 @@
-import { useState, useMemo } from 'react'
+import { useMemo } from 'react'
 import { diffSTIGs } from '../utils/diffStig.js'
+import Header from '@cloudscape-design/components/header'
+import Button from '@cloudscape-design/components/button'
+import Select from '@cloudscape-design/components/select'
+import FormField from '@cloudscape-design/components/form-field'
+import ExpandableSection from '@cloudscape-design/components/expandable-section'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import Box from '@cloudscape-design/components/box'
+import ColumnLayout from '@cloudscape-design/components/column-layout'
 import SeverityBadge from './badges/SeverityBadge.jsx'
-import s from './DiffView.module.css'
 
 const FIELD_LABELS = {
   title: 'Title',
@@ -12,60 +19,51 @@ const FIELD_LABELS = {
 }
 
 function ChangedEntry({ entry }) {
-  const [expanded, setExpanded] = useState(false)
   return (
-    <div className={s.changedEntry}>
-      <button
-        type="button"
-        className={s.changedHeader}
-        onClick={() => setExpanded((v) => !v)}
-        aria-expanded={expanded}
-      >
-        <span className={s.changedId}>{entry.stigId}</span>
-        <span className={s.changedFields}>{entry.fields.join(', ')}</span>
-        <span className={s.expandIcon} aria-hidden="true">{expanded ? '▲' : '▼'}</span>
-      </button>
-      {expanded && (
-        <div className={s.changedBody}>
-          {entry.fields.map((field) => (
-            <div key={field} className={s.fieldDiff}>
-              <p className={s.fieldLabel}>{FIELD_LABELS[field] ?? field}</p>
-              <div className={s.diffRows}>
-                <div className={`${s.diffRow} ${s.diffRowA}`}>
-                  <span className={s.diffSide}>A</span>
-                  <pre className={s.diffText}>{entry.a[field]}</pre>
-                </div>
-                <div className={`${s.diffRow} ${s.diffRowB}`}>
-                  <span className={s.diffSide}>B</span>
-                  <pre className={s.diffText}>{entry.b[field]}</pre>
-                </div>
+    <ExpandableSection
+      headerText={
+        <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: '#539fe5' }}>
+            {entry.stigId}
+          </span>
+          <span style={{ fontSize: 11, color: '#f59e0b' }}>{entry.fields.join(', ')}</span>
+        </SpaceBetween>
+      }
+    >
+      <SpaceBetween size="m">
+        {entry.fields.map((field) => (
+          <div key={field}>
+            <Box fontSize="body-s" fontWeight="bold" color="text-label" margin={{ bottom: 'xxs' }}>
+              {FIELD_LABELS[field] ?? field}
+            </Box>
+            <ColumnLayout columns={2}>
+              <div style={{
+                padding: '6px 10px',
+                borderRadius: 4,
+                borderLeft: '3px solid #ff4444',
+                background: '#ff444414',
+              }}>
+                <Box fontSize="body-s" color="text-status-inactive">A</Box>
+                <pre style={{ fontSize: 12, color: '#d1d5db', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, lineHeight: 1.5 }}>
+                  {entry.a[field]}
+                </pre>
               </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function TabPicker({ tabs, label, selected, onSelect }) {
-  return (
-    <div className={s.pickerGroup}>
-      <p className={s.pickerLabel}>{label}</p>
-      <div className={s.pickerOptions}>
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => onSelect(tab.id)}
-            className={`${s.pickerBtn} ${selected === tab.id ? s.pickerBtnActive : ''}`}
-            title={tab.stig.title}
-          >
-            {tab.stig.title}
-          </button>
+              <div style={{
+                padding: '6px 10px',
+                borderRadius: 4,
+                borderLeft: '3px solid #22c55e',
+                background: '#22c55e14',
+              }}>
+                <Box fontSize="body-s" color="text-status-inactive">B</Box>
+                <pre style={{ fontSize: 12, color: '#d1d5db', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0, lineHeight: 1.5 }}>
+                  {entry.b[field]}
+                </pre>
+              </div>
+            </ColumnLayout>
+          </div>
         ))}
-      </div>
-    </div>
+      </SpaceBetween>
+    </ExpandableSection>
   )
 }
 
@@ -82,75 +80,124 @@ export default function DiffView({ tabs, diffPair, onSetDiffPair, onExitDiff }) 
   const handleSetA = (id) => onSetDiffPair([id, tabBId])
   const handleSetB = (id) => onSetDiffPair([tabAId, id])
 
+  const tabOptions = tabs.map((t) => ({ value: t.id, label: t.stig.title }))
+
   return (
-    <div className={s.view}>
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', minHeight: 0 }}>
       {/* Selector row */}
-      <div className={s.selector}>
-        <h2 className={s.selectorTitle}>STIG Version Diff</h2>
-        <div className={s.pickers}>
-          <TabPicker tabs={tabs} label="Baseline (A)" selected={tabAId} onSelect={handleSetA} />
-          <span className={s.vs} aria-hidden="true">vs</span>
-          <TabPicker tabs={tabs} label="Compare (B)" selected={tabBId} onSelect={handleSetB} />
+      <div style={{ padding: '16px 20px', borderBottom: '1px solid #354150', flexShrink: 0 }}>
+        <Header
+          variant="h2"
+          actions={<Button onClick={onExitDiff}>Exit Diff</Button>}
+        >
+          STIG Version Diff
+        </Header>
+        <div style={{ marginTop: 12, display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+          <FormField label="Baseline (A)">
+            <Select
+              selectedOption={tabOptions.find((o) => o.value === tabAId) || null}
+              onChange={({ detail }) => handleSetA(detail.selectedOption.value)}
+              options={tabOptions}
+              placeholder="Select baseline"
+            />
+          </FormField>
+          <Box padding={{ bottom: 'xs' }} color="text-status-inactive" fontWeight="bold">vs</Box>
+          <FormField label="Compare (B)">
+            <Select
+              selectedOption={tabOptions.find((o) => o.value === tabBId) || null}
+              onChange={({ detail }) => handleSetB(detail.selectedOption.value)}
+              options={tabOptions}
+              placeholder="Select comparison"
+            />
+          </FormField>
         </div>
-        <button type="button" onClick={onExitDiff} className={s.exitBtn}>
-          Exit Diff
-        </button>
       </div>
 
       {/* Results */}
       {!tabA || !tabB ? (
-        <p className={s.placeholder}>Select a Baseline and Compare STIG above to begin.</p>
+        <Box textAlign="center" padding={{ vertical: 'xxl' }} color="text-status-inactive" fontSize="heading-s">
+          Select a Baseline and Compare STIG above to begin.
+        </Box>
       ) : !result ? null : (
-        <div className={s.results}>
-          {/* Added */}
-          <section className={s.section}>
-            <h3 className={`${s.sectionTitle} ${s.added}`}>
-              Added in B ({result.added.length})
-            </h3>
-            {result.added.length === 0 ? (
-              <p className={s.empty}>No rules added</p>
-            ) : (
-              result.added.map((rule) => (
-                <div key={rule.stigId} className={`${s.ruleChip} ${s.ruleChipAdded}`}>
-                  <span className={s.chipId}>{rule.stigId}</span>
-                  <SeverityBadge severity={rule.severity} />
-                  <span className={s.chipTitle}>{rule.title}</span>
-                </div>
-              ))
-            )}
-          </section>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
+          <SpaceBetween size="xl">
+            {/* Added */}
+            <ExpandableSection
+              variant="container"
+              headerText={`Added in B (${result.added.length})`}
+              defaultExpanded
+            >
+              {result.added.length === 0 ? (
+                <Box color="text-status-inactive">No rules added</Box>
+              ) : (
+                <SpaceBetween size="xs">
+                  {result.added.map((rule) => (
+                    <div key={rule.stigId} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '8px 12px', borderRadius: 6,
+                      borderLeft: '3px solid #22c55e',
+                      background: '#22c55e14',
+                    }}>
+                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: '#539fe5', minWidth: 65 }}>
+                        {rule.stigId}
+                      </span>
+                      <SeverityBadge severity={rule.severity} />
+                      <span style={{ fontSize: 13, color: '#d1d5db', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {rule.title}
+                      </span>
+                    </div>
+                  ))}
+                </SpaceBetween>
+              )}
+            </ExpandableSection>
 
-          {/* Removed */}
-          <section className={s.section}>
-            <h3 className={`${s.sectionTitle} ${s.removed}`}>
-              Removed from A ({result.removed.length})
-            </h3>
-            {result.removed.length === 0 ? (
-              <p className={s.empty}>No rules removed</p>
-            ) : (
-              result.removed.map((rule) => (
-                <div key={rule.stigId} className={`${s.ruleChip} ${s.ruleChipRemoved}`}>
-                  <span className={s.chipId}>{rule.stigId}</span>
-                  <SeverityBadge severity={rule.severity} />
-                  <span className={s.chipTitle}>{rule.title}</span>
-                </div>
-              ))
-            )}
-          </section>
+            {/* Removed */}
+            <ExpandableSection
+              variant="container"
+              headerText={`Removed from A (${result.removed.length})`}
+              defaultExpanded
+            >
+              {result.removed.length === 0 ? (
+                <Box color="text-status-inactive">No rules removed</Box>
+              ) : (
+                <SpaceBetween size="xs">
+                  {result.removed.map((rule) => (
+                    <div key={rule.stigId} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '8px 12px', borderRadius: 6,
+                      borderLeft: '3px solid #ff4444',
+                      background: '#ff444414',
+                    }}>
+                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: '#539fe5', minWidth: 65 }}>
+                        {rule.stigId}
+                      </span>
+                      <SeverityBadge severity={rule.severity} />
+                      <span style={{ fontSize: 13, color: '#d1d5db', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {rule.title}
+                      </span>
+                    </div>
+                  ))}
+                </SpaceBetween>
+              )}
+            </ExpandableSection>
 
-          {/* Changed */}
-          <section className={s.section}>
-            <h3 className={`${s.sectionTitle} ${s.changed}`}>
-              Changed ({result.changed.length})
-            </h3>
-            {result.changed.length === 0 ? (
-              <p className={s.empty}>No rules changed</p>
-            ) : (
-              result.changed.map((entry) => (
-                <ChangedEntry key={entry.stigId} entry={entry} />
-              ))
-            )}
-          </section>
+            {/* Changed */}
+            <ExpandableSection
+              variant="container"
+              headerText={`Changed (${result.changed.length})`}
+              defaultExpanded
+            >
+              {result.changed.length === 0 ? (
+                <Box color="text-status-inactive">No rules changed</Box>
+              ) : (
+                <SpaceBetween size="s">
+                  {result.changed.map((entry) => (
+                    <ChangedEntry key={entry.stigId} entry={entry} />
+                  ))}
+                </SpaceBetween>
+              )}
+            </ExpandableSection>
+          </SpaceBetween>
         </div>
       )}
     </div>

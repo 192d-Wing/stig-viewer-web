@@ -5,9 +5,9 @@ export const SEVERITY_MAP = {
 }
 
 export const SEVERITY_COLORS = {
-  'CAT I': 'var(--cat1)',
-  'CAT II': 'var(--cat2)',
-  'CAT III': 'var(--cat3)',
+  'CAT I': '#ff4444',
+  'CAT II': '#539fe5',
+  'CAT III': '#8d99a8',
 }
 
 export const SEVERITY_ORDER = ['CAT I', 'CAT II', 'CAT III']

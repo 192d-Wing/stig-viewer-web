@@ -1,22 +1,21 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
 
-    <!--
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+
+  <!--
       Production CSP — no unsafe-inline, no external origins, no data: scripts.
       Note: frame-ancestors is ignored in <meta> per spec; enforce via server header.
       Dev server relaxes this via vite.config.js server.headers (Vite HMR needs
       unsafe-eval + ws: + unsafe-inline for injected style tags).
     -->
-    <meta
-      http-equiv="Content-Security-Policy"
-      content="
+  <meta http-equiv="Content-Security-Policy" content="
         default-src 'none';
         script-src 'self';
-        style-src 'self';
+        style-src 'self' 'unsafe-inline';
         font-src 'self';
         img-src 'self' data:;
         connect-src http://localhost:8080;
@@ -24,13 +23,14 @@
         base-uri 'self';
         form-action 'none';
         upgrade-insecure-requests;
-      "
-    />
+      " />
 
-    <title>STIG Viewer — Web Edition</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+  <title>STIG Viewer Web Edition</title>
+</head>
+
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+
 </html>
