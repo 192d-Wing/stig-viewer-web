@@ -5,6 +5,11 @@ import AppLayout from '@cloudscape-design/components/app-layout'
 import SideNavigation from '@cloudscape-design/components/side-navigation'
 import SplitPanel from '@cloudscape-design/components/split-panel'
 import Button from '@cloudscape-design/components/button'
+import Modal from '@cloudscape-design/components/modal'
+import Box from '@cloudscape-design/components/box'
+import SpaceBetween from '@cloudscape-design/components/space-between'
+import Alert from '@cloudscape-design/components/alert'
+import { exportCKL } from './utils/exportCKL.js'
 import DropZone from './components/DropZone.jsx'
 import StigLibrary from './components/StigLibrary.jsx'
 import STIGView from './components/STIGView.jsx'
@@ -30,6 +35,8 @@ export default function App() {
 
   const [navOpen, setNavOpen] = useState(true)
   const [splitPanelOpen, setSplitPanelOpen] = useState(true)
+  const [showLibrary, setShowLibrary] = useState(false)
+  const [closingTabId, setClosingTabId] = useState(null)
   const fileInputRef = useRef(null)
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
@@ -89,6 +96,11 @@ export default function App() {
     }
   }
 
+  const handleLoadFromLibrary = useCallback((stigJson) => {
+    addStigFromBackend(stigJson)
+    setShowLibrary(false)
+  }, [addStigFromBackend])
+
   // Build SideNavigation items
   const navItems = tabs.map((tab) => ({
     type: 'link',
@@ -102,7 +114,7 @@ export default function App() {
         onClick={(e) => {
           e.preventDefault()
           e.stopPropagation()
-          removeTab(tab.id)
+          setClosingTabId(tab.id)
         }}
       />
     ),
@@ -110,10 +122,10 @@ export default function App() {
 
   // Determine content
   let content
-  if (!hasTabs) {
+  if (!hasTabs || showLibrary) {
     content = (
       <StigLibrary
-        onLoad={addStigFromBackend}
+        onLoad={handleLoadFromLibrary}
         onUploadTab={
           <DropZone onFilesLoad={addTabs} onLoadSample={addSampleTab} />
         }
@@ -177,7 +189,7 @@ export default function App() {
 
       <AppLayout
         headerSelector="#h"
-        contentType={!hasTabs ? 'table' : 'default'}
+        contentType={!hasTabs || showLibrary ? 'table' : 'default'}
         navigationHide={!hasTabs || isDiffMode}
         navigationOpen={navOpen && hasTabs && !isDiffMode}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}
@@ -185,13 +197,22 @@ export default function App() {
         navigation={
           <SideNavigation
             header={{ text: 'Open STIGs', href: '#' }}
-            activeHref={`#${activeTabId}`}
+            activeHref={showLibrary ? '#library' : `#${activeTabId}`}
             onFollow={(e) => {
               e.preventDefault()
               const id = e.detail.href.slice(1)
-              if (id && tabs.some((t) => t.id === id)) setActiveTab(id)
+              if (id === 'library') {
+                setShowLibrary(true)
+              } else if (id && tabs.some((t) => t.id === id)) {
+                setShowLibrary(false)
+                setActiveTab(id)
+              }
             }}
-            items={navItems}
+            items={[
+              { type: 'link', text: 'Browse Library', href: '#library', iconName: 'add-plus' },
+              { type: 'divider' },
+              ...navItems,
+            ]}
           />
         }
         toolsHide
@@ -215,6 +236,44 @@ export default function App() {
         onSplitPanelPreferencesChange={() => {}}
         content={content}
       />
+
+      <Modal
+        visible={closingTabId !== null}
+        onDismiss={() => setClosingTabId(null)}
+        header="Close checklist"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setClosingTabId(null)}>Cancel</Button>
+              <Button onClick={() => {
+                const tab = tabs.find((t) => t.id === closingTabId)
+                if (tab) {
+                  const { stig, assetInfo } = tab
+                  const xml = exportCKL(stig, assetInfo.hostname, assetInfo.ip, assetInfo.mac, assetInfo.fqdn)
+                  const blob = new Blob([xml], { type: 'application/xml' })
+                  const url = URL.createObjectURL(blob)
+                  const a = document.createElement('a')
+                  a.href = url
+                  a.download = `${stig.title.replace(/[^a-zA-Z0-9]/g, '_')}.ckl`
+                  a.click()
+                  URL.revokeObjectURL(url)
+                }
+                removeTab(closingTabId)
+                setClosingTabId(null)
+              }}>
+                Export .ckl & Close
+              </Button>
+              <Button variant="primary" onClick={() => { removeTab(closingTabId); setClosingTabId(null) }}>
+                Close without saving
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <Alert type="warning">
+          Any unsaved progress on this checklist will be lost. Export your work first if you need to keep it.
+        </Alert>
+      </Modal>
     </>
   )
 }
