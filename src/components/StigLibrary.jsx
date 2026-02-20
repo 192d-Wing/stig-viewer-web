@@ -10,7 +10,6 @@ import Input from "@cloudscape-design/components/input";
 import Select from "@cloudscape-design/components/select";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import TextFilter from "@cloudscape-design/components/text-filter";
-import Container from "@cloudscape-design/components/container";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Box from "@cloudscape-design/components/box";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
@@ -18,6 +17,8 @@ import SegmentedControl from "@cloudscape-design/components/segmented-control";
 import Pagination from "@cloudscape-design/components/pagination";
 import CollectionPreferences from "@cloudscape-design/components/collection-preferences";
 import Link from "@cloudscape-design/components/link";
+import Container from "@cloudscape-design/components/container";
+import ColumnLayout from "@cloudscape-design/components/column-layout";
 
 const BACKEND = "http://localhost:8080";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
@@ -493,6 +494,28 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
 
         {activeTab === "add" && (
           <SpaceBetween size="l">
+            {addStatus === "success" && addResult && (
+              <Alert
+                type="success"
+                dismissible
+                onDismiss={() => { setAddStatus("idle"); setAddResult(null); }}
+              >
+                <strong>{addResult.title}</strong> added &mdash;{" "}
+                {addResult.ruleCount} rules ({addResult.version}).{" "}
+                <Link onFollow={() => setActiveTab("library")}>
+                  View in Library
+                </Link>
+              </Alert>
+            )}
+            {addStatus === "error" && addResult && (
+              <Alert
+                type="error"
+                dismissible
+                onDismiss={() => { setAddStatus("idle"); setAddResult(null); }}
+              >
+                {addResult.error}
+              </Alert>
+            )}
             <Container
               header={
                 <Header
@@ -516,70 +539,76 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
             >
               <form onSubmit={handleAddSubmit}>
                 <SpaceBetween size="l">
-                  <FormField label="STIG ZIP file">
-                    <FileUpload
-                      value={addFiles}
-                      onChange={({ detail }) => setAddFiles(detail.value)}
-                      accept=".zip"
-                      constraintText="ZIP files only"
-                      i18nStrings={{
-                        uploadButtonText: () => "Choose file",
-                        dropzoneText: () => "Drop file to upload",
-                        removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
-                        limitShowFewer: "Show fewer files",
-                        limitShowMore: "Show more files",
-                        errorIconAriaLabel: "Error",
-                      }}
-                    />
-                  </FormField>
-                  <FormField label="ID" description="Slug, e.g. windows-11">
-                    <Input
-                      value={addId}
-                      onChange={({ detail }) => setAddId(detail.value)}
-                      placeholder="e.g. windows-11"
-                    />
-                  </FormField>
-                  <FormField label="Category">
-                    <Select
-                      selectedOption={
-                        CATEGORY_OPTIONS.find((o) => o.value === addCategory) ||
-                        CATEGORY_OPTIONS[0]
-                      }
-                      onChange={({ detail }) =>
-                        setAddCategory(detail.selectedOption.value)
-                      }
-                      options={CATEGORY_OPTIONS}
-                    />
-                  </FormField>
+                  <FileUpload
+                    value={addFiles}
+                    onChange={({ detail }) => setAddFiles(detail.value)}
+                    accept=".zip"
+                    showFileSize
+                    showFileLastModified
+                    i18nStrings={{
+                      uploadButtonText: (multiple) => multiple ? "Choose files" : "Choose file",
+                      dropzoneText: (multiple) => multiple ? "Drop files to upload" : "Drop file to upload",
+                      removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
+                      limitShowFewer: "Show fewer files",
+                      limitShowMore: "Show more files",
+                      errorIconAriaLabel: "Error",
+                    }}
+                  />
+                  <ColumnLayout columns={2}>
+                    <FormField label="ID" description="Slug, e.g. windows-11">
+                      <Input
+                        value={addId}
+                        onChange={({ detail }) => setAddId(detail.value)}
+                        placeholder="e.g. windows-11"
+                      />
+                    </FormField>
+                    <FormField label="Category" description="Used for filtering">
+                      <Select
+                        selectedOption={
+                          CATEGORY_OPTIONS.find((o) => o.value === addCategory) ||
+                          CATEGORY_OPTIONS[0]
+                        }
+                        onChange={({ detail }) =>
+                          setAddCategory(detail.selectedOption.value)
+                        }
+                        options={CATEGORY_OPTIONS}
+                      />
+                    </FormField>
+                  </ColumnLayout>
                   <Button
                     variant="primary"
                     loading={addStatus === "loading"}
                     disabled={addFiles.length === 0 || !addId.trim()}
                     formAction="submit"
-                    onClick={handleAddSubmit}
                   >
                     Upload to Library
                   </Button>
                 </SpaceBetween>
               </form>
-              {addStatus === "success" && addResult && (
-                <Box margin={{ top: "l" }}>
-                  <Alert type="success">
-                    <strong>{addResult.title}</strong> added &mdash;{" "}
-                    {addResult.ruleCount} rules ({addResult.version}).{" "}
-                    <Link onFollow={() => setActiveTab("library")}>
-                      View in Library
-                    </Link>
-                  </Alert>
-                </Box>
-              )}
-              {addStatus === "error" && addResult && (
-                <Box margin={{ top: "l" }}>
-                  <Alert type="error">{addResult.error}</Alert>
-                </Box>
-              )}
             </Container>
 
+            {libStatus === "success" && libResult && (
+              <Alert
+                type="success"
+                dismissible
+                onDismiss={() => { setLibStatus("idle"); setLibResult(null); }}
+              >
+                Imported <strong>{libResult.imported}</strong> STIGs
+                {libResult.errors > 0 && <> ({libResult.errors} skipped)</>}.{" "}
+                <Link onFollow={() => setActiveTab("library")}>
+                  View in Library
+                </Link>
+              </Alert>
+            )}
+            {libStatus === "error" && libResult && (
+              <Alert
+                type="error"
+                dismissible
+                onDismiss={() => { setLibStatus("idle"); setLibResult(null); }}
+              >
+                {libResult.error}
+              </Alert>
+            )}
             <Container
               header={
                 <Header
@@ -604,50 +633,31 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
             >
               <form onSubmit={handleLibSubmit}>
                 <SpaceBetween size="l">
-                  <FormField label="Library bundle ZIP">
-                    <FileUpload
-                      value={libFiles}
-                      onChange={({ detail }) => setLibFiles(detail.value)}
-                      accept=".zip"
-                      constraintText="ZIP files only"
-                      i18nStrings={{
-                        uploadButtonText: () => "Choose file",
-                        dropzoneText: () => "Drop file to upload",
-                        removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
-                        limitShowFewer: "Show fewer files",
-                        limitShowMore: "Show more files",
-                        errorIconAriaLabel: "Error",
-                      }}
-                    />
-                  </FormField>
+                  <FileUpload
+                    value={libFiles}
+                    onChange={({ detail }) => setLibFiles(detail.value)}
+                    accept=".zip"
+                    showFileSize
+                    showFileLastModified
+                    i18nStrings={{
+                      uploadButtonText: (multiple) => multiple ? "Choose files" : "Choose file",
+                      dropzoneText: (multiple) => multiple ? "Drop files to upload" : "Drop file to upload",
+                      removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
+                      limitShowFewer: "Show fewer files",
+                      limitShowMore: "Show more files",
+                      errorIconAriaLabel: "Error",
+                    }}
+                  />
                   <Button
                     variant="primary"
                     loading={libStatus === "loading"}
                     disabled={libFiles.length === 0}
                     formAction="submit"
-                    onClick={handleLibSubmit}
                   >
-                    Import Library Bundle
+                    Import Bundle
                   </Button>
                 </SpaceBetween>
               </form>
-              {libStatus === "success" && libResult && (
-                <Box margin={{ top: "l" }}>
-                  <Alert type="success">
-                    Imported <strong>{libResult.imported}</strong> STIGs
-                    {libResult.errors > 0 && <> ({libResult.errors} skipped)</>}
-                    .{" "}
-                    <Link onFollow={() => setActiveTab("library")}>
-                      View in Library
-                    </Link>
-                  </Alert>
-                </Box>
-              )}
-              {libStatus === "error" && libResult && (
-                <Box margin={{ top: "l" }}>
-                  <Alert type="error">{libResult.error}</Alert>
-                </Box>
-              )}
             </Container>
           </SpaceBetween>
         )}
