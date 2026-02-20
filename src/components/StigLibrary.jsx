@@ -492,7 +492,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         )}
 
         {activeTab === "add" && (
-          <>
+          <SpaceBetween size="l">
             <Container
               header={
                 <Header
@@ -649,7 +649,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
                 </Box>
               )}
             </Container>
-          </>
+          </SpaceBetween>
         )}
 
         {activeTab === "upload" && (
