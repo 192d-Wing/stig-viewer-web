@@ -18,6 +18,7 @@ use api::{
     catalog::{get_catalog, get_health},
     drafts::*,
     stig::get_stig,
+    test_support::{reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
 };
 use config::{load_sources, Config};
@@ -101,13 +102,22 @@ async fn main() -> Result<()> {
             auth_middleware,
         ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
-        .merge(draft_routes)
+        .merge(draft_routes);
+
+    // Test-only route — only registered outside production
+    if std::env::var("STIG_ENV").unwrap_or_default() != "production" {
+        app = app
+            .route("/api/test/reset", post(reset_handler))
+            .route("/api/test/set-role", post(set_role_handler));
+    }
+
+    let app = app
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);
