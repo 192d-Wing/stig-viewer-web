@@ -39,13 +39,46 @@ cp .env.example .env
 # edit .env — at minimum, change POSTGRES_PASSWORD and DATABASE_URL
 ```
 
-### 2. Start Postgres
+### 2. Start Postgres (and, for auth, Keycloak)
 
 ```bash
+# Postgres only
 docker compose up -d
+
+# Postgres + Keycloak (for the auth flow)
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 ```
 
 Compose refuses to start if `POSTGRES_{DB,USER,PASSWORD}` are missing.
+
+Keycloak ships with a pre-imported realm (`stig-viewer-dev`) and three
+test users:
+
+| Username | Password | Role   |
+| -------- | -------- | ------ |
+| admin    | admin    | admin  |
+| editor   | editor   | editor |
+| viewer   | viewer   | viewer |
+
+Admin console: http://localhost:8081 (`admin` / `admin`).
+
+To point the backend at this dev Keycloak, add to your `.env`:
+
+```
+OIDC_ISSUER_URL=http://localhost:8081/realms/stig-viewer-dev
+OIDC_CLIENT_ID=stig-viewer-web
+OIDC_CLIENT_SECRET=dev-only-not-secret
+OIDC_REDIRECT_URI=http://localhost:8080/api/auth/callback
+OIDC_POST_LOGIN_REDIRECT=http://localhost:5173
+SESSION_SECRET=<openssl rand -hex 32>
+OIDC_ADMIN_GROUP=stig-admins
+OIDC_EDITOR_GROUP=stig-editors
+OIDC_VIEWER_GROUP=stig-viewers
+```
+
+Without these, the backend starts in **dev open mode**: auth is disabled and
+every request is treated as an admin. Production must set `REQUIRE_AUTH=1`
+so missing OIDC config aborts startup.
 
 ### 3. Run the backend
 
@@ -73,19 +106,43 @@ Opens on `http://localhost:5173`.
 All settings live in environment variables. See `.env.example` for the full
 list. Key variables:
 
-| Variable                   | Who reads it      | Required | Default                  |
-| -------------------------- | ----------------- | -------- | ------------------------ |
-| `DATABASE_URL`             | backend           | yes      | —                        |
-| `PORT`                     | backend           | no       | `8080`                   |
-| `DATA_DIR`                 | backend           | no       | `data`                   |
-| `STIG_SYNC_INTERVAL_HOURS` | backend           | no       | `24`                     |
-| `RUST_LOG`                 | backend           | no       | `info`                   |
-| `POSTGRES_{DB,USER,PASSWORD}` | docker compose | yes    | —                        |
-| `POSTGRES_PORT`            | docker compose    | no       | `5432`                   |
-| `VITE_API_BASE_URL`        | frontend build    | no       | `http://localhost:8080`  |
+| Variable                      | Who reads it      | Required | Default                  |
+| ----------------------------- | ----------------- | -------- | ------------------------ |
+| `DATABASE_URL`                | backend           | yes      | —                        |
+| `PORT`                        | backend           | no       | `8080`                   |
+| `DATA_DIR`                    | backend           | no       | `data`                   |
+| `STIG_SYNC_INTERVAL_HOURS`    | backend           | no       | `24`                     |
+| `RUST_LOG`                    | backend           | no       | `info`                   |
+| `ALLOWED_ORIGINS`             | backend           | no       | localhost:{5173,8080}    |
+| `REQUIRE_AUTH`                | backend           | no       | `0` (dev-open if OIDC\_\* missing) |
+| `OIDC_ISSUER_URL`             | backend (auth)    | if auth  | —                        |
+| `OIDC_CLIENT_ID`              | backend (auth)    | if auth  | —                        |
+| `OIDC_CLIENT_SECRET`          | backend (auth)    | if auth  | —                        |
+| `OIDC_REDIRECT_URI`           | backend (auth)    | if auth  | —                        |
+| `OIDC_POST_LOGIN_REDIRECT`    | backend (auth)    | no       | `http://localhost:5173`  |
+| `OIDC_{ADMIN,EDITOR,VIEWER}_GROUP` | backend (auth) | no    | —                        |
+| `ALLOWED_GROUPS`              | backend (auth)    | no       | *(any authenticated)*    |
+| `SESSION_SECRET`              | backend (auth)    | if auth  | — (hex-encoded, >=32 B)  |
+| `COOKIE_SECURE`               | backend (auth)    | no       | `0` (set `1` over HTTPS) |
+| `POSTGRES_{DB,USER,PASSWORD}` | docker compose    | yes      | —                        |
+| `POSTGRES_PORT`               | docker compose    | no       | `5432`                   |
+| `KEYCLOAK_{ADMIN,ADMIN_PASSWORD}` | docker compose (dev) | no | `admin` / `admin`     |
+| `KEYCLOAK_PORT`               | docker compose (dev) | no    | `8081`                   |
+| `VITE_API_BASE_URL`           | frontend build    | no       | `http://localhost:8080`  |
 
 `VITE_API_BASE_URL` is baked into the built HTML's CSP `connect-src` and is
 the only origin the browser can talk to. Set it at build time in production.
+
+### Auth endpoints
+
+| Method | Path                  | Purpose                                  |
+| ------ | --------------------- | ---------------------------------------- |
+| GET    | `/api/auth/login`     | Start OIDC auth code + PKCE flow         |
+| GET    | `/api/auth/callback`  | IdP redirect target — completes login    |
+| GET    | `/api/auth/me`        | Current session's `{sub,email,role,exp}` |
+| POST   | `/api/auth/logout`    | Clear the session cookie                 |
+
+All other `/api/*` routes except `/api/health` require a valid session.
 
 ## Development workflow
 
@@ -116,6 +173,8 @@ CI (`.github/workflows/ci.yml`) runs all of the above on every PR.
 │   ├── stig-sources.toml Curated DISA download manifest
 │   └── Cargo.toml
 ├── docker-compose.yml    Postgres for local dev
+├── docker-compose.dev.yml  Keycloak layer for the auth flow
+├── keycloak/             Realm import for Keycloak dev
 ├── .env.example          Environment variable template
 ├── ROADMAP.md            Planned work
 └── .github/workflows/    CI
@@ -129,7 +188,10 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 - Production CSP: no `unsafe-inline` on `script-src`, no external origins
   except the configured API base, no `object-src`, no framing.
+- Authentication: OIDC relying party with auth code + PKCE, encrypted
+  session cookie (PrivateCookieJar), open-redirect protection on the
+  `return_to` parameter.
 - The backend validates upload IDs (alphanumeric + dashes) and guards
   against path traversal on disk writes.
-- Known gaps (auth, rate limits, XXE protection, audit logging) are tracked
-  in `ROADMAP.md` phases 1–2.
+- Known gaps (rate limits, XXE protection, audit logging) are tracked in
+  `ROADMAP.md` phase 2.

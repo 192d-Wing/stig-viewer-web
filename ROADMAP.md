@@ -18,26 +18,15 @@ Definition of done for every item:
 
 Goal: a secure, reproducible deployment outside a developer laptop.
 
-- **Authentication & authorization** (OIDC relying party)
-  - Backend acts as OIDC RP; no passwords stored locally
-  - Discovery via `OIDC_ISSUER_URL`; auth code flow + PKCE
-  - Session carried in a signed, encrypted cookie
-  - Role mapping from IdP group claims: `viewer`, `editor`, `admin`
-  - All `/api/*` routes protected except `/api/health` and `/api/auth/*`
-  - Config scaffold: `backend/src/auth/mod.rs` (this PR).
-    Full flow + middleware: follow-up PR.
-- **Secrets & configuration**
-  - `.env.example` checked in; `.env` git-ignored
-  - Backend fails fast on missing required env vars
-  - Remove hardcoded Postgres creds from `docker-compose.yml`
-- **Production config**
-  - Env-driven CSP `connect-src` (no more hardcoded `http://localhost:8080`)
-  - Env-driven `API_BASE_URL`, `SYNC_INTERVAL`, `DATABASE_URL`
-  - Separate `docker-compose.dev.yml` and `docker-compose.prod.yml`
-  - Production Dockerfiles for backend and frontend (multi-stage)
-- **CI baseline**
-  - `.github/workflows/ci.yml`: ESLint, Vite build, `cargo fmt --check`,
-    `cargo clippy`, `cargo check` on every PR
+- **Authentication & authorization** — ✅ done
+  (see the Done section for links)
+- **Secrets & configuration** — ✅ done
+- **Production config** — ⏳ partly done
+  - ✅ env-driven CSP `connect-src`, `DATABASE_URL`, `SYNC_INTERVAL`
+  - ✅ `docker-compose.dev.yml` for Keycloak layer
+  - ⏳ `docker-compose.prod.yml` + multi-stage production Dockerfiles for
+    backend and frontend
+- **CI baseline** — ✅ done
 
 ## Phase 2 — Trust & safety (2–3 weeks)
 
@@ -105,4 +94,22 @@ Goal: daily-driver quality for real STIG reviewers and operators.
 
 ## Done
 
-_(nothing yet)_
+### Phase 1
+
+- **Auth (OIDC RP)** — Keycloak dev stack, `/api/auth/{login,callback,me,logout}`
+  with PKCE, encrypted session cookie, `require_auth` middleware protecting
+  all `/api/*` except `/api/health`. Frontend login page and session-aware
+  `apiFetch`. Dev-open mode preserved for local work;
+  `REQUIRE_AUTH=1` enforces OIDC in production.
+  Files: `backend/src/auth/`, `src/components/Login.jsx`,
+  `src/hooks/useAuth.js`, `src/api.js`, `docker-compose.dev.yml`,
+  `keycloak/realm-dev.json`.
+- **Env-driven config** — Frontend API base URL + production CSP
+  `connect-src` come from `VITE_API_BASE_URL` at build time; backend reads
+  `DATABASE_URL`, `PORT`, `DATA_DIR`, `STIG_SYNC_INTERVAL_HOURS`,
+  `ALLOWED_ORIGINS` from env. Fail-fast on missing `DATABASE_URL`.
+- **Secrets hygiene** — `.env.example`, `.env*` git-ignored,
+  `docker-compose.yml` requires Postgres creds via `${VAR:?}` syntax.
+- **CI** — GitHub Actions runs ESLint, Vite build, `cargo fmt --check`,
+  `cargo clippy -D warnings`, `cargo check` on every PR.
+- **Docs** — `README.md`, `CONTRIBUTING.md`, `ROADMAP.md` (this file).
