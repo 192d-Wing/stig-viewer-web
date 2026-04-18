@@ -15,7 +15,7 @@ use axum::{
 use axum_extra::extract::cookie::Key;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -97,10 +97,26 @@ async fn main() -> Result<()> {
         }
     }
 
+    // CORS: credentialed requests require a specific origin allowlist (the
+    // spec forbids Access-Control-Allow-Origin: * with credentials). Without
+    // ALLOWED_ORIGINS set we fall back to the dev defaults.
+    let allowed_origins: Vec<_> = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:5173,http://localhost:8080".into())
+        .split(',')
+        .filter_map(|s| s.trim().parse::<axum::http::HeaderValue>().ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(allowed_origins)
+        .allow_credentials(true)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+        ]);
 
     let state = AppState {
         pool: pool.clone(),

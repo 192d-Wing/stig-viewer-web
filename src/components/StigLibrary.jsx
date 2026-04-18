@@ -19,8 +19,7 @@ import CollectionPreferences from "@cloudscape-design/components/collection-pref
 import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
-
-const BACKEND = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
+import { apiFetch, redirectToLogin, UnauthorizedError } from "../api.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 
@@ -100,7 +99,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     setCatalogLoading(true);
     setCatalogError(null);
     let cancelled = false;
-    fetch(`${BACKEND}/api/catalog`)
+    apiFetch(`/api/catalog`)
       .then((r) => {
         if (!r.ok) throw new Error(`Backend returned ${r.status}`);
         return r.json();
@@ -109,7 +108,12 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         if (!cancelled) setCatalog(data);
       })
       .catch((err) => {
-        if (!cancelled) setCatalogError(err.message);
+        if (cancelled) return;
+        if (err instanceof UnauthorizedError) {
+          redirectToLogin();
+          return;
+        }
+        setCatalogError(err.message);
       })
       .finally(() => {
         if (!cancelled) setCatalogLoading(false);
@@ -180,11 +184,15 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     async (id) => {
       setLoadingId(id);
       try {
-        const r = await fetch(`${BACKEND}/api/stigs/${encodeURIComponent(id)}`);
+        const r = await apiFetch(`/api/stigs/${encodeURIComponent(id)}`);
         if (!r.ok) throw new Error(`Backend returned ${r.status}`);
         const stig = await r.json();
         onLoad(stig);
       } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          redirectToLogin();
+          return;
+        }
         setCatalogError(`Failed to load STIG: ${err.message}`);
       } finally {
         setLoadingId(null);
@@ -204,7 +212,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         body.append("file", addFiles[0]);
         body.append("id", addId.trim());
         body.append("category", addCategory);
-        const r = await fetch(`${BACKEND}/api/upload`, {
+        const r = await apiFetch(`/api/upload`, {
           method: "POST",
           body,
         });
@@ -217,6 +225,10 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         setAddId("");
         fetchCatalog();
       } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          redirectToLogin();
+          return;
+        }
         setAddResult({ error: err.message });
         setAddStatus("error");
       }
@@ -233,7 +245,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       try {
         const body = new FormData();
         body.append("file", libFiles[0]);
-        const r = await fetch(`${BACKEND}/api/upload/library`, {
+        const r = await apiFetch(`/api/upload/library`, {
           method: "POST",
           body,
         });
@@ -245,6 +257,10 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         setLibFiles([]);
         fetchCatalog();
       } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          redirectToLogin();
+          return;
+        }
         setLibResult({ error: err.message });
         setLibStatus("error");
       }

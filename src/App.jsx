@@ -1,17 +1,45 @@
 import { useState, useMemo, useRef, useCallback } from 'react'
 import { useStigTabs } from './hooks/useStigTabs.js'
+import { useAuth } from './hooks/useAuth.js'
 import TopNavigation from '@cloudscape-design/components/top-navigation'
 import AppLayout from '@cloudscape-design/components/app-layout'
 import SideNavigation from '@cloudscape-design/components/side-navigation'
 import SplitPanel from '@cloudscape-design/components/split-panel'
 import Button from '@cloudscape-design/components/button'
+import Spinner from '@cloudscape-design/components/spinner'
 import DropZone from './components/DropZone.jsx'
 import StigLibrary from './components/StigLibrary.jsx'
 import STIGView from './components/STIGView.jsx'
 import DiffView from './components/DiffView.jsx'
 import RuleDetail from './components/RuleDetail.jsx'
+import Login from './components/Login.jsx'
 
 export default function App() {
+  const auth = useAuth()
+
+  if (auth.status === 'loading') {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <Spinner size="large" />
+      </div>
+    )
+  }
+
+  if (auth.status === 'anon') {
+    return <Login />
+  }
+
+  return <AppShell auth={auth} />
+}
+
+function AppShell({ auth }) {
   const {
     tabs,
     activeTabId,
@@ -87,6 +115,18 @@ export default function App() {
         onClick: handleDiffToggle,
       })
     }
+  }
+  if (auth.status === 'authed' && auth.user) {
+    utilities.push({
+      type: 'menu-dropdown',
+      text: auth.user.email || auth.user.sub,
+      description: `Role: ${auth.user.role}`,
+      iconName: 'user-profile',
+      items: [{ id: 'logout', text: 'Log out' }],
+      onItemClick: ({ detail }) => {
+        if (detail.id === 'logout') auth.logout()
+      },
+    })
   }
 
   // Build SideNavigation items
