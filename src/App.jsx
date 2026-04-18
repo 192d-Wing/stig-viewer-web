@@ -15,7 +15,8 @@ import DiffView from './components/DiffView.jsx'
 import RuleDetail from './components/RuleDetail.jsx'
 import Login from './components/Login.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
-import { useNotifications } from './hooks/useNotifications.js'
+import { useNotifications, notify } from './hooks/useNotifications.js'
+import { downloadAllCKL, downloadCombinedPOAM } from './utils/bulkExport.js'
 
 export default function App() {
   const auth = useAuth()
@@ -107,6 +108,27 @@ function AppShell({ auth }) {
     [setActiveTab, setSelectedRule, isDiffMode, setDiffPair],
   )
 
+  const handleBulkExport = useCallback(
+    async (kind) => {
+      if (tabs.length === 0) return
+      try {
+        if (kind === 'ckl') {
+          await downloadAllCKL(tabs)
+          notify.success(`Exported ${tabs.length} .ckl file${tabs.length === 1 ? '' : 's'}`)
+        } else if (kind === 'poam-csv') {
+          downloadCombinedPOAM(tabs, 'csv')
+          notify.success('Combined POAM (CSV) downloaded')
+        } else if (kind === 'poam-json') {
+          downloadCombinedPOAM(tabs, 'json')
+          notify.success('Combined POAM (JSON) downloaded')
+        }
+      } catch (err) {
+        notify.error(`Bulk export failed: ${err.message}`)
+      }
+    },
+    [tabs],
+  )
+
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
   const isDiffMode = diffPair !== null
   const hasTabs = tabs.length > 0
@@ -176,6 +198,18 @@ function AppShell({ auth }) {
       disabled: !canRedo,
       ariaLabel: 'Redo (Ctrl/Cmd+Shift+Z)',
       onClick: redo,
+    })
+    utilities.push({
+      type: 'menu-dropdown',
+      text: 'Export all',
+      iconName: 'download',
+      ariaLabel: 'Bulk export across all open tabs',
+      items: [
+        { id: 'ckl', text: 'All .ckl files' },
+        { id: 'poam-csv', text: 'Combined POAM (CSV)' },
+        { id: 'poam-json', text: 'Combined POAM (JSON)' },
+      ],
+      onItemClick: ({ detail }) => handleBulkExport(detail.id),
     })
     if (tabs.length >= 2) {
       utilities.push({

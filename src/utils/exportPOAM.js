@@ -96,3 +96,33 @@ export function exportPOAMJSON(stig, assetInfo, includeNonReviewed = false) {
     Object.fromEntries(POAM_HEADERS.map((h, i) => [h, row[i] ?? ''])),
   )
 }
+
+/**
+ * Build a single POAM CSV covering many tabs. One header row; rows from every
+ * tab are concatenated in the order given.
+ */
+export function bulkExportPOAMCSV(tabs, includeNonReviewed = false) {
+  const header = POAM_HEADERS.map(csvField).join(',')
+  const bodies = tabs
+    .map((t) =>
+      buildRows(t.stig, t.assetInfo, includeNonReviewed)
+        .map((row) => row.map(csvField).join(','))
+        .join('\n'),
+    )
+    .filter((s) => s.length > 0)
+  return bodies.length > 0 ? `${header}\n${bodies.join('\n')}` : header
+}
+
+/**
+ * Build a single POAM JSON array covering many tabs. Useful when the consumer
+ * (GRC tool, spreadsheet) prefers structured data over CSV.
+ */
+export function bulkExportPOAMJSON(tabs, includeNonReviewed = false) {
+  const out = []
+  for (const t of tabs) {
+    for (const obj of exportPOAMJSON(t.stig, t.assetInfo, includeNonReviewed)) {
+      out.push(obj)
+    }
+  }
+  return out
+}

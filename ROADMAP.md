@@ -67,11 +67,11 @@ Goal: daily-driver quality for real STIG reviewers and operators.
   - Frontend: catalog-loaded tabs fetch their workspace on open;
     status/asset changes trigger a 1-second debounced PUT
   - Local-file tabs are not persisted (no stable catalog id)
-- **Frontend**
-  - Global cross-rule full-text search
-  - Bulk export across all open tabs
-  - Undo/redo on rule status changes
-  - Offline mode via IndexedDB cache
+- **Frontend** — ⏳ partly done
+  - ✅ Global cross-rule search (Ctrl/Cmd+K modal)
+  - ✅ Bulk export across all open tabs (all .ckl + combined POAM)
+  - ✅ Undo/redo on rule status and bulk-status changes
+  - ⏳ Offline mode via IndexedDB cache
 - **Operations** — ⏳ partly done
   - ✅ `/api/sync` manual trigger endpoint (admin-only, audited)
   - ✅ Graceful shutdown on SIGTERM + SIGINT
