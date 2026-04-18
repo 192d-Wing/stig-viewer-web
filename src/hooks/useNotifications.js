@@ -38,6 +38,12 @@ export const notify = {
   warning: (content, opts) => push('warning', content, opts),
   error: (content, opts) => push('error', content, opts),
   dismiss,
+  // Test-only helper. The store is module-level so tests need to clear it
+  // between runs; app code should ignore this.
+  _reset: () => {
+    items = []
+    emit()
+  },
 }
 
 export function useNotifications() {
