@@ -18,10 +18,14 @@ Definition of done for every item:
 
 Goal: a secure, reproducible deployment outside a developer laptop.
 
-- **Authentication & authorization**
-  - Session-based login with bcrypt/argon2 password hashing
-  - Roles: `viewer`, `editor`, `admin`
-  - All `/api/*` routes protected except `/api/health`
+- **Authentication & authorization** (OIDC relying party)
+  - Backend acts as OIDC RP; no passwords stored locally
+  - Discovery via `OIDC_ISSUER_URL`; auth code flow + PKCE
+  - Session carried in a signed, encrypted cookie
+  - Role mapping from IdP group claims: `viewer`, `editor`, `admin`
+  - All `/api/*` routes protected except `/api/health` and `/api/auth/*`
+  - Config scaffold: `backend/src/auth/mod.rs` (this PR).
+    Full flow + middleware: follow-up PR.
 - **Secrets & configuration**
   - `.env.example` checked in; `.env` git-ignored
   - Backend fails fast on missing required env vars
