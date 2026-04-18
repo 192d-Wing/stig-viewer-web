@@ -22,3 +22,12 @@ chrono             = { version = "0.4", features = ["serde"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow             = "1"
+# ── Auth (OIDC relying party) ───────────────────────────────────────────────
+openidconnect      = { version = "3", default-features = false, features = ["reqwest", "rustls-tls"] }
+axum-extra         = { version = "0.9", features = ["cookie-private"] }
+cookie             = "0.18"
+url                = "2"
+hex                = "0.4"
+sha2               = "0.10"
+base64             = "0.22"
+time               = "0.3"

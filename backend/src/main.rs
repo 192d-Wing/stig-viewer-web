@@ -5,16 +5,18 @@ mod db;
 mod parser;
 mod sync;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, FromRef},
+    middleware,
     routing::{get, post},
     Router,
 };
+use axum_extra::extract::cookie::Key;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
@@ -22,20 +24,34 @@ use api::{
     stig::get_stig,
     upload::{upload_library, upload_stig},
 };
+use auth::AuthState;
 use config::{load_sources, Config};
 use db::init_pool;
 
 /// Unified application state shared by all Axum handlers.
-/// Axum requires a single State type per router.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Arc<PgPool>,
     pub config: Arc<Config>,
+    /// `Some` when OIDC is configured; `None` enables dev open mode.
+    pub auth: Option<AuthState>,
+}
+
+// Required so PrivateCookieJar can pull the cookie Key out of AppState.
+impl FromRef<AppState> for Key {
+    fn from_ref(state: &AppState) -> Self {
+        state
+            .auth
+            .as_ref()
+            .map(|a| a.cookie_key.clone())
+            // Dummy key used only when auth is disabled and no cookies are
+            // ever actually read or written; the extractor bails out early.
+            .unwrap_or_else(|| Key::from(&[0u8; 64]))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialise structured logging
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -44,7 +60,6 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
     let config = Arc::new(Config::from_env()?);
     let sources = Arc::new(load_sources()?);
 
@@ -54,14 +69,34 @@ async fn main() -> Result<()> {
         config.data_dir.display()
     );
 
-    // Ensure data directory exists
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
-    // Connect to Postgres and run migrations
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
 
-    // CORS — allow all origins in dev; tighten in production via env or nginx
+    // Initialise OIDC relying-party, or fall back to dev open mode.
+    let auth = AuthState::try_from_env(&config).await?;
+    match &auth {
+        Some(a) => info!(
+            "OIDC enabled: issuer={}",
+            a.config.issuer_url.as_deref().unwrap_or("?")
+        ),
+        None => {
+            if std::env::var("REQUIRE_AUTH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                anyhow::bail!(
+                    "REQUIRE_AUTH is set but OIDC env vars are incomplete. See .env.example."
+                );
+            }
+            warn!(
+                "OIDC not configured; starting in DEV OPEN MODE — all /api routes are unauthenticated. \
+                 Set OIDC_* env vars (and REQUIRE_AUTH=1 in production) to enforce login."
+            );
+        }
+    }
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -70,19 +105,30 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
+        auth,
     };
 
-    // Build Axum router — single AppState shared by all handlers
-    //
-    // Body limit applied globally at the router level (outermost layer) so it
-    // takes effect before Axum's built-in 2 MB default.  500 MB covers the
-    // largest DISA library bundle; all other routes are well under this.
-    let app = Router::new()
+    // Public routes: health + auth endpoints.
+    let public = Router::new()
         .route("/api/health", get(get_health))
+        .merge(auth::routes());
+
+    // Protected routes: everything that touches catalog, stigs, or uploads.
+    let protected = Router::new()
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::extractor::require_auth,
+        ));
+
+    // Body limit applied globally. 500 MB covers the largest DISA library
+    // bundle; all other routes are well under this.
+    let app = Router::new()
+        .merge(public)
+        .merge(protected)
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);
@@ -104,9 +150,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Start server ─────────────────────────────────────────────────────────
     let addr = format!("0.0.0.0:{}", config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
     info!("Listening on http://{addr}");
 
     axum::serve(listener, app)

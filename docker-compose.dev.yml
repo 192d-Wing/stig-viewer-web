@@ -1,0 +1,27 @@
+# Dev-only extension layered on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Adds Keycloak with a pre-provisioned realm (keycloak/realm-dev.json) that
+# defines the `stig-viewer-web` client, three role groups, and three test users
+# (admin / editor / viewer — passwords match usernames; dev-only).
+#
+# Admin console: http://localhost:8081  (user/pass from KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD)
+# Realm URL:     http://localhost:8081/realms/stig-viewer-dev
+# Test logins:   admin/admin, editor/editor, viewer/viewer
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${KEYCLOAK_PORT:-8081}:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /realms/stig-viewer-dev HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q '200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

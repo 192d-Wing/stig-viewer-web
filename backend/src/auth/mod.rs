@@ -1,55 +1,36 @@
 //! OIDC authentication — relying-party side.
 //!
-//! # Plan
+//! # Flow
 //!
-//! This module is a scaffold. Implementation lands in a follow-up PR.
-//!
-//! ## Flow
-//!
-//! 1. `GET /api/auth/login` — redirect to IdP authorization endpoint, state +
-//!    PKCE verifier stored in a signed cookie.
-//! 2. `GET /api/auth/callback` — exchange code for tokens, verify ID token,
-//!    look up / create a user row, write session cookie, redirect to frontend.
+//! 1. `GET /api/auth/login` — start auth: store state + nonce + PKCE verifier
+//!    in a short-lived signed cookie and 302 to the IdP authorization endpoint.
+//! 2. `GET /api/auth/callback` — exchange code for tokens, verify ID token +
+//!    nonce, map IdP groups to an internal role, write an encrypted session
+//!    cookie, and redirect back to the frontend.
 //! 3. `GET /api/auth/me` — return the current session's user + role.
-//! 4. `POST /api/auth/logout` — clear session cookie, optionally RP-initiated
-//!    logout at the IdP.
+//! 4. `POST /api/auth/logout` — clear the session cookie.
 //!
-//! ## Middleware
+//! # Dev bypass
 //!
-//! An Axum extractor (`AuthUser`) parses the session cookie on every request to
-//! a protected route and injects the user + role. A second extractor
-//! (`RequireRole(Role::Admin)`) gates admin endpoints.
-//!
-//! ## Role mapping
-//!
-//! The IdP's `groups` claim is compared against `OIDC_ADMIN_GROUP`,
-//! `OIDC_EDITOR_GROUP`, `OIDC_VIEWER_GROUP`. Highest-privilege match wins.
-//! Users with no matching group are rejected at callback if `ALLOWED_GROUPS`
-//! is non-empty.
-//!
-//! ## Libraries (proposed)
-//!
-//! - `openidconnect` — discovery, token verification, userinfo
-//! - `tower-cookies` or `axum-extra::extract::cookie` — signed cookies
-//! - `rand` + `base64` — state + PKCE
-//!
-//! ## Session storage
-//!
-//! Encrypted cookie holding `{user_id, role, exp}`. No server-side session
-//! table in the first cut; revoke on logout by setting an expired cookie.
-//! Revisit if we need forced logout across devices.
+//! When `OIDC_ISSUER_URL` (and the other required vars) aren't configured,
+//! [`AuthState::try_from_env`] returns `None` and the router falls back to an
+//! open mode — every protected handler sees a synthetic admin user. A warning
+//! is logged at startup; production must set `REQUIRE_AUTH=1` to make this
+//! startup condition fatal.
 
-// Scaffold: every item below is wired up in the follow-up PR that implements
-// the OIDC flow. Silence the dead-code warning at module scope until then.
-#![allow(dead_code)]
+pub mod client;
+pub mod extractor;
+pub mod handlers;
+pub mod session;
 
 use anyhow::Result;
+use axum_extra::extract::cookie::Key;
+use openidconnect::core::CoreClient;
+use std::sync::Arc;
+
+use crate::config::Config;
 
 /// OIDC relying-party configuration, loaded from env.
-///
-/// All fields are optional at the type level so the server can boot without
-/// OIDC configured during local development. Production startup should call
-/// [`OidcConfig::require`] to fail fast.
 #[derive(Debug, Clone, Default)]
 pub struct OidcConfig {
     pub issuer_url: Option<String>,
@@ -57,6 +38,7 @@ pub struct OidcConfig {
     pub client_secret: Option<String>,
     pub redirect_uri: Option<String>,
     pub session_secret: Option<String>,
+    pub post_login_redirect: String,
     pub allowed_groups: Vec<String>,
     pub admin_group: Option<String>,
     pub editor_group: Option<String>,
@@ -76,6 +58,10 @@ impl OidcConfig {
             client_secret: read("OIDC_CLIENT_SECRET"),
             redirect_uri: read("OIDC_REDIRECT_URI"),
             session_secret: read("SESSION_SECRET"),
+            // Where the IdP-returned callback redirects the browser after
+            // a successful login. Defaults to the frontend dev server.
+            post_login_redirect: read("OIDC_POST_LOGIN_REDIRECT")
+                .unwrap_or_else(|| "http://localhost:5173".into()),
             allowed_groups,
             admin_group: read("OIDC_ADMIN_GROUP"),
             editor_group: read("OIDC_EDITOR_GROUP"),
@@ -83,7 +69,6 @@ impl OidcConfig {
         }
     }
 
-    /// True once all required OIDC env vars are populated.
     pub fn is_enabled(&self) -> bool {
         self.issuer_url.is_some()
             && self.client_id.is_some()
@@ -91,23 +76,11 @@ impl OidcConfig {
             && self.redirect_uri.is_some()
             && self.session_secret.is_some()
     }
-
-    /// For production: returns Err if auth is not fully configured.
-    pub fn require(&self) -> Result<()> {
-        if self.is_enabled() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "OIDC is not fully configured. Required env vars: \
-                 OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, \
-                 OIDC_REDIRECT_URI, SESSION_SECRET. See .env.example."
-            )
-        }
-    }
 }
 
 /// Role assigned to an authenticated session, derived from IdP group claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Viewer,
     Editor,
@@ -115,7 +88,6 @@ pub enum Role {
 }
 
 impl Role {
-    /// Pick the highest-privilege role matching the user's IdP groups.
     pub fn from_groups(cfg: &OidcConfig, groups: &[String]) -> Option<Self> {
         let has =
             |name: &Option<String>| name.as_ref().is_some_and(|n| groups.iter().any(|g| g == n));
@@ -130,3 +102,31 @@ impl Role {
         }
     }
 }
+
+/// Fully-initialised auth subsystem: discovery done, cookie key derived.
+#[derive(Clone)]
+pub struct AuthState {
+    pub config: Arc<OidcConfig>,
+    pub client: Arc<CoreClient>,
+    pub cookie_key: Key,
+}
+
+impl AuthState {
+    /// Attempt to bring OIDC up. Returns `Ok(None)` if not configured (dev-open
+    /// mode); `Err` if configured but discovery or key derivation fails.
+    pub async fn try_from_env(_cfg: &Config) -> Result<Option<Self>> {
+        let oidc = OidcConfig::from_env();
+        if !oidc.is_enabled() {
+            return Ok(None);
+        }
+        let key = session::derive_key(oidc.session_secret.as_deref().unwrap_or_default())?;
+        let client = client::build(&oidc).await?;
+        Ok(Some(Self {
+            config: Arc::new(oidc),
+            client: Arc::new(client),
+            cookie_key: key,
+        }))
+    }
+}
+
+pub use handlers::routes;
