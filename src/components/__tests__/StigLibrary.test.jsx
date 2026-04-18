@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import 'fake-indexeddb/auto'
 import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import StigLibrary from '../StigLibrary.jsx'
+import { cacheCatalog, clearCache } from '../../utils/offlineCache.js'
 
 const CATALOG = [
   {
@@ -79,6 +81,21 @@ describe('<StigLibrary />', () => {
       expect(onLoad).toHaveBeenCalledWith(stigPayload, 'windows-11')
     })
     expect(globalThis.fetch.mock.calls[1][0]).toMatch(/\/api\/stigs\/windows-11$/)
+  })
+
+  it('falls back to the cached catalog when the network fails', async () => {
+    await clearCache()
+    await cacheCatalog(CATALOG)
+    // Simulate a dropped connection — fetch() rejects with TypeError.
+    globalThis.fetch.mockRejectedValueOnce(new TypeError('network down'))
+    render(<StigLibrary onLoad={() => {}} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('Windows 11 STIG')).toBeInTheDocument()
+    })
+    expect(
+      screen.getByText('Red Hat Enterprise Linux 9 STIG'),
+    ).toBeInTheDocument()
   })
 
   it('gracefully handles a 500 catalog response without crashing', async () => {

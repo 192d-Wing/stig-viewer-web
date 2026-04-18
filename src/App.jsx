@@ -16,6 +16,7 @@ import RuleDetail from './components/RuleDetail.jsx'
 import Login from './components/Login.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
 import { useNotifications, notify } from './hooks/useNotifications.js'
+import { useOnline } from './hooks/useOnline.js'
 import { downloadAllCKL, downloadCombinedPOAM } from './utils/bulkExport.js'
 
 export default function App() {
@@ -45,6 +46,7 @@ export default function App() {
 
 function AppShell({ auth }) {
   const notifications = useNotifications()
+  const online = useOnline()
   const {
     tabs,
     activeTabId,
@@ -322,7 +324,26 @@ function AppShell({ auth }) {
       <AppLayout
         headerSelector="#h"
         contentType={!hasTabs ? 'table' : 'default'}
-        notifications={<Flashbar items={notifications} stackItems />}
+        notifications={
+          <Flashbar
+            items={[
+              ...(online
+                ? []
+                : [
+                    {
+                      type: 'warning',
+                      header: 'Offline',
+                      content:
+                        'No network connection. Cached STIGs remain viewable; uploads and saves will resume when the connection returns.',
+                      id: 'offline',
+                      dismissible: false,
+                    },
+                  ]),
+              ...notifications,
+            ]}
+            stackItems
+          />
+        }
         navigationHide={!hasTabs || isDiffMode}
         navigationOpen={navOpen && hasTabs && !isDiffMode}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}

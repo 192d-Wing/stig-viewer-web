@@ -26,6 +26,12 @@ import {
   UnauthorizedError,
 } from "../api.js";
 import { notify } from "../hooks/useNotifications.js";
+import {
+  cacheCatalog,
+  cacheStig,
+  readCachedCatalog,
+  readCachedStig,
+} from "../utils/offlineCache.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 
@@ -111,12 +117,25 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         return r.json();
       })
       .then((data) => {
-        if (!cancelled) setCatalog(data);
+        if (cancelled) return;
+        setCatalog(data);
+        // Best-effort write-through cache; ignore failures.
+        cacheCatalog(data).catch(() => {});
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (cancelled) return;
         if (err instanceof UnauthorizedError) {
           redirectToLogin();
+          return;
+        }
+        // Network failures (TypeError from fetch) drop us into the offline
+        // path; serve the cached catalog if we have one.
+        const cached = await readCachedCatalog();
+        if (cached && !cancelled) {
+          setCatalog(cached.list);
+          notify.warning(
+            `Backend unreachable — showing cached catalog from ${new Date(cached.cachedAt).toLocaleString()}.`,
+          );
           return;
         }
         setCatalogError(err.message);
@@ -194,9 +213,19 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         if (!r.ok) throw await readApiError(r);
         const stig = await r.json();
         onLoad(stig, id);
+        cacheStig(id, stig).catch(() => {});
       } catch (err) {
         if (err instanceof UnauthorizedError) {
           redirectToLogin();
+          return;
+        }
+        // Offline / network fallback — serve the cached STIG if we have one.
+        const cached = await readCachedStig(id);
+        if (cached) {
+          onLoad(cached.stig, id);
+          notify.warning(
+            `Loaded "${cached.stig.title || id}" from cache (${new Date(cached.cachedAt).toLocaleString()}).`,
+          );
           return;
         }
         setCatalogError(`Failed to load STIG: ${err.message}`);
