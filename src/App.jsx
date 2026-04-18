@@ -14,6 +14,7 @@ import STIGView from './components/STIGView.jsx'
 import DiffView from './components/DiffView.jsx'
 import RuleDetail from './components/RuleDetail.jsx'
 import Login from './components/Login.jsx'
+import GlobalSearch from './components/GlobalSearch.jsx'
 import { useNotifications } from './hooks/useNotifications.js'
 
 export default function App() {
@@ -65,14 +66,27 @@ function AppShell({ auth }) {
 
   const [navOpen, setNavOpen] = useState(true)
   const [splitPanelOpen, setSplitPanelOpen] = useState(true)
+  const [searchOpen, setSearchOpen] = useState(false)
   const fileInputRef = useRef(null)
 
-  // Keyboard shortcuts: Cmd/Ctrl+Z for undo, Cmd/Ctrl+Shift+Z for redo.
-  // Skip when focus is inside a text input so typing isn't hijacked.
+  // Keyboard shortcuts:
+  //   Cmd/Ctrl+K       open global search
+  //   Cmd/Ctrl+Z       undo
+  //   Cmd/Ctrl+Shift+Z redo
+  //
+  // For Z we skip when focus is in a text input so typing isn't hijacked.
+  // Cmd/Ctrl+K is always honored — the modal itself owns the input focus.
   useEffect(() => {
     const onKey = (e) => {
       const mod = e.metaKey || e.ctrlKey
-      if (!mod || e.key.toLowerCase() !== 'z') return
+      if (!mod) return
+      const key = e.key.toLowerCase()
+      if (key === 'k') {
+        e.preventDefault()
+        setSearchOpen((v) => !v)
+        return
+      }
+      if (key !== 'z') return
       const el = document.activeElement
       const tag = el?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return
@@ -83,6 +97,15 @@ function AppShell({ auth }) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [undo, redo])
+
+  const handleGlobalNavigate = useCallback(
+    (tabId, ruleId) => {
+      setActiveTab(tabId)
+      setSelectedRule(tabId, ruleId)
+      if (isDiffMode) setDiffPair(null)
+    },
+    [setActiveTab, setSelectedRule, isDiffMode, setDiffPair],
+  )
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
   const isDiffMode = diffPair !== null
@@ -130,6 +153,13 @@ function AppShell({ auth }) {
       text: 'Open File',
       iconName: 'upload',
       onClick: () => fileInputRef.current?.click(),
+    })
+    utilities.push({
+      type: 'button',
+      text: 'Search',
+      iconName: 'search',
+      ariaLabel: 'Search rules (Ctrl/Cmd+K)',
+      onClick: () => setSearchOpen(true),
     })
     utilities.push({
       type: 'button',
@@ -295,6 +325,13 @@ function AppShell({ auth }) {
         onSplitPanelToggle={handleSplitPanelToggle}
         onSplitPanelPreferencesChange={() => {}}
         content={content}
+      />
+
+      <GlobalSearch
+        isOpen={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        tabs={tabs}
+        onNavigate={handleGlobalNavigate}
       />
     </>
   )
