@@ -17,6 +17,7 @@ import Login from './components/Login.jsx'
 import GlobalSearch from './components/GlobalSearch.jsx'
 import { useNotifications, notify } from './hooks/useNotifications.js'
 import { useOnline } from './hooks/useOnline.js'
+import { useOrgs } from './hooks/useOrgs.js'
 import { downloadAllCKL, downloadCombinedPOAM } from './utils/bulkExport.js'
 
 export default function App() {
@@ -47,6 +48,7 @@ export default function App() {
 function AppShell({ auth }) {
   const notifications = useNotifications()
   const online = useOnline()
+  const orgs = useOrgs()
   const {
     tabs,
     activeTabId,
@@ -221,6 +223,29 @@ function AppShell({ auth }) {
         onClick: handleDiffToggle,
       })
     }
+  }
+  if (orgs.active) {
+    const canSwitch = orgs.memberships.length >= 2
+    utilities.push({
+      type: 'menu-dropdown',
+      text: orgs.active.name || orgs.active.slug,
+      description: canSwitch ? 'Switch organisation' : 'Active organisation',
+      iconName: 'group',
+      ariaLabel: `Active organisation: ${orgs.active.name || orgs.active.slug}`,
+      disabled: !canSwitch,
+      // Empty `items` renders the dropdown greyed out; Cloudscape still
+      // shows the label + description, which is the point when only one
+      // membership exists.
+      items: canSwitch
+        ? orgs.memberships.map((o) => ({
+            id: o.slug,
+            text: o.name || o.slug,
+            description: o.slug === orgs.active.slug ? 'Active' : o.slug,
+            disabled: o.slug === orgs.active.slug,
+          }))
+        : [],
+      onItemClick: ({ detail }) => orgs.switchTo(detail.id),
+    })
   }
   if (auth.status === 'authed' && auth.user) {
     utilities.push({

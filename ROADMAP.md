@@ -104,11 +104,12 @@ Goal: daily-driver quality for real STIG reviewers and operators.
   encryption, non-atomic data-dir tar).
 - **Optional**
   - ✅ SSO via OIDC (shipped in Phase 1)
-  - ⏳ Multi-tenant organisations — ✅ data isolation + session scope +
-    `/api/orgs/me` + `/api/orgs/switch`. ✅ Admin org-creation
+  - ✅ Multi-tenant organisations — data isolation + session scope +
+    `/api/orgs/me` + `/api/orgs/switch`, admin org-creation
     (`POST /api/orgs`) and member-management
-    (`GET/POST/DELETE /api/orgs/:slug/members[/:user_sub]`).
-    Frontend org-switcher UI still pending.
+    (`GET/POST/DELETE /api/orgs/:slug/members[/:user_sub]`), and a
+    TopNavigation org switcher (`src/hooks/useOrgs.js`) that reloads
+    the app on switch so tab state and the catalog refetch cleanly.
   - Signed CKL export (detached signature)
 
 ---
