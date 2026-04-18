@@ -11,7 +11,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use sqlx::PgPool;
-use stig_viewer_backend::{build_app, config::Config, AppState};
+use stig_viewer_backend::{api::metrics::install_recorder, build_app, config::Config, AppState};
 use tempfile::TempDir;
 
 pub struct TestApp {
@@ -24,6 +24,10 @@ pub struct TestApp {
 }
 
 pub async fn spawn_app(pool: PgPool) -> TestApp {
+    // The Prometheus recorder is process-global; install_recorder is
+    // idempotent so parallel tests can call it safely.
+    install_recorder();
+
     let data_dir = tempfile::tempdir().expect("tempdir");
     tokio::fs::create_dir_all(data_dir.path().join("stigs"))
         .await

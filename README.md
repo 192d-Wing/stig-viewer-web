@@ -166,9 +166,31 @@ and asset-info edits are PUT back with a 1-second debounce.
 | GET    | `/api/readyz` | public    | Readiness: DB round-trip; 503 when degraded |
 | GET    | `/api/health` | public    | Back-compat alias for `/api/readyz`         |
 | POST   | `/api/sync`   | admin     | Fire a manual DISA sync; 202 Accepted       |
+| GET    | `/metrics`    | public    | Prometheus text exposition                  |
 
 The server installs shutdown handlers for both SIGINT (Ctrl+C) and SIGTERM
 (container orchestrators) and drains in-flight requests before exiting.
+
+### Request IDs & logging
+
+Every request is wrapped in a `http{request_id=…}` tracing span. A client-
+supplied `X-Request-Id` header is honored verbatim when present (otherwise
+a v4 UUID is generated). The id is echoed on the response so callers can
+correlate their logs with ours.
+
+Set `LOG_FORMAT=json` to emit one JSON record per event — the right format
+for Loki, Elasticsearch, Datadog, or CloudWatch ingest. Anything else uses
+the human-friendly default formatter.
+
+### Metrics
+
+`/metrics` exposes the standard Prometheus text format when the recorder
+has been installed (always true in the binary; opt-in in tests). Today
+the recorder tracks:
+
+- `http_requests_total{method,path,status}` — counter per request
+- `http_request_duration_seconds{method,path}` — latency histogram
+- `audit_events_total{action}` — one bump per audit row written
 
 All other `/api/*` routes except the liveness/readiness/auth endpoints
 require a valid session.

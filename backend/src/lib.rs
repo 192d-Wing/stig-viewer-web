@@ -29,7 +29,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use api::{
     audit::list_audit,
     catalog::{get_catalog, get_health},
+    metrics::{scrape as metrics_scrape, track as metrics_track},
     ops::{livez, readyz, trigger_sync},
+    request_id::with_request_id,
     stig::get_stig,
     upload::{upload_library, upload_stig},
     workspaces,
@@ -95,6 +97,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/health", get(get_health))
         .route("/api/livez", get(livez))
         .route("/api/readyz", get(readyz))
+        .route("/metrics", get(metrics_scrape))
         .merge(auth::routes());
 
     let protected_reads = Router::new()
@@ -139,18 +142,23 @@ pub fn build_app(state: AppState) -> Router {
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors)
+        // These two run outside the per-route handlers: metrics sees every
+        // request (so we can diff served vs. 4xx); request_id wraps the whole
+        // thing in a tracing span so handler logs carry the id.
+        .layer(middleware::from_fn(metrics_track))
+        .layer(middleware::from_fn(with_request_id))
 }
 
 /// Full server bootstrap — loads config, connects to Postgres, runs the
 /// DISA sync scheduler, and serves the app on `config.port`.
 pub async fn run() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    init_tracing();
+
+    // Install the Prometheus recorder before any metrics calls fire. Macros
+    // are no-ops before this so ordering is tolerant, but in-order is clean.
+    if api::metrics::install_recorder() {
+        tracing::info!("Prometheus /metrics recorder installed");
+    }
 
     let config = Arc::new(Config::from_env()?);
     let sources = Arc::new(load_sources()?);
@@ -228,6 +236,30 @@ pub async fn run() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Initialise tracing. `LOG_FORMAT=json` emits structured JSON lines (one
+/// per event) which is what most log aggregators want; anything else uses
+/// the human-friendly default formatter.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into());
+
+    let json = std::env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 }
 
 /// Wait for Ctrl+C (local dev) or SIGTERM (container orchestrators). On

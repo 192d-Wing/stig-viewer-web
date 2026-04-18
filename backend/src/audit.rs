@@ -70,7 +70,9 @@ pub async fn log(pool: &PgPool, entry: AuditEntry<'_>) {
 
     if let Err(e) = res {
         tracing::warn!("audit log insert failed: {e}");
+        return;
     }
+    crate::api::metrics::record_event("audit_events_total", entry.action);
 }
 
 /// Paginated read of recent events. Caller is responsible for the admin check.

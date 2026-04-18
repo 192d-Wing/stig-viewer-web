@@ -312,6 +312,66 @@ async fn workspace_rejects_bad_stig_id(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn request_id_header_is_echoed_when_supplied(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+    let supplied = "11111111-2222-3333-4444-555555555555";
+    let res = client
+        .get(format!("{}/api/health", app.base_url))
+        .header("x-request-id", supplied)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(supplied),
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn request_id_header_is_generated_when_absent(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/health", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+    let id = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    // UUID v4 canonical form: 8-4-4-4-12 hex chars.
+    assert_eq!(id.len(), 36, "expected a uuid, got {id:?}");
+    assert_eq!(id.matches('-').count(), 4);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn metrics_endpoint_exposes_request_counter(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    // Generate some traffic first.
+    for _ in 0..3 {
+        reqwest::get(format!("{}/api/health", app.base_url))
+            .await
+            .unwrap();
+    }
+    let body = reqwest::get(format!("{}/metrics", app.base_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("http_requests_total"));
+    assert!(body.contains("http_request_duration_seconds"));
+    assert!(
+        body.contains("path=\"/api/health\""),
+        "metrics body missing per-path label: {body}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn livez_always_returns_ok(pool: PgPool) {
     let app = spawn_app(pool).await;
     let res = reqwest::get(format!("{}/api/livez", app.base_url))

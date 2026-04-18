@@ -1,8 +1,10 @@
 pub mod audit;
 pub mod catalog;
 pub mod error;
+pub mod metrics;
 pub mod ops;
 pub mod ratelimit;
+pub mod request_id;
 pub mod stig;
 pub mod upload;
 pub mod workspaces;
