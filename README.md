@@ -147,6 +147,27 @@ the only origin the browser can talk to. Set it at build time in production.
 
 All other `/api/*` routes except `/api/health` require a valid session.
 
+### Error responses
+
+All `/api/*` handlers return a consistent error body on failure:
+
+```json
+{
+  "error": {
+    "code": "payload_too_large",
+    "message": "file exceeds MAX_UPLOAD_BYTES (…)",
+    "details": { "limitBytes": 52428800, "actualBytes": 73400320 }
+  }
+}
+```
+
+Codes are stable strings (e.g. `bad_request`, `unauthorized`, `forbidden`,
+`not_found`, `payload_too_large`, `unprocessable_entity`, `too_many_requests`,
+`internal_error`). `details` is optional and carries structured context for
+errors that need it. Internal errors never leak server-side messages; the
+client always sees `"internal server error"`. The frontend renders these as
+Cloudscape Flashbar notifications via `src/hooks/useNotifications.js`.
+
 ### Audit log
 
 Every upload and every login/logout is recorded in the `audit_log` table

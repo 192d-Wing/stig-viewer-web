@@ -2,12 +2,12 @@
 
 use axum::{
     extract::{Extension, Query, State},
-    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
 
 use crate::{
+    api::error::ApiError,
     audit::{self, AuditEvent},
     auth::{session::SessionData, Role},
     AppState,
@@ -26,15 +26,10 @@ pub async fn list_audit(
     State(state): State<AppState>,
     Extension(session): Extension<SessionData>,
     Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<AuditEvent>>, StatusCode> {
+) -> Result<Json<Vec<AuditEvent>>, ApiError> {
     if session.role != Role::Admin {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError::Forbidden);
     }
-    let rows = audit::list(&state.pool, q.limit.unwrap_or(100), q.before_id)
-        .await
-        .map_err(|e| {
-            tracing::error!("audit list failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let rows = audit::list(&state.pool, q.limit.unwrap_or(100), q.before_id).await?;
     Ok(Json(rows))
 }

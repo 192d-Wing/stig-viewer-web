@@ -19,7 +19,13 @@ import CollectionPreferences from "@cloudscape-design/components/collection-pref
 import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
-import { apiFetch, redirectToLogin, UnauthorizedError } from "../api.js";
+import {
+  apiFetch,
+  redirectToLogin,
+  readApiError,
+  UnauthorizedError,
+} from "../api.js";
+import { notify } from "../hooks/useNotifications.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 
@@ -100,8 +106,8 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
     setCatalogError(null);
     let cancelled = false;
     apiFetch(`/api/catalog`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`Backend returned ${r.status}`);
+      .then(async (r) => {
+        if (!r.ok) throw await readApiError(r);
         return r.json();
       })
       .then((data) => {
@@ -185,7 +191,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
       setLoadingId(id);
       try {
         const r = await apiFetch(`/api/stigs/${encodeURIComponent(id)}`);
-        if (!r.ok) throw new Error(`Backend returned ${r.status}`);
+        if (!r.ok) throw await readApiError(r);
         const stig = await r.json();
         onLoad(stig);
       } catch (err) {
@@ -216,14 +222,14 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
           method: "POST",
           body,
         });
+        if (!r.ok) throw await readApiError(r);
         const json = await r.json();
-        if (!r.ok)
-          throw new Error(json?.message ?? `Server returned ${r.status}`);
         setAddResult(json);
         setAddStatus("success");
         setAddFiles([]);
         setAddId("");
         fetchCatalog();
+        notify.success(`Uploaded "${json.title || json.id}"`);
       } catch (err) {
         if (err instanceof UnauthorizedError) {
           redirectToLogin();
@@ -231,6 +237,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         }
         setAddResult({ error: err.message });
         setAddStatus("error");
+        notify.error(`Upload failed: ${err.message}`);
       }
     },
     [addFiles, addId, addCategory, fetchCatalog],
@@ -249,18 +256,22 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
           method: "POST",
           body,
         });
+        if (!r.ok) throw await readApiError(r);
         const json = await r.json();
-        if (!r.ok)
-          throw new Error(json?.message ?? `Server returned ${r.status}`);
         setLibResult(json);
         setLibStatus("success");
         setLibFiles([]);
         fetchCatalog();
+        notify.success(
+          `Imported ${json.imported} STIGs from library` +
+            (json.errors ? ` (${json.errors} errors)` : ""),
+        );
       } catch (err) {
         if (err instanceof UnauthorizedError) {
           redirectToLogin();
           return;
         }
+        notify.error(`Library import failed: ${err.message}`);
         setLibResult({ error: err.message });
         setLibStatus("error");
       }

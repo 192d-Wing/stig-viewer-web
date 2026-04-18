@@ -2,12 +2,12 @@ use std::net::SocketAddr;
 
 use axum::{
     extract::{ConnectInfo, Extension, Multipart, State},
-    http::StatusCode,
     Json,
 };
 use chrono::Utc;
 
 use crate::{
+    api::error::ApiError,
     audit::{self, AuditEntry},
     auth::session::SessionData,
     db::{upsert_catalog, CatalogEntry},
@@ -17,125 +17,87 @@ use crate::{
 
 /// POST /api/upload
 ///
-/// Accepts a multipart form upload with the following fields (order-independent):
-///   file     — the DISA STIG ZIP (required)
+/// Multipart form fields (order-independent):
+///   file     — DISA STIG ZIP (required)
 ///   id       — machine-readable slug, e.g. "windows-11" (required)
-///   category — one of Windows / Linux / Browser / Network (required)
-///
-/// Example:
-///   curl -X POST http://localhost:8080/api/upload \
-///        -F "file=@U_MS_Windows_11_V2R3_STIG.zip" \
-///        -F "id=windows-11" \
-///        -F "category=Windows"
+///   category — Windows / Linux / Browser / Network (required)
 pub async fn upload_stig(
     State(state): State<AppState>,
     Extension(session): Extension<SessionData>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut zip_bytes: Option<Vec<u8>> = None;
     let mut id: Option<String> = None;
     let mut category: Option<String> = None;
 
-    // Collect all multipart fields
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
     {
         match field.name() {
             Some("file") => {
-                let bytes = field.bytes().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read file field: {e}"),
-                    )
-                })?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("reading file field: {e}")))?;
                 zip_bytes = Some(bytes.to_vec());
             }
             Some("id") => {
-                let text = field.text().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read id field: {e}"),
-                    )
-                })?;
-                // Validate id — alphanumeric + hyphens only
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("reading id field: {e}")))?;
                 if !text.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
+                    return Err(ApiError::BadRequest(
                         "id must be alphanumeric with hyphens only".into(),
                     ));
                 }
                 id = Some(text);
             }
             Some("category") => {
-                let text = field.text().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read category field: {e}"),
-                    )
-                })?;
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("reading category field: {e}")))?;
                 category = Some(text);
             }
-            _ => {} // ignore unknown fields
+            _ => {}
         }
     }
 
-    let zip_bytes = zip_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
-    let id = id.ok_or((StatusCode::BAD_REQUEST, "Missing 'id' field".into()))?;
-    let category = category.ok_or((StatusCode::BAD_REQUEST, "Missing 'category' field".into()))?;
+    let zip_bytes = zip_bytes.ok_or_else(|| ApiError::BadRequest("missing 'file' field".into()))?;
+    let id = id.ok_or_else(|| ApiError::BadRequest("missing 'id' field".into()))?;
+    let category =
+        category.ok_or_else(|| ApiError::BadRequest("missing 'category' field".into()))?;
 
-    if zip_bytes.len() > state.config.max_upload_bytes {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
+    let limit = state.config.max_upload_bytes;
+    if zip_bytes.len() > limit {
+        return Err(ApiError::PayloadTooLarge {
+            message: format!(
                 "file exceeds MAX_UPLOAD_BYTES ({} > {})",
                 zip_bytes.len(),
-                state.config.max_upload_bytes
+                limit
             ),
-        ));
+            limit_bytes: limit,
+            actual_bytes: zip_bytes.len(),
+        });
     }
 
-    // Extract and parse XCCDF
-    let xccdf = extract_xccdf_from_zip(&zip_bytes).map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("ZIP extraction failed: {e}"),
-        )
-    })?;
+    let xccdf = extract_xccdf_from_zip(&zip_bytes)
+        .map_err(|e| ApiError::Unprocessable(format!("ZIP extraction failed: {e}")))?;
 
-    let stig = parse_xccdf(&xccdf).map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("XCCDF parse failed: {e}"),
-        )
-    })?;
+    let stig = parse_xccdf(&xccdf)
+        .map_err(|e| ApiError::Unprocessable(format!("XCCDF parse failed: {e}")))?;
 
-    // Write JSON file
     let stigs_dir = state.config.data_dir.join("stigs");
-    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create data dir: {e}"),
-        )
-    })?;
+    tokio::fs::create_dir_all(&stigs_dir).await?;
 
     let json_path = stigs_dir.join(format!("{id}.json"));
-    let json_str = serde_json::to_string(&stig).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialisation failed: {e}"),
-        )
-    })?;
-    tokio::fs::write(&json_path, &json_str).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write JSON: {e}"),
-        )
-    })?;
+    let json_str = serde_json::to_string(&stig)?;
+    tokio::fs::write(&json_path, &json_str).await?;
 
-    // Upsert catalog row
     let rule_count = stig.rules.len() as i32;
     let title = if stig.title.is_empty() {
         id.clone()
@@ -152,12 +114,9 @@ pub async fn upload_stig(
         json_path: json_path.to_string_lossy().into_owned(),
         last_updated: Utc::now(),
     };
-    upsert_catalog(&state.pool, &entry).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database upsert failed: {e}"),
-        )
-    })?;
+    upsert_catalog(&state.pool, &entry)
+        .await
+        .map_err(|e| ApiError::Internal(format!("catalog upsert: {e}")))?;
 
     tracing::info!("Uploaded STIG '{id}' ({title}): {rule_count} rules");
 
@@ -190,50 +149,41 @@ pub async fn upload_stig(
 
 /// POST /api/upload/library
 ///
-/// Accepts a DISA SRG/STIG Library bundle ZIP (the big all-in-one download).
-/// Iterates every `*_STIG.zip` inside, parses each XCCDF, auto-assigns an ID
-/// from the inner filename and a category from the XCCDF title, then writes
-/// JSON files and upserts all catalog rows in one pass.
-///
-/// Body limit: 500 MB (set on the route in main.rs).
-///
-/// Example:
-///   curl -X POST http://localhost:8080/api/upload/library \
-///        -F "file=@U_SRG-STIG_Library_January_2026.zip"
+/// Accepts a DISA SRG/STIG Library bundle ZIP. Iterates every `*_STIG.zip`
+/// inside, parses each XCCDF, writes JSON files, and upserts catalog rows.
 pub async fn upload_library(
     State(state): State<AppState>,
     Extension(session): Extension<SessionData>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Read the single 'file' field
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut zip_bytes: Option<Vec<u8>> = None;
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+        .map_err(|e| ApiError::BadRequest(format!("multipart error: {e}")))?
     {
         if field.name() == Some("file") {
-            let bytes = field.bytes().await.map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read file field: {e}"),
-                )
-            })?;
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("reading file field: {e}")))?;
             zip_bytes = Some(bytes.to_vec());
         }
     }
-    let zip_bytes = zip_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
+    let zip_bytes = zip_bytes.ok_or_else(|| ApiError::BadRequest("missing 'file' field".into()))?;
 
-    if zip_bytes.len() > state.config.max_library_bytes {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
+    let limit = state.config.max_library_bytes;
+    if zip_bytes.len() > limit {
+        return Err(ApiError::PayloadTooLarge {
+            message: format!(
                 "library bundle exceeds MAX_LIBRARY_BYTES ({} > {})",
                 zip_bytes.len(),
-                state.config.max_library_bytes
+                limit
             ),
-        ));
+            limit_bytes: limit,
+            actual_bytes: zip_bytes.len(),
+        });
     }
 
     tracing::info!(
@@ -241,25 +191,13 @@ pub async fn upload_library(
         zip_bytes.len() / 1_048_576
     );
 
-    // Parsing is CPU-bound — run on blocking thread pool
     let (lib_entries, parse_errors) =
         tokio::task::spawn_blocking(move || extract_all_from_library(&zip_bytes))
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Task panic: {e}"),
-                )
-            })?;
+            .map_err(|e| ApiError::Internal(format!("task panic: {e}")))?;
 
-    // Write JSON files and upsert catalog rows
     let stigs_dir = state.config.data_dir.join("stigs");
-    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create data dir: {e}"),
-        )
-    })?;
+    tokio::fs::create_dir_all(&stigs_dir).await?;
 
     let mut imported = 0usize;
     let mut db_errors: Vec<serde_json::Value> = Vec::new();

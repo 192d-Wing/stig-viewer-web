@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod catalog;
+pub mod error;
 pub mod ratelimit;
 pub mod stig;
 pub mod upload;

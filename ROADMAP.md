@@ -46,10 +46,11 @@ Goal: confidence that changes don't regress and that the app is safe to expose.
   - ✅ CORS allowlist derived from ALLOWED_ORIGINS
   - ✅ Audit log (`audit_log` table, `GET /api/audit` admin-only;
     records upload.stig, upload.library, auth.login, auth.logout)
-- **Error handling** — ⏳ not started
-  - Typed error enum in backend, mapped to structured JSON responses
-  - Surface validation errors in UI via toast notifications
-  - Distinguish client (4xx) vs server (5xx) failure modes
+- **Error handling** — ✅ done
+  - `ApiError` enum + `IntoResponse` → `{error:{code,message,details}}`
+  - All `/api/*` handlers converted to return `Result<_, ApiError>`
+  - Frontend `readApiError` + `notify.error` via Cloudscape Flashbar
+  - Internal error messages never leak to the client
 
 ## Phase 3 — UX & ops (3–4 weeks)
 

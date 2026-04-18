@@ -1,10 +1,10 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
 
+use crate::api::error::ApiError;
 use crate::db::{count_catalog, list_catalog};
 use crate::AppState;
 
@@ -17,13 +17,8 @@ pub struct CatalogQuery {
 pub async fn get_catalog(
     State(state): State<AppState>,
     Query(params): Query<CatalogQuery>,
-) -> Result<impl axum::response::IntoResponse, StatusCode> {
-    let entries = list_catalog(&state.pool, params.category.as_deref())
-        .await
-        .map_err(|e| {
-            tracing::error!("catalog query failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+) -> Result<Json<Vec<crate::db::CatalogEntry>>, ApiError> {
+    let entries = list_catalog(&state.pool, params.category.as_deref()).await?;
     Ok(Json(entries))
 }
 

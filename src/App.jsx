@@ -7,12 +7,14 @@ import SideNavigation from '@cloudscape-design/components/side-navigation'
 import SplitPanel from '@cloudscape-design/components/split-panel'
 import Button from '@cloudscape-design/components/button'
 import Spinner from '@cloudscape-design/components/spinner'
+import Flashbar from '@cloudscape-design/components/flashbar'
 import DropZone from './components/DropZone.jsx'
 import StigLibrary from './components/StigLibrary.jsx'
 import STIGView from './components/STIGView.jsx'
 import DiffView from './components/DiffView.jsx'
 import RuleDetail from './components/RuleDetail.jsx'
 import Login from './components/Login.jsx'
+import { useNotifications } from './hooks/useNotifications.js'
 
 export default function App() {
   const auth = useAuth()
@@ -40,6 +42,7 @@ export default function App() {
 }
 
 function AppShell({ auth }) {
+  const notifications = useNotifications()
   const {
     tabs,
     activeTabId,
@@ -218,6 +221,7 @@ function AppShell({ auth }) {
       <AppLayout
         headerSelector="#h"
         contentType={!hasTabs ? 'table' : 'default'}
+        notifications={<Flashbar items={notifications} stackItems />}
         navigationHide={!hasTabs || isDiffMode}
         navigationOpen={navOpen && hasTabs && !isDiffMode}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}
