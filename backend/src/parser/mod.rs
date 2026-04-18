@@ -453,3 +453,80 @@ pub fn extract_all_from_library(
 
     (entries, errors)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_to_id_strips_prefix_suffix_and_version() {
+        assert_eq!(
+            filename_to_id("U_MS_Windows_11_V2R3_STIG.zip"),
+            "ms-windows-11"
+        );
+        assert_eq!(filename_to_id("U_RHEL_9_V2R2_STIG.zip"), "rhel-9");
+    }
+
+    #[test]
+    fn filename_to_id_handles_zip_entry_paths_and_case() {
+        assert_eq!(filename_to_id("sub/U_RHEL_9_V2R2_STIG.ZIP"), "rhel-9");
+    }
+
+    #[test]
+    fn filename_to_id_slugifies_and_collapses_dashes() {
+        assert_eq!(filename_to_id("Some Thing   Weird!.zip"), "some-thing-weird");
+    }
+
+    #[test]
+    fn infer_category_matches_os_family() {
+        assert_eq!(infer_category("Microsoft Windows 11 STIG"), "Windows");
+        assert_eq!(infer_category("Red Hat Enterprise Linux 9 STIG"), "Linux");
+        assert_eq!(infer_category("Ubuntu 22.04 STIG"), "Linux");
+        assert_eq!(infer_category("Google Chrome Browser STIG"), "Browser");
+        assert_eq!(infer_category("Cisco IOS XE STIG"), "Network");
+    }
+
+    #[test]
+    fn map_severity_maps_high_low_and_defaults_medium() {
+        assert_eq!(map_severity("high"), "CAT I");
+        assert_eq!(map_severity("HIGH"), "CAT I");
+        assert_eq!(map_severity("low"), "CAT III");
+        assert_eq!(map_severity("medium"), "CAT II");
+        assert_eq!(map_severity(""), "CAT II");
+        assert_eq!(map_severity("garbage"), "CAT II");
+    }
+
+    #[test]
+    fn clean_description_strips_tags_and_collapses_whitespace() {
+        let raw = "<VulnDiscussion>why it matters</VulnDiscussion><FalsePositives>none</FalsePositives>";
+        assert_eq!(clean_description(raw), "why it matters");
+    }
+
+    #[test]
+    fn parse_xccdf_pulls_title_and_rules() {
+        // Minimal but realistic XCCDF 1.1.4 document.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1">
+  <title>Test Benchmark</title>
+  <description>Test benchmark description.</description>
+  <version>1</version>
+  <Group id="V-1000">
+    <Rule id="SV-1000r1_rule" severity="high">
+      <title>Test Rule</title>
+      <description>&lt;VulnDiscussion&gt;some discussion&lt;/VulnDiscussion&gt;</description>
+      <fixtext>apply fix</fixtext>
+      <check system="x"><check-content>verify setting</check-content></check>
+    </Rule>
+  </Group>
+</Benchmark>"#;
+        let stig = parse_xccdf(xml).expect("parses");
+        assert_eq!(stig.title, "Test Benchmark");
+        assert_eq!(stig.version, "1");
+        assert_eq!(stig.rules.len(), 1);
+        let r = &stig.rules[0];
+        assert_eq!(r.id, "SV-1000r1_rule");
+        assert_eq!(r.group_id, "V-1000");
+        assert_eq!(r.severity, "CAT I");
+        assert_eq!(r.title, "Test Rule");
+    }
+}

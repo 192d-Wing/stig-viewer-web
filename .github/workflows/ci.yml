@@ -29,6 +29,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Test
+        run: npm test
+
       - name: Build
         run: npm run build
         env:
@@ -61,3 +64,6 @@ jobs:
 
       - name: cargo check
         run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test
