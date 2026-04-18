@@ -32,17 +32,20 @@ Goal: a secure, reproducible deployment outside a developer laptop.
 
 Goal: confidence that changes don't regress and that the app is safe to expose.
 
-- **Testing**
-  - Vitest + React Testing Library for parsers and core views
-  - Rust integration tests for upload / parse / catalog endpoints
-  - Target 60% line coverage on parsing modules
-- **Security hardening**
-  - Rate limit upload endpoints (per-IP + per-user)
-  - Per-file size cap in addition to global body limit
-  - XML parser configured against XXE / billion-laughs
-  - Audit log table: who uploaded / changed what, when
-  - Tighten CORS to an allowlist derived from env
-- **Error handling**
+- **Testing** — ⏳ in progress
+  - ✅ Vitest + RTL scaffolding; diff/parseCKL covered (14 tests)
+  - ✅ Rust unit tests for parser (11 tests) + XXE probe
+  - ✅ `npm test` and `cargo test` run in CI
+  - ⏳ RTL coverage for key components (StigLibrary, STIGView)
+  - ⏳ Rust integration tests for upload / catalog endpoints
+  - ⏳ Coverage target 60% on parsing modules
+- **Security hardening** — ⏳ mostly done
+  - ✅ Per-IP rate limit on upload endpoints (UPLOAD_RATE_PER_MIN)
+  - ✅ Per-file size caps (MAX_UPLOAD_BYTES, MAX_LIBRARY_BYTES)
+  - ✅ XML parser XXE-safe (regression test)
+  - ✅ CORS allowlist derived from ALLOWED_ORIGINS
+  - ⏳ Audit log table: who uploaded / changed what, when
+- **Error handling** — ⏳ not started
   - Typed error enum in backend, mapped to structured JSON responses
   - Surface validation errors in UI via toast notifications
   - Distinguish client (4xx) vs server (5xx) failure modes
