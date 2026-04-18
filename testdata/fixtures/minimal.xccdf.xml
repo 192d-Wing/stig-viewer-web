@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shared XCCDF fixture for parser-parity tests. Kept minimal but realistic:
+  three Group/Rule pairs across all severities, with CCI mappings and
+  VulnDiscussion-wrapped description text that the cleaner must strip.
+
+  DISA STIGs use exactly one Rule per Group. The frontend parser
+  (src/utils/parseXCCDF.js) honors that invariant; the backend parser
+  (backend/src/parser/mod.rs) iterates all rules in a group. This fixture
+  matches DISA's shape so both parsers agree.
+
+  Used by:
+  - src/utils/__tests__/parserParity.test.js   (frontend parseXCCDF)
+  - backend/src/parser/mod.rs::parity_tests    (backend parse_xccdf)
+-->
+<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1" id="test-benchmark">
+  <title>Parity Fixture STIG</title>
+  <description>Shared fixture for FE/BE parser parity tests.</description>
+  <version>2</version>
+  <plain-text id="release-info">Release: 4 Benchmark Date: 01 Jan 2026</plain-text>
+
+  <Group id="V-1001">
+    <Rule id="SV-1001r1_rule" severity="high">
+      <title>Critical rule under test</title>
+      <description>&lt;VulnDiscussion&gt;Why this critical finding matters.&lt;/VulnDiscussion&gt;&lt;FalsePositives&gt;None.&lt;/FalsePositives&gt;</description>
+      <fixtext>Apply the configuration change.</fixtext>
+      <check system="C-1001r1_chk">
+        <check-content>Verify the setting with a runtime probe.</check-content>
+      </check>
+      <ident system="http://iase.disa.mil/cci">CCI-000015</ident>
+      <ident system="http://iase.disa.mil/cci">CCI-000017</ident>
+    </Rule>
+  </Group>
+
+  <Group id="V-1002">
+    <Rule id="SV-1002r1_rule" severity="medium">
+      <title>Medium-severity rule</title>
+      <description>&lt;VulnDiscussion&gt;Medium impact finding.&lt;/VulnDiscussion&gt;</description>
+      <fixtext>Document the justification.</fixtext>
+      <check system="C-1002r1_chk">
+        <check-content>Review audit logs.</check-content>
+      </check>
+      <ident system="http://iase.disa.mil/cci">CCI-000200</ident>
+    </Rule>
+  </Group>
+
+  <Group id="V-1003">
+    <Rule id="SV-1003r1_rule" severity="low">
+      <title>Informational finding</title>
+      <description>&lt;VulnDiscussion&gt;Minor informational check.&lt;/VulnDiscussion&gt;</description>
+      <fixtext>Note in documentation.</fixtext>
+      <check system="C-1003r1_chk">
+        <check-content>No runtime probe required.</check-content>
+      </check>
+    </Rule>
+  </Group>
+</Benchmark>

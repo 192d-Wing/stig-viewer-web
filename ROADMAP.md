@@ -90,13 +90,20 @@ Goal: daily-driver quality for real STIG reviewers and operators.
 
 ## Phase 4 — Polish (ongoing)
 
-- **Refactor** `stig-viewer.jsx` into feature modules:
-  `upload/`, `rules/`, `diff/`, `export/`, `library/`
-- **Dedupe** XCCDF/CKL parsing — backend becomes source of truth,
-  frontend becomes a thin viewer
-- **Backups** — documented `pg_dump` cron + restore runbook
+- **Refactor** `stig-viewer.jsx` — ✅ done (actually already done before
+  this roadmap was written; the legacy file was removed and the
+  `src/components/` decomposition is the source of truth).
+- **Dedupe** XCCDF/CKL parsing — ✅ kept intentional. The frontend
+  parses user-supplied local files (offline workflow); the backend
+  parses uploads to produce the catalog JSON. Divergence is guarded
+  by the shared fixture in `testdata/fixtures/minimal.xccdf.xml`
+  exercised by both FE (`src/utils/__tests__/parserParity.test.js`)
+  and BE (`backend/src/parser/mod.rs::parity_fixture_*`) tests.
+- **Backups** — ✅ `BACKUPS.md` covers pg_dump, data/ snapshot, cron
+  cadence, restore runbook, and known gaps (no PITR, no at-rest
+  encryption, non-atomic data-dir tar).
 - **Optional**
-  - SSO via OIDC
+  - ✅ SSO via OIDC (shipped in Phase 1)
   - Multi-tenant organizations
   - Signed CKL export (detached signature)
 

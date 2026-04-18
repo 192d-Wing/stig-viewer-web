@@ -526,6 +526,52 @@ mod tests {
         );
     }
 
+    // ── Parity with the frontend parser ──────────────────────────────────────
+    //
+    // Shared fixture also exercised by
+    // src/utils/__tests__/parserParity.test.js on the JS side. Any assertion
+    // that drifts between these two tests indicates a real parser
+    // divergence.
+    const PARITY_FIXTURE: &str = include_str!("../../../testdata/fixtures/minimal.xccdf.xml");
+
+    #[test]
+    fn parity_fixture_parses_three_rules_with_expected_severities() {
+        let stig = parse_xccdf(PARITY_FIXTURE).expect("fixture parses");
+        assert_eq!(stig.title, "Parity Fixture STIG");
+        assert_eq!(stig.version, "2");
+        assert_eq!(stig.rules.len(), 3);
+
+        let by_stig_id: std::collections::HashMap<_, _> =
+            stig.rules.iter().map(|r| (r.stig_id.as_str(), r)).collect();
+        assert_eq!(by_stig_id["V-1001"].severity, "CAT I");
+        assert_eq!(by_stig_id["V-1001"].id, "SV-1001r1_rule");
+        assert_eq!(by_stig_id["V-1002"].severity, "CAT II");
+        assert_eq!(by_stig_id["V-1003"].severity, "CAT III");
+    }
+
+    #[test]
+    fn parity_fixture_strips_vulndiscussion_and_falsepositives() {
+        let stig = parse_xccdf(PARITY_FIXTURE).expect("fixture parses");
+        let critical = stig
+            .rules
+            .iter()
+            .find(|r| r.id == "SV-1001r1_rule")
+            .unwrap();
+        assert_eq!(critical.description, "Why this critical finding matters.");
+        assert!(!critical.description.contains("FalsePositives"));
+        assert!(!critical.description.contains('<'));
+    }
+
+    #[test]
+    fn parity_fixture_initialises_override_fields() {
+        let stig = parse_xccdf(PARITY_FIXTURE).expect("fixture parses");
+        for r in &stig.rules {
+            assert_eq!(r.status, "not_reviewed");
+            assert_eq!(r.finding_details, "");
+            assert_eq!(r.comments, "");
+        }
+    }
+
     #[test]
     fn parse_xccdf_pulls_title_and_rules() {
         // Minimal but realistic XCCDF 1.1.4 document.
