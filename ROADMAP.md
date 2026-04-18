@@ -33,11 +33,11 @@ Goal: a secure, reproducible deployment outside a developer laptop.
 Goal: confidence that changes don't regress and that the app is safe to expose.
 
 - **Testing** — ⏳ in progress
-  - ✅ Vitest + RTL scaffolding (31 tests): parseCKL, diffSTIGs,
-    readApiError, useNotifications, useAuth, Login, StigLibrary
+  - ✅ Vitest + RTL scaffolding (43 tests): parseCKL, diffSTIGs,
+    readApiError, useNotifications, useAuth, Login, StigLibrary,
+    RuleDetail, DiffView, STIGView
   - ✅ Rust unit tests (14 tests): parser, ratelimit, ApiError
   - ✅ `npm test` and `cargo test` run in CI
-  - ⏳ RTL coverage for STIGView, DiffView, RuleDetail
   - ⏳ Rust integration tests for upload / catalog endpoints against
     a real Postgres
   - ⏳ Coverage target 60% on parsing modules
