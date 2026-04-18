@@ -68,12 +68,12 @@ Goal: daily-driver quality for real STIG reviewers and operators.
   - Bulk export across all open tabs
   - Undo/redo on rule status changes
   - Offline mode via IndexedDB cache
-- **Operations**
-  - `/api/sync` manual trigger endpoint (admin-only)
-  - `/metrics` Prometheus endpoint
-  - Structured JSON logs with request IDs
-  - Graceful shutdown on SIGTERM
-  - Split health into `/livez` and `/readyz`
+- **Operations** — ⏳ partly done
+  - ✅ `/api/sync` manual trigger endpoint (admin-only, audited)
+  - ✅ Graceful shutdown on SIGTERM + SIGINT
+  - ✅ Split health into `/livez` and `/readyz` (with `/api/health` alias)
+  - ⏳ `/metrics` Prometheus endpoint
+  - ⏳ Structured JSON logs with request IDs
 - **Documentation**
   - Top-level README with quickstart
   - CONTRIBUTING.md with dev workflow

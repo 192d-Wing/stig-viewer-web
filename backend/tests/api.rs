@@ -193,6 +193,41 @@ async fn upload_with_invalid_id_returns_bad_request(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn livez_always_returns_ok(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/livez", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn readyz_is_ok_when_db_is_reachable(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/readyz", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sync_endpoint_returns_500_when_sources_unconfigured(pool: PgPool) {
+    // The test harness leaves `sources: None`, which the endpoint must
+    // surface as a structured error rather than panic.
+    let app = spawn_app(pool).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/sync", app.base_url))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "internal_error");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn audit_endpoint_returns_uploaded_events(pool: PgPool) {
     let app = spawn_app(pool).await;
     let zip = minimal_stig_zip("Audit Me", "1", "SV-1");

@@ -29,11 +29,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use api::{
     audit::list_audit,
     catalog::{get_catalog, get_health},
+    ops::{livez, readyz, trigger_sync},
     stig::get_stig,
     upload::{upload_library, upload_stig},
 };
 use auth::AuthState;
-use config::{load_sources, Config};
+use config::{load_sources, Config, StigSource};
 use db::init_pool;
 
 /// Unified application state shared by all Axum handlers.
@@ -43,6 +44,9 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// `Some` when OIDC is configured; `None` enables dev open mode.
     pub auth: Option<AuthState>,
+    /// DISA sources manifest. `None` when tests skip loading it; the
+    /// `POST /api/sync` endpoint returns an error in that case.
+    pub sources: Option<Arc<Vec<StigSource>>>,
 }
 
 // Required so PrivateCookieJar can pull the cookie Key out of AppState.
@@ -85,7 +89,11 @@ pub fn build_app(state: AppState) -> Router {
     ));
 
     let public = Router::new()
+        // /api/health is retained as an alias for /api/readyz so existing
+        // probes keep working; prefer /api/livez or /api/readyz for new ones.
         .route("/api/health", get(get_health))
+        .route("/api/livez", get(livez))
+        .route("/api/readyz", get(readyz))
         .merge(auth::routes());
 
     let protected_reads = Router::new()
@@ -96,6 +104,15 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             auth::extractor::require_auth,
         ));
+
+    // Admin-only mutations that aren't uploads.
+    let protected_admin =
+        Router::new()
+            .route("/api/sync", post(trigger_sync))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::extractor::require_auth,
+            ));
 
     let protected_uploads = Router::new()
         .route("/api/upload", post(upload_stig))
@@ -112,6 +129,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .merge(public)
         .merge(protected_reads)
+        .merge(protected_admin)
         .merge(protected_uploads)
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
@@ -169,6 +187,7 @@ pub async fn run() -> Result<()> {
         pool: pool.clone(),
         config: config.clone(),
         auth,
+        sources: Some(sources.clone()),
     };
 
     let app = build_app(state);
@@ -206,9 +225,27 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Wait for Ctrl+C (local dev) or SIGTERM (container orchestrators). On
+/// non-Unix platforms only Ctrl+C is installed.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
-    info!("Shutting down…");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("Shutting down (SIGINT)…"),
+        _ = terminate => info!("Shutting down (SIGTERM)…"),
+    }
 }

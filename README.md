@@ -145,7 +145,20 @@ the only origin the browser can talk to. Set it at build time in production.
 | GET    | `/api/auth/me`        | Current session's `{sub,email,role,exp}` |
 | POST   | `/api/auth/logout`    | Clear the session cookie                 |
 
-All other `/api/*` routes except `/api/health` require a valid session.
+### Ops endpoints
+
+| Method | Path          | Auth      | Purpose                                     |
+| ------ | ------------- | --------- | ------------------------------------------- |
+| GET    | `/api/livez`  | public    | Liveness: process is up                     |
+| GET    | `/api/readyz` | public    | Readiness: DB round-trip; 503 when degraded |
+| GET    | `/api/health` | public    | Back-compat alias for `/api/readyz`         |
+| POST   | `/api/sync`   | admin     | Fire a manual DISA sync; 202 Accepted       |
+
+The server installs shutdown handlers for both SIGINT (Ctrl+C) and SIGTERM
+(container orchestrators) and drains in-flight requests before exiting.
+
+All other `/api/*` routes except the liveness/readiness/auth endpoints
+require a valid session.
 
 ### Error responses
 

@@ -45,6 +45,7 @@ pub async fn spawn_app(pool: PgPool) -> TestApp {
         pool: pool.clone(),
         config,
         auth: None,
+        sources: None,
     };
 
     let app = build_app(state);
