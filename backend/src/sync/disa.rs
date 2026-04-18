@@ -33,8 +33,7 @@ async fn sync_one(
     let zip_bytes = resp.bytes().await.context("Failed to read response body")?;
 
     // 2. Extract XCCDF XML from ZIP (handles double-zipped STIGs)
-    let xccdf =
-        extract_xccdf_from_zip(&zip_bytes).context("Failed to extract XCCDF from ZIP")?;
+    let xccdf = extract_xccdf_from_zip(&zip_bytes).context("Failed to extract XCCDF from ZIP")?;
 
     // 3. Parse XCCDF → StigData
     let stig = parse_xccdf(&xccdf).context("Failed to parse XCCDF")?;
@@ -50,7 +49,11 @@ async fn sync_one(
     let entry = CatalogEntry {
         id: source.id.clone(),
         // Prefer title parsed from XCCDF; fall back to the manifest title
-        title: if stig.title.is_empty() { source.title.clone() } else { stig.title.clone() },
+        title: if stig.title.is_empty() {
+            source.title.clone()
+        } else {
+            stig.title.clone()
+        },
         category: source.category.clone(),
         version: stig.version.clone(),
         release_info: stig.release_info.clone(),

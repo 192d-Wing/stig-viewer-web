@@ -19,7 +19,11 @@ pub async fn get_stig(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let path = state.config.data_dir.join("stigs").join(format!("{id}.json"));
+    let path = state
+        .config
+        .data_dir
+        .join("stigs")
+        .join(format!("{id}.json"));
 
     let contents = tokio::fs::read_to_string(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {

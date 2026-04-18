@@ -5,14 +5,22 @@ mod parser;
 mod sync;
 
 use anyhow::Result;
-use axum::{extract::DefaultBodyLimit, routing::{get, post}, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    Router,
+};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use api::{catalog::{get_catalog, get_health}, stig::get_stig, upload::{upload_library, upload_stig}};
+use api::{
+    catalog::{get_catalog, get_health},
+    stig::get_stig,
+    upload::{upload_library, upload_stig},
+};
 use config::{load_sources, Config};
 use db::init_pool;
 
@@ -28,9 +36,10 @@ pub struct AppState {
 async fn main() -> Result<()> {
     // Initialise structured logging
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "stig_viewer_backend=info,tower_http=info".into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 

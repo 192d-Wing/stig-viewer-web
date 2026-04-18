@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 
 /// Catalog entry as stored in PostgreSQL and returned by GET /api/catalog.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
