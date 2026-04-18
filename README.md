@@ -145,6 +145,19 @@ the only origin the browser can talk to. Set it at build time in production.
 | GET    | `/api/auth/me`        | Current session's `{sub,email,role,exp}` |
 | POST   | `/api/auth/logout`    | Clear the session cookie                 |
 
+### Persistence (workspaces)
+
+| Method | Path                          | Auth       | Purpose                                 |
+| ------ | ----------------------------- | ---------- | --------------------------------------- |
+| GET    | `/api/workspaces/:stig_id`    | any user   | Fetch this user's workspace for a STIG  |
+| PUT    | `/api/workspaces/:stig_id`    | any user   | Upsert asset info + rule overrides      |
+
+Body: `{ "assetInfo": { … }, "ruleOverrides": { <ruleId>: { status, findingDetails, comments } } }`.
+Both must be JSON objects. The row is keyed by `(user_sub, stig_id)` — users
+can only see and mutate their own. When a STIG is loaded from the catalog the
+frontend fetches the workspace and merges it into the tab; subsequent status
+and asset-info edits are PUT back with a 1-second debounce.
+
 ### Ops endpoints
 
 | Method | Path          | Auth      | Purpose                                     |

@@ -20,7 +20,7 @@ describe('useAuth', () => {
   })
 
   it('transitions to authed on a 200 /me response', async () => {
-    global.fetch.mockResolvedValueOnce(
+    globalThis.fetch.mockResolvedValueOnce(
       res({
         status: 200,
         body: { sub: 'u1', email: 'u1@x', role: 'admin', exp: 0 },
@@ -33,27 +33,27 @@ describe('useAuth', () => {
   })
 
   it('transitions to disabled when /me returns 204', async () => {
-    global.fetch.mockResolvedValueOnce(res({ status: 204, body: undefined }))
+    globalThis.fetch.mockResolvedValueOnce(res({ status: 204, body: undefined }))
     const { result } = renderHook(() => useAuth())
     await waitFor(() => expect(result.current.status).toBe('disabled'))
     expect(result.current.user).toBeNull()
   })
 
   it('transitions to anon on 401', async () => {
-    global.fetch.mockResolvedValueOnce(res({ status: 401, body: {} }))
+    globalThis.fetch.mockResolvedValueOnce(res({ status: 401, body: {} }))
     const { result } = renderHook(() => useAuth())
     await waitFor(() => expect(result.current.status).toBe('anon'))
     expect(result.current.user).toBeNull()
   })
 
   it('transitions to anon on network error', async () => {
-    global.fetch.mockRejectedValueOnce(new TypeError('network down'))
+    globalThis.fetch.mockRejectedValueOnce(new TypeError('network down'))
     const { result } = renderHook(() => useAuth())
     await waitFor(() => expect(result.current.status).toBe('anon'))
   })
 
   it('logout() posts /api/auth/logout and flips to anon', async () => {
-    global.fetch
+    globalThis.fetch
       // initial /me
       .mockResolvedValueOnce(
         res({ status: 200, body: { sub: 'u1', role: 'admin', exp: 0 } }),
@@ -71,7 +71,7 @@ describe('useAuth', () => {
     expect(result.current.status).toBe('anon')
     expect(result.current.user).toBeNull()
     // Second call should be the logout POST
-    const [, logoutCall] = global.fetch.mock.calls
+    const [, logoutCall] = globalThis.fetch.mock.calls
     expect(logoutCall[0]).toMatch(/\/api\/auth\/logout$/)
     expect(logoutCall[1]).toMatchObject({ method: 'POST' })
   })

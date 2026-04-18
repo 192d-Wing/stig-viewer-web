@@ -60,9 +60,13 @@ Goal: confidence that changes don't regress and that the app is safe to expose.
 
 Goal: daily-driver quality for real STIG reviewers and operators.
 
-- **Persistence**
-  - Save asset metadata and rule statuses to backend
-  - Per-user workspaces / saved checklists
+- **Persistence** — ✅ done
+  - `workspaces` table keyed by (user_sub, stig_id) with JSONB
+    `asset_info` and `rule_overrides` columns
+  - `GET/PUT /api/workspaces/:stig_id` per-user endpoints
+  - Frontend: catalog-loaded tabs fetch their workspace on open;
+    status/asset changes trigger a 1-second debounced PUT
+  - Local-file tabs are not persisted (no stable catalog id)
 - **Frontend**
   - Global cross-rule full-text search
   - Bulk export across all open tabs

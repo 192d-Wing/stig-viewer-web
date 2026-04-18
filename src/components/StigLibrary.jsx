@@ -193,7 +193,7 @@ export default function StigLibrary({ onLoad, onUploadTab }) {
         const r = await apiFetch(`/api/stigs/${encodeURIComponent(id)}`);
         if (!r.ok) throw await readApiError(r);
         const stig = await r.json();
-        onLoad(stig);
+        onLoad(stig, id);
       } catch (err) {
         if (err instanceof UnauthorizedError) {
           redirectToLogin();
