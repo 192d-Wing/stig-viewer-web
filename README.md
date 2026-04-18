@@ -187,6 +187,37 @@ When a STIG is loaded from the catalog the frontend fetches the workspace
 and merges it into the tab; subsequent status and asset-info edits are PUT
 back with a 1-second debounce.
 
+### Signed CKL export
+
+When `SIGNING_KEY_HEX` is set (32-byte Ed25519 seed), two endpoints come
+online:
+
+| Method | Path                  | Auth     | Purpose                                       |
+| ------ | --------------------- | -------- | --------------------------------------------- |
+| GET    | `/api/signing/pubkey` | public   | Verifying key + key-id fingerprint            |
+| POST   | `/api/sign`           | any user | Body `{content: base64, resource?: string}`   |
+
+`/api/sign` hashes the content, wraps the hash + signer identity + `signedAt`
+timestamp in a JSON signing document, and returns a detached Ed25519
+signature over that document. The frontend's "Signed .ckl" export action
+POSTs the CKL bytes, downloads the `.ckl` and a `.ckl.sig.json` sidecar
+containing the bundle, and toasts the server's `key_id`.
+
+Verifying offline:
+
+```bash
+# 1. Fetch the public key once and pin it.
+curl http://server/api/signing/pubkey | jq -r .publicKey | base64 -d > pub.bin
+
+# 2. Reconstruct the signed document bytes (serde's struct order is
+#    stable; match that order when re-serialising in your verifier).
+#    Compute sha256(ckl) and confirm it equals document.sha256.
+#    Then verify the signature with any Ed25519 library.
+```
+
+The signature attests the server saw these exact bytes at that time under
+that user's session. Replay is prevented by the embedded `signedAt`.
+
 ### Ops endpoints
 
 | Method | Path          | Auth      | Purpose                                     |

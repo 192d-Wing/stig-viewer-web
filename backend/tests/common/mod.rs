@@ -12,7 +12,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use sqlx::PgPool;
 use stig_viewer_backend::{
-    api::metrics::install_recorder, build_app, config::Config, orgs, AppState,
+    api::metrics::install_recorder, api::signing::SigningState, build_app, config::Config, orgs,
+    AppState,
 };
 use tempfile::TempDir;
 
@@ -26,6 +27,33 @@ pub struct TestApp {
 }
 
 pub async fn spawn_app(pool: PgPool) -> TestApp {
+    spawn_app_with_signing(pool, None).await
+}
+
+/// Fixed 32-byte seed used by signing-enabled tests so the same public key
+/// is reused across reruns. DO NOT commit a real-world signing key.
+pub const TEST_SIGNING_KEY_HEX: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Variant that installs a deterministic Ed25519 key so tests can round-
+/// trip signing without touching the process-wide env.
+pub async fn spawn_app_signed(pool: PgPool) -> TestApp {
+    let bytes = hex::decode(TEST_SIGNING_KEY_HEX).expect("test key hex");
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let verifying = signing_key.verifying_key();
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifying.as_bytes());
+    let key_id = hex::encode(&digest[..8]);
+    let signing = SigningState {
+        signing_key: Arc::new(signing_key),
+        key_id,
+    };
+    spawn_app_with_signing(pool, Some(signing)).await
+}
+
+async fn spawn_app_with_signing(pool: PgPool, signing: Option<SigningState>) -> TestApp {
     // The Prometheus recorder is process-global; install_recorder is
     // idempotent so parallel tests can call it safely.
     install_recorder();
@@ -48,12 +76,14 @@ pub async fn spawn_app(pool: PgPool) -> TestApp {
 
     let pool = Arc::new(pool);
     let default_org = orgs::default_org(&pool).await.expect("default org seeded");
+
     let state = AppState {
         pool: pool.clone(),
         config,
         auth: None,
         sources: None,
         default_org,
+        signing,
     };
 
     let app = build_app(state);

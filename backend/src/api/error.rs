@@ -35,6 +35,9 @@ pub enum ApiError {
     },
     Unprocessable(String),
     TooManyRequests,
+    /// Feature requires configuration the server doesn't have (e.g. signing
+    /// is disabled because no key is loaded). Maps to 503.
+    Unavailable(String),
     Internal(String),
 }
 
@@ -49,6 +52,7 @@ impl ApiError {
             ApiError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -63,6 +67,7 @@ impl ApiError {
             ApiError::PayloadTooLarge { .. } => "payload_too_large",
             ApiError::Unprocessable(_) => "unprocessable_entity",
             ApiError::TooManyRequests => "too_many_requests",
+            ApiError::Unavailable(_) => "service_unavailable",
             ApiError::Internal(_) => "internal_error",
         }
     }
@@ -72,7 +77,8 @@ impl ApiError {
             ApiError::BadRequest(m)
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
-            | ApiError::Unprocessable(m) => m.clone(),
+            | ApiError::Unprocessable(m)
+            | ApiError::Unavailable(m) => m.clone(),
             ApiError::PayloadTooLarge { message, .. } => message.clone(),
             ApiError::Unauthorized => "authentication required".into(),
             ApiError::Forbidden => "insufficient permissions".into(),

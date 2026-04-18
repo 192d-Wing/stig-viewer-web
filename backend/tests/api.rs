@@ -12,10 +12,12 @@ mod common;
 
 use std::io::Write;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{Verifier, VerifyingKey};
 use reqwest::StatusCode;
 use sqlx::PgPool;
 
-use common::spawn_app;
+use common::{spawn_app, spawn_app_signed};
 
 /// Build a minimal DISA-shaped ZIP containing a `*_xccdf.xml` entry.
 fn minimal_stig_zip(title: &str, version: &str, rule_id: &str) -> Vec<u8> {
@@ -643,6 +645,111 @@ async fn orgs_members_404_for_unknown_slug(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn signing_endpoints_return_503_when_disabled(pool: PgPool) {
+    let app = spawn_app(pool).await;
+
+    let res = reqwest::get(format!("{}/api/signing/pubkey", app.base_url))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "service_unavailable");
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/sign", app.base_url))
+        .json(&serde_json::json!({ "content": BASE64.encode(b"hello") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn signing_pubkey_and_sign_round_trip(pool: PgPool) {
+    let app = spawn_app_signed(pool).await;
+    let client = reqwest::Client::new();
+
+    // 1. Fetch the public key.
+    let pk: serde_json::Value = reqwest::get(format!("{}/api/signing/pubkey", app.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pk["algorithm"], "ed25519");
+    let key_id = pk["keyId"].as_str().unwrap().to_string();
+    let pk_bytes = BASE64.decode(pk["publicKey"].as_str().unwrap()).unwrap();
+    let vk = VerifyingKey::from_bytes(&pk_bytes.try_into().unwrap()).unwrap();
+
+    // 2. Sign an arbitrary payload.
+    let payload = b"<CHECKLIST>pretend this is a ckl</CHECKLIST>";
+    let res = client
+        .post(format!("{}/api/sign", app.base_url))
+        .json(&serde_json::json!({
+            "content": BASE64.encode(payload),
+            "resource": "windows-11",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bundle: serde_json::Value = res.json().await.unwrap();
+
+    // 3. Verify against the public key.
+    assert_eq!(bundle["keyId"], key_id);
+    let doc = &bundle["document"];
+    assert_eq!(doc["algorithm"], "ed25519");
+    assert_eq!(doc["resource"], "windows-11");
+
+    let doc_bytes = serde_json::to_vec(doc).unwrap();
+    let sig_bytes = BASE64
+        .decode(bundle["signature"].as_str().unwrap())
+        .unwrap();
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes.try_into().unwrap());
+    vk.verify(&doc_bytes, &signature)
+        .expect("signature must verify against pubkey");
+
+    // 4. The sha256 in the document matches the payload.
+    use sha2::{Digest, Sha256};
+    let expected_sha = hex::encode(Sha256::digest(payload));
+    assert_eq!(doc["sha256"], expected_sha);
+
+    // 5. Tampering invalidates the signature.
+    let mut tampered = doc_bytes.clone();
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 1;
+    }
+    assert!(
+        vk.verify(&tampered, &signature).is_err(),
+        "verification must fail on tampered document"
+    );
+
+    // 6. Audit row was written.
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'signing.sign' AND resource = $1",
+    )
+    .bind("windows-11")
+    .fetch_one(app.pool.as_ref())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn signing_rejects_empty_or_oversize_content(pool: PgPool) {
+    let app = spawn_app_signed(pool).await;
+    let client = reqwest::Client::new();
+
+    let res = client
+        .post(format!("{}/api/sign", app.base_url))
+        .json(&serde_json::json!({ "content": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[sqlx::test(migrations = "./migrations")]

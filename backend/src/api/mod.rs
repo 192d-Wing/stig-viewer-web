@@ -6,6 +6,7 @@ pub mod ops;
 pub mod orgs;
 pub mod ratelimit;
 pub mod request_id;
+pub mod signing;
 pub mod stig;
 pub mod upload;
 pub mod workspaces;

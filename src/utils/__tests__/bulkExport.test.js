@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { bulkExportPOAMCSV, bulkExportPOAMJSON } from '../exportPOAM.js'
+import { downloadSignedCKL } from '../bulkExport.js'
 
 const rule = (overrides = {}) => ({
   id: 'R-1',
@@ -75,5 +76,98 @@ describe('bulkExportPOAMJSON', () => {
     expect(rows).toHaveLength(2)
     expect(rows[0]['Control Vulnerability ID']).toBe('V-100')
     expect(rows[1]['Control Vulnerability ID']).toBe('V-200')
+  })
+})
+
+describe('downloadSignedCKL', () => {
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  const downloads = []
+
+  beforeEach(() => {
+    downloads.length = 0
+    vi.stubGlobal('fetch', vi.fn())
+    URL.createObjectURL = () => 'blob:stub'
+    URL.revokeObjectURL = () => {}
+
+    // Capture <a>.click() calls so tests can assert two files were offered
+    // to the browser.
+    const origCreate = document.createElement.bind(document)
+    document.createElement = (tag) => {
+      const el = origCreate(tag)
+      if (tag === 'a') {
+        el.click = () => downloads.push(el.download)
+      }
+      return el
+    }
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    URL.createObjectURL = originalCreateObjectURL
+    URL.revokeObjectURL = originalRevokeObjectURL
+    // document.createElement is restored by the reset in beforeEach.
+  })
+
+  it('POSTs the CKL bytes to /api/sign and downloads two files', async () => {
+    const tab = {
+      catalogId: 'windows-11',
+      assetInfo: { hostname: 'host', ip: '', mac: '', fqdn: '' },
+      stig: {
+        title: 'Windows 11 STIG',
+        version: '1',
+        releaseInfo: 'Release: 1',
+        rules: [
+          {
+            id: 'R-1',
+            stigId: 'V-1',
+            title: 't',
+            severity: 'CAT II',
+            status: 'open',
+            findingDetails: '',
+            comments: '',
+            description: 'd',
+            checkText: 'c',
+            fixText: 'f',
+            cciIds: [],
+          },
+        ],
+      },
+    }
+    globalThis.fetch.mockResolvedValueOnce({
+      status: 200,
+      ok: true,
+      json: async () => ({
+        document: {
+          algorithm: 'ed25519',
+          sha256: 'abc',
+          signed_at: '2025-01-01T00:00:00Z',
+          signed_by: 'u1',
+          signed_org: 'default',
+          resource: 'windows-11',
+        },
+        signature: 'sig',
+        keyId: 'deadbeef',
+      }),
+    })
+
+    const bundle = await downloadSignedCKL(tab)
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+    const [url, init] = globalThis.fetch.mock.calls[0]
+    expect(url).toMatch(/\/api\/sign$/)
+    expect(init.method).toBe('POST')
+    const sent = JSON.parse(init.body)
+    expect(sent.resource).toBe('windows-11')
+    // content is base64; decoding it should yield XML.
+    const decoded = atob(sent.content)
+    expect(decoded).toContain('<CHECKLIST>')
+
+    expect(bundle.keyId).toBe('deadbeef')
+    // Browser was handed two downloads in order: the .ckl then the sidecar.
+    expect(downloads).toEqual([
+      'Windows_11_STIG.ckl',
+      'Windows_11_STIG.ckl.sig.json',
+    ])
   })
 })

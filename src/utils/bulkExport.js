@@ -1,5 +1,6 @@
 import { exportCKL } from './exportCKL.js'
 import { bulkExportPOAMCSV, bulkExportPOAMJSON } from './exportPOAM.js'
+import { apiFetch, readApiError, UnauthorizedError } from '../api.js'
 
 // Delay between sequential downloads so browsers don't suppress the later
 // ones as "automatic downloads blocked".
@@ -39,6 +40,54 @@ export async function downloadAllCKL(tabs) {
     }
   }
 }
+
+// Encode a string as base64 using window.btoa after UTF-8 encoding. btoa
+// only handles Latin-1; CKL payloads can contain multi-byte characters.
+function toBase64(str) {
+  const bytes = new TextEncoder().encode(str)
+  let binary = ''
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return window.btoa(binary)
+}
+
+/**
+ * Ask the server to sign one tab's CKL. Downloads both the .ckl and a
+ * JSON sidecar containing the detached signature, the signing document,
+ * and the key id. Resolves with the bundle so callers can display key-id
+ * confirmation to the user.
+ *
+ * Throws UnauthorizedError on 401 so the auth hook can redirect; any other
+ * error bubbles up for the caller to surface via toast.
+ */
+export async function downloadSignedCKL(tab) {
+  const { hostname = '', ip = '', mac = '', fqdn = '' } = tab.assetInfo || {}
+  const xml = exportCKL(tab.stig, hostname, ip, mac, fqdn)
+  const base = sanitizeFilename(tab.stig.title || 'stig')
+
+  const res = await apiFetch('/api/sign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      content: toBase64(xml),
+      resource: tab.catalogId || tab.stig.title || null,
+    }),
+  })
+  if (!res.ok) throw await readApiError(res)
+  const bundle = await res.json()
+
+  // Hand both files to the browser back-to-back. Tests rely on the .ckl
+  // landing first so the sidecar has a matching companion.
+  downloadBlob(new Blob([xml], { type: 'application/xml' }), `${base}.ckl`)
+  await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS))
+  downloadBlob(
+    new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }),
+    `${base}.ckl.sig.json`,
+  )
+  return bundle
+}
+
+// Re-export so UI code can narrow error handling.
+export { UnauthorizedError }
 
 /**
  * Download a single combined POAM file containing open findings from every tab.

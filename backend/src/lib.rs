@@ -34,6 +34,7 @@ use api::{
     ops::{livez, readyz, trigger_sync},
     orgs as orgs_handlers,
     request_id::with_request_id,
+    signing::{pubkey as signing_pubkey, sign as signing_sign, SigningState},
     stig::get_stig,
     upload::{upload_library, upload_stig},
     workspaces,
@@ -55,6 +56,9 @@ pub struct AppState {
     /// Resolved at startup from the `default` org row. Dev-open sessions
     /// and first-login OIDC users land here unless they pick another org.
     pub default_org: orgs::Organization,
+    /// `Some` when `SIGNING_KEY_HEX` is configured. The signing endpoints
+    /// return 503 otherwise so clients can tell that the feature is off.
+    pub signing: Option<SigningState>,
 }
 
 // Required so PrivateCookieJar can pull the cookie Key out of AppState.
@@ -104,6 +108,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/health", get(get_health))
         .route("/api/livez", get(livez))
         .route("/api/readyz", get(readyz))
+        // Public pubkey so offline verifiers can check signatures without
+        // having to log in. It's a public key by definition.
+        .route("/api/signing/pubkey", get(signing_pubkey))
         .route("/metrics", get(metrics_scrape))
         .merge(auth::routes());
 
@@ -131,6 +138,7 @@ pub fn build_app(state: AppState) -> Router {
             "/api/workspaces/:stig_id",
             get(workspaces::get).put(workspaces::put),
         )
+        .route("/api/sign", post(signing_sign))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::extractor::require_auth,
@@ -199,6 +207,12 @@ pub async fn run() -> Result<()> {
 
     let default_org = orgs::default_org(&pool).await?;
 
+    let signing = SigningState::from_env()?;
+    match &signing {
+        Some(s) => info!("Signing enabled: key_id={}", s.key_id),
+        None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
+    }
+
     let auth = AuthState::try_from_env(&config).await?;
     match &auth {
         Some(a) => info!(
@@ -227,6 +241,7 @@ pub async fn run() -> Result<()> {
         auth,
         sources: Some(sources.clone()),
         default_org,
+        signing,
     };
 
     let app = build_app(state.clone());

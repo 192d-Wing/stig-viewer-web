@@ -18,7 +18,12 @@ import GlobalSearch from './components/GlobalSearch.jsx'
 import { useNotifications, notify } from './hooks/useNotifications.js'
 import { useOnline } from './hooks/useOnline.js'
 import { useOrgs } from './hooks/useOrgs.js'
-import { downloadAllCKL, downloadCombinedPOAM } from './utils/bulkExport.js'
+import {
+  downloadAllCKL,
+  downloadCombinedPOAM,
+  downloadSignedCKL,
+  UnauthorizedError as BulkUnauthorizedError,
+} from './utils/bulkExport.js'
 
 export default function App() {
   const auth = useAuth()
@@ -125,12 +130,25 @@ function AppShell({ auth }) {
         } else if (kind === 'poam-json') {
           downloadCombinedPOAM(tabs, 'json')
           notify.success('Combined POAM (JSON) downloaded')
+        } else if (kind === 'ckl-signed') {
+          // Sign one tab at a time — server-side signing is authenticated
+          // and audited per bundle; batching the API call would hide who
+          // signed what.
+          if (!activeTab) {
+            notify.warning('Select a tab to sign.')
+            return
+          }
+          const bundle = await downloadSignedCKL(activeTab)
+          notify.success(
+            `Signed .ckl for "${activeTab.stig.title}" (key ${bundle.keyId})`,
+          )
         }
       } catch (err) {
+        if (err instanceof BulkUnauthorizedError) return
         notify.error(`Bulk export failed: ${err.message}`)
       }
     },
-    [tabs],
+    [tabs, activeTab],
   )
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
@@ -212,6 +230,12 @@ function AppShell({ auth }) {
         { id: 'ckl', text: 'All .ckl files' },
         { id: 'poam-csv', text: 'Combined POAM (CSV)' },
         { id: 'poam-json', text: 'Combined POAM (JSON)' },
+        {
+          id: 'ckl-signed',
+          text: 'Signed .ckl (active tab)',
+          description: 'Server-signed; downloads .ckl + .sig.json',
+          disabled: !activeTab,
+        },
       ],
       onItemClick: ({ detail }) => handleBulkExport(detail.id),
     })

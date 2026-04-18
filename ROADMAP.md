@@ -110,7 +110,9 @@ Goal: daily-driver quality for real STIG reviewers and operators.
     (`GET/POST/DELETE /api/orgs/:slug/members[/:user_sub]`), and a
     TopNavigation org switcher (`src/hooks/useOrgs.js`) that reloads
     the app on switch so tab state and the catalog refetch cleanly.
-  - Signed CKL export (detached signature)
+  - ✅ Signed CKL export — Ed25519 signing key from `SIGNING_KEY_HEX`,
+    `GET /api/signing/pubkey` + `POST /api/sign`, toolbar "Signed .ckl"
+    action that downloads `.ckl` + `.ckl.sig.json` and audits the event.
 
 ---
 
