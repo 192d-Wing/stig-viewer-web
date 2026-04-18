@@ -59,6 +59,64 @@ pub async fn count_catalog(pool: &PgPool) -> Result<i64> {
     Ok(row.0)
 }
 
+/// Per-user review state for one STIG. `asset_info` and `rule_overrides` are
+/// opaque JSON blobs serialized from / deserialized by the frontend; the
+/// backend never interprets their shape.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+    pub stig_id: String,
+    pub asset_info: serde_json::Value,
+    pub rule_overrides: serde_json::Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Fetch the current user's workspace for a STIG. `Ok(None)` means the user
+/// has never touched it.
+pub async fn get_workspace(
+    pool: &PgPool,
+    user_sub: &str,
+    stig_id: &str,
+) -> Result<Option<Workspace>> {
+    let row = sqlx::query_as::<_, Workspace>(
+        "SELECT stig_id, asset_info, rule_overrides, updated_at \
+         FROM workspaces WHERE user_sub = $1 AND stig_id = $2",
+    )
+    .bind(user_sub)
+    .bind(stig_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Upsert the user's workspace for a STIG. `updated_at` is bumped to NOW().
+pub async fn upsert_workspace(
+    pool: &PgPool,
+    user_sub: &str,
+    stig_id: &str,
+    asset_info: &serde_json::Value,
+    rule_overrides: &serde_json::Value,
+) -> Result<Workspace> {
+    let row = sqlx::query_as::<_, Workspace>(
+        r#"
+        INSERT INTO workspaces (user_sub, stig_id, asset_info, rule_overrides, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (user_sub, stig_id) DO UPDATE SET
+            asset_info     = EXCLUDED.asset_info,
+            rule_overrides = EXCLUDED.rule_overrides,
+            updated_at     = NOW()
+        RETURNING stig_id, asset_info, rule_overrides, updated_at
+        "#,
+    )
+    .bind(user_sub)
+    .bind(stig_id)
+    .bind(asset_info)
+    .bind(rule_overrides)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert a catalog entry — inserts or updates on conflict.
 pub async fn upsert_catalog(pool: &PgPool, entry: &CatalogEntry) -> Result<()> {
     sqlx::query(

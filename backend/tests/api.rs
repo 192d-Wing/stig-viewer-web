@@ -193,6 +193,125 @@ async fn upload_with_invalid_id_returns_bad_request(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn workspace_404_before_first_put(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/workspaces/windows-11", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_put_then_get_round_trips(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+
+    let payload = serde_json::json!({
+        "assetInfo": { "hostname": "host-1", "ip": "10.0.0.5" },
+        "ruleOverrides": {
+            "SV-1000r1_rule": {
+                "status": "not_a_finding",
+                "findingDetails": "verified",
+                "comments": ""
+            }
+        }
+    });
+
+    let res = client
+        .put(format!("{}/api/workspaces/windows-11", app.base_url))
+        .json(&payload)
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(res.status(), StatusCode::OK);
+    let stored: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(stored["stigId"], "windows-11");
+    assert_eq!(stored["assetInfo"]["hostname"], "host-1");
+    assert_eq!(
+        stored["ruleOverrides"]["SV-1000r1_rule"]["status"],
+        "not_a_finding"
+    );
+
+    let res = reqwest::get(format!("{}/api/workspaces/windows-11", app.base_url))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let fetched: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(fetched["assetInfo"]["ip"], "10.0.0.5");
+    assert_eq!(
+        fetched["ruleOverrides"]["SV-1000r1_rule"]["findingDetails"],
+        "verified"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_put_updates_existing_row(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+
+    let url = format!("{}/api/workspaces/windows-11", app.base_url);
+    client
+        .put(&url)
+        .json(&serde_json::json!({
+            "assetInfo": { "hostname": "first" },
+            "ruleOverrides": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = client
+        .put(&url)
+        .json(&serde_json::json!({
+            "assetInfo": { "hostname": "second" },
+            "ruleOverrides": { "R-1": { "status": "open" } }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let fetched: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert_eq!(fetched["assetInfo"]["hostname"], "second");
+    assert_eq!(fetched["ruleOverrides"]["R-1"]["status"], "open");
+
+    // Exactly one row for this (user, stig).
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(app.pool.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_put_rejects_non_object_payloads(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::Client::new()
+        .put(format!("{}/api/workspaces/windows-11", app.base_url))
+        .json(&serde_json::json!({
+            "assetInfo": "not an object",
+            "ruleOverrides": {}
+        }))
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn workspace_rejects_bad_stig_id(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/workspaces/bad..id", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn livez_always_returns_ok(pool: PgPool) {
     let app = spawn_app(pool).await;
     let res = reqwest::get(format!("{}/api/livez", app.base_url))

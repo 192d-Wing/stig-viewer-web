@@ -32,6 +32,7 @@ use api::{
     ops::{livez, readyz, trigger_sync},
     stig::get_stig,
     upload::{upload_library, upload_stig},
+    workspaces,
 };
 use auth::AuthState;
 use config::{load_sources, Config, StigSource};
@@ -100,6 +101,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/audit", get(list_audit))
+        .route(
+            "/api/workspaces/:stig_id",
+            get(workspaces::get).put(workspaces::put),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::extractor::require_auth,
