@@ -121,6 +121,54 @@ describe('useStigTabs workspace sync', () => {
     expect(payload.ruleOverrides['R-2']).toBeUndefined()
   })
 
+  it('undoes and redoes a rule status change', async () => {
+    globalThis.fetch.mockResolvedValueOnce(fakeRes({ status: 404, body: {} }))
+
+    const { result } = renderHook(() => useStigTabs())
+    await act(async () => {
+      await result.current.addStigFromBackend(SAMPLE_STIG, 'windows-11')
+    })
+    const tabId = result.current.tabs[0].id
+    expect(result.current.canUndo).toBe(false)
+
+    await act(async () => {
+      result.current.updateRule(tabId, 'R-1', { status: 'open' })
+    })
+    expect(result.current.tabs[0].stig.rules[0].status).toBe('open')
+    expect(result.current.canUndo).toBe(true)
+    expect(result.current.canRedo).toBe(false)
+
+    await act(async () => result.current.undo())
+    expect(result.current.tabs[0].stig.rules[0].status).toBe('not_reviewed')
+    expect(result.current.canUndo).toBe(false)
+    expect(result.current.canRedo).toBe(true)
+
+    await act(async () => result.current.redo())
+    expect(result.current.tabs[0].stig.rules[0].status).toBe('open')
+    expect(result.current.canUndo).toBe(true)
+    expect(result.current.canRedo).toBe(false)
+  })
+
+  it('records setAllStatus as a single entry and undoes to the prior mix', async () => {
+    globalThis.fetch.mockResolvedValueOnce(fakeRes({ status: 404, body: {} }))
+
+    const { result } = renderHook(() => useStigTabs())
+    await act(async () => {
+      await result.current.addStigFromBackend(SAMPLE_STIG, 'windows-11')
+    })
+    const tabId = result.current.tabs[0].id
+
+    await act(async () => result.current.updateRule(tabId, 'R-1', { status: 'open' }))
+    await act(async () => result.current.setAllStatus(tabId, 'not_applicable'))
+
+    expect(result.current.tabs[0].stig.rules.every((r) => r.status === 'not_applicable')).toBe(true)
+
+    await act(async () => result.current.undo())
+    // Restored to the mix: R-1 open, R-2 not_reviewed.
+    expect(result.current.tabs[0].stig.rules[0].status).toBe('open')
+    expect(result.current.tabs[0].stig.rules[1].status).toBe('not_reviewed')
+  })
+
   it('does not persist tabs added from local files', async () => {
     const { result } = renderHook(() => useStigTabs())
 

@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback } from 'react'
+import { useState, useMemo, useRef, useCallback, useEffect } from 'react'
 import { useStigTabs } from './hooks/useStigTabs.js'
 import { useAuth } from './hooks/useAuth.js'
 import TopNavigation from '@cloudscape-design/components/top-navigation'
@@ -57,11 +57,32 @@ function AppShell({ auth }) {
     setSelectedRule,
     setAllStatus,
     setDiffPair,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
   } = useStigTabs()
 
   const [navOpen, setNavOpen] = useState(true)
   const [splitPanelOpen, setSplitPanelOpen] = useState(true)
   const fileInputRef = useRef(null)
+
+  // Keyboard shortcuts: Cmd/Ctrl+Z for undo, Cmd/Ctrl+Shift+Z for redo.
+  // Skip when focus is inside a text input so typing isn't hijacked.
+  useEffect(() => {
+    const onKey = (e) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (!mod || e.key.toLowerCase() !== 'z') return
+      const el = document.activeElement
+      const tag = el?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || el?.isContentEditable) return
+      e.preventDefault()
+      if (e.shiftKey) redo()
+      else undo()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [undo, redo])
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null
   const isDiffMode = diffPair !== null
@@ -109,6 +130,22 @@ function AppShell({ auth }) {
       text: 'Open File',
       iconName: 'upload',
       onClick: () => fileInputRef.current?.click(),
+    })
+    utilities.push({
+      type: 'button',
+      text: 'Undo',
+      iconName: 'undo',
+      disabled: !canUndo,
+      ariaLabel: 'Undo (Ctrl/Cmd+Z)',
+      onClick: undo,
+    })
+    utilities.push({
+      type: 'button',
+      text: 'Redo',
+      iconName: 'redo',
+      disabled: !canRedo,
+      ariaLabel: 'Redo (Ctrl/Cmd+Shift+Z)',
+      onClick: redo,
     })
     if (tabs.length >= 2) {
       utilities.push({
