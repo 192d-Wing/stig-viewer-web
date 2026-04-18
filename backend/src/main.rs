@@ -1,4 +1,5 @@
 mod api;
+mod audit;
 mod auth;
 mod config;
 mod db;
@@ -20,6 +21,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
+    audit::list_audit,
     catalog::{get_catalog, get_health},
     stig::get_stig,
     upload::{upload_library, upload_stig},
@@ -134,6 +136,7 @@ async fn main() -> Result<()> {
     let protected_reads = Router::new()
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
+        .route("/api/audit", get(list_audit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::extractor::require_auth,

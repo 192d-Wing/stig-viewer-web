@@ -44,7 +44,8 @@ Goal: confidence that changes don't regress and that the app is safe to expose.
   - ✅ Per-file size caps (MAX_UPLOAD_BYTES, MAX_LIBRARY_BYTES)
   - ✅ XML parser XXE-safe (regression test)
   - ✅ CORS allowlist derived from ALLOWED_ORIGINS
-  - ⏳ Audit log table: who uploaded / changed what, when
+  - ✅ Audit log (`audit_log` table, `GET /api/audit` admin-only;
+    records upload.stig, upload.library, auth.login, auth.logout)
 - **Error handling** — ⏳ not started
   - Typed error enum in backend, mapped to structured JSON responses
   - Surface validation errors in UI via toast notifications

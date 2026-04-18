@@ -147,6 +147,21 @@ the only origin the browser can talk to. Set it at build time in production.
 
 All other `/api/*` routes except `/api/health` require a valid session.
 
+### Audit log
+
+Every upload and every login/logout is recorded in the `audit_log` table
+along with the actor, their role, the peer IP, a status code, and a JSONB
+metadata blob. Query it via:
+
+```
+GET /api/audit?limit=100&before_id=<cursor>
+```
+
+Admins only. `before_id` enables keyset pagination: pass the last `id`
+from the previous page to get the next older batch. Response is ordered
+by `id DESC`. Recorded actions today: `upload.stig`, `upload.library`,
+`auth.login`, `auth.logout`.
+
 ## Development workflow
 
 ```bash

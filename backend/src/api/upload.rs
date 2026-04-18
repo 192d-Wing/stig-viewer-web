@@ -1,11 +1,15 @@
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{Multipart, State},
+    extract::{ConnectInfo, Extension, Multipart, State},
     http::StatusCode,
     Json,
 };
 use chrono::Utc;
 
 use crate::{
+    audit::{self, AuditEntry},
+    auth::session::SessionData,
     db::{upsert_catalog, CatalogEntry},
     parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf},
     AppState,
@@ -25,6 +29,8 @@ use crate::{
 ///        -F "category=Windows"
 pub async fn upload_stig(
     State(state): State<AppState>,
+    Extension(session): Extension<SessionData>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut zip_bytes: Option<Vec<u8>> = None;
@@ -155,6 +161,24 @@ pub async fn upload_stig(
 
     tracing::info!("Uploaded STIG '{id}' ({title}): {rule_count} rules");
 
+    audit::log(
+        &state.pool,
+        AuditEntry {
+            session: &session,
+            action: "upload.stig",
+            resource: Some(&id),
+            remote_ip: Some(addr.ip().to_string()),
+            status_code: 200,
+            metadata: Some(serde_json::json!({
+                "title": title,
+                "category": category,
+                "ruleCount": rule_count,
+                "version": stig.version,
+            })),
+        },
+    )
+    .await;
+
     Ok(Json(serde_json::json!({
         "id": id,
         "title": title,
@@ -178,6 +202,8 @@ pub async fn upload_stig(
 ///        -F "file=@U_SRG-STIG_Library_January_2026.zip"
 pub async fn upload_library(
     State(state): State<AppState>,
+    Extension(session): Extension<SessionData>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Read the single 'file' field
@@ -290,6 +316,22 @@ pub async fn upload_library(
 
     let total_errors = all_errors.len();
     tracing::info!("Library import complete: {imported} imported, {total_errors} errors");
+
+    audit::log(
+        &state.pool,
+        AuditEntry {
+            session: &session,
+            action: "upload.library",
+            resource: None,
+            remote_ip: Some(addr.ip().to_string()),
+            status_code: 200,
+            metadata: Some(serde_json::json!({
+                "imported": imported,
+                "errors": total_errors,
+            })),
+        },
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "imported": imported,

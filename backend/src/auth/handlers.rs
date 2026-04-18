@@ -1,7 +1,9 @@
 //! OIDC HTTP handlers: /login, /callback, /logout, /me.
 
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -136,6 +138,7 @@ struct IdTokenExtraClaims {
 
 async fn callback(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(q): Query<CallbackQuery>,
     jar: PrivateCookieJar,
 ) -> Response {
@@ -266,12 +269,43 @@ async fn callback(
         }
     };
 
+    crate::audit::log(
+        &state.pool,
+        crate::audit::AuditEntry {
+            session: &session,
+            action: "auth.login",
+            resource: None,
+            remote_ip: Some(addr.ip().to_string()),
+            status_code: 200,
+            metadata: None,
+        },
+    )
+    .await;
+
     (jar, Redirect::temporary(&oauth_state.return_to)).into_response()
 }
 
 // ── /logout ──────────────────────────────────────────────────────────────────
 
-async fn logout(State(_state): State<AppState>, jar: PrivateCookieJar) -> Response {
+async fn logout(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    jar: PrivateCookieJar,
+) -> Response {
+    if let Some(session) = read_session(&jar) {
+        crate::audit::log(
+            &state.pool,
+            crate::audit::AuditEntry {
+                session: &session,
+                action: "auth.logout",
+                resource: None,
+                remote_ip: Some(addr.ip().to_string()),
+                status_code: 204,
+                metadata: None,
+            },
+        )
+        .await;
+    }
     let jar = jar.remove(Cookie::from(SESSION_COOKIE));
     (jar, StatusCode::NO_CONTENT).into_response()
 }
