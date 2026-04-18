@@ -87,6 +87,8 @@ pub fn build_app(state: AppState) -> Router {
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::ACCEPT]);
@@ -111,6 +113,20 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/audit", get(list_audit))
         .route("/api/orgs/me", get(orgs_handlers::me))
         .route("/api/orgs/switch", post(orgs_handlers::switch_org))
+        // Admin org management — server-side role check; route is mounted
+        // in the authenticated bucket so it goes through require_auth.
+        .route(
+            "/api/orgs",
+            get(orgs_handlers::list_all).post(orgs_handlers::create),
+        )
+        .route(
+            "/api/orgs/:slug/members",
+            get(orgs_handlers::members_list).post(orgs_handlers::members_add),
+        )
+        .route(
+            "/api/orgs/:slug/members/:user_sub",
+            axum::routing::delete(orgs_handlers::members_remove),
+        )
         .route(
             "/api/workspaces/:stig_id",
             get(workspaces::get).put(workspaces::put),

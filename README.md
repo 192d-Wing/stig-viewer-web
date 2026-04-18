@@ -157,10 +157,21 @@ A built-in "default" organisation absorbs pre-existing rows on upgrade.
 OIDC users are auto-enrolled into the default org on first login so a
 fresh deployment isn't stranded; strict provisioning can be added later.
 
-| Method | Path                   | Auth     | Purpose                                  |
-| ------ | ---------------------- | -------- | ---------------------------------------- |
-| GET    | `/api/orgs/me`         | any user | `{active, memberships}` for the caller   |
-| POST   | `/api/orgs/switch`     | any user | Body `{slug}` — change the active org    |
+| Method | Path                                       | Auth     | Purpose                                       |
+| ------ | ------------------------------------------ | -------- | --------------------------------------------- |
+| GET    | `/api/orgs/me`                             | any user | `{active, memberships}` for the caller        |
+| POST   | `/api/orgs/switch`                         | any user | Body `{slug}` — change the active org         |
+| GET    | `/api/orgs`                                | admin    | List every organisation on the instance       |
+| POST   | `/api/orgs`                                | admin    | Body `{slug, name}` — create an org (201/409) |
+| GET    | `/api/orgs/:slug/members`                  | admin    | List that org's members                       |
+| POST   | `/api/orgs/:slug/members`                  | admin    | Body `{user_sub}` — add a member (204)        |
+| DELETE | `/api/orgs/:slug/members/:user_sub`        | admin    | Remove a member (204)                         |
+
+Slug format: 3–32 lowercase alphanumerics or hyphens, no leading/trailing
+dashes. Re-creating an existing slug returns 409 Conflict. Removing yourself
+from your currently-active organisation is rejected with 400; switch orgs
+first. Every mutation is written to the audit log as `orgs.create`,
+`orgs.member.add`, or `orgs.member.remove`.
 
 ### Persistence (workspaces)
 

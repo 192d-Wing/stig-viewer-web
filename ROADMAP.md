@@ -105,9 +105,10 @@ Goal: daily-driver quality for real STIG reviewers and operators.
 - **Optional**
   - ✅ SSO via OIDC (shipped in Phase 1)
   - ⏳ Multi-tenant organisations — ✅ data isolation + session scope +
-    /api/orgs/me + /api/orgs/switch. Admin org-creation and
-    member-management endpoints still pending; frontend org-switcher UI
-    still pending.
+    `/api/orgs/me` + `/api/orgs/switch`. ✅ Admin org-creation
+    (`POST /api/orgs`) and member-management
+    (`GET/POST/DELETE /api/orgs/:slug/members[/:user_sub]`).
+    Frontend org-switcher UI still pending.
   - Signed CKL export (detached signature)
 
 ---

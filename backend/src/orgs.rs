@@ -61,6 +61,60 @@ pub async fn ensure_membership(pool: &PgPool, org_id: i64, user_sub: &str) -> Re
     Ok(())
 }
 
+/// Returns true if a new row was deleted, false if no membership existed.
+pub async fn remove_membership(pool: &PgPool, org_id: i64, user_sub: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM org_memberships WHERE org_id = $1 AND user_sub = $2")
+        .bind(org_id)
+        .bind(user_sub)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// List every organisation known to the instance. Admin-only use.
+pub async fn list_all(pool: &PgPool) -> Result<Vec<Organization>> {
+    let rows =
+        sqlx::query_as::<_, Organization>("SELECT id, slug, name FROM organizations ORDER BY slug")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+/// Create a new organisation. Returns the fresh row; `None` when the slug
+/// already exists (the caller maps this to 409 Conflict).
+pub async fn create(pool: &PgPool, slug: &str, name: &str) -> Result<Option<Organization>> {
+    let row = sqlx::query_as::<_, Organization>(
+        "INSERT INTO organizations (slug, name) VALUES ($1, $2) \
+         ON CONFLICT (slug) DO NOTHING \
+         RETURNING id, slug, name",
+    )
+    .bind(slug)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Members of one org. Only `user_sub` and `created_at` are known; the IdP
+/// owns display name / email lookups.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Member {
+    pub user_sub: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn list_members(pool: &PgPool, org_id: i64) -> Result<Vec<Member>> {
+    let rows = sqlx::query_as::<_, Member>(
+        "SELECT user_sub, created_at FROM org_memberships \
+         WHERE org_id = $1 ORDER BY created_at",
+    )
+    .bind(org_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Does this user have a row in `org_memberships` for this org? Handlers use
 /// it to gate cross-org access — no membership ⇒ 403.
 pub async fn is_member(pool: &PgPool, org_id: i64, user_sub: &str) -> Result<bool> {

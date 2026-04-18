@@ -462,6 +462,190 @@ async fn catalog_and_workspaces_isolate_by_org(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn orgs_list_all_returns_default_in_dev_open(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/orgs", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let items = body.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["slug"], "default");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_create_then_list_includes_new_row(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+
+    let res = client
+        .post(format!("{}/api/orgs", app.base_url))
+        .json(&serde_json::json!({ "slug": "acme-corp", "name": "Acme Corp" }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["slug"], "acme-corp");
+    assert_eq!(body["name"], "Acme Corp");
+
+    let list: serde_json::Value = reqwest::get(format!("{}/api/orgs", app.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let slugs: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["slug"].as_str().unwrap())
+        .collect();
+    assert!(slugs.contains(&"default"));
+    assert!(slugs.contains(&"acme-corp"));
+
+    // Audit row was written.
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE action = 'orgs.create'")
+            .fetch_one(app.pool.as_ref())
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_create_rejects_invalid_slug(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/orgs", app.base_url))
+        .json(&serde_json::json!({ "slug": "BAD SLUG", "name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("lowercase"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_create_409s_on_duplicate_slug(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "slug": "acme", "name": "Acme" });
+
+    let first = client
+        .post(format!("{}/api/orgs", app.base_url))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = client
+        .post(format!("{}/api/orgs", app.base_url))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "conflict");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_member_add_list_and_remove_round_trip(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/orgs", app.base_url))
+        .json(&serde_json::json!({ "slug": "acme", "name": "Acme" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Add a member.
+    let res = client
+        .post(format!("{}/api/orgs/acme/members", app.base_url))
+        .json(&serde_json::json!({ "user_sub": "user-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // Idempotent — POSTing the same sub twice stays 204.
+    let again = client
+        .post(format!("{}/api/orgs/acme/members", app.base_url))
+        .json(&serde_json::json!({ "user_sub": "user-1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NO_CONTENT);
+
+    // List shows exactly that user.
+    let members: serde_json::Value =
+        reqwest::get(format!("{}/api/orgs/acme/members", app.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let arr = members.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["userSub"], "user-1");
+
+    // Remove them.
+    let removed = client
+        .delete(format!("{}/api/orgs/acme/members/user-1", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+
+    // Removing again now 404s.
+    let again = client
+        .delete(format!("{}/api/orgs/acme/members/user-1", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_member_remove_rejects_self_on_active_org(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    // Dev-open session's sub is 'dev-open-mode' and active org is 'default';
+    // the guardrail must refuse to kick us out of our own active org.
+    let res = reqwest::Client::new()
+        .delete(format!(
+            "{}/api/orgs/default/members/dev-open-mode",
+            app.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot remove yourself"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_members_404_for_unknown_slug(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/orgs/does-not-exist/members", app.base_url))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn livez_always_returns_ok(pool: PgPool) {
     let app = spawn_app(pool).await;
     let res = reqwest::get(format!("{}/api/livez", app.base_url))
