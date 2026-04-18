@@ -2,13 +2,20 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: stig_viewer
-      POSTGRES_USER: stig
-      POSTGRES_PASSWORD: stig_local
+      # Values come from a `.env` file alongside this compose file.
+      # See `.env.example` for the required variables. Missing values fail fast.
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required - see .env.example}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required - see .env.example}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required - see .env.example}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:

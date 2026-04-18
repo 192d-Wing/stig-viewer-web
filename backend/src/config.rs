@@ -32,17 +32,20 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        // DATABASE_URL is required. No hardcoded fallback: a wrong default in
+        // production is worse than a loud failure at startup.
+        let database_url = std::env::var("DATABASE_URL").context(
+            "DATABASE_URL is required (e.g. postgres://user:pass@host:5432/stig_viewer). \
+             See .env.example.",
+        )?;
+
         Ok(Self {
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".into())
                 .parse()
                 .context("PORT must be a valid port number")?,
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://stig:stig_local@localhost:5432/stig_viewer".into()
-            }),
-            data_dir: PathBuf::from(
-                std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into()),
-            ),
+            database_url,
+            data_dir: PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into())),
             sync_interval_hours: std::env::var("STIG_SYNC_INTERVAL_HOURS")
                 .unwrap_or_else(|_| "24".into())
                 .parse()
@@ -55,7 +58,6 @@ impl Config {
 pub fn load_sources() -> Result<Vec<StigSource>> {
     let raw = fs::read_to_string("stig-sources.toml")
         .context("Cannot read stig-sources.toml — run from the backend/ directory")?;
-    let parsed: SourcesFile =
-        toml::from_str(&raw).context("Failed to parse stig-sources.toml")?;
+    let parsed: SourcesFile = toml::from_str(&raw).context("Failed to parse stig-sources.toml")?;
     Ok(parsed.stigs)
 }

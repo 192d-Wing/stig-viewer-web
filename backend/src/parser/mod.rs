@@ -48,9 +48,16 @@ pub struct StigData {
 fn clean_description(raw: &str) -> String {
     // Tags to strip completely (with their contents)
     const STRIP_TAGS: &[&str] = &[
-        "FalsePositives", "FalseNegatives", "Documentable", "Mitigations",
-        "SeverityOverrideGuidance", "PotentialImpacts", "ThirdPartyTools",
-        "MitigationControl", "Responsibility", "IAControls",
+        "FalsePositives",
+        "FalseNegatives",
+        "Documentable",
+        "Mitigations",
+        "SeverityOverrideGuidance",
+        "PotentialImpacts",
+        "ThirdPartyTools",
+        "MitigationControl",
+        "Responsibility",
+        "IAControls",
     ];
 
     let mut s = raw.to_string();
@@ -91,7 +98,7 @@ fn clean_description(raw: &str) -> String {
 }
 
 /// Extract text content of the first child element with the given local name.
-fn child_text<'a>(parent_bytes: &'a [u8], tag: &str) -> Option<String> {
+fn child_text(parent_bytes: &[u8], tag: &str) -> Option<String> {
     // We use a simple substring search since quick-xml events are finer-grained;
     // this helper is used on already-extracted text buffers.
     let open = format!("<{tag}");
@@ -157,15 +164,13 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                     }
                     "Group" if in_benchmark => {
                         in_group = true;
-                        current_group_id =
-                            attr_value(e.as_ref(), "id").unwrap_or_default();
+                        current_group_id = attr_value(e.as_ref(), "id").unwrap_or_default();
                     }
                     "Rule" if in_group => {
                         in_rule = true;
                         rule_depth = depth;
                         let rule_id = attr_value(e.as_ref(), "id").unwrap_or_default();
-                        let severity_raw =
-                            attr_value(e.as_ref(), "severity").unwrap_or_default();
+                        let severity_raw = attr_value(e.as_ref(), "severity").unwrap_or_default();
                         current_rule = Some(Rule {
                             id: rule_id,
                             stig_id: current_group_id.clone(),
@@ -208,9 +213,7 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                     if let Some(ref mut rule) = current_rule {
                         match current_tag.as_str() {
                             "title" => rule.title = text,
-                            "description" => {
-                                rule.description = clean_description(&text)
-                            }
+                            "description" => rule.description = clean_description(&text),
                             "fixtext" | "fix-text" => rule.fix_text = text,
                             "check-content" => rule.check_text = text,
                             "ident" => rule.cci_ids.push(text),
@@ -318,10 +321,7 @@ pub fn filename_to_id(zip_name: &str) -> String {
         let bytes = base.as_bytes();
         let mut cut = base.len();
         for i in (0..bytes.len().saturating_sub(3)).rev() {
-            if bytes[i] == b'_'
-                && bytes[i + 1] == b'V'
-                && bytes[i + 2].is_ascii_digit()
-            {
+            if bytes[i] == b'_' && bytes[i + 1] == b'V' && bytes[i + 2].is_ascii_digit() {
                 cut = i;
                 break;
             }
@@ -332,7 +332,13 @@ pub fn filename_to_id(zip_name: &str) -> String {
     // Slugify: lowercase, non-alphanum → hyphen, collapse repeated hyphens
     let raw: String = base
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
 
     let mut slug = String::with_capacity(raw.len());

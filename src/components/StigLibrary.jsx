@@ -20,7 +20,7 @@ import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 
-const BACKEND = "http://localhost:8080";
+const BACKEND = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 

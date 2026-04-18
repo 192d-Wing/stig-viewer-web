@@ -3,3 +3,8 @@ dist
 
 # Rust
 backend/target
+
+# Local environment overrides — never commit real secrets
+.env
+.env.local
+.env.*.local
