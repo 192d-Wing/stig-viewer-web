@@ -37,9 +37,11 @@ Goal: confidence that changes don't regress and that the app is safe to expose.
     readApiError, useNotifications, useAuth, Login, StigLibrary,
     RuleDetail, DiffView, STIGView
   - ✅ Rust unit tests (14 tests): parser, ratelimit, ApiError
-  - ✅ `npm test` and `cargo test` run in CI
-  - ⏳ Rust integration tests for upload / catalog endpoints against
-    a real Postgres
+  - ✅ Rust integration tests (7 tests) via `sqlx::test` + real server:
+    health, catalog, 404/400 error envelopes, upload → catalog →
+    /stigs/:id round-trip, audit-log writes
+  - ✅ `npm test` and `cargo test` run in CI, with Postgres as a service
+    container for integration tests
   - ⏳ Coverage target 60% on parsing modules
 - **Security hardening** — ⏳ mostly done
   - ✅ Per-IP rate limit on upload endpoints (UPLOAD_RATE_PER_MIN)

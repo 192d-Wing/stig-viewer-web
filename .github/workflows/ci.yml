@@ -39,11 +39,30 @@ jobs:
           VITE_API_BASE_URL: http://localhost:8080
 
   backend:
-    name: Backend (fmt + clippy + check)
+    name: Backend (fmt + clippy + check + test)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: backend
+    # Postgres is needed by the integration tests (sqlx::test creates a fresh
+    # database per test). Unit tests would run fine without it but cargo test
+    # runs both suites.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/test
     steps:
       - uses: actions/checkout@v4
 

@@ -188,6 +188,7 @@ by `id DESC`. Recorded actions today: `upload.stig`, `upload.library`,
 ```bash
 # Frontend
 npm run lint          # ESLint with security rules, zero warnings
+npm test              # Vitest unit + component tests
 npm run build         # Production build into dist/
 
 # Backend
@@ -195,9 +196,19 @@ cd backend
 cargo fmt --check     # Formatting
 cargo clippy --all-targets -- -D warnings
 cargo check
+
+# Unit tests — no Postgres needed
+cargo test --lib --bins
+
+# Integration tests — need a reachable Postgres. The sqlx::test attribute
+# creates a fresh database per test under DATABASE_URL.
+docker compose up -d postgres
+export DATABASE_URL=postgres://stig:change-me-dev-only@localhost:5432/stig_viewer
+cargo test --test api
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above on every PR.
+CI (`.github/workflows/ci.yml`) runs all of the above on every PR, including
+the integration tests against a Postgres service container.
 
 ## Project layout
 
