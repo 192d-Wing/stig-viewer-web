@@ -114,7 +114,7 @@ pub async fn upload_stig(
         json_path: json_path.to_string_lossy().into_owned(),
         last_updated: Utc::now(),
     };
-    upsert_catalog(&state.pool, &entry)
+    upsert_catalog(&state.pool, session.active_org_id, &entry)
         .await
         .map_err(|e| ApiError::Internal(format!("catalog upsert: {e}")))?;
 
@@ -235,7 +235,7 @@ pub async fn upload_library(
             last_updated: Utc::now(),
         };
 
-        match upsert_catalog(&state.pool, &catalog_entry).await {
+        match upsert_catalog(&state.pool, session.active_org_id, &catalog_entry).await {
             Ok(_) => {
                 tracing::info!("  Imported '{}' ({title}): {rule_count} rules", entry.id);
                 imported += 1;

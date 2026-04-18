@@ -10,12 +10,15 @@ use crate::{
     parser::{extract_xccdf_from_zip, parse_xccdf},
 };
 
-/// Download, parse, and index one STIG from DISA.
+/// Download, parse, and index one STIG from DISA. All scheduled syncs land
+/// in the default organisation since DISA content is globally shared; admins
+/// can copy rows into other orgs from there.
 async fn sync_one(
     source: &StigSource,
     client: &reqwest::Client,
     pool: &PgPool,
     data_dir: &Path,
+    org_id: i64,
 ) -> Result<()> {
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
@@ -61,7 +64,7 @@ async fn sync_one(
         json_path: json_path.to_string_lossy().into_owned(),
         last_updated: Utc::now(),
     };
-    upsert_catalog(pool, &entry)
+    upsert_catalog(pool, org_id, &entry)
         .await
         .context("Failed to upsert catalog entry")?;
 
@@ -74,11 +77,12 @@ async fn sync_one(
     Ok(())
 }
 
-/// Run one full sync pass across all STIG sources.
+/// Run one full sync pass across all STIG sources into the given org.
 pub async fn run_sync(
     config: &Arc<Config>,
     sources: &Arc<Vec<StigSource>>,
     pool: &PgPool,
+    org_id: i64,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("stig-viewer-backend/0.1")
@@ -87,7 +91,7 @@ pub async fn run_sync(
 
     let mut errors = 0usize;
     for source in sources.as_ref() {
-        if let Err(e) = sync_one(source, &client, pool, &config.data_dir).await {
+        if let Err(e) = sync_one(source, &client, pool, &config.data_dir, org_id).await {
             error!("Failed to sync '{}': {e:#}", source.id);
             errors += 1;
         }

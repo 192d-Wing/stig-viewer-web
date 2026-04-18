@@ -372,6 +372,96 @@ async fn metrics_endpoint_exposes_request_counter(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn orgs_me_reports_default_membership_in_dev_open_mode(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::get(format!("{}/api/orgs/me", app.base_url))
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["active"]["slug"], "default");
+    // Dev-open synthetic admin isn't actually a member of the default org in
+    // DB (dev-open bypasses the membership table), so memberships is empty
+    // but `active` still reports the current scope.
+    assert!(body["memberships"].is_array());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn orgs_switch_rejected_in_dev_open_mode(pool: PgPool) {
+    let app = spawn_app(pool).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/api/orgs/switch", app.base_url))
+        .json(&serde_json::json!({ "slug": "default" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn catalog_and_workspaces_isolate_by_org(pool: PgPool) {
+    // Seed a second org and put a row into each. The dev-open synthetic
+    // user is scoped to `default`, so only rows in `default` should come
+    // back through /api/catalog.
+    let pool_arc = std::sync::Arc::new(pool.clone());
+
+    sqlx::query("INSERT INTO organizations (slug, name) VALUES ($1, $2)")
+        .bind("other")
+        .bind("Other tenant")
+        .execute(pool_arc.as_ref())
+        .await
+        .unwrap();
+    let (other_id,): (i64,) = sqlx::query_as("SELECT id FROM organizations WHERE slug = 'other'")
+        .fetch_one(pool_arc.as_ref())
+        .await
+        .unwrap();
+    let (default_id,): (i64,) =
+        sqlx::query_as("SELECT id FROM organizations WHERE slug = 'default'")
+            .fetch_one(pool_arc.as_ref())
+            .await
+            .unwrap();
+
+    for (org, slug, title) in [
+        (default_id, "mine", "Default tenant STIG"),
+        (other_id, "theirs", "Other tenant STIG"),
+    ] {
+        sqlx::query(
+            "INSERT INTO stigs_catalog \
+             (org_id, id, title, category, version, release_info, rule_count, json_path) \
+             VALUES ($1, $2, $3, 'Windows', '1', '', 0, $4)",
+        )
+        .bind(org)
+        .bind(slug)
+        .bind(title)
+        .bind(format!("/data/{slug}.json"))
+        .execute(pool_arc.as_ref())
+        .await
+        .unwrap();
+    }
+
+    let app = spawn_app(pool).await;
+
+    // /api/catalog returns only the default-tenant row for the dev-open user.
+    let catalog: serde_json::Value = reqwest::get(format!("{}/api/catalog", app.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = catalog.as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], "mine");
+
+    // Fetching the other tenant's STIG by id returns 404, not its JSON.
+    let res = reqwest::get(format!("{}/api/stigs/theirs", app.base_url))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn livez_always_returns_ok(pool: PgPool) {
     let app = spawn_app(pool).await;
     let res = reqwest::get(format!("{}/api/livez", app.base_url))

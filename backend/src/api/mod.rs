@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod error;
 pub mod metrics;
 pub mod ops;
+pub mod orgs;
 pub mod ratelimit;
 pub mod request_id;
 pub mod stig;

@@ -25,6 +25,13 @@ pub struct SessionData {
     pub role: Role,
     /// Unix timestamp (seconds) at which the session expires.
     pub exp: i64,
+    /// Organisation the session is currently scoped to. Every data-touching
+    /// handler filters by this value; users can switch between orgs they
+    /// belong to via `POST /api/orgs/switch`.
+    #[serde(default)]
+    pub active_org_id: i64,
+    #[serde(default)]
+    pub active_org_slug: String,
 }
 
 impl SessionData {

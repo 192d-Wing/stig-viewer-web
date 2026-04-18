@@ -145,6 +145,23 @@ the only origin the browser can talk to. Set it at build time in production.
 | GET    | `/api/auth/me`        | Current session's `{sub,email,role,exp}` |
 | POST   | `/api/auth/logout`    | Clear the session cookie                 |
 
+### Multi-tenant organisations
+
+Every data-carrying table (`stigs_catalog`, `workspaces`, `audit_log`) is
+scoped by `org_id`. The session cookie carries the caller's active org;
+handlers filter by it, so two tenants on the same instance can't see each
+other's uploads, audits, or reviewer state. Membership lives in
+`org_memberships` and is enforced on every `/api/orgs/switch` request.
+
+A built-in "default" organisation absorbs pre-existing rows on upgrade.
+OIDC users are auto-enrolled into the default org on first login so a
+fresh deployment isn't stranded; strict provisioning can be added later.
+
+| Method | Path                   | Auth     | Purpose                                  |
+| ------ | ---------------------- | -------- | ---------------------------------------- |
+| GET    | `/api/orgs/me`         | any user | `{active, memberships}` for the caller   |
+| POST   | `/api/orgs/switch`     | any user | Body `{slug}` — change the active org    |
+
 ### Persistence (workspaces)
 
 | Method | Path                          | Auth       | Purpose                                 |
@@ -153,10 +170,11 @@ the only origin the browser can talk to. Set it at build time in production.
 | PUT    | `/api/workspaces/:stig_id`    | any user   | Upsert asset info + rule overrides      |
 
 Body: `{ "assetInfo": { … }, "ruleOverrides": { <ruleId>: { status, findingDetails, comments } } }`.
-Both must be JSON objects. The row is keyed by `(user_sub, stig_id)` — users
-can only see and mutate their own. When a STIG is loaded from the catalog the
-frontend fetches the workspace and merges it into the tab; subsequent status
-and asset-info edits are PUT back with a 1-second debounce.
+Both must be JSON objects. Rows are keyed by `(org_id, user_sub, stig_id)` —
+users can only see and mutate their own, scoped to the currently active org.
+When a STIG is loaded from the catalog the frontend fetches the workspace
+and merges it into the tab; subsequent status and asset-info edits are PUT
+back with a 1-second debounce.
 
 ### Ops endpoints
 

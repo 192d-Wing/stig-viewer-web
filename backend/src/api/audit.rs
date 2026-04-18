@@ -30,6 +30,12 @@ pub async fn list_audit(
     if session.role != Role::Admin {
         return Err(ApiError::Forbidden);
     }
-    let rows = audit::list(&state.pool, q.limit.unwrap_or(100), q.before_id).await?;
+    let rows = audit::list(
+        &state.pool,
+        session.active_org_id,
+        q.limit.unwrap_or(100),
+        q.before_id,
+    )
+    .await?;
     Ok(Json(rows))
 }

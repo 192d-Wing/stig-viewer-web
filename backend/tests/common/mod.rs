@@ -11,7 +11,9 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use sqlx::PgPool;
-use stig_viewer_backend::{api::metrics::install_recorder, build_app, config::Config, AppState};
+use stig_viewer_backend::{
+    api::metrics::install_recorder, build_app, config::Config, orgs, AppState,
+};
 use tempfile::TempDir;
 
 pub struct TestApp {
@@ -45,11 +47,13 @@ pub async fn spawn_app(pool: PgPool) -> TestApp {
     });
 
     let pool = Arc::new(pool);
+    let default_org = orgs::default_org(&pool).await.expect("default org seeded");
     let state = AppState {
         pool: pool.clone(),
         config,
         auth: None,
         sources: None,
+        default_org,
     };
 
     let app = build_app(state);

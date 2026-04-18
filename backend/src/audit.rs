@@ -53,10 +53,11 @@ pub async fn log(pool: &PgPool, entry: AuditEntry<'_>) {
     let res = sqlx::query(
         r#"
         INSERT INTO audit_log
-            (actor_sub, actor_email, actor_role, action, resource, remote_ip, status_code, metadata)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (org_id, actor_sub, actor_email, actor_role, action, resource, remote_ip, status_code, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
     )
+    .bind(entry.session.active_org_id)
     .bind(&entry.session.sub)
     .bind(entry.session.email.as_deref())
     .bind(role)
@@ -75,24 +76,39 @@ pub async fn log(pool: &PgPool, entry: AuditEntry<'_>) {
     crate::api::metrics::record_event("audit_events_total", entry.action);
 }
 
-/// Paginated read of recent events. Caller is responsible for the admin check.
-pub async fn list(pool: &PgPool, limit: i64, before_id: Option<i64>) -> Result<Vec<AuditEvent>> {
+/// Paginated read of recent events scoped to an org. Caller is responsible
+/// for the admin check.
+pub async fn list(
+    pool: &PgPool,
+    org_id: i64,
+    limit: i64,
+    before_id: Option<i64>,
+) -> Result<Vec<AuditEvent>> {
     let limit = limit.clamp(1, 500);
     let rows = match before_id {
         Some(id) => {
             sqlx::query_as::<_, AuditEvent>(
-                "SELECT * FROM audit_log WHERE id < $1 ORDER BY id DESC LIMIT $2",
+                "SELECT id, created_at, actor_sub, actor_email, actor_role, action, \
+                        resource, remote_ip, status_code, metadata \
+                 FROM audit_log WHERE org_id = $1 AND id < $2 \
+                 ORDER BY id DESC LIMIT $3",
             )
+            .bind(org_id)
             .bind(id)
             .bind(limit)
             .fetch_all(pool)
             .await?
         }
         None => {
-            sqlx::query_as::<_, AuditEvent>("SELECT * FROM audit_log ORDER BY id DESC LIMIT $1")
-                .bind(limit)
-                .fetch_all(pool)
-                .await?
+            sqlx::query_as::<_, AuditEvent>(
+                "SELECT id, created_at, actor_sub, actor_email, actor_role, action, \
+                        resource, remote_ip, status_code, metadata \
+                 FROM audit_log WHERE org_id = $1 ORDER BY id DESC LIMIT $2",
+            )
+            .bind(org_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
         }
     };
     Ok(rows)

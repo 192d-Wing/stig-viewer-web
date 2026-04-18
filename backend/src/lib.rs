@@ -9,6 +9,7 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod orgs;
 pub mod parser;
 pub mod sync;
 
@@ -31,6 +32,7 @@ use api::{
     catalog::{get_catalog, get_health},
     metrics::{scrape as metrics_scrape, track as metrics_track},
     ops::{livez, readyz, trigger_sync},
+    orgs as orgs_handlers,
     request_id::with_request_id,
     stig::get_stig,
     upload::{upload_library, upload_stig},
@@ -50,6 +52,9 @@ pub struct AppState {
     /// DISA sources manifest. `None` when tests skip loading it; the
     /// `POST /api/sync` endpoint returns an error in that case.
     pub sources: Option<Arc<Vec<StigSource>>>,
+    /// Resolved at startup from the `default` org row. Dev-open sessions
+    /// and first-login OIDC users land here unless they pick another org.
+    pub default_org: orgs::Organization,
 }
 
 // Required so PrivateCookieJar can pull the cookie Key out of AppState.
@@ -104,6 +109,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/audit", get(list_audit))
+        .route("/api/orgs/me", get(orgs_handlers::me))
+        .route("/api/orgs/switch", post(orgs_handlers::switch_org))
         .route(
             "/api/workspaces/:stig_id",
             get(workspaces::get).put(workspaces::put),
@@ -174,6 +181,8 @@ pub async fn run() -> Result<()> {
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
 
+    let default_org = orgs::default_org(&pool).await?;
+
     let auth = AuthState::try_from_env(&config).await?;
     match &auth {
         Some(a) => info!(
@@ -201,21 +210,24 @@ pub async fn run() -> Result<()> {
         config: config.clone(),
         auth,
         sources: Some(sources.clone()),
+        default_org,
     };
 
-    let app = build_app(state);
+    let app = build_app(state.clone());
 
-    // Scheduler.
+    // Scheduler — scheduled syncs always write to the default org since
+    // DISA content is globally shared.
     {
         let cfg = config.clone();
         let src = sources.clone();
         let db = pool.clone();
+        let org_id = state.default_org.id;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
             loop {
                 interval.tick().await;
-                if let Err(e) = sync::run_sync(&cfg, &src, &db).await {
+                if let Err(e) = sync::run_sync(&cfg, &src, &db, org_id).await {
                     tracing::error!("Sync error: {e:#}");
                 }
             }

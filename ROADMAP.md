@@ -104,7 +104,10 @@ Goal: daily-driver quality for real STIG reviewers and operators.
   encryption, non-atomic data-dir tar).
 - **Optional**
   - ✅ SSO via OIDC (shipped in Phase 1)
-  - Multi-tenant organizations
+  - ⏳ Multi-tenant organisations — ✅ data isolation + session scope +
+    /api/orgs/me + /api/orgs/switch. Admin org-creation and
+    member-management endpoints still pending; frontend org-switcher UI
+    still pending.
   - Signed CKL export (detached signature)
 
 ---

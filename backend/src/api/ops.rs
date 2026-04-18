@@ -62,10 +62,13 @@ pub async fn trigger_sync(
     let config = state.config.clone();
     let pool = state.pool.clone();
     let sources_count = sources.len();
+    // Manual syncs land in the caller's active org so an admin can
+    // refresh their tenant's copy explicitly.
+    let org_id = session.active_org_id;
 
     // Fire-and-forget. Errors land in tracing; the caller just sees 202.
     tokio::spawn(async move {
-        if let Err(e) = crate::sync::run_sync(&config, &sources, &pool).await {
+        if let Err(e) = crate::sync::run_sync(&config, &sources, &pool, org_id).await {
             tracing::error!("Manual sync failed: {e:#}");
         }
     });

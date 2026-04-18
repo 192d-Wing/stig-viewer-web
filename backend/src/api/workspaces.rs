@@ -70,7 +70,7 @@ pub async fn get(
     Path(stig_id): Path<String>,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     validate_stig_id(&stig_id)?;
-    let ws = get_workspace(&state.pool, &session.sub, &stig_id)
+    let ws = get_workspace(&state.pool, session.active_org_id, &session.sub, &stig_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no workspace for '{stig_id}'")))?;
     Ok(Json(ws.into()))
@@ -92,6 +92,7 @@ pub async fn put(
     }
     let ws = upsert_workspace(
         &state.pool,
+        session.active_org_id,
         &session.sub,
         &stig_id,
         &body.asset_info,

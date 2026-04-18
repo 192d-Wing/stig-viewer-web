@@ -25,11 +25,15 @@ pub async fn require_auth(
     next: Next,
 ) -> Result<Response, StatusCode> {
     if state.auth.is_none() {
-        req.extensions_mut().insert(dev_synthetic_user());
+        req.extensions_mut().insert(dev_synthetic_user(&state));
         return Ok(next.run(req).await);
     }
 
     let session = read_session_from_headers(&state, &req).ok_or(StatusCode::UNAUTHORIZED)?;
+    // Paranoia: any path that accepts an unbound org_id is a tenant leak.
+    if session.active_org_id == 0 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     req.extensions_mut().insert(session);
     Ok(next.run(req).await)
 }
@@ -48,11 +52,13 @@ fn read_session_from_headers(state: &AppState, req: &Request) -> Option<SessionD
     Some(session)
 }
 
-fn dev_synthetic_user() -> SessionData {
+fn dev_synthetic_user(state: &AppState) -> SessionData {
     SessionData {
         sub: "dev-open-mode".into(),
         email: Some("dev@local".into()),
         role: Role::Admin,
         exp: chrono::Utc::now().timestamp() + 86_400,
+        active_org_id: state.default_org.id,
+        active_org_slug: state.default_org.slug.clone(),
     }
 }

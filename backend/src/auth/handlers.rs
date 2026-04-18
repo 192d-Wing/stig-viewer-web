@@ -254,11 +254,35 @@ async fn callback(
 
     debug!("login: sub={sub} role={role:?} exp={exp}");
 
+    // First-login auto-enrolment into the default org so a fresh deployment
+    // doesn't strand its first users. Pick the first membership we find as
+    // the active org; if there are none, seed one. Errors here are fatal
+    // for the login — we'd otherwise hand out a cookie with org_id=0 that
+    // the extractor refuses anyway.
+    let active_org = match crate::orgs::list_for_user(&state.pool, &sub).await {
+        Ok(mut orgs) if !orgs.is_empty() => orgs.remove(0),
+        Ok(_) => {
+            if let Err(e) =
+                crate::orgs::ensure_membership(&state.pool, state.default_org.id, &sub).await
+            {
+                error!("failed to enrol {sub} in default org: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response();
+            }
+            state.default_org.clone()
+        }
+        Err(e) => {
+            error!("membership lookup failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "login failed").into_response();
+        }
+    };
+
     let session = SessionData {
         sub,
         email,
         role,
         exp,
+        active_org_id: active_org.id,
+        active_org_slug: active_org.slug,
     };
 
     let jar = match serde_json::to_string(&session) {
