@@ -474,7 +474,10 @@ mod tests {
 
     #[test]
     fn filename_to_id_slugifies_and_collapses_dashes() {
-        assert_eq!(filename_to_id("Some Thing   Weird!.zip"), "some-thing-weird");
+        assert_eq!(
+            filename_to_id("Some Thing   Weird!.zip"),
+            "some-thing-weird"
+        );
     }
 
     #[test]
@@ -498,8 +501,29 @@ mod tests {
 
     #[test]
     fn clean_description_strips_tags_and_collapses_whitespace() {
-        let raw = "<VulnDiscussion>why it matters</VulnDiscussion><FalsePositives>none</FalsePositives>";
+        let raw =
+            "<VulnDiscussion>why it matters</VulnDiscussion><FalsePositives>none</FalsePositives>";
         assert_eq!(clean_description(raw), "why it matters");
+    }
+
+    #[test]
+    fn parse_xccdf_ignores_external_entity_declarations() {
+        // XXE probe: if quick-xml ever starts resolving SYSTEM entities this
+        // test fails either by reading the file or by substituting its
+        // contents into the title. Neither is acceptable.
+        let xml = r#"<?xml version="1.0"?>
+<!DOCTYPE Benchmark [
+  <!ENTITY xxe SYSTEM "file:///etc/passwd">
+]>
+<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1">
+  <title>ok&xxe;</title>
+  <version>1</version>
+</Benchmark>"#;
+        let stig = parse_xccdf(xml).expect("parses without network or file access");
+        assert!(
+            !stig.title.contains("root:") && !stig.title.contains("/bin/"),
+            "parser resolved an external entity — XXE regression"
+        );
     }
 
     #[test]

@@ -80,6 +80,17 @@ pub async fn upload_stig(
     let id = id.ok_or((StatusCode::BAD_REQUEST, "Missing 'id' field".into()))?;
     let category = category.ok_or((StatusCode::BAD_REQUEST, "Missing 'category' field".into()))?;
 
+    if zip_bytes.len() > state.config.max_upload_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "file exceeds MAX_UPLOAD_BYTES ({} > {})",
+                zip_bytes.len(),
+                state.config.max_upload_bytes
+            ),
+        ));
+    }
+
     // Extract and parse XCCDF
     let xccdf = extract_xccdf_from_zip(&zip_bytes).map_err(|e| {
         (
@@ -187,6 +198,17 @@ pub async fn upload_library(
         }
     }
     let zip_bytes = zip_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
+
+    if zip_bytes.len() > state.config.max_library_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "library bundle exceeds MAX_LIBRARY_BYTES ({} > {})",
+                zip_bytes.len(),
+                state.config.max_library_bytes
+            ),
+        ));
+    }
 
     tracing::info!(
         "Library bundle received ({} MB), processing…",

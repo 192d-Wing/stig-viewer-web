@@ -112,6 +112,9 @@ list. Key variables:
 | `PORT`                        | backend           | no       | `8080`                   |
 | `DATA_DIR`                    | backend           | no       | `data`                   |
 | `STIG_SYNC_INTERVAL_HOURS`    | backend           | no       | `24`                     |
+| `MAX_UPLOAD_BYTES`            | backend           | no       | `52428800` (50 MiB)      |
+| `MAX_LIBRARY_BYTES`           | backend           | no       | `524288000` (500 MiB)    |
+| `UPLOAD_RATE_PER_MIN`         | backend           | no       | `10` (`0` disables)      |
 | `RUST_LOG`                    | backend           | no       | `info`                   |
 | `ALLOWED_ORIGINS`             | backend           | no       | localhost:{5173,8080}    |
 | `REQUIRE_AUTH`                | backend           | no       | `0` (dev-open if OIDC\_\* missing) |
@@ -193,5 +196,9 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
   `return_to` parameter.
 - The backend validates upload IDs (alphanumeric + dashes) and guards
   against path traversal on disk writes.
-- Known gaps (rate limits, XXE protection, audit logging) are tracked in
+- Per-file size caps (`MAX_UPLOAD_BYTES`, `MAX_LIBRARY_BYTES`) and per-IP
+  upload rate limit (`UPLOAD_RATE_PER_MIN`).
+- XML parsing via quick-xml, which does not resolve external entities
+  (XXE). A regression test in `backend/src/parser/mod.rs` locks this in.
+- Known gaps (audit logging, typed error responses) are tracked in
   `ROADMAP.md` phase 2.

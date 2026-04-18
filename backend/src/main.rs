@@ -113,10 +113,7 @@ async fn main() -> Result<()> {
             axum::http::Method::POST,
             axum::http::Method::OPTIONS,
         ])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::ACCEPT,
-        ]);
+        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::ACCEPT]);
 
     let state = AppState {
         pool: pool.clone(),
@@ -124,17 +121,33 @@ async fn main() -> Result<()> {
         auth,
     };
 
+    // Per-IP rate limiter applied to upload routes only. Fixed-window counter
+    // per minute; zero disables the limit.
+    let upload_limiter = Arc::new(api::ratelimit::RateLimiter::new(config.upload_rate_per_min));
+
     // Public routes: health + auth endpoints.
     let public = Router::new()
         .route("/api/health", get(get_health))
         .merge(auth::routes());
 
-    // Protected routes: everything that touches catalog, stigs, or uploads.
-    let protected = Router::new()
+    // Read-only protected routes.
+    let protected_reads = Router::new()
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::extractor::require_auth,
+        ));
+
+    // Upload routes carry the rate-limit layer on top of auth. Layer order is
+    // bottom-up: auth runs first, then rate-limit.
+    let protected_uploads = Router::new()
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
+        .layer(middleware::from_fn_with_state(
+            upload_limiter.clone(),
+            api::ratelimit::limit,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::extractor::require_auth,
@@ -144,7 +157,8 @@ async fn main() -> Result<()> {
     // bundle; all other routes are well under this.
     let app = Router::new()
         .merge(public)
-        .merge(protected)
+        .merge(protected_reads)
+        .merge(protected_uploads)
         .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);
@@ -172,9 +186,14 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind {addr}"))?;
     info!("Listening on http://{addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` is required so the rate-limit
+    // middleware can extract the peer's SocketAddr.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

@@ -28,6 +28,12 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// How often the sync scheduler runs (hours).
     pub sync_interval_hours: u64,
+    /// Maximum bytes accepted by `POST /api/upload` (single STIG ZIP).
+    pub max_upload_bytes: usize,
+    /// Maximum bytes accepted by `POST /api/upload/library` (DISA library bundle).
+    pub max_library_bytes: usize,
+    /// Per-IP upload rate limit: requests per minute.
+    pub upload_rate_per_min: u32,
 }
 
 impl Config {
@@ -50,7 +56,22 @@ impl Config {
                 .unwrap_or_else(|_| "24".into())
                 .parse()
                 .context("STIG_SYNC_INTERVAL_HOURS must be a positive integer")?,
+            max_upload_bytes: parse_bytes_env("MAX_UPLOAD_BYTES", 50 * 1024 * 1024)?,
+            max_library_bytes: parse_bytes_env("MAX_LIBRARY_BYTES", 500 * 1024 * 1024)?,
+            upload_rate_per_min: std::env::var("UPLOAD_RATE_PER_MIN")
+                .unwrap_or_else(|_| "10".into())
+                .parse()
+                .context("UPLOAD_RATE_PER_MIN must be a non-negative integer")?,
         })
+    }
+}
+
+fn parse_bytes_env(key: &str, default: usize) -> Result<usize> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<usize>()
+            .with_context(|| format!("{key} must be a non-negative integer (bytes)")),
+        Err(_) => Ok(default),
     }
 }
 
