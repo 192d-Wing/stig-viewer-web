@@ -10,6 +10,7 @@ import ColumnLayout from "@cloudscape-design/components/column-layout";
 import ProgressBar from "@cloudscape-design/components/progress-bar";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import PieChart from "@cloudscape-design/components/pie-chart";
+import LineChart from "@cloudscape-design/components/line-chart";
 import Button from "@cloudscape-design/components/button";
 import { apiGet } from "../utils/api.js";
 
@@ -27,6 +28,7 @@ function pct(numer, denom) {
 
 export default function Dashboard() {
   const [data, setData] = useState(null);
+  const [trend, setTrend] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -34,8 +36,12 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
-      const d = await apiGet("/api/dashboard");
+      const [d, t] = await Promise.all([
+        apiGet("/api/dashboard"),
+        apiGet("/api/dashboard/trend?days=30"),
+      ]);
       setData(d);
+      setTrend(t);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -157,6 +163,59 @@ export default function Dashboard() {
               empty={
                 <Box textAlign="center" color="inherit">
                   No data yet
+                </Box>
+              }
+            />
+          </Container>
+        )}
+
+        {/* Trend over time */}
+        {trend && trend.overall.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={`${trend.overall.length} snapshot${trend.overall.length === 1 ? "" : "s"} in the last 30 days`}
+              >
+                Posture over time
+              </Header>
+            }
+          >
+            <LineChart
+              series={[
+                {
+                  title: "Open",
+                  type: "line",
+                  color: "#d13212",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.open,
+                  })),
+                },
+                {
+                  title: "Reviewed",
+                  type: "line",
+                  color: "#1d8102",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.reviewed,
+                  })),
+                },
+              ]}
+              xScaleType="time"
+              xTitle="Time"
+              yTitle="Rules"
+              height={220}
+              hideFilter
+              ariaLabel="Posture trend"
+              empty={
+                <Box textAlign="center" color="inherit">
+                  No snapshots yet
+                </Box>
+              }
+              noMatch={
+                <Box textAlign="center" color="inherit">
+                  No data in selected range
                 </Box>
               }
             />
