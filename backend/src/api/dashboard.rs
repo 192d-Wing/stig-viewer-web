@@ -523,6 +523,63 @@ pub async fn trend_handler(
     Ok(Json(TrendResponse { overall, by_asset }))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetTrendResponse {
+    pub overall: Vec<TrendPoint>,
+}
+
+/// GET /api/assets/:id/trend?days=N — single-asset variant of the
+/// dashboard trend. Returns one time series summed across the asset's
+/// checklists (not split by STIG).
+pub async fn asset_trend_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(asset_id): axum::extract::Path<String>,
+    Query(params): Query<TrendQuery>,
+) -> Result<Json<AssetTrendResponse>, StatusCode> {
+    let pool = state.pool.as_ref();
+    let days = params.days.clamp(1, 365);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            captured_at,
+            SUM(open_count)::BIGINT     AS open,
+            SUM(naf_count)::BIGINT      AS naf,
+            SUM(na_count)::BIGINT       AS na,
+            SUM(reviewed_count)::BIGINT AS reviewed,
+            SUM(rule_count)::BIGINT     AS total
+        FROM checklist_snapshots
+        WHERE asset_id = $1
+          AND captured_at >= NOW() - ($2 || ' days')::INTERVAL
+        GROUP BY captured_at
+        ORDER BY captured_at ASC
+        "#,
+    )
+    .bind(&asset_id)
+    .bind(days.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_db)?;
+
+    let overall = rows
+        .into_iter()
+        .map(|r| -> Result<TrendPoint, sqlx::Error> {
+            Ok(TrendPoint {
+                captured_at: r.try_get("captured_at")?,
+                open: r.try_get("open")?,
+                naf: r.try_get("naf")?,
+                na: r.try_get("na")?,
+                reviewed: r.try_get("reviewed")?,
+                total: r.try_get("total")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_db)?;
+
+    Ok(Json(AssetTrendResponse { overall }))
+}
+
 fn map_db(e: sqlx::Error) -> StatusCode {
     tracing::error!("dashboard db error: {e:#}");
     StatusCode::INTERNAL_SERVER_ERROR

@@ -12,6 +12,7 @@ import Alert from "@cloudscape-design/components/alert";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import LineChart from "@cloudscape-design/components/line-chart";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 
@@ -21,6 +22,7 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
   const [asset, setAsset] = useState(null);
   const [checklists, setChecklists] = useState([]);
   const [catalog, setCatalog] = useState([]);
+  const [trend, setTrend] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -33,15 +35,17 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     setLoading(true);
     setError(null);
     try {
-      const [a, cls, cat] = await Promise.all([
+      const [a, cls, cat, tr] = await Promise.all([
         apiGet(`/api/assets/${assetId}`),
         apiGet(`/api/assets/${assetId}/checklists`),
         // catalog is public — but apiGet sends creds anyway, no harm
         apiGet("/api/catalog"),
+        apiGet(`/api/assets/${assetId}/trend?days=30`).catch(() => null),
       ]);
       setAsset(a);
       setChecklists(cls);
       setCatalog(cat);
+      setTrend(tr);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -151,6 +155,58 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
             </div>
           </ColumnLayout>
         </Container>
+
+        {trend && trend.overall.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={`${trend.overall.length} snapshot${trend.overall.length === 1 ? "" : "s"} in the last 30 days`}
+              >
+                Posture over time
+              </Header>
+            }
+          >
+            <LineChart
+              series={[
+                {
+                  title: "Open",
+                  type: "line",
+                  color: "#d13212",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.open,
+                  })),
+                },
+                {
+                  title: "Reviewed",
+                  type: "line",
+                  color: "#1d8102",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.reviewed,
+                  })),
+                },
+              ]}
+              xScaleType="time"
+              xTitle="Time"
+              yTitle="Rules"
+              height={220}
+              hideFilter
+              ariaLabel={`${asset.name} posture trend`}
+              empty={
+                <Box textAlign="center" color="inherit">
+                  No snapshots yet
+                </Box>
+              }
+              noMatch={
+                <Box textAlign="center" color="inherit">
+                  No data in selected range
+                </Box>
+              }
+            />
+          </Container>
+        )}
 
         <Table
           variant="container"
