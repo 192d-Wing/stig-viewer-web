@@ -17,6 +17,7 @@ import DiffView from "./components/DiffView.jsx";
 import RuleDetail from "./components/RuleDetail.jsx";
 import STIGWriter from "./components/STIGWriter.jsx";
 import AssetsLibrary from "./components/AssetsLibrary.jsx";
+import Dashboard from "./components/Dashboard.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
 import { apiFetch } from "./utils/api.js";
 
@@ -57,7 +58,8 @@ export default function App() {
 
   const isWriter = appMode === "writer";
   const isSystems = appMode === "systems";
-  const isLibraryMode = !isWriter && !isSystems;
+  const isDashboard = appMode === "dashboard";
+  const isLibraryMode = !isWriter && !isSystems && !isDashboard;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isDiffMode = diffPair !== null;
@@ -119,6 +121,12 @@ export default function App() {
       text: "Systems",
       variant: isSystems ? "primary-button" : undefined,
       onClick: () => setAppMode("systems"),
+    },
+    {
+      type: "button",
+      text: "Dashboard",
+      variant: isDashboard ? "primary-button" : undefined,
+      onClick: () => setAppMode("dashboard"),
     },
   ];
   if (isLibraryMode && hasTabs) {
@@ -183,7 +191,9 @@ export default function App() {
 
   // Determine content
   let content;
-  if (isSystems) {
+  if (isDashboard) {
+    content = <Dashboard />;
+  } else if (isSystems) {
     content = <AssetsLibrary />;
   } else if (isWriter) {
     content = (
