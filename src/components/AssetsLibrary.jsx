@@ -16,6 +16,7 @@ import { apiGet, apiJson, apiFetch } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 import AssetDetail from "./AssetDetail.jsx";
 import ChecklistView from "./ChecklistView.jsx";
+import AssetCompare from "./AssetCompare.jsx";
 
 const CLASSIFICATIONS = [
   { label: "Unclassified", value: "unclassified" },
@@ -225,6 +226,10 @@ export default function AssetsLibrary() {
     );
   }
 
+  if (view === "compare") {
+    return <AssetCompare onBack={() => setView("list")} />;
+  }
+
   return (
     <>
       <Table
@@ -248,9 +253,17 @@ export default function AssetsLibrary() {
           <Header
             counter={`(${assets.length})`}
             actions={
-              <Button variant="primary" onClick={openCreate}>
-                Add system
-              </Button>
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  onClick={() => setView("compare")}
+                  disabled={assets.length < 2}
+                >
+                  Compare
+                </Button>
+                <Button variant="primary" onClick={openCreate}>
+                  Add system
+                </Button>
+              </SpaceBetween>
             }
           >
             Systems
