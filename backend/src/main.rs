@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod db;
+mod db_assets;
 mod db_drafts;
 mod parser;
 mod sync;
@@ -15,6 +16,10 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
+    assets::{
+        create_asset_handler, delete_asset_handler, get_asset_handler, list_assets_handler,
+        update_asset_handler,
+    },
     auth::{
         auth_middleware, build_oidc_context, callback_handler, login_handler, logout_handler,
         me_handler, AppAuthState, OidcEnv,
@@ -91,8 +96,15 @@ async fn main() -> Result<()> {
         .route("/auth/logout", post(logout_handler))
         .with_state(auth_state.clone());
 
-    // Draft + /api/users/me routes — require an authenticated session.
+    // Draft + asset + /api/users/me routes — require an authenticated session.
     let draft_routes = Router::new()
+        .route("/api/assets", get(list_assets_handler).post(create_asset_handler))
+        .route(
+            "/api/assets/:id",
+            get(get_asset_handler)
+                .put(update_asset_handler)
+                .delete(delete_asset_handler),
+        )
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
         .route(
