@@ -335,6 +335,31 @@ pub async fn me_handler(req: Request) -> Result<Json<AuthUser>, StatusCode> {
     Ok(Json(user))
 }
 
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct UserSummary {
+    pub id: String,
+    pub display_name: String,
+}
+
+/// GET /api/users — list all users (id + display name) for assignee pickers.
+/// Auth-protected via the surrounding router; we don't need the AuthUser
+/// here, only the DB pool, so we take State<crate::AppState>.
+pub async fn list_users_handler(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Result<Json<Vec<UserSummary>>, StatusCode> {
+    let rows = sqlx::query_as::<_, UserSummary>(
+        "SELECT id, display_name FROM users ORDER BY display_name",
+    )
+    .fetch_all(state.pool.as_ref())
+    .await
+    .map_err(|e| {
+        tracing::error!("list users failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(rows))
+}
+
 // ── Middleware ──────────────────────────────────────────────────────────────
 
 /// Combined app state for handlers that need both pool and OIDC ctx.

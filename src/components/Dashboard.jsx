@@ -13,6 +13,7 @@ import PieChart from "@cloudscape-design/components/pie-chart";
 import LineChart from "@cloudscape-design/components/line-chart";
 import Button from "@cloudscape-design/components/button";
 import Select from "@cloudscape-design/components/select";
+import Toggle from "@cloudscape-design/components/toggle";
 import { apiGet } from "../utils/api.js";
 
 const SEVERITY_OPTIONS = [
@@ -49,6 +50,7 @@ export default function Dashboard() {
   // Drill-down: { ruleId?: string } or null
   const [drilldown, setDrilldown] = useState(null);
   const [severityFilter, setSeverityFilter] = useState(null); // option object or null
+  const [mineOnly, setMineOnly] = useState(false);
   const [findings, setFindings] = useState([]);
   const [findingsLoading, setFindingsLoading] = useState(false);
   const [findingsError, setFindingsError] = useState(null);
@@ -80,7 +82,7 @@ export default function Dashboard() {
   // Close the expanded panel whenever the drill-down/filter changes.
   useEffect(() => {
     setExpandedFinding(null);
-  }, [drilldown, severityFilter]);
+  }, [drilldown, severityFilter, mineOnly]);
 
   // Load findings when drilldown is active or severity filter changes.
   useEffect(() => {
@@ -93,6 +95,7 @@ export default function Dashboard() {
     const qs = new URLSearchParams({ status: "open" });
     if (drilldown.ruleId) qs.set("ruleId", drilldown.ruleId);
     if (severityFilter?.value) qs.set("severity", severityFilter.value);
+    if (mineOnly) qs.set("assignee", "me");
     setFindingsLoading(true);
     setFindingsError(null);
     apiGet(`/api/findings?${qs.toString()}`)
@@ -108,7 +111,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [drilldown, severityFilter]);
+  }, [drilldown, severityFilter, mineOnly]);
 
   // Pre-flatten the per-asset / per-checklist rows for the table.
   const checklistRows = useMemo(() => {
@@ -439,6 +442,32 @@ export default function Dashboard() {
               { id: "stig", header: "STIG", cell: (f) => f.stigTitle },
               { id: "owner", header: "Owner", cell: (f) => f.ownerName },
               {
+                id: "assignee",
+                header: "Assignee",
+                cell: (f) =>
+                  f.assigneeName ? (
+                    f.assigneeName
+                  ) : (
+                    <Box color="text-status-inactive">Unassigned</Box>
+                  ),
+              },
+              {
+                id: "due",
+                header: "Due",
+                cell: (f) => {
+                  if (!f.dueDate) {
+                    return <Box color="text-status-inactive">—</Box>;
+                  }
+                  const due = new Date(f.dueDate);
+                  const overdue = due < new Date();
+                  return (
+                    <Box color={overdue ? "text-status-error" : "inherit"}>
+                      {f.dueDate}
+                    </Box>
+                  );
+                },
+              },
+              {
                 id: "updated",
                 header: "Last update",
                 cell: (f) => new Date(f.updatedAt).toLocaleString(),
@@ -460,18 +489,26 @@ export default function Dashboard() {
               </Header>
             }
             filter={
-              <Select
-                selectedOption={severityFilter ?? SEVERITY_OPTIONS[0]}
-                onChange={({ detail }) =>
-                  setSeverityFilter(
-                    detail.selectedOption.value
-                      ? detail.selectedOption
-                      : null,
-                  )
-                }
-                options={SEVERITY_OPTIONS}
-                ariaLabel="Filter by severity"
-              />
+              <SpaceBetween direction="horizontal" size="m">
+                <Select
+                  selectedOption={severityFilter ?? SEVERITY_OPTIONS[0]}
+                  onChange={({ detail }) =>
+                    setSeverityFilter(
+                      detail.selectedOption.value
+                        ? detail.selectedOption
+                        : null,
+                    )
+                  }
+                  options={SEVERITY_OPTIONS}
+                  ariaLabel="Filter by severity"
+                />
+                <Toggle
+                  checked={mineOnly}
+                  onChange={({ detail }) => setMineOnly(detail.checked)}
+                >
+                  Mine only
+                </Toggle>
+              </SpaceBetween>
             }
             empty={
               <Box textAlign="center" padding="l">

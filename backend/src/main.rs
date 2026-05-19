@@ -22,8 +22,8 @@ use api::{
         update_asset_handler,
     },
     auth::{
-        auth_middleware, build_oidc_context, callback_handler, login_handler, logout_handler,
-        me_handler, AppAuthState, OidcEnv,
+        auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
+        logout_handler, me_handler, AppAuthState, OidcEnv,
     },
     catalog::{get_catalog, get_health},
     checklists::{
@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
             "/api/drafts/:id/comments",
             get(list_comments_handler).post(add_comment_handler),
         )
+        .route("/api/users", get(list_users_handler))
         .route("/api/users/me", get(me_handler))
         .route("/api/dashboard", get(get_dashboard_handler))
         .route("/api/dashboard/trend", get(get_dashboard_trend_handler))

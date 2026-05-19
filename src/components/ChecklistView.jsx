@@ -14,6 +14,8 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import TextFilter from "@cloudscape-design/components/text-filter";
+import Select from "@cloudscape-design/components/select";
+import DatePicker from "@cloudscape-design/components/date-picker";
 import { apiGet, apiJson } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 
@@ -50,9 +52,12 @@ export default function ChecklistView({ checklistId, onBack }) {
     status: "not_reviewed",
     findingDetails: "",
     comments: "",
+    assigneeId: null,
+    dueDate: "",
   });
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
+  const [users, setUsers] = useState([]);
 
   const [filter, setFilter] = useState("");
 
@@ -72,6 +77,21 @@ export default function ChecklistView({ checklistId, onBack }) {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Load the user list once for the Assignee Select.
+  useEffect(() => {
+    let cancelled = false;
+    apiGet("/api/users")
+      .then((rows) => {
+        if (!cancelled) setUsers(rows);
+      })
+      .catch(() => {
+        // Non-fatal — the Select just won't have options.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const isOwner = detail && currentUser?.id === detail.asset.ownerId;
 
@@ -99,6 +119,8 @@ export default function ChecklistView({ checklistId, onBack }) {
       status: rule.state.status,
       findingDetails: rule.state.findingDetails,
       comments: rule.state.comments,
+      assigneeId: rule.state.assigneeId ?? null,
+      dueDate: rule.state.dueDate ?? "",
     });
     setSaveError(null);
     setEditing(rule);
@@ -109,10 +131,15 @@ export default function ChecklistView({ checklistId, onBack }) {
     setSaving(true);
     setSaveError(null);
     try {
+      // DatePicker yields YYYY/MM/DD or YYYY-MM-DD; backend wants YYYY-MM-DD,
+      // and an empty string should mean "no due date" → null.
+      const dueDate = draft.dueDate
+        ? draft.dueDate.replace(/\//g, "-")
+        : null;
       await apiJson(
         `/api/checklists/${checklistId}/rules/${encodeURIComponent(editing.id)}`,
         "PATCH",
-        draft,
+        { ...draft, dueDate },
       );
       setEditing(null);
       await refresh();
@@ -268,6 +295,46 @@ export default function ChecklistView({ checklistId, onBack }) {
                 items={STATUSES.map((s) => ({ value: s.value, label: s.label }))}
               />
             </FormField>
+            <ColumnLayout columns={2}>
+              <FormField label="Assignee">
+                <Select
+                  selectedOption={
+                    draft.assigneeId
+                      ? {
+                          value: draft.assigneeId,
+                          label:
+                            users.find((u) => u.id === draft.assigneeId)
+                              ?.displayName ?? draft.assigneeId,
+                        }
+                      : { value: null, label: "Unassigned" }
+                  }
+                  onChange={({ detail: d }) =>
+                    setDraft((f) => ({
+                      ...f,
+                      assigneeId: d.selectedOption.value || null,
+                    }))
+                  }
+                  options={[
+                    { value: null, label: "Unassigned" },
+                    ...users.map((u) => ({
+                      value: u.id,
+                      label: u.displayName,
+                    })),
+                  ]}
+                  disabled={!isOwner}
+                />
+              </FormField>
+              <FormField label="Due date">
+                <DatePicker
+                  value={draft.dueDate}
+                  onChange={({ detail: d }) =>
+                    setDraft((f) => ({ ...f, dueDate: d.value }))
+                  }
+                  placeholder="YYYY/MM/DD"
+                  disabled={!isOwner}
+                />
+              </FormField>
+            </ColumnLayout>
             <FormField label="Finding details" description="What was observed?">
               <Textarea
                 value={draft.findingDetails}
