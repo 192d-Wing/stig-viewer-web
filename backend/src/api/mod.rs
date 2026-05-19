@@ -6,6 +6,7 @@ pub mod checklists;
 pub mod dashboard;
 pub mod drafts;
 pub mod findings;
+pub mod report;
 pub mod stig;
 pub mod test_support;
 pub mod upload;
