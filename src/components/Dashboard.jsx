@@ -45,6 +45,24 @@ function pct(numer, denom) {
   return Math.round((numer / denom) * 1000) / 10; // one decimal
 }
 
+const AUDIT_FIELD_LABELS = {
+  status: "status",
+  finding_details: "finding details",
+  comments: "comments",
+  assignee_id: "assignee",
+  due_date: "due date",
+};
+
+function auditFieldLabel(field) {
+  return AUDIT_FIELD_LABELS[field] ?? field;
+}
+
+function formatAuditValue(v) {
+  if (v == null) return "";
+  if (v.length > 60) return v.slice(0, 60) + "…";
+  return v;
+}
+
 function drilldownTitle(d) {
   if (d.ruleId) return "Rule drill-down";
   if (d.kind === "overdue") return "Overdue findings";
@@ -80,6 +98,10 @@ export default function Dashboard() {
 
   // Inline expanded finding shown below the drill-down table.
   const [expandedFinding, setExpandedFinding] = useState(null);
+  const [ruleHistory, setRuleHistory] = useState([]);
+
+  // Recent activity (loaded with the rest of the dashboard).
+  const [activity, setActivity] = useState([]);
 
   // Baselines
   const [baselines, setBaselines] = useState([]);
@@ -98,12 +120,14 @@ export default function Dashboard() {
     setLoading(true);
     setError(null);
     try {
-      const [d, t] = await Promise.all([
+      const [d, t, a] = await Promise.all([
         apiGet("/api/dashboard"),
         apiGet("/api/dashboard/trend?days=30"),
+        apiGet("/api/activity?limit=25").catch(() => []),
       ]);
       setData(d);
       setTrend(t);
+      setActivity(a);
       setRefreshTick((n) => n + 1);
     } catch (err) {
       setError(err.message);
@@ -190,6 +214,27 @@ export default function Dashboard() {
   useEffect(() => {
     setExpandedFinding(null);
   }, [drilldown, severityFilter, mineOnly]);
+
+  // Load the audit history for whichever rule is expanded.
+  useEffect(() => {
+    if (!expandedFinding) {
+      setRuleHistory([]);
+      return;
+    }
+    let cancelled = false;
+    apiGet(
+      `/api/checklists/${expandedFinding.checklistId}/rules/${encodeURIComponent(expandedFinding.ruleId)}/history`,
+    )
+      .then((rows) => {
+        if (!cancelled) setRuleHistory(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setRuleHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [expandedFinding]);
 
   // Load findings when drilldown is active or severity filter changes.
   useEffect(() => {
@@ -738,6 +783,34 @@ export default function Dashboard() {
                 {new Date(expandedFinding.updatedAt).toLocaleString()} ·
                 owner {expandedFinding.ownerName}
               </Box>
+
+              {ruleHistory.length > 0 && (
+                <div>
+                  <Box variant="awsui-key-label">History</Box>
+                  <Box padding={{ top: "xs" }}>
+                    {ruleHistory.map((h) => (
+                      <Box key={h.id} padding={{ vertical: "xxs" }}>
+                        <Box
+                          variant="small"
+                          color="text-body-secondary"
+                          display="inline"
+                        >
+                          {new Date(h.occurredAt).toLocaleString()}
+                        </Box>{" "}
+                        <strong>{h.userName}</strong> changed{" "}
+                        <em>{auditFieldLabel(h.field)}</em>:{" "}
+                        <span style={{ opacity: 0.7 }}>
+                          {formatAuditValue(h.fromValue) || "(empty)"}
+                        </span>{" "}
+                        →{" "}
+                        <strong>
+                          {formatAuditValue(h.toValue) || "(empty)"}
+                        </strong>
+                      </Box>
+                    ))}
+                  </Box>
+                </div>
+              )}
             </SpaceBetween>
           </Container>
         )}
@@ -816,6 +889,48 @@ export default function Dashboard() {
                 />
               </ColumnLayout>
             )}
+          </Container>
+        )}
+
+        {/* Recent activity */}
+        {activity.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                counter={`(${activity.length})`}
+                description="The most recent rule-state changes across all systems."
+              >
+                Recent activity
+              </Header>
+            }
+          >
+            <SpaceBetween direction="vertical" size="xs">
+              {activity.map((a) => (
+                <Box key={a.id} variant="small">
+                  <Box
+                    display="inline"
+                    color="text-body-secondary"
+                    variant="span"
+                  >
+                    {new Date(a.occurredAt).toLocaleString()}
+                  </Box>{" "}
+                  <strong>{a.userName}</strong> changed{" "}
+                  <em>{auditFieldLabel(a.field)}</em> on{" "}
+                  <strong>{a.ruleId}</strong>
+                  {a.assetName && (
+                    <>
+                      {" — "}
+                      <span style={{ opacity: 0.7 }}>{a.assetName}</span>
+                    </>
+                  )}{" "}
+                  <span style={{ opacity: 0.6 }}>
+                    ({formatAuditValue(a.fromValue) || "—"} →{" "}
+                    {formatAuditValue(a.toValue) || "—"})
+                  </span>
+                </Box>
+              ))}
+            </SpaceBetween>
           </Container>
         )}
 
