@@ -16,6 +16,7 @@ import STIGView from "./components/STIGView.jsx";
 import DiffView from "./components/DiffView.jsx";
 import RuleDetail from "./components/RuleDetail.jsx";
 import STIGWriter from "./components/STIGWriter.jsx";
+import AssetsLibrary from "./components/AssetsLibrary.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
 import { apiFetch } from "./utils/api.js";
 
@@ -55,6 +56,8 @@ export default function App() {
   const fileInputRef = useRef(null);
 
   const isWriter = appMode === "writer";
+  const isSystems = appMode === "systems";
+  const isLibraryMode = !isWriter && !isSystems;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isDiffMode = diffPair !== null;
@@ -102,7 +105,7 @@ export default function App() {
     {
       type: "button",
       text: "Viewer",
-      variant: !isWriter ? "primary-button" : undefined,
+      variant: isLibraryMode ? "primary-button" : undefined,
       onClick: () => setAppMode("viewer"),
     },
     {
@@ -111,8 +114,14 @@ export default function App() {
       variant: isWriter ? "primary-button" : undefined,
       onClick: () => setAppMode("writer"),
     },
+    {
+      type: "button",
+      text: "Systems",
+      variant: isSystems ? "primary-button" : undefined,
+      onClick: () => setAppMode("systems"),
+    },
   ];
-  if (!isWriter && hasTabs) {
+  if (isLibraryMode && hasTabs) {
     utilities.push({
       type: "button",
       text: "Open File",
@@ -174,7 +183,9 @@ export default function App() {
 
   // Determine content
   let content;
-  if (isWriter) {
+  if (isSystems) {
+    content = <AssetsLibrary />;
+  } else if (isWriter) {
     content = (
       <STIGWriter
         initialDraftId={writerDraftId}
