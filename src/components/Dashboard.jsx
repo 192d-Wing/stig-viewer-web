@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import Container from "@cloudscape-design/components/container";
 import Header from "@cloudscape-design/components/header";
 import Box from "@cloudscape-design/components/box";
@@ -14,7 +14,11 @@ import LineChart from "@cloudscape-design/components/line-chart";
 import Button from "@cloudscape-design/components/button";
 import Select from "@cloudscape-design/components/select";
 import Toggle from "@cloudscape-design/components/toggle";
-import { apiGet } from "../utils/api.js";
+import Modal from "@cloudscape-design/components/modal";
+import FormField from "@cloudscape-design/components/form-field";
+import Input from "@cloudscape-design/components/input";
+import { apiFetch, apiGet, apiJson } from "../utils/api.js";
+import { AuthContext } from "./AuthGate.jsx";
 
 const SEVERITY_OPTIONS = [
   { label: "All severities", value: null },
@@ -60,6 +64,7 @@ function describeDrilldown(d) {
 }
 
 export default function Dashboard() {
+  const currentUser = useContext(AuthContext);
   const [data, setData] = useState(null);
   const [trend, setTrend] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -76,6 +81,19 @@ export default function Dashboard() {
   // Inline expanded finding shown below the drill-down table.
   const [expandedFinding, setExpandedFinding] = useState(null);
 
+  // Baselines
+  const [baselines, setBaselines] = useState([]);
+  const [selectedBaselineId, setSelectedBaselineId] = useState(null);
+  const [baselineDiff, setBaselineDiff] = useState(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  // Bumped by the dashboard's Refresh button so the diff useEffect re-fires
+  // even when selectedBaselineId is unchanged.
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [newBaselineName, setNewBaselineName] = useState("");
+  const [savingBaseline, setSavingBaseline] = useState(false);
+  const [saveBaselineError, setSaveBaselineError] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -86,6 +104,7 @@ export default function Dashboard() {
       ]);
       setData(d);
       setTrend(t);
+      setRefreshTick((n) => n + 1);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -96,6 +115,76 @@ export default function Dashboard() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const refreshBaselines = useCallback(async () => {
+    try {
+      const rows = await apiGet("/api/baselines");
+      setBaselines(rows);
+      setSelectedBaselineId((curr) => {
+        if (curr && rows.find((b) => b.id === curr)) return curr;
+        return rows[0]?.id ?? null;
+      });
+    } catch {
+      // Non-fatal — leave the picker empty.
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshBaselines();
+  }, [refreshBaselines]);
+
+  // Load diff when a baseline is selected.
+  useEffect(() => {
+    if (!selectedBaselineId) {
+      setBaselineDiff(null);
+      return;
+    }
+    let cancelled = false;
+    setDiffLoading(true);
+    apiGet(`/api/baselines/${selectedBaselineId}/diff`)
+      .then((d) => {
+        if (!cancelled) setBaselineDiff(d);
+      })
+      .catch(() => {
+        if (!cancelled) setBaselineDiff(null);
+      })
+      .finally(() => {
+        if (!cancelled) setDiffLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedBaselineId, refreshTick]);
+
+  const saveBaseline = useCallback(async () => {
+    const name = newBaselineName.trim();
+    if (!name) {
+      setSaveBaselineError("Name is required.");
+      return;
+    }
+    setSavingBaseline(true);
+    setSaveBaselineError(null);
+    try {
+      const created = await apiJson("/api/baselines", "POST", { name });
+      setSaveModalOpen(false);
+      setNewBaselineName("");
+      await refreshBaselines();
+      setSelectedBaselineId(created.id);
+    } catch (err) {
+      setSaveBaselineError(err.message);
+    } finally {
+      setSavingBaseline(false);
+    }
+  }, [newBaselineName, refreshBaselines]);
+
+  const deleteBaseline = useCallback(
+    async (id) => {
+      const res = await apiFetch(`/api/baselines/${id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 204) return;
+      await refreshBaselines();
+    },
+    [refreshBaselines],
+  );
 
   // Close the expanded panel whenever the drill-down/filter changes.
   useEffect(() => {
@@ -201,9 +290,20 @@ export default function Dashboard() {
         <Header
           variant="h1"
           actions={
-            <Button iconName="refresh" onClick={refresh}>
-              Refresh
-            </Button>
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button
+                onClick={() => {
+                  setNewBaselineName("");
+                  setSaveBaselineError(null);
+                  setSaveModalOpen(true);
+                }}
+              >
+                Save baseline
+              </Button>
+              <Button iconName="refresh" onClick={refresh}>
+                Refresh
+              </Button>
+            </SpaceBetween>
           }
         >
           Compliance dashboard
@@ -641,8 +741,160 @@ export default function Dashboard() {
             </SpaceBetween>
           </Container>
         )}
+
+        {/* Changes since baseline */}
+        {baselines.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={
+                  baselineDiff
+                    ? `${baselineDiff.regressed.length} regressed · ${baselineDiff.improved.length} improved · ${baselineDiff.unchanged} unchanged`
+                    : "Pick a baseline to see what changed since."
+                }
+                actions={
+                  <SpaceBetween direction="horizontal" size="xs">
+                    <Select
+                      selectedOption={
+                        selectedBaselineId
+                          ? {
+                              value: selectedBaselineId,
+                              label:
+                                baselines.find(
+                                  (b) => b.id === selectedBaselineId,
+                                )?.name ?? selectedBaselineId,
+                            }
+                          : null
+                      }
+                      onChange={({ detail }) =>
+                        setSelectedBaselineId(detail.selectedOption.value)
+                      }
+                      options={baselines.map((b) => ({
+                        value: b.id,
+                        label: b.name,
+                        description: `by ${b.createdByName} · ${b.ruleCount} rules`,
+                      }))}
+                      placeholder="Choose a baseline"
+                    />
+                    {selectedBaselineId && (
+                      <Button
+                        variant="normal"
+                        disabled={
+                          !baselines.find(
+                            (b) =>
+                              b.id === selectedBaselineId &&
+                              b.createdBy === currentUser?.id,
+                          )
+                        }
+                        onClick={() => deleteBaseline(selectedBaselineId)}
+                      >
+                        Delete
+                      </Button>
+                    )}
+                  </SpaceBetween>
+                }
+              >
+                Changes since baseline
+              </Header>
+            }
+          >
+            {diffLoading && (
+              <StatusIndicator type="loading">Loading…</StatusIndicator>
+            )}
+            {baselineDiff && (
+              <ColumnLayout columns={2}>
+                <DiffTable
+                  title="Regressed"
+                  tone="red"
+                  rows={baselineDiff.regressed}
+                />
+                <DiffTable
+                  title="Improved"
+                  tone="green"
+                  rows={baselineDiff.improved}
+                />
+              </ColumnLayout>
+            )}
+          </Container>
+        )}
+
+        {/* Save baseline modal */}
+        <Modal
+          visible={saveModalOpen}
+          onDismiss={() => setSaveModalOpen(false)}
+          header="Save baseline"
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="link"
+                  onClick={() => setSaveModalOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={savingBaseline}
+                  onClick={saveBaseline}
+                >
+                  Save
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="p" color="text-body-secondary">
+              Capture the current compliance state as a named baseline.
+              Future dashboard sessions can show which rules regressed
+              or improved since this baseline was taken.
+            </Box>
+            <FormField label="Name">
+              <Input
+                value={newBaselineName}
+                onChange={({ detail }) => setNewBaselineName(detail.value)}
+                placeholder="e.g. Q2 2026 audit"
+                autoFocus
+              />
+            </FormField>
+            {saveBaselineError && (
+              <Alert type="error">{saveBaselineError}</Alert>
+            )}
+          </SpaceBetween>
+        </Modal>
       </SpaceBetween>
     </Box>
+  );
+}
+
+function DiffTable({ title, tone, rows }) {
+  return (
+    <div>
+      <Box variant="awsui-key-label">
+        <Badge color={tone}>{title}</Badge>{" "}
+        <span style={{ marginLeft: 8 }}>({rows.length})</span>
+      </Box>
+      {rows.length === 0 ? (
+        <Box color="text-body-secondary" padding={{ top: "xs" }}>
+          None.
+        </Box>
+      ) : (
+        <Box padding={{ top: "xs" }}>
+          {rows.map((r) => (
+            <Box
+              key={`${r.checklistId}:${r.ruleId}`}
+              padding={{ vertical: "xxs" }}
+            >
+              <strong>{r.ruleId}</strong> — {r.assetName} ·{" "}
+              <span style={{ opacity: 0.7 }}>
+                {r.fromStatus} → {r.toStatus}
+              </span>
+            </Box>
+          ))}
+        </Box>
+      )}
+    </div>
   );
 }
 
