@@ -1,5 +1,10 @@
-use axum::{extract::State, http::StatusCode, Json};
-use serde::Serialize;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::AppState;
@@ -189,6 +194,178 @@ pub async fn get_handler(
 
 async fn count_one(pool: &sqlx::PgPool, sql: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await
+}
+
+// ── Snapshots ───────────────────────────────────────────────────────────────
+
+/// Capture one snapshot row per current checklist. Idempotent at second
+/// resolution but the (captured_at, checklist_id) PK means two snapshots
+/// within the same second would collide; for the daily scheduler that's
+/// not a concern, and the test-only manual trigger sleeps to dodge it.
+pub async fn take_snapshot(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        r#"
+        INSERT INTO checklist_snapshots
+            (checklist_id, asset_id, stig_id, rule_count,
+             open_count, naf_count, na_count, reviewed_count)
+        SELECT
+            c.id,
+            c.asset_id,
+            c.stig_id,
+            COALESCE(sc.rule_count, 0),
+            COALESCE(SUM(CASE WHEN cr.status = 'open' THEN 1 ELSE 0 END), 0)::INT,
+            COALESCE(SUM(CASE WHEN cr.status = 'not_a_finding' THEN 1 ELSE 0 END), 0)::INT,
+            COALESCE(SUM(CASE WHEN cr.status = 'not_applicable' THEN 1 ELSE 0 END), 0)::INT,
+            COUNT(cr.rule_id)::INT
+        FROM checklists c
+        LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
+        LEFT JOIN checklist_rules cr ON cr.checklist_id = c.id
+        GROUP BY c.id, c.asset_id, c.stig_id, sc.rule_count
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// POST /api/test/snapshot — manually take a snapshot. Only registered
+/// when STIG_ENV != "production"; used by E2E to populate trend data.
+pub async fn snapshot_handler(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
+    take_snapshot(state.pool.as_ref()).await.map_err(map_db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrendQuery {
+    #[serde(default = "default_days")]
+    pub days: i64,
+}
+
+fn default_days() -> i64 {
+    30
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrendResponse {
+    pub overall: Vec<TrendPoint>,
+    pub by_asset: Vec<AssetTrend>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrendPoint {
+    pub captured_at: DateTime<Utc>,
+    pub open: i64,
+    pub naf: i64,
+    pub na: i64,
+    pub reviewed: i64,
+    pub total: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetTrend {
+    pub asset_id: String,
+    pub asset_name: String,
+    pub series: Vec<TrendPoint>,
+}
+
+/// GET /api/dashboard/trend?days=N — aggregated trend over the last N days.
+///
+/// Buckets by `captured_at` (one bucket per snapshot run) and sums counts
+/// across checklists. Per-asset series sums across an asset's checklists.
+pub async fn trend_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TrendQuery>,
+) -> Result<Json<TrendResponse>, StatusCode> {
+    let pool = state.pool.as_ref();
+    let days = params.days.clamp(1, 365);
+
+    // Overall: one row per captured_at, summed across all checklists.
+    let overall_rows = sqlx::query(
+        r#"
+        SELECT
+            captured_at,
+            SUM(open_count)::BIGINT     AS open,
+            SUM(naf_count)::BIGINT      AS naf,
+            SUM(na_count)::BIGINT       AS na,
+            SUM(reviewed_count)::BIGINT AS reviewed,
+            SUM(rule_count)::BIGINT     AS total
+        FROM checklist_snapshots
+        WHERE captured_at >= NOW() - ($1 || ' days')::INTERVAL
+        GROUP BY captured_at
+        ORDER BY captured_at ASC
+        "#,
+    )
+    .bind(days.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_db)?;
+
+    let overall = overall_rows
+        .into_iter()
+        .map(|r| -> Result<TrendPoint, sqlx::Error> {
+            Ok(TrendPoint {
+                captured_at: r.try_get("captured_at")?,
+                open: r.try_get("open")?,
+                naf: r.try_get("naf")?,
+                na: r.try_get("na")?,
+                reviewed: r.try_get("reviewed")?,
+                total: r.try_get("total")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_db)?;
+
+    // Per-asset: rows are sorted by asset, then by captured_at, so we can
+    // fold them into AssetTrend entries in a single pass.
+    let asset_rows = sqlx::query(
+        r#"
+        SELECT
+            s.asset_id,
+            a.name AS asset_name,
+            s.captured_at,
+            SUM(s.open_count)::BIGINT     AS open,
+            SUM(s.naf_count)::BIGINT      AS naf,
+            SUM(s.na_count)::BIGINT       AS na,
+            SUM(s.reviewed_count)::BIGINT AS reviewed,
+            SUM(s.rule_count)::BIGINT     AS total
+        FROM checklist_snapshots s
+        JOIN assets a ON a.id = s.asset_id
+        WHERE s.captured_at >= NOW() - ($1 || ' days')::INTERVAL
+        GROUP BY s.asset_id, a.name, s.captured_at
+        ORDER BY s.asset_id, s.captured_at ASC
+        "#,
+    )
+    .bind(days.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_db)?;
+
+    let mut by_asset: Vec<AssetTrend> = Vec::new();
+    for r in asset_rows {
+        let asset_id: String = r.try_get("asset_id").map_err(map_db)?;
+        let asset_name: String = r.try_get("asset_name").map_err(map_db)?;
+        let point = TrendPoint {
+            captured_at: r.try_get("captured_at").map_err(map_db)?,
+            open: r.try_get("open").map_err(map_db)?,
+            naf: r.try_get("naf").map_err(map_db)?,
+            na: r.try_get("na").map_err(map_db)?,
+            reviewed: r.try_get("reviewed").map_err(map_db)?,
+            total: r.try_get("total").map_err(map_db)?,
+        };
+        match by_asset.last_mut() {
+            Some(t) if t.asset_id == asset_id => t.series.push(point),
+            _ => by_asset.push(AssetTrend {
+                asset_id,
+                asset_name,
+                series: vec![point],
+            }),
+        }
+    }
+
+    Ok(Json(TrendResponse { overall, by_asset }))
 }
 
 fn map_db(e: sqlx::Error) -> StatusCode {
