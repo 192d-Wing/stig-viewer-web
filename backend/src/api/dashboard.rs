@@ -23,8 +23,19 @@ pub struct Totals {
     pub assets: i64,
     pub checklists: i64,
     pub open_findings: i64,
+    pub overdue_findings: i64, // Open with due_date < CURRENT_DATE
+    pub stale_findings: i64,   // Open with no activity in N days (default 30)
+    pub stale_threshold_days: i64,
     pub reviewed_rules: i64,   // count of rule rows that have been touched
     pub total_rules: i64,      // sum of stig.rule_count across all checklists
+}
+
+fn stale_threshold_days() -> i64 {
+    std::env::var("STALE_FINDING_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &i64| n > 0)
+        .unwrap_or(30)
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +55,7 @@ pub struct ChecklistSummary {
     pub stig_title: String,
     pub rule_count: i64,
     pub open_count: i64,
+    pub overdue_count: i64,
     pub naf_count: i64,
     pub na_count: i64,
     pub reviewed_count: i64,
@@ -62,13 +74,36 @@ pub async fn get_handler(
 ) -> Result<Json<DashboardResponse>, StatusCode> {
     let pool = state.pool.as_ref();
 
+    let stale_days = stale_threshold_days();
+
     // Totals — independent, can run in parallel.
-    let (assets_count, checklists_count, open_count, reviewed_count, total_rules) = tokio::join!(
+    let (
+        assets_count,
+        checklists_count,
+        open_count,
+        overdue_count,
+        stale_count,
+        reviewed_count,
+        total_rules,
+    ) = tokio::join!(
         count_one(pool, "SELECT COUNT(*) FROM assets"),
         count_one(pool, "SELECT COUNT(*) FROM checklists"),
         count_one(
             pool,
-            "SELECT COUNT(*) FROM checklist_rules WHERE status = 'open'"
+            "SELECT COUNT(*) FROM checklist_rules WHERE status = 'open'",
+        ),
+        count_one(
+            pool,
+            "SELECT COUNT(*) FROM checklist_rules \
+             WHERE status = 'open' AND due_date IS NOT NULL AND due_date < CURRENT_DATE",
+        ),
+        count_one_with(
+            pool,
+            // No activity in N days. Uses updated_at as proxy; revisit if a
+            // dedicated status_changed_at column is added later.
+            "SELECT COUNT(*) FROM checklist_rules \
+             WHERE status = 'open' AND updated_at < NOW() - ($1 || ' days')::INTERVAL",
+            stale_days.to_string(),
         ),
         count_one(pool, "SELECT COUNT(*) FROM checklist_rules"),
         count_one(
@@ -85,6 +120,9 @@ pub async fn get_handler(
         assets: assets_count.map_err(map_db)?,
         checklists: checklists_count.map_err(map_db)?,
         open_findings: open_count.map_err(map_db)?,
+        overdue_findings: overdue_count.map_err(map_db)?,
+        stale_findings: stale_count.map_err(map_db)?,
+        stale_threshold_days: stale_days,
         reviewed_rules: reviewed_count.map_err(map_db)?,
         total_rules: total_rules.map_err(map_db)?,
     };
@@ -103,6 +141,8 @@ pub async fn get_handler(
             COALESCE(sc.title, c.stig_id) AS stig_title,
             COALESCE(sc.rule_count, 0)::BIGINT AS rule_count,
             COALESCE(SUM(CASE WHEN cr.status = 'open' THEN 1 ELSE 0 END), 0)           AS open_count,
+            COALESCE(SUM(CASE WHEN cr.status = 'open' AND cr.due_date IS NOT NULL
+                                 AND cr.due_date < CURRENT_DATE THEN 1 ELSE 0 END), 0) AS overdue_count,
             COALESCE(SUM(CASE WHEN cr.status = 'not_a_finding' THEN 1 ELSE 0 END), 0)  AS naf_count,
             COALESCE(SUM(CASE WHEN cr.status = 'not_applicable' THEN 1 ELSE 0 END), 0) AS na_count,
             COUNT(cr.rule_id) AS reviewed_count
@@ -149,6 +189,7 @@ pub async fn get_handler(
                 stig_title: row.try_get("stig_title").map_err(map_sqlx)?,
                 rule_count: row.try_get("rule_count").map_err(map_sqlx)?,
                 open_count: row.try_get("open_count").map_err(map_sqlx)?,
+                overdue_count: row.try_get("overdue_count").map_err(map_sqlx)?,
                 naf_count: row.try_get("naf_count").map_err(map_sqlx)?,
                 na_count: row.try_get("na_count").map_err(map_sqlx)?,
                 reviewed_count: row.try_get("reviewed_count").map_err(map_sqlx)?,
@@ -194,6 +235,17 @@ pub async fn get_handler(
 
 async fn count_one(pool: &sqlx::PgPool, sql: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await
+}
+
+async fn count_one_with(
+    pool: &sqlx::PgPool,
+    sql: &str,
+    arg: String,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(sql)
+        .bind(arg)
+        .fetch_one(pool)
+        .await
 }
 
 // ── Snapshots ───────────────────────────────────────────────────────────────
