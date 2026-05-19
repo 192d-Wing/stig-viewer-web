@@ -439,10 +439,3 @@ pub async fn add_comment_handler(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-// ── User endpoints ──────────────────────────────────────────────────────────
-
-pub async fn get_me_handler(
-    Extension(user): Extension<AuthUser>,
-) -> Json<AuthUser> {
-    Json(user)
-}

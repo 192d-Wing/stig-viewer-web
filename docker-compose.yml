@@ -47,6 +47,18 @@ services:
       # Hours between DISA sync runs; set to a huge number to effectively disable
       # (used by CI to keep startup fast and avoid hitting external URLs).
       STIG_SYNC_INTERVAL_HOURS: ${STIG_SYNC_INTERVAL_HOURS:-24}
+      # OIDC config. The internal URL is used by the backend for discovery
+      # and token exchange (server-to-server, via the docker network). The
+      # public URL is what the backend redirects the browser to.
+      OIDC_INTERNAL_URL: http://keycloak:8081/realms/stig-viewer
+      OIDC_PUBLIC_URL: http://localhost:8081
+      OIDC_CLIENT_ID: stig-viewer-app
+      OIDC_CLIENT_SECRET: dev-only-not-a-real-secret
+      OIDC_REDIRECT_URI: http://localhost:8080/auth/callback
+      FRONTEND_URL: ${VITE_API_URL_FRONTEND:-http://localhost:5173}
+      # Allow the X-User-Id test bypass. Production deployments MUST leave
+      # this unset (the backend additionally refuses it when STIG_ENV=production).
+      ALLOW_TEST_AUTH_HEADER: ${ALLOW_TEST_AUTH_HEADER:-true}
       CARGO_TARGET_DIR: /target
     ports:
       - "8080:8080"
@@ -56,6 +68,8 @@ services:
       - cargo_registry:/usr/local/cargo/registry
     depends_on:
       postgres:
+        condition: service_healthy
+      keycloak:
         condition: service_healthy
     command: cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
 
