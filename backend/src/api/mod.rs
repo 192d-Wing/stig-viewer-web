@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod auth;
 pub mod catalog;
+pub mod checklists;
 pub mod drafts;
 pub mod stig;
 pub mod test_support;
