@@ -42,7 +42,7 @@ use api::{
     drafts::*,
     findings::list_handler as list_findings_handler,
     stig::get_stig,
-    test_support::{reset_handler, set_role_handler},
+    test_support::{backdate_handler, reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
 };
 use config::{load_sources, Config};
@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
             .route("/api/test/reset", post(reset_handler))
             .route("/api/test/set-role", post(set_role_handler))
             .route("/api/test/snapshot", post(snapshot_trigger_handler))
+            .route("/api/test/backdate-rule", post(backdate_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }

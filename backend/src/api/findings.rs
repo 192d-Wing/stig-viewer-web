@@ -23,6 +23,12 @@ pub struct FindingsQuery {
     /// Filter by assignee. The literal value "me" resolves to the
     /// authenticated user's id; any other value is treated as a user id.
     pub assignee: Option<String>,
+    /// When true, only return findings whose due_date is before today.
+    #[serde(default)]
+    pub past_due: bool,
+    /// When set, only return findings with no activity (updated_at) in
+    /// the last N days.
+    pub older_than_days: Option<i64>,
 }
 
 fn default_status() -> String {
@@ -113,9 +119,11 @@ pub async fn list_handler(
         LEFT JOIN users au         ON au.id = cr.assignee_id
         LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
         WHERE cr.status = $1
-          AND ($2::text IS NULL OR cr.rule_id    = $2)
-          AND ($3::text IS NULL OR c.asset_id    = $3)
+          AND ($2::text IS NULL OR cr.rule_id     = $2)
+          AND ($3::text IS NULL OR c.asset_id     = $3)
           AND ($4::text IS NULL OR cr.assignee_id = $4)
+          AND ($5::bool = false OR (cr.due_date IS NOT NULL AND cr.due_date < CURRENT_DATE))
+          AND ($6::text IS NULL OR cr.updated_at < NOW() - ($6 || ' days')::INTERVAL)
         ORDER BY a.name, c.stig_id, cr.rule_id
         "#,
     )
@@ -123,6 +131,8 @@ pub async fn list_handler(
     .bind(params.rule_id.as_deref())
     .bind(params.asset_id.as_deref())
     .bind(assignee_filter.as_deref())
+    .bind(params.past_due)
+    .bind(params.older_than_days.map(|n| n.to_string()))
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(|e| {

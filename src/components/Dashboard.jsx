@@ -41,6 +41,24 @@ function pct(numer, denom) {
   return Math.round((numer / denom) * 1000) / 10; // one decimal
 }
 
+function drilldownTitle(d) {
+  if (d.ruleId) return "Rule drill-down";
+  if (d.kind === "overdue") return "Overdue findings";
+  if (d.kind === "stale") return "Stale findings";
+  return "Open findings";
+}
+
+function describeDrilldown(d) {
+  if (d.ruleId) return `Open instances of ${d.ruleId} across systems.`;
+  if (d.kind === "overdue") {
+    return "Open findings whose due date has already passed.";
+  }
+  if (d.kind === "stale") {
+    return `Open findings with no activity in the last ${d.olderThanDays} days.`;
+  }
+  return "All currently-open findings across systems.";
+}
+
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [trend, setTrend] = useState(null);
@@ -96,6 +114,10 @@ export default function Dashboard() {
     if (drilldown.ruleId) qs.set("ruleId", drilldown.ruleId);
     if (severityFilter?.value) qs.set("severity", severityFilter.value);
     if (mineOnly) qs.set("assignee", "me");
+    if (drilldown.kind === "overdue") qs.set("pastDue", "true");
+    if (drilldown.kind === "stale" && drilldown.olderThanDays) {
+      qs.set("olderThanDays", String(drilldown.olderThanDays));
+    }
     setFindingsLoading(true);
     setFindingsError(null);
     apiGet(`/api/findings?${qs.toString()}`)
@@ -188,7 +210,7 @@ export default function Dashboard() {
         </Header>
 
         {/* KPI row */}
-        <ColumnLayout columns={4} variant="text-grid">
+        <ColumnLayout columns={6} variant="text-grid">
           <KpiCard label="Systems" value={totals.assets} />
           <KpiCard label="Applied STIGs" value={totals.checklists} />
           <KpiCard
@@ -196,7 +218,33 @@ export default function Dashboard() {
             value={totals.openFindings}
             tone={totals.openFindings > 0 ? "warning" : "ok"}
             onClick={
-              totals.openFindings > 0 ? () => setDrilldown({}) : undefined
+              totals.openFindings > 0
+                ? () => setDrilldown({ kind: "open" })
+                : undefined
+            }
+          />
+          <KpiCard
+            label="Overdue"
+            value={totals.overdueFindings}
+            tone={totals.overdueFindings > 0 ? "warning" : null}
+            onClick={
+              totals.overdueFindings > 0
+                ? () => setDrilldown({ kind: "overdue" })
+                : undefined
+            }
+          />
+          <KpiCard
+            label={`Stale (>${totals.staleThresholdDays}d)`}
+            value={totals.staleFindings}
+            tone={totals.staleFindings > 0 ? "warning" : null}
+            onClick={
+              totals.staleFindings > 0
+                ? () =>
+                    setDrilldown({
+                      kind: "stale",
+                      olderThanDays: totals.staleThresholdDays,
+                    })
+                : undefined
             }
           />
           <KpiCard
@@ -321,6 +369,16 @@ export default function Dashboard() {
                 r.empty ? null : (
                   <Badge color={r.openCount > 0 ? "red" : "grey"}>
                     {r.openCount}
+                  </Badge>
+                ),
+            },
+            {
+              id: "overdue",
+              header: "Overdue",
+              cell: (r) =>
+                r.empty ? null : (
+                  <Badge color={r.overdueCount > 0 ? "red" : "grey"}>
+                    {r.overdueCount}
                   </Badge>
                 ),
             },
@@ -475,17 +533,13 @@ export default function Dashboard() {
             ]}
             header={
               <Header
-                description={
-                  drilldown.ruleId
-                    ? `Open instances of ${drilldown.ruleId} across systems.`
-                    : "All currently-open findings across systems."
-                }
+                description={describeDrilldown(drilldown)}
                 counter={`(${findings.length})`}
                 actions={
                   <Button onClick={() => setDrilldown(null)}>Close</Button>
                 }
               >
-                {drilldown.ruleId ? "Rule drill-down" : "Open findings"}
+                {drilldownTitle(drilldown)}
               </Header>
             }
             filter={
