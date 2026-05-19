@@ -95,6 +95,17 @@ pub async fn upsert_rule(
     assignee_id: Option<&str>,
     due_date: Option<NaiveDate>,
 ) -> Result<ChecklistRuleRow> {
+    let mut tx = pool.begin().await?;
+
+    // Snapshot existing state (if any) so we can emit audit diffs.
+    let existing: Option<ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
+        "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = $2",
+    )
+    .bind(checklist_id)
+    .bind(rule_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
     let row = sqlx::query_as::<_, ChecklistRuleRow>(
         r#"
         INSERT INTO checklist_rules
@@ -120,14 +131,61 @@ pub async fn upsert_rule(
     .bind(updated_by)
     .bind(assignee_id)
     .bind(due_date)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+
+    // Audit: write one row per field that actually changed. For a brand-new
+    // row, treat "from" as the implicit defaults (status='not_reviewed',
+    // empty strings, NULLs) so the audit log shows the initial assignment.
+    let prev_status = existing.as_ref().map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+    let prev_finding = existing.as_ref().map(|e| e.finding_details.as_str()).unwrap_or("");
+    let prev_comments = existing.as_ref().map(|e| e.comments.as_str()).unwrap_or("");
+    let prev_assignee: Option<&str> = existing.as_ref().and_then(|e| e.assignee_id.as_deref());
+    let prev_due: Option<NaiveDate> = existing.as_ref().and_then(|e| e.due_date);
+
+    let due_str = due_date.map(|d| d.to_string());
+    let prev_due_str = prev_due.map(|d| d.to_string());
+
+    let diffs: Vec<(&str, Option<String>, Option<String>)> = vec![
+        ("status", Some(prev_status.into()), Some(status.into())),
+        (
+            "finding_details",
+            Some(prev_finding.into()),
+            Some(finding_details.into()),
+        ),
+        ("comments", Some(prev_comments.into()), Some(comments.into())),
+        (
+            "assignee_id",
+            prev_assignee.map(|s| s.into()),
+            assignee_id.map(|s| s.into()),
+        ),
+        ("due_date", prev_due_str, due_str),
+    ];
+    for (field, from, to) in diffs {
+        if from == to {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO rule_audit \
+             (user_id, checklist_id, rule_id, field, from_value, to_value) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(updated_by)
+        .bind(checklist_id)
+        .bind(rule_id)
+        .bind(field)
+        .bind(from)
+        .bind(to)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     // Bump the parent checklist's updated_at so the asset list reflects activity.
     sqlx::query("UPDATE checklists SET updated_at = NOW() WHERE id = $1")
         .bind(checklist_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await?;
     Ok(row)
 }

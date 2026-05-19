@@ -21,6 +21,7 @@ use api::{
         create_asset_handler, delete_asset_handler, get_asset_handler, list_assets_handler,
         update_asset_handler,
     },
+    audit::{activity_handler, rule_history_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
@@ -146,6 +147,11 @@ async fn main() -> Result<()> {
             "/api/checklists/:id/rules/:rule_id",
             axum::routing::patch(update_checklist_rule_handler),
         )
+        .route(
+            "/api/checklists/:id/rules/:rule_id/history",
+            get(rule_history_handler),
+        )
+        .route("/api/activity", get(activity_handler))
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
         .route(
