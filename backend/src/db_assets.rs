@@ -14,6 +14,8 @@ pub struct AssetRow {
     pub owner_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -26,10 +28,12 @@ pub struct AssetSummary {
     pub owner_id: String,
     pub owner_name: String,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub tags: Vec<String>,
 }
 
 pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
-    let rows = sqlx::query_as::<_, AssetSummary>(
+    let mut rows = sqlx::query_as::<_, AssetSummary>(
         r#"
         SELECT a.id, a.name, a.hostname, a.classification,
                a.owner_id, u.display_name AS owner_name, a.updated_at
@@ -40,6 +44,23 @@ pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
     )
     .fetch_all(pool)
     .await?;
+
+    // Attach tags in a single grouped query.
+    let tag_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut by_asset: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (asset_id, tag) in tag_rows {
+        by_asset.entry(asset_id).or_default().push(tag);
+    }
+    for r in &mut rows {
+        if let Some(tags) = by_asset.remove(&r.id) {
+            r.tags = tags;
+        }
+    }
     Ok(rows)
 }
 
@@ -48,7 +69,35 @@ pub async fn get_asset(pool: &PgPool, id: &str) -> Result<Option<AssetRow>> {
         .bind(id)
         .fetch_optional(pool)
         .await?;
-    Ok(row)
+    let mut row = match row {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let tags: Vec<String> =
+        sqlx::query_scalar("SELECT tag FROM asset_tags WHERE asset_id = $1 ORDER BY tag")
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
+    row.tags = tags;
+    Ok(Some(row))
+}
+
+/// Replace the asset's tag set. Inserts/deletes in a single transaction.
+pub async fn replace_tags(pool: &PgPool, asset_id: &str, tags: &[String]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM asset_tags WHERE asset_id = $1")
+        .bind(asset_id)
+        .execute(&mut *tx)
+        .await?;
+    for tag in tags {
+        sqlx::query("INSERT INTO asset_tags (asset_id, tag) VALUES ($1, $2)")
+            .bind(asset_id)
+            .bind(tag)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn insert_asset(pool: &PgPool, asset: &AssetRow) -> Result<()> {

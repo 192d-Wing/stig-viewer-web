@@ -12,6 +12,7 @@ import Textarea from "@cloudscape-design/components/textarea";
 import Alert from "@cloudscape-design/components/alert";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import TokenGroup from "@cloudscape-design/components/token-group";
 import { apiGet, apiJson, apiFetch } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 import AssetDetail from "./AssetDetail.jsx";
@@ -37,6 +38,7 @@ const EMPTY_FORM = {
   hostname: "",
   description: "",
   classification: "unclassified",
+  tags: [],
 };
 
 function classificationLabel(value) {
@@ -55,6 +57,7 @@ export default function AssetsLibrary() {
 
   const [modal, setModal] = useState(null); // { mode: "create" | "edit", asset? }
   const [form, setForm] = useState(EMPTY_FORM);
+  const [tagDraft, setTagDraft] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState(null);
 
@@ -79,6 +82,7 @@ export default function AssetsLibrary() {
 
   const openCreate = useCallback(() => {
     setForm(EMPTY_FORM);
+    setTagDraft("");
     setSubmitError(null);
     setModal({ mode: "create" });
   }, []);
@@ -89,14 +93,33 @@ export default function AssetsLibrary() {
       hostname: asset.hostname,
       description: asset.description ?? "",
       classification: asset.classification,
+      tags: asset.tags ?? [],
     });
+    setTagDraft("");
     setSubmitError(null);
     setModal({ mode: "edit", asset });
   }, []);
 
   const closeModal = useCallback(() => {
     setModal(null);
+    setTagDraft("");
     setSubmitError(null);
+  }, []);
+
+  const commitTagDraft = useCallback(() => {
+    const t = tagDraft.trim();
+    if (!t) return;
+    setForm((f) =>
+      f.tags.includes(t) ? f : { ...f, tags: [...f.tags, t] },
+    );
+    setTagDraft("");
+  }, [tagDraft]);
+
+  const removeTag = useCallback((idx) => {
+    setForm((f) => ({
+      ...f,
+      tags: f.tags.filter((_, i) => i !== idx),
+    }));
   }, []);
 
   const submit = useCallback(async () => {
@@ -104,22 +127,29 @@ export default function AssetsLibrary() {
       setSubmitError("Name is required.");
       return;
     }
+    // Capture any tag the user typed but didn't press Enter on.
+    const pending = tagDraft.trim();
+    const body =
+      pending && !form.tags.includes(pending)
+        ? { ...form, tags: [...form.tags, pending] }
+        : form;
     setSubmitting(true);
     setSubmitError(null);
     try {
       if (modal.mode === "create") {
-        await apiJson("/api/assets", "POST", form);
+        await apiJson("/api/assets", "POST", body);
       } else {
-        await apiJson(`/api/assets/${modal.asset.id}`, "PUT", form);
+        await apiJson(`/api/assets/${modal.asset.id}`, "PUT", body);
       }
       setModal(null);
+      setTagDraft("");
       await refresh();
     } catch (err) {
       setSubmitError(err.message);
     } finally {
       setSubmitting(false);
     }
-  }, [form, modal, refresh]);
+  }, [form, modal, refresh, tagDraft]);
 
   const confirmDelete = useCallback(async () => {
     if (!deleteTarget) return;
@@ -165,6 +195,22 @@ export default function AssetsLibrary() {
             {classificationLabel(a.classification)}
           </Badge>
         ),
+      },
+      {
+        id: "tags",
+        header: "Tags",
+        cell: (a) =>
+          a.tags && a.tags.length > 0 ? (
+            <SpaceBetween direction="horizontal" size="xxs">
+              {a.tags.map((t) => (
+                <Badge key={t} color="grey">
+                  {t}
+                </Badge>
+              ))}
+            </SpaceBetween>
+          ) : (
+            "—"
+          ),
       },
       {
         id: "owner",
@@ -335,6 +381,30 @@ export default function AssetsLibrary() {
               }
               options={CLASSIFICATIONS}
             />
+          </FormField>
+          <FormField
+            label="Tags"
+            description="Press Enter to add. Use tags to group systems (e.g. production, pii)."
+          >
+            <SpaceBetween direction="vertical" size="xs">
+              <Input
+                value={tagDraft}
+                onChange={({ detail }) => setTagDraft(detail.value)}
+                onKeyDown={(e) => {
+                  if (e.detail.key === "Enter") {
+                    e.preventDefault();
+                    commitTagDraft();
+                  }
+                }}
+                placeholder="Add tag…"
+              />
+              {form.tags.length > 0 && (
+                <TokenGroup
+                  items={form.tags.map((t) => ({ label: t, value: t }))}
+                  onDismiss={({ detail }) => removeTag(detail.itemIndex)}
+                />
+              )}
+            </SpaceBetween>
           </FormField>
           {submitError && <Alert type="error">{submitError}</Alert>}
         </SpaceBetween>

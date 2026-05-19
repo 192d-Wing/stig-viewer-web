@@ -20,6 +20,8 @@ pub struct CreateAssetRequest {
     pub description: String,
     #[serde(default = "default_classification")]
     pub classification: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_classification() -> String {
@@ -35,6 +37,30 @@ pub struct UpdateAssetRequest {
     #[serde(default)]
     pub description: String,
     pub classification: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+const MAX_TAG_LEN: usize = 50;
+
+/// Trim, dedup, and validate-length a user-supplied tag list. Returns
+/// 400 if any tag is too long after trimming. Empty strings dropped.
+fn normalize_tags(input: &[String]) -> Result<Vec<String>, StatusCode> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for raw in input {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.chars().count() > MAX_TAG_LEN {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    Ok(out)
 }
 
 pub async fn list_assets_handler(
@@ -56,6 +82,7 @@ pub async fn create_asset_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let tags = normalize_tags(&req.tags)?;
     let now = chrono::Utc::now();
     let asset = db_assets::AssetRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -66,10 +93,16 @@ pub async fn create_asset_handler(
         owner_id: user.id.clone(),
         created_at: now,
         updated_at: now,
+        tags: tags.clone(),
     };
     db_assets::insert_asset(state.pool.as_ref(), &asset)
         .await
         .map_err(map_db)?;
+    if !tags.is_empty() {
+        db_assets::replace_tags(state.pool.as_ref(), &asset.id, &tags)
+            .await
+            .map_err(map_db)?;
+    }
     Ok((StatusCode::CREATED, Json(asset)))
 }
 
@@ -103,6 +136,7 @@ pub async fn update_asset_handler(
     if name.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let tags = normalize_tags(&req.tags)?;
 
     db_assets::update_asset(
         state.pool.as_ref(),
@@ -114,6 +148,9 @@ pub async fn update_asset_handler(
     )
     .await
     .map_err(map_db)?;
+    db_assets::replace_tags(state.pool.as_ref(), &id, &tags)
+        .await
+        .map_err(map_db)?;
 
     db_assets::get_asset(state.pool.as_ref(), &id)
         .await
