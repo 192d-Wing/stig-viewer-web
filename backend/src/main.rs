@@ -33,6 +33,7 @@ use api::{
         list_for_asset_handler as list_checklists_for_asset_handler,
         update_rule_handler as update_checklist_rule_handler,
     },
+    dashboard::get_handler as get_dashboard_handler,
     drafts::*,
     stig::get_stig,
     test_support::{reset_handler, set_role_handler},
@@ -150,6 +151,7 @@ async fn main() -> Result<()> {
             get(list_comments_handler).post(add_comment_handler),
         )
         .route("/api/users/me", get(me_handler))
+        .route("/api/dashboard", get(get_dashboard_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
