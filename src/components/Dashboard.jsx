@@ -270,15 +270,28 @@ export default function Dashboard() {
   }, [drilldown, severityFilter, mineOnly]);
 
   // Pre-flatten the per-asset / per-checklist rows for the table.
+  // Sort assets by risk score descending so the most-at-risk system surfaces.
   const checklistRows = useMemo(() => {
     if (!data) return [];
-    return data.byAsset.flatMap((a) =>
+    const sorted = [...data.byAsset].sort(
+      (a, b) => (b.riskScore ?? 0) - (a.riskScore ?? 0),
+    );
+    return sorted.flatMap((a) =>
       a.checklists.length === 0
-        ? [{ assetId: a.id, assetName: a.name, ownerName: a.ownerName, empty: true }]
+        ? [
+            {
+              assetId: a.id,
+              assetName: a.name,
+              ownerName: a.ownerName,
+              riskScore: a.riskScore,
+              empty: true,
+            },
+          ]
         : a.checklists.map((c) => ({
             assetId: a.id,
             assetName: a.name,
             ownerName: a.ownerName,
+            riskScore: a.riskScore,
             ...c,
           })),
     );
@@ -354,8 +367,8 @@ export default function Dashboard() {
           Compliance dashboard
         </Header>
 
-        {/* KPI row */}
-        <ColumnLayout columns={6} variant="text-grid">
+        {/* KPI row — 4-column grid; 7 cards wrap to 4 + 3. */}
+        <ColumnLayout columns={4} variant="text-grid">
           <KpiCard label="Systems" value={totals.assets} />
           <KpiCard label="Applied STIGs" value={totals.checklists} />
           <KpiCard
@@ -367,6 +380,12 @@ export default function Dashboard() {
                 ? () => setDrilldown({ kind: "open" })
                 : undefined
             }
+          />
+          <KpiCard
+            label="Compliant"
+            value={`${compliantPct}%`}
+            sub={`${totals.reviewedRules - totals.openFindings} of ${totals.totalRules} rules`}
+            tone={totals.openFindings === 0 && totals.reviewedRules > 0 ? "ok" : null}
           />
           <KpiCard
             label="Overdue"
@@ -393,10 +412,14 @@ export default function Dashboard() {
             }
           />
           <KpiCard
-            label="Compliant"
-            value={`${compliantPct}%`}
-            sub={`${totals.reviewedRules - totals.openFindings} of ${totals.totalRules} rules`}
-            tone={totals.openFindings === 0 && totals.reviewedRules > 0 ? "ok" : null}
+            label="Highest risk"
+            value={totals.highestRiskScore}
+            sub={
+              totals.highestRiskAssetName
+                ? `on ${totals.highestRiskAssetName}`
+                : undefined
+            }
+            tone={totals.highestRiskScore > 0 ? "warning" : "ok"}
           />
         </ColumnLayout>
 
@@ -526,6 +549,15 @@ export default function Dashboard() {
                     {r.overdueCount}
                   </Badge>
                 ),
+            },
+            {
+              id: "risk",
+              header: "Risk",
+              cell: (r) => (
+                <Badge color={r.riskScore > 0 ? "red" : "grey"}>
+                  {r.riskScore ?? 0}
+                </Badge>
+              ),
             },
             {
               id: "naf",
