@@ -14,6 +14,8 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import { apiGet, apiJson, apiFetch } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
+import AssetDetail from "./AssetDetail.jsx";
+import ChecklistView from "./ChecklistView.jsx";
 
 const CLASSIFICATIONS = [
   { label: "Unclassified", value: "unclassified" },
@@ -42,6 +44,9 @@ function classificationLabel(value) {
 
 export default function AssetsLibrary() {
   const currentUser = useContext(AuthContext);
+
+  // view = "list" | {type: "asset", id} | {type: "checklist", id, assetId}
+  const [view, setView] = useState("list");
 
   const [assets, setAssets] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -136,7 +141,14 @@ export default function AssetsLibrary() {
       {
         id: "name",
         header: "Name",
-        cell: (a) => a.name,
+        cell: (a) => (
+          <Button
+            variant="inline-link"
+            onClick={() => setView({ type: "asset", id: a.id })}
+          >
+            {a.name}
+          </Button>
+        ),
         sortingField: "name",
       },
       {
@@ -191,6 +203,27 @@ export default function AssetsLibrary() {
     ],
     [currentUser, openEdit],
   );
+
+  if (view?.type === "asset") {
+    return (
+      <AssetDetail
+        assetId={view.id}
+        onBack={() => setView("list")}
+        onOpenChecklist={(cid) =>
+          setView({ type: "checklist", id: cid, assetId: view.id })
+        }
+      />
+    );
+  }
+
+  if (view?.type === "checklist") {
+    return (
+      <ChecklistView
+        checklistId={view.id}
+        onBack={() => setView({ type: "asset", id: view.assetId })}
+      />
+    );
+  }
 
   return (
     <>
