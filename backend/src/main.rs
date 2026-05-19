@@ -40,6 +40,7 @@ use api::{
         trend_handler as get_dashboard_trend_handler,
     },
     drafts::*,
+    findings::list_handler as list_findings_handler,
     stig::get_stig,
     test_support::{reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
@@ -158,6 +159,7 @@ async fn main() -> Result<()> {
         .route("/api/users/me", get(me_handler))
         .route("/api/dashboard", get(get_dashboard_handler))
         .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
+        .route("/api/findings", get(list_findings_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

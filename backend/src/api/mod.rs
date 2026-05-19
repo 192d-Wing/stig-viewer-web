@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod checklists;
 pub mod dashboard;
 pub mod drafts;
+pub mod findings;
 pub mod stig;
 pub mod test_support;
 pub mod upload;
