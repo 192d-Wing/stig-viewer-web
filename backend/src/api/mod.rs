@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod auth;
+pub mod baselines;
 pub mod catalog;
 pub mod checklists;
 pub mod dashboard;

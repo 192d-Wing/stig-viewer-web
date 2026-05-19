@@ -25,6 +25,12 @@ use api::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
     },
+    baselines::{
+        create_handler as create_baseline_handler,
+        delete_handler as delete_baseline_handler,
+        diff_handler as baseline_diff_handler,
+        list_handler as list_baselines_handler,
+    },
     catalog::{get_catalog, get_health},
     checklists::{
         create_handler as create_checklist_handler,
@@ -161,6 +167,12 @@ async fn main() -> Result<()> {
         .route("/api/dashboard", get(get_dashboard_handler))
         .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
         .route("/api/findings", get(list_findings_handler))
+        .route(
+            "/api/baselines",
+            get(list_baselines_handler).post(create_baseline_handler),
+        )
+        .route("/api/baselines/:id", axum::routing::delete(delete_baseline_handler))
+        .route("/api/baselines/:id/diff", get(baseline_diff_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
