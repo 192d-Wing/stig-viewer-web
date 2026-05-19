@@ -1,4 +1,4 @@
-const BACKEND = "http://localhost:8080";
+const BACKEND = process.env.VITE_API_URL || "http://localhost:8080";
 
 /**
  * Inject a userId into localStorage before every page load so the

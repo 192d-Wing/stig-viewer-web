@@ -5,7 +5,7 @@ import Input from "@cloudscape-design/components/input";
 import Button from "@cloudscape-design/components/button";
 import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
-import { apiFetch } from "../utils/api.js";
+import { apiFetch, BACKEND } from "../utils/api.js";
 
 /**
  * Checks localStorage for a userId. If absent, shows a modal to
@@ -52,7 +52,7 @@ export default function UserSetup({ children }) {
     } catch (err) {
       localStorage.removeItem("userId");
       const msg = err.message?.includes("Failed to fetch")
-        ? "Cannot connect to backend. Make sure the server is running on localhost:8080."
+        ? `Cannot connect to backend at ${BACKEND}. Make sure the server is running.`
         : err.message;
       setError(msg);
     } finally {

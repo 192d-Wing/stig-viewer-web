@@ -1,6 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+// Backend origin used in CSP connect-src. Override via VITE_API_URL at build/dev time
+// to point the frontend at a non-localhost backend (LAN IP, tunnel, etc.).
+const API_URL = process.env.VITE_API_URL || 'http://localhost:8080'
+
 // Shared security headers (non-CSP)
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -17,7 +21,7 @@ const PROD_CSP = [
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self'",
   "img-src 'self' data:",
-  "connect-src http://localhost:8080",
+  `connect-src ${API_URL}`,
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'none'",
@@ -37,7 +41,7 @@ const DEV_CSP = [
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self'",
   "img-src 'self' data:",
-  "connect-src 'self' ws: wss: http://localhost:8080",
+  `connect-src 'self' ws: wss: ${API_URL}`,
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'none'",
