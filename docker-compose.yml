@@ -1,14 +1,57 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
-      POSTGRES_DB: stig_viewer
       POSTGRES_USER: stig
       POSTGRES_PASSWORD: stig_local
+      POSTGRES_DB: stig_viewer
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stig -d stig_viewer"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    environment:
+      DATABASE_URL: postgres://stig:stig_local@postgres:5432/stig_viewer
+      PORT: "8080"
+      RUST_LOG: info
+      STIG_ENV: development
+      CARGO_TARGET_DIR: /target
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend:/app
+      - backend_target:/target
+      - cargo_registry:/usr/local/cargo/registry
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./:/app
+      - /app/backend
+      - /app/node_modules
+      - /app/dist
+    command: npm run dev -- --host 0.0.0.0
 
 volumes:
   postgres_data:
+  backend_target:
+  cargo_registry:
