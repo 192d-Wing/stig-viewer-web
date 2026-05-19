@@ -33,7 +33,12 @@ use api::{
         list_for_asset_handler as list_checklists_for_asset_handler,
         update_rule_handler as update_checklist_rule_handler,
     },
-    dashboard::get_handler as get_dashboard_handler,
+    dashboard::{
+        get_handler as get_dashboard_handler,
+        snapshot_handler as snapshot_trigger_handler,
+        take_snapshot,
+        trend_handler as get_dashboard_trend_handler,
+    },
     drafts::*,
     stig::get_stig,
     test_support::{reset_handler, set_role_handler},
@@ -152,6 +157,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/users/me", get(me_handler))
         .route("/api/dashboard", get(get_dashboard_handler))
+        .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -172,6 +178,7 @@ async fn main() -> Result<()> {
         let test_router: Router = Router::new()
             .route("/api/test/reset", post(reset_handler))
             .route("/api/test/set-role", post(set_role_handler))
+            .route("/api/test/snapshot", post(snapshot_trigger_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }
@@ -191,6 +198,28 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 if let Err(e) = sync::run_sync(&cfg, &src, &db).await {
                     tracing::error!("Sync error: {e:#}");
+                }
+            }
+        });
+    }
+
+    // Dashboard snapshot scheduler — captures one row per checklist into
+    // checklist_snapshots on each tick. Interval is in hours so it lines
+    // up with the existing scheduler pattern; default 24h.
+    {
+        let snap_hours: u64 = std::env::var("DASHBOARD_SNAPSHOT_INTERVAL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let db = pool.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(snap_hours * 3600));
+            loop {
+                interval.tick().await;
+                match take_snapshot(&db).await {
+                    Ok(n) => tracing::info!("dashboard snapshot captured: {n} checklists"),
+                    Err(e) => tracing::error!("dashboard snapshot failed: {e:#}"),
                 }
             }
         });
