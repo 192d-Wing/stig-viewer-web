@@ -100,6 +100,17 @@ export default function Dashboard() {
   const [expandedFinding, setExpandedFinding] = useState(null);
   const [ruleHistory, setRuleHistory] = useState([]);
 
+  // Drill-down multi-select + bulk-edit
+  const [selectedFindings, setSelectedFindings] = useState([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkDraft, setBulkDraft] = useState({
+    status: "",
+    findingDetails: "",
+    comments: "",
+  });
+  const [bulkSaving, setBulkSaving] = useState(false);
+  const [bulkError, setBulkError] = useState(null);
+
   // Recent activity (loaded with the rest of the dashboard).
   const [activity, setActivity] = useState([]);
 
@@ -209,6 +220,50 @@ export default function Dashboard() {
     },
     [refreshBaselines],
   );
+
+  // Clear selection when the drilldown filters change.
+  useEffect(() => {
+    setSelectedFindings([]);
+  }, [drilldown, severityFilter, mineOnly]);
+
+  const openBulkModal = useCallback(() => {
+    setBulkDraft({ status: "", findingDetails: "", comments: "" });
+    setBulkError(null);
+    setBulkOpen(true);
+  }, []);
+
+  const saveBulk = useCallback(async () => {
+    if (selectedFindings.length === 0) return;
+    // Build a patch object that only includes fields the user actually set.
+    const patch = {};
+    if (bulkDraft.status) patch.status = bulkDraft.status;
+    if (bulkDraft.findingDetails) patch.findingDetails = bulkDraft.findingDetails;
+    if (bulkDraft.comments) patch.comments = bulkDraft.comments;
+    if (Object.keys(patch).length === 0) {
+      setBulkError("Set at least one field to apply.");
+      return;
+    }
+    setBulkSaving(true);
+    setBulkError(null);
+    try {
+      await apiJson("/api/findings/bulk", "PATCH", {
+        targets: selectedFindings.map((f) => ({
+          checklistId: f.checklistId,
+          ruleId: f.ruleId,
+        })),
+        patch,
+      });
+      setBulkOpen(false);
+      setSelectedFindings([]);
+      // Refetch the drill-down + the dashboard counters.
+      setRefreshTick((n) => n + 1);
+      await refresh();
+    } catch (err) {
+      setBulkError(err.message);
+    } finally {
+      setBulkSaving(false);
+    }
+  }, [selectedFindings, bulkDraft, refresh]);
 
   // Close the expanded panel whenever the drill-down/filter changes.
   useEffect(() => {
@@ -642,6 +697,11 @@ export default function Dashboard() {
             items={findings}
             loading={findingsLoading}
             loadingText="Loading findings"
+            selectionType="multi"
+            selectedItems={selectedFindings}
+            onSelectionChange={({ detail }) =>
+              setSelectedFindings(detail.selectedItems)
+            }
             trackBy={(f) => `${f.checklistId}:${f.ruleId}`}
             columnDefinitions={[
               {
@@ -716,7 +776,18 @@ export default function Dashboard() {
                 description={describeDrilldown(drilldown)}
                 counter={`(${findings.length})`}
                 actions={
-                  <Button onClick={() => setDrilldown(null)}>Close</Button>
+                  <SpaceBetween direction="horizontal" size="xs">
+                    <Button
+                      disabled={selectedFindings.length === 0}
+                      onClick={openBulkModal}
+                    >
+                      Bulk update
+                      {selectedFindings.length > 0
+                        ? ` (${selectedFindings.length})`
+                        : ""}
+                    </Button>
+                    <Button onClick={() => setDrilldown(null)}>Close</Button>
+                  </SpaceBetween>
                 }
               >
                 {drilldownTitle(drilldown)}
@@ -968,6 +1039,82 @@ export default function Dashboard() {
             </SpaceBetween>
           </Container>
         )}
+
+        {/* Bulk-edit modal */}
+        <Modal
+          visible={bulkOpen}
+          onDismiss={() => setBulkOpen(false)}
+          header={`Bulk update — ${selectedFindings.length} finding${selectedFindings.length === 1 ? "" : "s"}`}
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button variant="link" onClick={() => setBulkOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={bulkSaving}
+                  onClick={saveBulk}
+                >
+                  Apply
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="p" color="text-body-secondary">
+              Leave a field blank to keep each finding's current value.
+              At least one field must be set.
+            </Box>
+            <FormField label="Status">
+              <Select
+                selectedOption={
+                  bulkDraft.status
+                    ? {
+                        value: bulkDraft.status,
+                        label: bulkDraft.status,
+                      }
+                    : { value: "", label: "(leave unchanged)" }
+                }
+                onChange={({ detail }) =>
+                  setBulkDraft((d) => ({
+                    ...d,
+                    status: detail.selectedOption.value,
+                  }))
+                }
+                options={[
+                  { value: "", label: "(leave unchanged)" },
+                  { value: "open", label: "Open" },
+                  { value: "not_a_finding", label: "Not a finding" },
+                  { value: "not_applicable", label: "Not applicable" },
+                  { value: "not_reviewed", label: "Not reviewed" },
+                ]}
+              />
+            </FormField>
+            <FormField
+              label="Finding details"
+              description="Replaces existing finding-details on every selected rule."
+            >
+              <Input
+                value={bulkDraft.findingDetails}
+                onChange={({ detail }) =>
+                  setBulkDraft((d) => ({ ...d, findingDetails: detail.value }))
+                }
+                placeholder="e.g. closed by mitigation #42"
+              />
+            </FormField>
+            <FormField label="Comments">
+              <Input
+                value={bulkDraft.comments}
+                onChange={({ detail }) =>
+                  setBulkDraft((d) => ({ ...d, comments: detail.value }))
+                }
+              />
+            </FormField>
+            {bulkError && <Alert type="error">{bulkError}</Alert>}
+          </SpaceBetween>
+        </Modal>
 
         {/* Save baseline modal */}
         <Modal
