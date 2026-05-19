@@ -88,7 +88,13 @@ async fn main() -> Result<()> {
     // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
     let cors = CorsLayer::new()
         .allow_origin(frontend_origin.parse::<HeaderValue>()?)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::COOKIE, header::HeaderName::from_static("x-user-id")])
         .allow_credentials(true);
 
