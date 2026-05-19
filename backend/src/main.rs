@@ -18,8 +18,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
     assets::{
-        create_asset_handler, delete_asset_handler, get_asset_handler, list_assets_handler,
-        update_asset_handler,
+        compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
+        get_asset_handler, list_assets_handler, update_asset_handler,
     },
     audit::{activity_handler, rule_history_handler},
     auth::{
@@ -135,6 +135,10 @@ async fn main() -> Result<()> {
                 .delete(delete_asset_handler),
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
+        .route(
+            "/api/assets/:left/diff/:right",
+            get(compare_assets_handler),
+        )
         .route(
             "/api/assets/:id/checklists",
             get(list_checklists_for_asset_handler).post(create_checklist_handler),
