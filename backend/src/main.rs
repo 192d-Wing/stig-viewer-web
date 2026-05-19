@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod db;
 mod db_assets;
+mod db_checklists;
 mod db_drafts;
 mod parser;
 mod sync;
@@ -25,6 +26,13 @@ use api::{
         me_handler, AppAuthState, OidcEnv,
     },
     catalog::{get_catalog, get_health},
+    checklists::{
+        create_handler as create_checklist_handler,
+        delete_handler as delete_checklist_handler,
+        get_handler as get_checklist_handler,
+        list_for_asset_handler as list_checklists_for_asset_handler,
+        update_rule_handler as update_checklist_rule_handler,
+    },
     drafts::*,
     stig::get_stig,
     test_support::{reset_handler, set_role_handler},
@@ -104,6 +112,18 @@ async fn main() -> Result<()> {
             get(get_asset_handler)
                 .put(update_asset_handler)
                 .delete(delete_asset_handler),
+        )
+        .route(
+            "/api/assets/:id/checklists",
+            get(list_checklists_for_asset_handler).post(create_checklist_handler),
+        )
+        .route(
+            "/api/checklists/:id",
+            get(get_checklist_handler).delete(delete_checklist_handler),
+        )
+        .route(
+            "/api/checklists/:id/rules/:rule_id",
+            axum::routing::patch(update_checklist_rule_handler),
         )
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
