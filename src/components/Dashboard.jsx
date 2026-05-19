@@ -53,6 +53,9 @@ export default function Dashboard() {
   const [findingsLoading, setFindingsLoading] = useState(false);
   const [findingsError, setFindingsError] = useState(null);
 
+  // Inline expanded finding shown below the drill-down table.
+  const [expandedFinding, setExpandedFinding] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -73,6 +76,11 @@ export default function Dashboard() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Close the expanded panel whenever the drill-down/filter changes.
+  useEffect(() => {
+    setExpandedFinding(null);
+  }, [drilldown, severityFilter]);
 
   // Load findings when drilldown is active or severity filter changes.
   useEffect(() => {
@@ -395,7 +403,26 @@ export default function Dashboard() {
             loadingText="Loading findings"
             trackBy={(f) => `${f.checklistId}:${f.ruleId}`}
             columnDefinitions={[
-              { id: "rule", header: "Rule", cell: (f) => f.ruleId },
+              {
+                id: "rule",
+                header: "Rule",
+                cell: (f) => (
+                  <Button
+                    variant="inline-link"
+                    onClick={() =>
+                      setExpandedFinding((curr) =>
+                        curr &&
+                        curr.checklistId === f.checklistId &&
+                        curr.ruleId === f.ruleId
+                          ? null
+                          : f,
+                      )
+                    }
+                  >
+                    {f.ruleId}
+                  </Button>
+                ),
+              },
               {
                 id: "severity",
                 header: "Severity",
@@ -458,8 +485,93 @@ export default function Dashboard() {
         {findingsError && (
           <Alert type="error">{findingsError}</Alert>
         )}
+
+        {drilldown && expandedFinding && (
+          <Container
+            header={
+              <Header
+                actions={
+                  <Button onClick={() => setExpandedFinding(null)}>
+                    Close
+                  </Button>
+                }
+                description={
+                  expandedFinding.title || expandedFinding.stigTitle
+                }
+              >
+                {expandedFinding.ruleId}
+                {expandedFinding.severity && (
+                  <Box
+                    display="inline"
+                    margin={{ left: "s" }}
+                    variant="span"
+                  >
+                    <Badge
+                      color={SEVERITY_BADGE[expandedFinding.severity] ?? "grey"}
+                    >
+                      {expandedFinding.severity}
+                    </Badge>
+                  </Box>
+                )}
+              </Header>
+            }
+          >
+            <SpaceBetween direction="vertical" size="m">
+              {expandedFinding.description && (
+                <RuleSection title="Description">
+                  {expandedFinding.description}
+                </RuleSection>
+              )}
+              {expandedFinding.checkText && (
+                <RuleSection title="Check">
+                  {expandedFinding.checkText}
+                </RuleSection>
+              )}
+              {expandedFinding.fixText && (
+                <RuleSection title="Fix">
+                  {expandedFinding.fixText}
+                </RuleSection>
+              )}
+              {expandedFinding.findingDetails && (
+                <RuleSection title="Finding details (current)">
+                  {expandedFinding.findingDetails}
+                </RuleSection>
+              )}
+              {expandedFinding.comments && (
+                <RuleSection title="Comments (current)">
+                  {expandedFinding.comments}
+                </RuleSection>
+              )}
+              <Box variant="small" color="text-body-secondary">
+                {expandedFinding.assetName} ·{" "}
+                {new Date(expandedFinding.updatedAt).toLocaleString()} ·
+                owner {expandedFinding.ownerName}
+              </Box>
+            </SpaceBetween>
+          </Container>
+        )}
       </SpaceBetween>
     </Box>
+  );
+}
+
+function RuleSection({ title, children }) {
+  return (
+    <div>
+      <Box variant="awsui-key-label">{title}</Box>
+      <Box variant="p" color="text-body-secondary">
+        <pre
+          style={{
+            whiteSpace: "pre-wrap",
+            margin: 0,
+            fontFamily: "inherit",
+            fontSize: "inherit",
+          }}
+        >
+          {children}
+        </pre>
+      </Box>
+    </div>
   );
 }
 

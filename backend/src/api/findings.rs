@@ -39,10 +39,27 @@ pub struct Finding {
     pub asset_id: String,
     pub asset_name: String,
     pub owner_name: String,
-    /// Populated from the STIG JSON after the SQL query. None if the JSON
-    /// can't be read or the rule isn't found there.
+    // The following fields are populated from the STIG JSON after the SQL
+    // query. None if the JSON can't be read or the rule isn't found there.
     #[sqlx(default)]
     pub severity: Option<String>,
+    #[sqlx(default)]
+    pub title: Option<String>,
+    #[sqlx(default)]
+    pub description: Option<String>,
+    #[sqlx(default)]
+    pub check_text: Option<String>,
+    #[sqlx(default)]
+    pub fix_text: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuleMeta {
+    severity: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    check_text: Option<String>,
+    fix_text: Option<String>,
 }
 
 /// GET /api/findings?status=open[&ruleId=...][&assetId=...]
@@ -89,20 +106,26 @@ pub async fn list_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Attach severity from the STIG JSON files. One read per unique stig_id.
-    // Failures (missing file, parse error) leave severity as None — the
-    // frontend treats that as "Unknown".
-    let mut severity_by_stig: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // Attach rule metadata from the STIG JSON files. One read per unique
+    // stig_id. Failures (missing file, parse error) leave fields as None —
+    // the frontend treats those as "Unknown".
+    let mut meta_by_stig: HashMap<String, HashMap<String, RuleMeta>> = HashMap::new();
     for f in &rows {
-        if severity_by_stig.contains_key(&f.stig_id) {
+        if meta_by_stig.contains_key(&f.stig_id) {
             continue;
         }
-        let map = load_severity_map(&state, &f.stig_id).await;
-        severity_by_stig.insert(f.stig_id.clone(), map);
+        let map = load_rule_meta_map(&state, &f.stig_id).await;
+        meta_by_stig.insert(f.stig_id.clone(), map);
     }
     for f in &mut rows {
-        if let Some(map) = severity_by_stig.get(&f.stig_id) {
-            f.severity = map.get(&f.rule_id).cloned();
+        if let Some(map) = meta_by_stig.get(&f.stig_id) {
+            if let Some(m) = map.get(&f.rule_id) {
+                f.severity = m.severity.clone();
+                f.title = m.title.clone();
+                f.description = m.description.clone();
+                f.check_text = m.check_text.clone();
+                f.fix_text = m.fix_text.clone();
+            }
         }
     }
 
@@ -119,9 +142,12 @@ pub async fn list_handler(
     Ok(Json(rows))
 }
 
-/// Read a STIG JSON file from disk and build a {rule_id -> severity} map.
+/// Read a STIG JSON file from disk and build a {rule_id -> RuleMeta} map.
 /// Returns an empty map on any read/parse failure (logged).
-async fn load_severity_map(state: &AppState, stig_id: &str) -> HashMap<String, String> {
+async fn load_rule_meta_map(
+    state: &AppState,
+    stig_id: &str,
+) -> HashMap<String, RuleMeta> {
     if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return HashMap::new();
     }
@@ -133,14 +159,14 @@ async fn load_severity_map(state: &AppState, stig_id: &str) -> HashMap<String, S
     let contents = match tokio::fs::read_to_string(&path).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("severity lookup: cannot read {stig_id}.json: {e}");
+            tracing::warn!("rule-meta lookup: cannot read {stig_id}.json: {e}");
             return HashMap::new();
         }
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("severity lookup: cannot parse {stig_id}.json: {e}");
+            tracing::warn!("rule-meta lookup: cannot parse {stig_id}.json: {e}");
             return HashMap::new();
         }
     };
@@ -148,12 +174,23 @@ async fn load_severity_map(state: &AppState, stig_id: &str) -> HashMap<String, S
         Some(r) => r,
         None => return HashMap::new(),
     };
+    let s = |r: &serde_json::Value, k: &str| {
+        r.get(k).and_then(|v| v.as_str()).map(|x| x.to_string())
+    };
     rules
         .iter()
         .filter_map(|r| {
             let id = r.get("id")?.as_str()?.to_string();
-            let sev = r.get("severity")?.as_str()?.to_string();
-            Some((id, sev))
+            Some((
+                id,
+                RuleMeta {
+                    severity: s(r, "severity"),
+                    title: s(r, "title"),
+                    description: s(r, "description"),
+                    check_text: s(r, "checkText"),
+                    fix_text: s(r, "fixText"),
+                },
+            ))
         })
         .collect()
 }
