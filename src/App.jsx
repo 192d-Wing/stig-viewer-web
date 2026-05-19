@@ -18,6 +18,7 @@ import RuleDetail from "./components/RuleDetail.jsx";
 import STIGWriter from "./components/STIGWriter.jsx";
 import AssetsLibrary from "./components/AssetsLibrary.jsx";
 import Dashboard from "./components/Dashboard.jsx";
+import MyFindings from "./components/MyFindings.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
 import { apiFetch } from "./utils/api.js";
 
@@ -59,7 +60,8 @@ export default function App() {
   const isWriter = appMode === "writer";
   const isSystems = appMode === "systems";
   const isDashboard = appMode === "dashboard";
-  const isLibraryMode = !isWriter && !isSystems && !isDashboard;
+  const isMyFindings = appMode === "myfindings";
+  const isLibraryMode = !isWriter && !isSystems && !isDashboard && !isMyFindings;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isDiffMode = diffPair !== null;
@@ -128,6 +130,12 @@ export default function App() {
       variant: isDashboard ? "primary-button" : undefined,
       onClick: () => setAppMode("dashboard"),
     },
+    {
+      type: "button",
+      text: "My findings",
+      variant: isMyFindings ? "primary-button" : undefined,
+      onClick: () => setAppMode("myfindings"),
+    },
   ];
   if (isLibraryMode && hasTabs) {
     utilities.push({
@@ -193,6 +201,8 @@ export default function App() {
   let content;
   if (isDashboard) {
     content = <Dashboard />;
+  } else if (isMyFindings) {
+    content = <MyFindings />;
   } else if (isSystems) {
     content = <AssetsLibrary />;
   } else if (isWriter) {
