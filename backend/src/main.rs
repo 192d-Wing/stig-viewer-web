@@ -9,12 +9,16 @@ use anyhow::Result;
 use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
+use axum::http::{header, HeaderValue, Method};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
-    auth::auth_middleware,
+    auth::{
+        auth_middleware, build_oidc_context, callback_handler, login_handler, logout_handler,
+        me_handler, AppAuthState, OidcEnv,
+    },
     catalog::{get_catalog, get_health},
     drafts::*,
     stig::get_stig,
@@ -24,8 +28,6 @@ use api::{
 use config::{load_sources, Config};
 use db::init_pool;
 
-/// Unified application state shared by all Axum handlers.
-/// Axum requires a single State type per router.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Arc<PgPool>,
@@ -34,7 +36,6 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialise structured logging
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             "stig_viewer_backend=info,tower_http=info".into()
@@ -42,7 +43,6 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configuration
     let config = Arc::new(Config::from_env()?);
     let sources = Arc::new(load_sources()?);
 
@@ -52,31 +52,46 @@ async fn main() -> Result<()> {
         config.data_dir.display()
     );
 
-    // Ensure data directory exists
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
-    // Connect to Postgres and run migrations
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
 
-    // CORS — allow all origins in dev; tighten in production via env or nginx
+    // ── OIDC setup ──────────────────────────────────────────────────────────
+    let oidc_env = OidcEnv::from_env()?;
+    let frontend_origin = oidc_env.frontend_url.clone();
+    let oidc = build_oidc_context(&oidc_env).await?;
+    info!(
+        "OIDC client ready (issuer={}, test_header_auth={})",
+        oidc_env.internal_issuer_url, oidc_env.allow_test_auth_header
+    );
+
+    let auth_state = AppAuthState {
+        pool: pool.clone(),
+        oidc: oidc.clone(),
+    };
+
+    // CORS — cookie-based auth requires a specific origin (not "*")
+    // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(frontend_origin.parse::<HeaderValue>()?)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::COOKIE, header::HeaderName::from_static("x-user-id")])
+        .allow_credentials(true);
 
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
     };
 
-    // Build Axum router — single AppState shared by all handlers
-    //
-    // Body limit applied globally at the router level (outermost layer) so it
-    // takes effect before Axum's built-in 2 MB default.  500 MB covers the
-    // largest DISA library bundle; all other routes are well under this.
+    // Auth flow routes — public, do not require an existing session.
+    let auth_routes: Router = Router::new()
+        .route("/auth/login", get(login_handler))
+        .route("/auth/callback", get(callback_handler))
+        .route("/auth/logout", post(logout_handler))
+        .with_state(auth_state.clone());
 
-    // Draft routes — protected by auth middleware
+    // Draft + /api/users/me routes — require an authenticated session.
     let draft_routes = Router::new()
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
@@ -96,11 +111,12 @@ async fn main() -> Result<()> {
             "/api/drafts/:id/comments",
             get(list_comments_handler).post(add_comment_handler),
         )
-        .route("/api/users/me", get(get_me_handler))
+        .route("/api/users/me", get(me_handler))
         .route_layer(middleware::from_fn_with_state(
-            state.pool.clone(),
+            auth_state.clone(),
             auth_middleware,
-        ));
+        ))
+        .with_state(state.clone());
 
     let mut app = Router::new()
         .route("/api/health", get(get_health))
@@ -108,21 +124,22 @@ async fn main() -> Result<()> {
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
+        .with_state(state.clone())
+        .merge(auth_routes)
         .merge(draft_routes);
 
-    // Test-only route — only registered outside production
     if std::env::var("STIG_ENV").unwrap_or_default() != "production" {
-        app = app
+        let test_router: Router = Router::new()
             .route("/api/test/reset", post(reset_handler))
-            .route("/api/test/set-role", post(set_role_handler));
+            .route("/api/test/set-role", post(set_role_handler))
+            .with_state(state.clone());
+        app = app.merge(test_router);
     }
 
     let app = app
-        .with_state(state)
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);
 
-    // ── Scheduler ────────────────────────────────────────────────────────────
     {
         let cfg = config.clone();
         let src = sources.clone();
@@ -131,7 +148,7 @@ async fn main() -> Result<()> {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
             loop {
-                interval.tick().await; // first tick is immediate
+                interval.tick().await;
                 if let Err(e) = sync::run_sync(&cfg, &src, &db).await {
                     tracing::error!("Sync error: {e:#}");
                 }
@@ -139,7 +156,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Start server ─────────────────────────────────────────────────────────
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");
