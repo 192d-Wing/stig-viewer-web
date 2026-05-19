@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -24,6 +24,8 @@ pub struct ChecklistRuleRow {
     pub comments: String,
     pub updated_at: DateTime<Utc>,
     pub updated_by: Option<String>,
+    pub assignee_id: Option<String>,
+    pub due_date: Option<NaiveDate>,
 }
 
 pub async fn list_checklists_for_asset(
@@ -81,6 +83,7 @@ pub async fn list_rule_overrides(
     Ok(rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_rule(
     pool: &PgPool,
     checklist_id: &str,
@@ -89,17 +92,22 @@ pub async fn upsert_rule(
     finding_details: &str,
     comments: &str,
     updated_by: &str,
+    assignee_id: Option<&str>,
+    due_date: Option<NaiveDate>,
 ) -> Result<ChecklistRuleRow> {
     let row = sqlx::query_as::<_, ChecklistRuleRow>(
         r#"
         INSERT INTO checklist_rules
-            (checklist_id, rule_id, status, finding_details, comments, updated_by, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            (checklist_id, rule_id, status, finding_details, comments,
+             updated_by, assignee_id, due_date, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
         ON CONFLICT (checklist_id, rule_id) DO UPDATE
            SET status = EXCLUDED.status,
                finding_details = EXCLUDED.finding_details,
                comments = EXCLUDED.comments,
                updated_by = EXCLUDED.updated_by,
+               assignee_id = EXCLUDED.assignee_id,
+               due_date = EXCLUDED.due_date,
                updated_at = NOW()
         RETURNING *
         "#,
@@ -110,6 +118,8 @@ pub async fn upsert_rule(
     .bind(finding_details)
     .bind(comments)
     .bind(updated_by)
+    .bind(assignee_id)
+    .bind(due_date)
     .fetch_one(pool)
     .await?;
 
