@@ -41,6 +41,7 @@ use api::{
         update_rule_handler as update_checklist_rule_handler,
     },
     dashboard::{
+        asset_trend_handler,
         get_handler as get_dashboard_handler,
         snapshot_handler as snapshot_trigger_handler,
         take_snapshot,
@@ -135,6 +136,7 @@ async fn main() -> Result<()> {
                 .delete(delete_asset_handler),
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
+        .route("/api/assets/:id/trend", get(asset_trend_handler))
         .route(
             "/api/assets/:left/diff/:right",
             get(compare_assets_handler),
