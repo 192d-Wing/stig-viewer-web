@@ -32,6 +32,12 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Drill-down: { ruleId?: string } or null
+  const [drilldown, setDrilldown] = useState(null);
+  const [findings, setFindings] = useState([]);
+  const [findingsLoading, setFindingsLoading] = useState(false);
+  const [findingsError, setFindingsError] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -52,6 +58,33 @@ export default function Dashboard() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Load findings when drilldown is active.
+  useEffect(() => {
+    if (!drilldown) {
+      setFindings([]);
+      setFindingsError(null);
+      return;
+    }
+    let cancelled = false;
+    const qs = new URLSearchParams({ status: "open" });
+    if (drilldown.ruleId) qs.set("ruleId", drilldown.ruleId);
+    setFindingsLoading(true);
+    setFindingsError(null);
+    apiGet(`/api/findings?${qs.toString()}`)
+      .then((rows) => {
+        if (!cancelled) setFindings(rows);
+      })
+      .catch((err) => {
+        if (!cancelled) setFindingsError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setFindingsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [drilldown]);
 
   // Pre-flatten the per-asset / per-checklist rows for the table.
   const checklistRows = useMemo(() => {
@@ -135,6 +168,9 @@ export default function Dashboard() {
             label="Open findings"
             value={totals.openFindings}
             tone={totals.openFindings > 0 ? "warning" : "ok"}
+            onClick={
+              totals.openFindings > 0 ? () => setDrilldown({}) : undefined
+            }
           />
           <KpiCard
             label="Compliant"
@@ -301,7 +337,18 @@ export default function Dashboard() {
             items={data.topOpenRules}
             trackBy="ruleId"
             columnDefinitions={[
-              { id: "rule", header: "Rule", cell: (r) => r.ruleId },
+              {
+                id: "rule",
+                header: "Rule",
+                cell: (r) => (
+                  <Button
+                    variant="inline-link"
+                    onClick={() => setDrilldown({ ruleId: r.ruleId })}
+                  >
+                    {r.ruleId}
+                  </Button>
+                ),
+              },
               {
                 id: "affected",
                 header: "Affected systems",
@@ -322,12 +369,59 @@ export default function Dashboard() {
             }
           />
         )}
+
+        {/* Drill-down panel */}
+        {drilldown && (
+          <Table
+            variant="container"
+            items={findings}
+            loading={findingsLoading}
+            loadingText="Loading findings"
+            trackBy={(f) => `${f.checklistId}:${f.ruleId}`}
+            columnDefinitions={[
+              { id: "rule", header: "Rule", cell: (f) => f.ruleId },
+              { id: "asset", header: "System", cell: (f) => f.assetName },
+              { id: "stig", header: "STIG", cell: (f) => f.stigTitle },
+              { id: "owner", header: "Owner", cell: (f) => f.ownerName },
+              {
+                id: "updated",
+                header: "Last update",
+                cell: (f) => new Date(f.updatedAt).toLocaleString(),
+              },
+            ]}
+            header={
+              <Header
+                description={
+                  drilldown.ruleId
+                    ? `Open instances of ${drilldown.ruleId} across systems.`
+                    : "All currently-open findings across systems."
+                }
+                counter={`(${findings.length})`}
+                actions={
+                  <Button onClick={() => setDrilldown(null)}>Close</Button>
+                }
+              >
+                {drilldown.ruleId ? "Rule drill-down" : "Open findings"}
+              </Header>
+            }
+            empty={
+              <Box textAlign="center" padding="l">
+                <Box variant="p" color="text-body-secondary">
+                  No matching findings.
+                </Box>
+              </Box>
+            }
+          />
+        )}
+        {findingsError && (
+          <Alert type="error">{findingsError}</Alert>
+        )}
       </SpaceBetween>
     </Box>
   );
 }
 
-function KpiCard({ label, value, sub, tone }) {
+function KpiCard({ label, value, sub, tone, onClick }) {
   const indicator =
     tone === "ok" ? (
       <StatusIndicator type="success">{value}</StatusIndicator>
@@ -342,6 +436,11 @@ function KpiCard({ label, value, sub, tone }) {
         <Box variant="small" color="text-body-secondary">
           {sub}
         </Box>
+      )}
+      {onClick && (
+        <Button variant="inline-link" onClick={onClick}>
+          View details
+        </Button>
       )}
     </Container>
   );
