@@ -1,12 +1,13 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::api::auth::AuthUser;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +20,9 @@ pub struct FindingsQuery {
     /// Filter by severity string (e.g. "CAT I", "CAT II", "CAT III").
     /// Case-insensitive exact match against the STIG JSON's rule.severity.
     pub severity: Option<String>,
+    /// Filter by assignee. The literal value "me" resolves to the
+    /// authenticated user's id; any other value is treated as a user id.
+    pub assignee: Option<String>,
 }
 
 fn default_status() -> String {
@@ -39,6 +43,9 @@ pub struct Finding {
     pub asset_id: String,
     pub asset_name: String,
     pub owner_name: String,
+    pub assignee_id: Option<String>,
+    pub assignee_name: Option<String>,
+    pub due_date: Option<NaiveDate>,
     // The following fields are populated from the STIG JSON after the SQL
     // query. None if the JSON can't be read or the rule isn't found there.
     #[sqlx(default)]
@@ -62,14 +69,25 @@ struct RuleMeta {
     fix_text: Option<String>,
 }
 
-/// GET /api/findings?status=open[&ruleId=...][&assetId=...]
+/// GET /api/findings?status=open[&ruleId=...][&assetId=...][&severity=...][&assignee=me|<id>]
 pub async fn list_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     Query(params): Query<FindingsQuery>,
 ) -> Result<Json<Vec<Finding>>, StatusCode> {
     if !is_valid_status(&params.status) {
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    // Resolve the assignee filter: "me" → current user's id, anything else
+    // passed through as a user id.
+    let assignee_filter: Option<String> = params.assignee.as_deref().map(|s| {
+        if s.eq_ignore_ascii_case("me") {
+            user.id.clone()
+        } else {
+            s.to_string()
+        }
+    });
 
     let mut rows = sqlx::query_as::<_, Finding>(
         r#"
@@ -84,21 +102,27 @@ pub async fn list_handler(
             COALESCE(sc.title, c.stig_id) AS stig_title,
             c.asset_id,
             a.name           AS asset_name,
-            u.display_name   AS owner_name
+            u.display_name   AS owner_name,
+            cr.assignee_id,
+            au.display_name  AS assignee_name,
+            cr.due_date
         FROM checklist_rules cr
         JOIN checklists c ON c.id = cr.checklist_id
         JOIN assets a     ON a.id = c.asset_id
         JOIN users u      ON u.id = a.owner_id
+        LEFT JOIN users au         ON au.id = cr.assignee_id
         LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
         WHERE cr.status = $1
-          AND ($2::text IS NULL OR cr.rule_id  = $2)
-          AND ($3::text IS NULL OR c.asset_id  = $3)
+          AND ($2::text IS NULL OR cr.rule_id    = $2)
+          AND ($3::text IS NULL OR c.asset_id    = $3)
+          AND ($4::text IS NULL OR cr.assignee_id = $4)
         ORDER BY a.name, c.stig_id, cr.rule_id
         "#,
     )
     .bind(&params.status)
     .bind(params.rule_id.as_deref())
     .bind(params.asset_id.as_deref())
+    .bind(assignee_filter.as_deref())
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(|e| {

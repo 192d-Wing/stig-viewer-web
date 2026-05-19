@@ -26,6 +26,10 @@ pub struct UpdateRuleRequest {
     pub finding_details: String,
     #[serde(default)]
     pub comments: String,
+    #[serde(default)]
+    pub assignee_id: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<chrono::NaiveDate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +186,8 @@ pub async fn update_rule_handler(
         &req.finding_details,
         &req.comments,
         &user.id,
+        req.assignee_id.as_deref(),
+        req.due_date,
     )
     .await
     .map_err(map_db)?;
@@ -261,17 +267,34 @@ fn merge_rule(
                 "updatedAt".into(),
                 Value::String(o.updated_at.to_rfc3339()),
             );
-            if let Some(by) = &o.updated_by {
-                state_obj.insert("updatedBy".into(), Value::String(by.clone()));
-            } else {
-                state_obj.insert("updatedBy".into(), Value::Null);
-            }
+            state_obj.insert(
+                "updatedBy".into(),
+                o.updated_by
+                    .as_ref()
+                    .map(|s| Value::String(s.clone()))
+                    .unwrap_or(Value::Null),
+            );
+            state_obj.insert(
+                "assigneeId".into(),
+                o.assignee_id
+                    .as_ref()
+                    .map(|s| Value::String(s.clone()))
+                    .unwrap_or(Value::Null),
+            );
+            state_obj.insert(
+                "dueDate".into(),
+                o.due_date
+                    .map(|d| Value::String(d.to_string()))
+                    .unwrap_or(Value::Null),
+            );
         } else {
             state_obj.insert("status".into(), Value::String("not_reviewed".into()));
             state_obj.insert("findingDetails".into(), Value::String("".into()));
             state_obj.insert("comments".into(), Value::String("".into()));
             state_obj.insert("updatedAt".into(), Value::Null);
             state_obj.insert("updatedBy".into(), Value::Null);
+            state_obj.insert("assigneeId".into(), Value::Null);
+            state_obj.insert("dueDate".into(), Value::Null);
         }
     }
     obj.insert("state".into(), Value::Object(state_obj));
