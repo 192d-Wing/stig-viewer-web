@@ -4,6 +4,7 @@ import '@cloudscape-design/global-styles/index.css'
 import { applyMode, Mode } from '@cloudscape-design/global-styles'
 import './index.css'
 import App from './App.jsx'
+import AuthGate from './components/AuthGate.jsx'
 
 applyMode(Mode.Dark)
 
@@ -35,7 +36,9 @@ if (!root) throw new Error('Root element #root not found')
 createRoot(root).render(
   <StrictMode>
     <ErrorBoundary>
-      <App />
+      <AuthGate>
+        <App />
+      </AuthGate>
     </ErrorBoundary>
   </StrictMode>,
 )

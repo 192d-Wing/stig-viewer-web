@@ -1,6 +1,7 @@
 {
   "realm": "stig-viewer",
   "enabled": true,
+  "sslRequired": "none",
   "registrationAllowed": false,
   "resetPasswordAllowed": false,
   "rememberMe": true,

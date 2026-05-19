@@ -11,7 +11,11 @@ export async function apiFetch(path, opts = {}) {
   const headers = new Headers(opts.headers)
   if (userId) headers.set('X-User-Id', userId)
 
-  const res = await fetch(`${BACKEND}${path}`, { ...opts, headers })
+  const res = await fetch(`${BACKEND}${path}`, {
+    credentials: 'include',
+    ...opts,
+    headers,
+  })
   return res
 }
 
