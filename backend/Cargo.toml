@@ -27,3 +27,4 @@ openidconnect      = { version = "4", features = ["reqwest", "rustls-tls"], defa
 axum-extra         = { version = "0.9", features = ["cookie"] }
 url                = "2"
 time               = "0.3"
+printpdf           = "0.7"

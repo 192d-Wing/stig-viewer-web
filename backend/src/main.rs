@@ -47,6 +47,7 @@ use api::{
     },
     drafts::*,
     findings::list_handler as list_findings_handler,
+    report::report_handler as asset_report_handler,
     stig::get_stig,
     test_support::{backdate_handler, reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
@@ -132,6 +133,7 @@ async fn main() -> Result<()> {
                 .put(update_asset_handler)
                 .delete(delete_asset_handler),
         )
+        .route("/api/assets/:id/report.pdf", get(asset_report_handler))
         .route(
             "/api/assets/:id/checklists",
             get(list_checklists_for_asset_handler).post(create_checklist_handler),

@@ -12,7 +12,7 @@ import Alert from "@cloudscape-design/components/alert";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import { apiGet, apiJson, apiFetch } from "../utils/api.js";
+import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 
 export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
@@ -118,7 +118,20 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
 
         <Container
           header={
-            <Header variant="h1" description={asset.description || undefined}>
+            <Header
+              variant="h1"
+              description={asset.description || undefined}
+              actions={
+                <Button
+                  iconName="download"
+                  href={`${BACKEND}/api/assets/${asset.id}/report.pdf`}
+                  target="_blank"
+                  download
+                >
+                  Download PDF report
+                </Button>
+              }
+            >
               {asset.name}
             </Header>
           }
