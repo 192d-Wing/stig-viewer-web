@@ -501,6 +501,9 @@ export default function Dashboard() {
           </Container>
         )}
 
+        {/* Compliance heatmap: asset × STIG matrix */}
+        {data.byAsset.length > 0 && <HeatmapSection byAsset={data.byAsset} />}
+
         {/* Per-asset / per-checklist progress */}
         <Table
           variant="container"
@@ -1086,6 +1089,151 @@ function KpiCard({ label, value, sub, tone, onClick }) {
           View details
         </Button>
       )}
+    </Container>
+  );
+}
+
+// ── Compliance heatmap ──────────────────────────────────────────────────────
+
+function cellColor(c) {
+  if (!c) return { bg: "transparent", fg: "var(--awsui-color-text-status-inactive)", label: "—" };
+  if (c.openCount > 0) {
+    return { bg: "#7a1c1c", fg: "#fff", label: String(c.openCount) };
+  }
+  if (c.reviewedCount === 0) {
+    return { bg: "#444", fg: "#ccc", label: "·" };
+  }
+  if (c.reviewedCount < c.ruleCount) {
+    return { bg: "#7a5e1c", fg: "#fff", label: "↻" };
+  }
+  return { bg: "#1c5e2d", fg: "#fff", label: "✓" };
+}
+
+function HeatmapSection({ byAsset }) {
+  // Collect unique STIG titles across all assets, sorted alphabetically.
+  const stigs = [];
+  const seen = new Map();
+  for (const a of byAsset) {
+    for (const c of a.checklists) {
+      if (!seen.has(c.stigId)) {
+        seen.set(c.stigId, c.stigTitle);
+        stigs.push({ id: c.stigId, title: c.stigTitle });
+      }
+    }
+  }
+  stigs.sort((a, b) => a.title.localeCompare(b.title));
+
+  if (stigs.length === 0) {
+    return null;
+  }
+
+  const cellLookup = new Map(); // `${assetId}:${stigId}` → checklist
+  for (const a of byAsset) {
+    for (const c of a.checklists) {
+      cellLookup.set(`${a.id}:${c.stigId}`, c);
+    }
+  }
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="Open count per (system, STIG). Green = all reviewed and compliant, yellow = in progress, red = open findings, grey = not started."
+        >
+          Posture heatmap
+        </Header>
+      }
+    >
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: 12 }}>
+          <thead>
+            <tr>
+              <th
+                style={{
+                  textAlign: "left",
+                  padding: "6px 10px",
+                  borderBottom: "1px solid #444",
+                  position: "sticky",
+                  left: 0,
+                  background: "var(--awsui-color-background-container-content)",
+                }}
+              >
+                System
+              </th>
+              {stigs.map((s) => (
+                <th
+                  key={s.id}
+                  style={{
+                    padding: "6px 10px",
+                    borderBottom: "1px solid #444",
+                    fontWeight: 400,
+                    fontSize: 11,
+                    writingMode: "vertical-rl",
+                    transform: "rotate(180deg)",
+                    whiteSpace: "nowrap",
+                    maxHeight: 180,
+                  }}
+                  title={s.title}
+                >
+                  {s.title.length > 30 ? s.title.slice(0, 30) + "…" : s.title}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {byAsset.map((a) => (
+              <tr key={a.id}>
+                <td
+                  style={{
+                    padding: "6px 10px",
+                    borderBottom: "1px solid #2b2b2b",
+                    position: "sticky",
+                    left: 0,
+                    background: "var(--awsui-color-background-container-content)",
+                  }}
+                >
+                  {a.name}
+                </td>
+                {stigs.map((s) => {
+                  const c = cellLookup.get(`${a.id}:${s.id}`);
+                  const { bg, fg, label } = cellColor(c);
+                  const tip = c
+                    ? `${a.name} · ${s.title}\n${c.openCount} open / ${c.nafCount} NaF / ${c.naCount} N/A / ${c.reviewedCount} reviewed of ${c.ruleCount}`
+                    : `${a.name} · ${s.title} — not applied`;
+                  return (
+                    <td
+                      key={s.id}
+                      title={tip}
+                      style={{
+                        padding: 0,
+                        borderBottom: "1px solid #2b2b2b",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: 32,
+                          height: 28,
+                          margin: 2,
+                          background: bg,
+                          color: fg,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontWeight: 600,
+                          borderRadius: 3,
+                        }}
+                      >
+                        {label}
+                      </div>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </Container>
   );
 }
