@@ -24,6 +24,9 @@ services:
       PORT: "8080"
       RUST_LOG: info
       STIG_ENV: development
+      # Hours between DISA sync runs; set to a huge number to effectively disable
+      # (used by CI to keep startup fast and avoid hitting external URLs).
+      STIG_SYNC_INTERVAL_HOURS: ${STIG_SYNC_INTERVAL_HOURS:-24}
       CARGO_TARGET_DIR: /target
     ports:
       - "8080:8080"
@@ -42,6 +45,10 @@ services:
       dockerfile: Dockerfile.dev
     environment:
       CHOKIDAR_USEPOLLING: "true"
+      # Backend origin embedded into the Vite bundle + CSP connect-src.
+      # Override from the host shell to point at a non-localhost backend, e.g.:
+      #   VITE_API_URL=http://192.168.1.5:8080 docker compose up
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8080}
     ports:
       - "5173:5173"
     volumes:

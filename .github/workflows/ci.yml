@@ -25,26 +25,10 @@ jobs:
     needs: lint-and-build
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_DB: stig_viewer
-          POSTGRES_USER: stig
-          POSTGRES_PASSWORD: stig_local
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U stig -d stig_viewer"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
-      DATABASE_URL: postgres://stig:stig_local@localhost:5432/stig_viewer
-      PORT: 8080
-      DATA_DIR: data
-      STIG_SYNC_INTERVAL_HOURS: 999999
+      # Skip the DISA sync scheduler in CI — keeps backend startup fast and
+      # avoids depending on the external network.
+      STIG_SYNC_INTERVAL_HOURS: "999999"
 
     steps:
       - uses: actions/checkout@v6
@@ -56,46 +40,46 @@ jobs:
 
       - run: npm ci
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Cache Rust builds
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: backend
-
-      - name: Build backend
-        run: cargo build
-        working-directory: backend
-
-      - name: Start backend
-        run: cargo run &
-        working-directory: backend
+      - name: Start dev stack
+        run: docker compose up -d
 
       - name: Wait for backend
         run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/api/health && exit 0
-            sleep 2
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8080/api/health >/dev/null; then
+              echo "backend healthy after ${i} attempts"
+              exit 0
+            fi
+            sleep 3
           done
-          echo "Backend did not start" && exit 1
-
-      - name: Start frontend
-        run: npm run dev &
+          echo "Backend did not become healthy"
+          docker compose logs backend
+          exit 1
 
       - name: Wait for frontend
         run: |
-          for i in $(seq 1 15); do
-            curl -sf http://localhost:5173 && exit 0
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:5173 >/dev/null; then
+              echo "frontend healthy after ${i} attempts"
+              exit 0
+            fi
             sleep 2
           done
-          echo "Frontend did not start" && exit 1
+          echo "Frontend did not become healthy"
+          docker compose logs frontend
+          exit 1
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
       - name: Run E2E tests
         run: npx playwright test
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs
 
       - name: Upload test artifacts
         if: failure()
@@ -106,3 +90,7 @@ jobs:
             playwright-report/
             test-results/
           retention-days: 7
+
+      - name: Stop dev stack
+        if: always()
+        run: docker compose down -v
