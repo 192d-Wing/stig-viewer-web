@@ -47,7 +47,7 @@ use api::{
         trend_handler as get_dashboard_trend_handler,
     },
     drafts::*,
-    findings::list_handler as list_findings_handler,
+    findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
     report::report_handler as asset_report_handler,
     stig::get_stig,
     test_support::{backdate_handler, reset_handler, set_role_handler},
@@ -179,6 +179,10 @@ async fn main() -> Result<()> {
         .route("/api/dashboard", get(get_dashboard_handler))
         .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
         .route("/api/findings", get(list_findings_handler))
+        .route(
+            "/api/findings/bulk",
+            axum::routing::patch(bulk_findings_handler),
+        )
         .route(
             "/api/baselines",
             get(list_baselines_handler).post(create_baseline_handler),

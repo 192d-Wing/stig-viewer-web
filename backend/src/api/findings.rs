@@ -232,3 +232,151 @@ async fn load_rule_meta_map(
 fn is_valid_status(s: &str) -> bool {
     matches!(s, "open" | "not_a_finding" | "not_applicable" | "not_reviewed")
 }
+
+// ── Bulk patch ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkTarget {
+    pub checklist_id: String,
+    pub rule_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkPatch {
+    pub status: Option<String>,
+    pub finding_details: Option<String>,
+    pub comments: Option<String>,
+    /// Present = set assignee to this user_id. Absent = leave each target's
+    /// existing assignee alone. Clearing an existing assignee via bulk is
+    /// not supported in MVP (would need null-vs-absent distinction).
+    pub assignee_id: Option<String>,
+    /// Same semantics as assigneeId.
+    pub due_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkRequest {
+    pub targets: Vec<BulkTarget>,
+    pub patch: BulkPatch,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkResponse {
+    pub updated: usize,
+}
+
+/// PATCH /api/findings/bulk
+/// Apply the same patch to a list of (checklistId, ruleId) targets.
+/// Caller must own the asset for every target; otherwise the entire
+/// request is rejected with 403 (no partial application).
+pub async fn bulk_handler(
+    State(state): State<crate::AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<BulkRequest>,
+) -> Result<Json<BulkResponse>, StatusCode> {
+    if req.targets.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Some(s) = &req.patch.status {
+        if !is_valid_status(s) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let pool = state.pool.as_ref();
+
+    // Owner check: every target's checklist must belong to an asset owned
+    // by the caller. One IN-list query suffices.
+    let checklist_ids: Vec<&str> = req.targets.iter().map(|t| t.checklist_id.as_str()).collect();
+    let owner_rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT c.id, a.owner_id \
+         FROM checklists c \
+         JOIN assets a ON a.id = c.asset_id \
+         WHERE c.id = ANY($1)",
+    )
+    .bind(&checklist_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("bulk owner-check failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let owners: std::collections::HashMap<String, String> = owner_rows.into_iter().collect();
+    for t in &req.targets {
+        match owners.get(&t.checklist_id) {
+            Some(owner) if owner == &user.id => {}
+            Some(_) => return Err(StatusCode::FORBIDDEN),
+            None => return Err(StatusCode::NOT_FOUND),
+        }
+    }
+
+    // Apply each patch using the existing upsert_rule path so audit log
+    // entries are written per-field-changed, just like a single PATCH.
+    let mut updated = 0usize;
+    for t in &req.targets {
+        // Fetch existing row to fill in untouched fields.
+        let existing = sqlx::query_as::<_, crate::db_checklists::ChecklistRuleRow>(
+            "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = $2",
+        )
+        .bind(&t.checklist_id)
+        .bind(&t.rule_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("bulk existing fetch failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let status = req
+            .patch
+            .status
+            .clone()
+            .or_else(|| existing.as_ref().map(|e| e.status.clone()))
+            .unwrap_or_else(|| "not_reviewed".into());
+        let finding_details = req
+            .patch
+            .finding_details
+            .clone()
+            .or_else(|| existing.as_ref().map(|e| e.finding_details.clone()))
+            .unwrap_or_default();
+        let comments = req
+            .patch
+            .comments
+            .clone()
+            .or_else(|| existing.as_ref().map(|e| e.comments.clone()))
+            .unwrap_or_default();
+        let assignee_id = req
+            .patch
+            .assignee_id
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|e| e.assignee_id.clone()));
+        let due_date = req
+            .patch
+            .due_date
+            .or_else(|| existing.as_ref().and_then(|e| e.due_date));
+
+        crate::db_checklists::upsert_rule(
+            pool,
+            &t.checklist_id,
+            &t.rule_id,
+            &status,
+            &finding_details,
+            &comments,
+            &user.id,
+            assignee_id.as_deref(),
+            due_date,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("bulk upsert_rule failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        updated += 1;
+    }
+
+    Ok(Json(BulkResponse { updated }))
+}
