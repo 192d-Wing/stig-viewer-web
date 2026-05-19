@@ -9,7 +9,10 @@ use axum::{
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration, Utc};
 use openidconnect::{
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    core::{
+        CoreAuthenticationFlow, CoreClient, CoreIdTokenVerifier, CoreJsonWebKeySet,
+        CoreProviderMetadata,
+    },
     reqwest, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
@@ -48,6 +51,10 @@ pub struct OidcContext {
     pub http: reqwest::Client,
     pub public_auth_base: String, // e.g. http://localhost:8081  (for browser redirect rewrite)
     pub internal_issuer: String,  // e.g. http://keycloak:8081/realms/stig-viewer  (used for discovery)
+    pub public_issuer: String,    // e.g. http://localhost:8081/realms/stig-viewer  (what tokens actually carry as iss)
+    pub jwks: CoreJsonWebKeySet,
+    pub client_id: ClientId,
+    pub client_secret: ClientSecret,
     pub frontend_url: String,
     pub allow_test_auth_header: bool,
 }
@@ -98,18 +105,39 @@ pub async fn build_oidc_context(env: &OidcEnv) -> Result<OidcContext> {
     .await
     .context("OIDC discovery failed")?;
 
+    let jwks = provider_metadata.jwks().clone();
+
+    let client_id = ClientId::new(env.client_id.clone());
+    let client_secret = ClientSecret::new(env.client_secret.clone());
     let client = CoreClient::from_provider_metadata(
         provider_metadata,
-        ClientId::new(env.client_id.clone()),
-        Some(ClientSecret::new(env.client_secret.clone())),
+        client_id.clone(),
+        Some(client_secret.clone()),
     )
     .set_redirect_uri(RedirectUrl::new(env.redirect_uri.clone())?);
+
+    // Public issuer = rewrite the discovery (internal) issuer's origin to the
+    // browser-facing public origin. Tokens minted by an IdP that auth'd the
+    // browser at the public URL will carry this issuer in their iss claim.
+    let public_issuer = url::Url::parse(&env.internal_issuer_url)
+        .ok()
+        .and_then(|u| {
+            let pub_base = url::Url::parse(&env.public_auth_base).ok()?;
+            Some(rewrite_origin(u, &env.internal_issuer_url, pub_base.as_str()).to_string())
+        })
+        .unwrap_or_else(|| env.internal_issuer_url.clone());
+    // url::Url::to_string() adds a trailing slash; strip it to match issuer string form.
+    let public_issuer = public_issuer.trim_end_matches('/').to_string();
 
     Ok(OidcContext {
         client: Arc::new(client),
         http,
         public_auth_base: env.public_auth_base.clone(),
         internal_issuer: env.internal_issuer_url.clone(),
+        public_issuer,
+        jwks,
+        client_id,
+        client_secret,
         frontend_url: env.frontend_url.clone(),
         allow_test_auth_header: env.allow_test_auth_header,
     })
@@ -211,11 +239,21 @@ pub async fn callback_handler(
             StatusCode::UNAUTHORIZED
         })?;
 
-    // Validate ID token.
+    // Validate ID token. Build the verifier with the PUBLIC issuer URL
+    // (matching what the IdP put in the iss claim — Keycloak ties iss to
+    // the hostname the browser used at auth time, not where the backend
+    // exchanges the code) and reuse the JWKS fetched at discovery time.
     let id_token = token_response
         .id_token()
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    let id_token_verifier = oidc.client.id_token_verifier();
+    let verifier_issuer = IssuerUrl::new(oidc.public_issuer.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let id_token_verifier = CoreIdTokenVerifier::new_confidential_client(
+        oidc.client_id.clone(),
+        oidc.client_secret.clone(),
+        verifier_issuer,
+        oidc.jwks.clone(),
+    );
     let claims = id_token
         .claims(&id_token_verifier, &Nonce::new(auth_state.nonce))
         .map_err(|e| {

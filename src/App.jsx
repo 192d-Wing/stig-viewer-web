@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback } from "react";
+import { useState, useMemo, useRef, useCallback, useContext } from "react";
 import { useStigTabs } from "./hooks/useStigTabs.js";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
 import AppLayout from "@cloudscape-design/components/app-layout";
@@ -16,9 +16,20 @@ import STIGView from "./components/STIGView.jsx";
 import DiffView from "./components/DiffView.jsx";
 import RuleDetail from "./components/RuleDetail.jsx";
 import STIGWriter from "./components/STIGWriter.jsx";
-import UserSetup from "./components/UserSetup.jsx";
+import { AuthContext } from "./components/AuthGate.jsx";
+import { apiFetch } from "./utils/api.js";
 
 export default function App() {
+  const currentUser = useContext(AuthContext);
+
+  const handleSignOut = useCallback(async () => {
+    try {
+      await apiFetch("/auth/logout", { method: "POST" });
+    } finally {
+      window.location.reload();
+    }
+  }, []);
+
   const {
     tabs,
     activeTabId,
@@ -117,6 +128,17 @@ export default function App() {
       });
     }
   }
+  if (currentUser) {
+    utilities.push({
+      type: "menu-dropdown",
+      text: currentUser.display_name || "Account",
+      iconName: "user-profile",
+      items: [{ id: "signout", text: "Sign out" }],
+      onItemClick: ({ detail }) => {
+        if (detail.id === "signout") handleSignOut();
+      },
+    });
+  }
 
   const handleLoadFromLibrary = useCallback(
     (stigJson) => {
@@ -194,7 +216,7 @@ export default function App() {
   }
 
   return (
-    <UserSetup>
+    <>
       <div id="h">
         <TopNavigation
           identity={{
@@ -337,6 +359,6 @@ export default function App() {
           first if you need to keep it.
         </Alert>
       </Modal>
-    </UserSetup>
+    </>
   );
 }
