@@ -12,7 +12,21 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import PieChart from "@cloudscape-design/components/pie-chart";
 import LineChart from "@cloudscape-design/components/line-chart";
 import Button from "@cloudscape-design/components/button";
+import Select from "@cloudscape-design/components/select";
 import { apiGet } from "../utils/api.js";
+
+const SEVERITY_OPTIONS = [
+  { label: "All severities", value: null },
+  { label: "CAT I", value: "CAT I" },
+  { label: "CAT II", value: "CAT II" },
+  { label: "CAT III", value: "CAT III" },
+];
+
+const SEVERITY_BADGE = {
+  "CAT I": "red",
+  "CAT II": "blue",
+  "CAT III": "grey",
+};
 
 const STATUS_COLORS = {
   Open: "red",
@@ -34,6 +48,7 @@ export default function Dashboard() {
 
   // Drill-down: { ruleId?: string } or null
   const [drilldown, setDrilldown] = useState(null);
+  const [severityFilter, setSeverityFilter] = useState(null); // option object or null
   const [findings, setFindings] = useState([]);
   const [findingsLoading, setFindingsLoading] = useState(false);
   const [findingsError, setFindingsError] = useState(null);
@@ -59,7 +74,7 @@ export default function Dashboard() {
     refresh();
   }, [refresh]);
 
-  // Load findings when drilldown is active.
+  // Load findings when drilldown is active or severity filter changes.
   useEffect(() => {
     if (!drilldown) {
       setFindings([]);
@@ -69,6 +84,7 @@ export default function Dashboard() {
     let cancelled = false;
     const qs = new URLSearchParams({ status: "open" });
     if (drilldown.ruleId) qs.set("ruleId", drilldown.ruleId);
+    if (severityFilter?.value) qs.set("severity", severityFilter.value);
     setFindingsLoading(true);
     setFindingsError(null);
     apiGet(`/api/findings?${qs.toString()}`)
@@ -84,7 +100,7 @@ export default function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [drilldown]);
+  }, [drilldown, severityFilter]);
 
   // Pre-flatten the per-asset / per-checklist rows for the table.
   const checklistRows = useMemo(() => {
@@ -380,6 +396,18 @@ export default function Dashboard() {
             trackBy={(f) => `${f.checklistId}:${f.ruleId}`}
             columnDefinitions={[
               { id: "rule", header: "Rule", cell: (f) => f.ruleId },
+              {
+                id: "severity",
+                header: "Severity",
+                cell: (f) =>
+                  f.severity ? (
+                    <Badge color={SEVERITY_BADGE[f.severity] ?? "grey"}>
+                      {f.severity}
+                    </Badge>
+                  ) : (
+                    <Box color="text-status-inactive">—</Box>
+                  ),
+              },
               { id: "asset", header: "System", cell: (f) => f.assetName },
               { id: "stig", header: "STIG", cell: (f) => f.stigTitle },
               { id: "owner", header: "Owner", cell: (f) => f.ownerName },
@@ -403,6 +431,20 @@ export default function Dashboard() {
               >
                 {drilldown.ruleId ? "Rule drill-down" : "Open findings"}
               </Header>
+            }
+            filter={
+              <Select
+                selectedOption={severityFilter ?? SEVERITY_OPTIONS[0]}
+                onChange={({ detail }) =>
+                  setSeverityFilter(
+                    detail.selectedOption.value
+                      ? detail.selectedOption
+                      : null,
+                  )
+                }
+                options={SEVERITY_OPTIONS}
+                ariaLabel="Filter by severity"
+              />
             }
             empty={
               <Box textAlign="center" padding="l">
