@@ -74,6 +74,47 @@ pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     Ok(())
 }
 
+/// Stamp a checklist with a new applied_version + applied_release.
+/// Used by re-apply to clear the drift flag once the user has acked
+/// that the catalog has moved forward.
+pub async fn set_applied_version(
+    pool: &PgPool,
+    id: &str,
+    version: &str,
+    release: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE checklists \
+         SET applied_version = $1, applied_release = $2, updated_at = NOW() \
+         WHERE id = $3",
+    )
+    .bind(version)
+    .bind(release)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete rule overrides whose `rule_id` is not in `keep`. Used by
+/// re-apply to drop overrides for rules that no longer exist in the
+/// new STIG revision. Returns the count deleted.
+pub async fn prune_orphan_rule_overrides(
+    pool: &PgPool,
+    checklist_id: &str,
+    keep: &[String],
+) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM checklist_rules \
+         WHERE checklist_id = $1 AND rule_id <> ALL($2)",
+    )
+    .bind(checklist_id)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Look up the current (version, release_info) for a STIG in the catalog.
 /// Returns ("", "") if not in the catalog so create_handler can still
 /// proceed for user-uploaded STIGs that don't sit in stigs_catalog.

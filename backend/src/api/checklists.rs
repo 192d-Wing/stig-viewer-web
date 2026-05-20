@@ -159,6 +159,68 @@ pub async fn delete_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReapplyResponse {
+    pub checklist: db_checklists::ChecklistRow,
+    pub pruned_rules: u64,
+}
+
+/// POST /api/checklists/:id/reapply — refresh a checklist against the
+/// current catalog. Stamps the live `(version, release)` onto the row
+/// and prunes any rule overrides whose rule_id no longer exists in the
+/// new STIG JSON. Existing overrides for rules that still exist are
+/// preserved unchanged.
+pub async fn reapply_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ReapplyResponse>, StatusCode> {
+    let checklist = db_checklists::get_checklist(state.pool.as_ref(), &id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let asset = db_assets::get_asset(state.pool.as_ref(), &checklist.asset_id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if asset.owner_id != user.id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let (version, release) =
+        db_checklists::catalog_version(state.pool.as_ref(), &checklist.stig_id)
+            .await
+            .map_err(map_db)?;
+
+    // Pull the new STIG's rule IDs so we know which overrides to keep.
+    let mut stig = load_stig_json(&state, &checklist.stig_id).await?;
+    let rules = take_rules(&mut stig);
+    let keep: Vec<String> = rules
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let pruned = db_checklists::prune_orphan_rule_overrides(state.pool.as_ref(), &id, &keep)
+        .await
+        .map_err(map_db)?;
+    db_checklists::set_applied_version(state.pool.as_ref(), &id, &version, &release)
+        .await
+        .map_err(map_db)?;
+
+    let updated = db_checklists::get_checklist(state.pool.as_ref(), &id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ReapplyResponse {
+        checklist: updated,
+        pruned_rules: pruned,
+    }))
+}
+
 /// PATCH /api/checklists/:id/rules/:rule_id — update one rule's state.
 pub async fn update_rule_handler(
     State(state): State<AppState>,
