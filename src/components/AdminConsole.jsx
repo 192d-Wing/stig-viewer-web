@@ -6,11 +6,15 @@ import Modal from "@cloudscape-design/components/modal";
 import Box from "@cloudscape-design/components/box";
 import Badge from "@cloudscape-design/components/badge";
 import Select from "@cloudscape-design/components/select";
+import Multiselect from "@cloudscape-design/components/multiselect";
+import Input from "@cloudscape-design/components/input";
+import Toggle from "@cloudscape-design/components/toggle";
 import FormField from "@cloudscape-design/components/form-field";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Alert from "@cloudscape-design/components/alert";
 import Container from "@cloudscape-design/components/container";
-import { apiGet, apiJson } from "../utils/api.js";
+import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import { apiGet, apiJson, apiFetch } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
   { label: "Author", value: "author" },
@@ -23,6 +27,10 @@ const ROLE_BADGE = {
   reviewer: "green",
   admin: "red",
 };
+
+// Only 'assigned' fires today; the backend column is array-typed so we
+// can add more kinds (overdue, status_change, …) without a schema bump.
+const KIND_OPTIONS = [{ label: "Assigned", value: "assigned" }];
 
 function roleLabel(value) {
   return ROLE_OPTIONS.find((o) => o.value === value)?.label ?? value;
@@ -45,9 +53,16 @@ function relativeTime(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+/** Show a truncated URL with hover-title for the full value. */
+function truncateUrl(url, max = 50) {
+  if (!url) return "";
+  return url.length > max ? `${url.slice(0, max - 1)}…` : url;
+}
+
 export default function AdminConsole() {
   const [users, setUsers] = useState([]);
   const [assets, setAssets] = useState([]);
+  const [webhooks, setWebhooks] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -63,16 +78,27 @@ export default function AdminConsole() {
   const [ownerError, setOwnerError] = useState(null);
   const [ownerSuccess, setOwnerSuccess] = useState(null);
 
+  // Webhook modal state. `mode` is 'create' or 'edit'.
+  const [hookModal, setHookModal] = useState(null);
+  const [hookSubmitting, setHookSubmitting] = useState(false);
+  const [hookError, setHookError] = useState(null);
+
+  // Deliveries panel state: { webhook, rows, loading } | null
+  const [deliveriesPanel, setDeliveriesPanel] = useState(null);
+  const [testFlash, setTestFlash] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [u, a] = await Promise.all([
+      const [u, a, w] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
+        apiGet("/api/webhooks").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
+      setWebhooks(w);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -135,6 +161,119 @@ export default function AdminConsole() {
     }
   }, [ownerAsset, ownerUser, refresh]);
 
+  // ── Webhook helpers ────────────────────────────────────────────────────
+
+  const openCreateHook = useCallback(() => {
+    setHookModal({
+      mode: "create",
+      id: null,
+      name: "",
+      url: "",
+      secret: "",
+      kinds: ["assigned"],
+      enabled: true,
+    });
+    setHookError(null);
+  }, []);
+
+  const submitHook = useCallback(async () => {
+    if (!hookModal) return;
+    setHookSubmitting(true);
+    setHookError(null);
+    try {
+      const body = {
+        name: hookModal.name,
+        url: hookModal.url,
+        secret: hookModal.secret,
+        kinds: hookModal.kinds,
+      };
+      if (hookModal.mode === "create") {
+        await apiJson("/api/webhooks", "POST", body);
+      } else {
+        await apiJson(`/api/webhooks/${hookModal.id}`, "PATCH", {
+          ...body,
+          enabled: hookModal.enabled,
+        });
+      }
+      setHookModal(null);
+      await refresh();
+    } catch (err) {
+      setHookError(err.message);
+    } finally {
+      setHookSubmitting(false);
+    }
+  }, [hookModal, refresh]);
+
+  const toggleHookEnabled = useCallback(
+    async (hook, next) => {
+      try {
+        await apiJson(`/api/webhooks/${hook.id}`, "PATCH", { enabled: next });
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      }
+    },
+    [refresh],
+  );
+
+  const deleteHook = useCallback(
+    async (hook) => {
+      if (
+        !window.confirm(`Delete webhook "${hook.name}"? This can't be undone.`)
+      ) {
+        return;
+      }
+      try {
+        const res = await apiFetch(`/api/webhooks/${hook.id}`, {
+          method: "DELETE",
+        });
+        if (!res.ok && res.status !== 204) {
+          throw new Error(`Delete failed: ${res.status}`);
+        }
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      }
+    },
+    [refresh],
+  );
+
+  const testHook = useCallback(async (hook) => {
+    setTestFlash(null);
+    try {
+      const res = await apiFetch(`/api/webhooks/${hook.id}/test`, {
+        method: "POST",
+      });
+      if (!res.ok && res.status !== 202) {
+        throw new Error(`Test failed: ${res.status}`);
+      }
+      setTestFlash(
+        `Test event dispatched to "${hook.name}". Open Deliveries to view the result.`,
+      );
+    } catch (err) {
+      setError(err.message);
+    }
+  }, []);
+
+  const openDeliveries = useCallback(async (hook) => {
+    setDeliveriesPanel({ webhook: hook, rows: [], loading: true });
+    try {
+      const rows = await apiGet(`/api/webhooks/${hook.id}/deliveries`);
+      setDeliveriesPanel({
+        webhook: hook,
+        rows: rows.slice(0, 10),
+        loading: false,
+      });
+    } catch (err) {
+      setDeliveriesPanel({
+        webhook: hook,
+        rows: [],
+        loading: false,
+        error: err.message,
+      });
+    }
+  }, []);
+
   const columns = useMemo(
     () => [
       {
@@ -181,6 +320,78 @@ export default function AdminConsole() {
     [openRoleModal],
   );
 
+  const webhookColumns = useMemo(
+    () => [
+      {
+        id: "name",
+        header: "Name",
+        cell: (w) => w.name,
+      },
+      {
+        id: "url",
+        header: "URL",
+        cell: (w) => <span title={w.url}>{truncateUrl(w.url)}</span>,
+      },
+      {
+        id: "kinds",
+        header: "Events",
+        cell: (w) => (
+          <SpaceBetween direction="horizontal" size="xxs">
+            {(w.kinds ?? []).map((k) => (
+              <Badge key={k} color="blue">
+                {k}
+              </Badge>
+            ))}
+          </SpaceBetween>
+        ),
+      },
+      {
+        id: "enabled",
+        header: "Enabled",
+        cell: (w) => (
+          <Toggle
+            checked={w.enabled}
+            onChange={({ detail }) => toggleHookEnabled(w, detail.checked)}
+          />
+        ),
+      },
+      {
+        id: "actions",
+        header: "",
+        cell: (w) => (
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button variant="inline-link" onClick={() => testHook(w)}>
+              Test
+            </Button>
+            <Button variant="inline-link" onClick={() => openDeliveries(w)}>
+              Deliveries
+            </Button>
+            <Button
+              variant="inline-link"
+              onClick={() =>
+                setHookModal({
+                  mode: "edit",
+                  id: w.id,
+                  name: w.name,
+                  url: w.url,
+                  secret: w.secret ?? "",
+                  kinds: w.kinds ?? ["assigned"],
+                  enabled: w.enabled,
+                })
+              }
+            >
+              Edit
+            </Button>
+            <Button variant="inline-link" onClick={() => deleteHook(w)}>
+              Delete
+            </Button>
+          </SpaceBetween>
+        ),
+      },
+    ],
+    [toggleHookEnabled, testHook, openDeliveries, deleteHook],
+  );
+
   const assetOptions = useMemo(
     () =>
       assets.map((a) => ({
@@ -201,9 +412,18 @@ export default function AdminConsole() {
     [users],
   );
 
+  const selectedKindOptions = hookModal
+    ? KIND_OPTIONS.filter((o) => (hookModal.kinds ?? []).includes(o.value))
+    : [];
+
   return (
     <SpaceBetween direction="vertical" size="l">
       {error && <Alert type="error">{error}</Alert>}
+      {testFlash && (
+        <Alert type="success" dismissible onDismiss={() => setTestFlash(null)}>
+          {testFlash}
+        </Alert>
+      )}
 
       <Table
         items={users}
@@ -274,6 +494,31 @@ export default function AdminConsole() {
         </SpaceBetween>
       </Container>
 
+      <Table
+        items={webhooks}
+        columnDefinitions={webhookColumns}
+        loading={loading}
+        loadingText="Loading webhooks"
+        empty={
+          <Box textAlign="center" padding="l">
+            No webhooks configured.
+          </Box>
+        }
+        header={
+          <Header
+            counter={`(${webhooks.length})`}
+            description="Outbound HTTP notifications fired when a finding is assigned. Compatible with Slack incoming webhooks."
+            actions={
+              <Button variant="primary" onClick={openCreateHook}>
+                Add webhook
+              </Button>
+            }
+          >
+            Webhooks
+          </Header>
+        }
+      />
+
       <Modal
         visible={roleModal !== null}
         onDismiss={() => setRoleModal(null)}
@@ -312,6 +557,150 @@ export default function AdminConsole() {
           </FormField>
           {roleError && <Alert type="error">{roleError}</Alert>}
         </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={hookModal !== null}
+        onDismiss={() => setHookModal(null)}
+        header={hookModal?.mode === "edit" ? "Edit webhook" : "Add webhook"}
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setHookModal(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={hookSubmitting}
+                onClick={submitHook}
+              >
+                Save
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          <FormField label="Name">
+            <Input
+              value={hookModal?.name ?? ""}
+              onChange={({ detail }) =>
+                setHookModal((m) => (m ? { ...m, name: detail.value } : m))
+              }
+              placeholder="Slack #security"
+            />
+          </FormField>
+          <FormField
+            label="URL"
+            description="Slack incoming webhook URL or any HTTPS endpoint."
+          >
+            <Input
+              value={hookModal?.url ?? ""}
+              onChange={({ detail }) =>
+                setHookModal((m) => (m ? { ...m, url: detail.value } : m))
+              }
+              placeholder="https://hooks.slack.com/services/…"
+            />
+          </FormField>
+          <FormField
+            label="Secret"
+            description="Optional. Sent as the X-Webhook-Secret header on each delivery."
+          >
+            <Input
+              value={hookModal?.secret ?? ""}
+              type="password"
+              onChange={({ detail }) =>
+                setHookModal((m) => (m ? { ...m, secret: detail.value } : m))
+              }
+            />
+          </FormField>
+          <FormField label="Events">
+            <Multiselect
+              selectedOptions={selectedKindOptions}
+              onChange={({ detail }) =>
+                setHookModal((m) =>
+                  m
+                    ? {
+                        ...m,
+                        kinds: detail.selectedOptions.map((o) => o.value),
+                      }
+                    : m,
+                )
+              }
+              options={KIND_OPTIONS}
+              placeholder="Select event kinds"
+            />
+          </FormField>
+          {hookError && <Alert type="error">{hookError}</Alert>}
+        </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={deliveriesPanel !== null}
+        onDismiss={() => setDeliveriesPanel(null)}
+        header={`Recent deliveries: ${deliveriesPanel?.webhook?.name ?? ""}`}
+        size="large"
+        footer={
+          <Box float="right">
+            <Button variant="link" onClick={() => setDeliveriesPanel(null)}>
+              Close
+            </Button>
+          </Box>
+        }
+      >
+        {deliveriesPanel?.loading ? (
+          <Box textAlign="center" padding="l">
+            Loading…
+          </Box>
+        ) : deliveriesPanel?.error ? (
+          <Alert type="error">{deliveriesPanel.error}</Alert>
+        ) : !deliveriesPanel?.rows?.length ? (
+          <Box textAlign="center" padding="l">
+            No deliveries yet.
+          </Box>
+        ) : (
+          <Table
+            variant="embedded"
+            items={deliveriesPanel.rows}
+            columnDefinitions={[
+              {
+                id: "attempted_at",
+                header: "When",
+                cell: (d) => relativeTime(d.attemptedAt),
+              },
+              {
+                id: "kind",
+                header: "Kind",
+                cell: (d) => d.kind,
+              },
+              {
+                id: "status",
+                header: "Status",
+                cell: (d) =>
+                  d.error ? (
+                    <StatusIndicator type="error">Failed</StatusIndicator>
+                  ) : d.httpStatus && d.httpStatus >= 200 && d.httpStatus < 300 ? (
+                    <StatusIndicator type="success">
+                      {d.httpStatus}
+                    </StatusIndicator>
+                  ) : (
+                    <StatusIndicator type="warning">
+                      {d.httpStatus ?? "—"}
+                    </StatusIndicator>
+                  ),
+              },
+              {
+                id: "detail",
+                header: "Detail",
+                cell: (d) => (
+                  <Box variant="code">
+                    {(d.error ?? d.response ?? "").slice(0, 200)}
+                  </Box>
+                ),
+              },
+            ]}
+          />
+        )}
       </Modal>
     </SpaceBetween>
   );
