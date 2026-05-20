@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::db_assets;
+use crate::db_attachments;
 use crate::db_checklists;
 use crate::AppState;
 
@@ -92,6 +93,16 @@ pub async fn report_handler(
             .map(|r| (r.rule_id.clone(), r))
             .collect();
 
+        // Attachment counts per rule. Findings with N>0 get an
+        // "Attachments: N" line in the PDF body.
+        let attachment_counts = db_attachments::counts_for_checklist(pool, &c.id)
+            .await
+            .map_err(map_db)?;
+        let attachments_by_rule: HashMap<String, i64> = attachment_counts
+            .into_iter()
+            .map(|r| (r.rule_id, r.count))
+            .collect();
+
         let mut rule_rows: Vec<RuleSummary> = Vec::new();
         let (mut open, mut naf, mut na, mut not_reviewed) = (0, 0, 0, 0);
         for rule in &rules {
@@ -120,12 +131,14 @@ pub async fn report_handler(
                 "not_applicable" => na += 1,
                 _ => not_reviewed += 1,
             }
+            let attachments = attachments_by_rule.get(&rid).copied().unwrap_or(0);
             rule_rows.push(RuleSummary {
                 id: rid,
                 title,
                 severity,
                 status,
                 finding_details,
+                attachments,
             });
         }
 
@@ -175,6 +188,7 @@ struct RuleSummary {
     severity: String,
     status: String,
     finding_details: String,
+    attachments: i64,
 }
 
 // ── PDF rendering ───────────────────────────────────────────────────────────
@@ -273,6 +287,14 @@ fn render_pdf(
                         &fonts.regular,
                     );
                     state.advance(LH_BODY * 0.7);
+                    if rule.attachments > 0 {
+                        state.text(
+                            &format!("Attachments: {}", rule.attachments),
+                            SIZE_SMALL,
+                            &fonts.regular,
+                        );
+                        state.advance(LH_BODY * 0.7);
+                    }
                     if !rule.title.is_empty() {
                         state.wrapped(&rule.title, SIZE_BODY, &fonts.regular, 95);
                     }
