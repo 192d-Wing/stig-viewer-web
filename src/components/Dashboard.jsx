@@ -19,6 +19,7 @@ import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
 import { apiFetch, apiGet, apiJson } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
+import { useUrlState } from "../hooks/useUrlState.js";
 
 const SEVERITY_OPTIONS = [
   { label: "All severities", value: null },
@@ -89,9 +90,52 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
 
   // Drill-down: { ruleId?: string } or null
-  const [drilldown, setDrilldown] = useState(null);
-  const [severityFilter, setSeverityFilter] = useState(null); // option object or null
-  const [mineOnly, setMineOnly] = useState(false);
+  // Drill-down + filter state lives in `?dd=…&rule=…&stale=N&sev=…&me=true`
+  // so the URL bar is a saveable, shareable view.
+  // dd ∈ "" | "open" | "overdue" | "stale" | "rule"
+  const [urlFilters, setUrlFilters] = useUrlState({
+    dd: "",
+    rule: "",
+    stale: 0,
+    sev: "",
+    me: false,
+  });
+  const drilldown = useMemo(() => {
+    if (!urlFilters.dd) return null;
+    if (urlFilters.dd === "rule") return { ruleId: urlFilters.rule };
+    if (urlFilters.dd === "stale") {
+      return { kind: "stale", olderThanDays: urlFilters.stale || 30 };
+    }
+    return { kind: urlFilters.dd };
+  }, [urlFilters.dd, urlFilters.rule, urlFilters.stale]);
+  const severityFilter = useMemo(
+    () => SEVERITY_OPTIONS.find((o) => o.value === urlFilters.sev) ?? null,
+    [urlFilters.sev],
+  );
+  const mineOnly = urlFilters.me;
+
+  const setDrilldown = useCallback(
+    (d) => {
+      if (!d) {
+        setUrlFilters({ dd: "", rule: "", stale: 0 });
+      } else if (d.ruleId) {
+        setUrlFilters({ dd: "rule", rule: d.ruleId, stale: 0 });
+      } else if (d.kind === "stale") {
+        setUrlFilters({ dd: "stale", rule: "", stale: d.olderThanDays ?? 30 });
+      } else {
+        setUrlFilters({ dd: d.kind, rule: "", stale: 0 });
+      }
+    },
+    [setUrlFilters],
+  );
+  const setSeverityFilter = useCallback(
+    (opt) => setUrlFilters({ sev: opt?.value ?? "" }),
+    [setUrlFilters],
+  );
+  const setMineOnly = useCallback(
+    (v) => setUrlFilters({ me: !!v }),
+    [setUrlFilters],
+  );
   const [findings, setFindings] = useState([]);
   const [findingsLoading, setFindingsLoading] = useState(false);
   const [findingsError, setFindingsError] = useState(null);

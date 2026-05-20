@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback, useContext } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback, useContext } from "react";
 import { useStigTabs } from "./hooks/useStigTabs.js";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
 import AppLayout from "@cloudscape-design/components/app-layout";
@@ -49,7 +49,42 @@ export default function App() {
     setDiffPair,
   } = useStigTabs();
 
-  const [appMode, setAppMode] = useState("viewer");
+  // Top-level "view" is encoded in `?view=` so the URL is shareable. On
+  // initial load we honor the param; subsequent clicks call `navigateTo`,
+  // which pushState's a new history entry and clears stale page-specific
+  // params from the previous view.
+  const [appMode, setAppMode] = useState(() => {
+    const v = new URLSearchParams(window.location.search).get("view");
+    return ["viewer", "writer", "systems", "dashboard", "myfindings"].includes(v)
+      ? v
+      : "viewer";
+  });
+
+  const navigateTo = useCallback((mode) => {
+    setAppMode(mode);
+    const params = new URLSearchParams();
+    if (mode !== "viewer") params.set("view", mode);
+    const qs = params.toString();
+    window.history.pushState(
+      null,
+      "",
+      `${window.location.pathname}${qs ? `?${qs}` : ""}`,
+    );
+  }, []);
+
+  // Pick up browser back/forward.
+  useEffect(() => {
+    const onPop = () => {
+      const v = new URLSearchParams(window.location.search).get("view");
+      setAppMode(
+        ["viewer", "writer", "systems", "dashboard", "myfindings"].includes(v)
+          ? v
+          : "viewer",
+      );
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
   const [navOpen, setNavOpen] = useState(true);
   const [splitPanelOpen, setSplitPanelOpen] = useState(true);
   const [showLibrary, setShowLibrary] = useState(false);
@@ -110,31 +145,31 @@ export default function App() {
       type: "button",
       text: "Viewer",
       variant: isLibraryMode ? "primary-button" : undefined,
-      onClick: () => setAppMode("viewer"),
+      onClick: () => navigateTo("viewer"),
     },
     {
       type: "button",
       text: "Writer",
       variant: isWriter ? "primary-button" : undefined,
-      onClick: () => setAppMode("writer"),
+      onClick: () => navigateTo("writer"),
     },
     {
       type: "button",
       text: "Systems",
       variant: isSystems ? "primary-button" : undefined,
-      onClick: () => setAppMode("systems"),
+      onClick: () => navigateTo("systems"),
     },
     {
       type: "button",
       text: "Dashboard",
       variant: isDashboard ? "primary-button" : undefined,
-      onClick: () => setAppMode("dashboard"),
+      onClick: () => navigateTo("dashboard"),
     },
     {
       type: "button",
       text: "My findings",
       variant: isMyFindings ? "primary-button" : undefined,
-      onClick: () => setAppMode("myfindings"),
+      onClick: () => navigateTo("myfindings"),
     },
   ];
   if (isLibraryMode && hasTabs) {
@@ -173,10 +208,13 @@ export default function App() {
     [addStigFromBackend],
   );
 
-  const handleStartDraft = useCallback((draftId) => {
-    setWriterDraftId(draftId);
-    setAppMode("writer");
-  }, []);
+  const handleStartDraft = useCallback(
+    (draftId) => {
+      setWriterDraftId(draftId);
+      navigateTo("writer");
+    },
+    [navigateTo],
+  );
 
   // Build SideNavigation items
   const navItems = tabs.map((tab) => ({
