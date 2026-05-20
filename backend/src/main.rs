@@ -50,6 +50,11 @@ use api::{
     },
     bundle::bundle_handler as asset_bundle_handler,
     catalog::{get_catalog, get_health},
+    compliance_report::{
+        download_handler as download_compliance_report_handler,
+        list_handler as list_compliance_reports_handler,
+        run_report as run_compliance_report,
+    },
     checklists::{
         bulk_reapply_handler as bulk_reapply_checklists_handler,
         create_handler as create_checklist_handler,
@@ -81,7 +86,8 @@ use api::{
     stig::get_stig,
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
-        reset_handler, run_digest_handler, run_retention_handler, set_role_handler,
+        reset_handler, run_digest_handler, run_report_handler, run_retention_handler,
+        set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -260,6 +266,11 @@ async fn main() -> Result<()> {
         )
         .route("/api/baselines/:id", axum::routing::delete(delete_baseline_handler))
         .route("/api/baselines/:id/diff", get(baseline_diff_handler))
+        .route("/api/reports", get(list_compliance_reports_handler))
+        .route(
+            "/api/reports/:id/report.pdf",
+            get(download_compliance_report_handler),
+        )
         .route("/api/admin/users", get(admin_list_users_handler))
         .route(
             "/api/admin/users/:id/role",
@@ -316,6 +327,7 @@ async fn main() -> Result<()> {
             .route("/api/test/backdate-baseline", post(backdate_baseline_handler))
             .route("/api/test/bump-stig", post(bump_stig_handler))
             .route("/api/test/run-digest", post(run_digest_handler))
+            .route("/api/test/run-report", post(run_report_handler))
             .route("/api/test/run-retention", post(run_retention_handler))
             .route("/api/test/backdate-audit", post(backdate_audit_handler))
             .with_state(state.clone());
@@ -423,6 +435,38 @@ async fn main() -> Result<()> {
                         "audit retention pruned {n} rows (retain_days={retain_days}, archive={archive_enabled})"
                     ),
                     Err(e) => tracing::error!("audit retention failed: {e:#}"),
+                }
+            }
+        });
+    }
+
+    // Continuous compliance report scheduler — renders a fleet-wide PDF
+    // on a configurable cadence (default weekly) and fires a
+    // `compliance_report` webhook event so Slack / receivers can pick up
+    // the link.
+    {
+        let report_hours: u64 = std::env::var("COMPLIANCE_REPORT_INTERVAL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(168);
+        let range_days: i32 = std::env::var("COMPLIANCE_REPORT_RANGE_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        let db = pool.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(report_hours * 3600));
+            loop {
+                interval.tick().await;
+                match run_compliance_report(&db, &cfg.data_dir, range_days).await {
+                    Ok(row) => tracing::info!(
+                        "compliance report generated: id={} pdf={}",
+                        row.id,
+                        row.pdf_path
+                    ),
+                    Err(e) => tracing::error!("compliance report failed: {e:#}"),
                 }
             }
         });

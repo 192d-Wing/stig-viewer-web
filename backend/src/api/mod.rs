@@ -8,6 +8,7 @@ pub mod baselines;
 pub mod bundle;
 pub mod catalog;
 pub mod checklists;
+pub mod compliance_report;
 pub mod dashboard;
 pub mod drafts;
 pub mod findings;

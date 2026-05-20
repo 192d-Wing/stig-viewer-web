@@ -2,6 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::api::compliance_report;
 use crate::api::webhooks::run_overdue_digest;
 use crate::audit_retention;
 use crate::AppState;
@@ -133,6 +134,43 @@ pub async fn run_digest_handler(
         Ok(count) => Ok(Json(json!({ "count": count }))),
         Err(e) => {
             tracing::error!("Test run-digest failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct RunReportRequest {
+    #[serde(default = "default_report_days")]
+    pub range_days: i32,
+}
+
+fn default_report_days() -> i32 {
+    7
+}
+
+/// POST /api/test/run-report — synchronously generate a compliance
+/// report once and return its id. Used by E2E to drive the report
+/// path without waiting for the weekly scheduler.
+pub async fn run_report_handler(
+    State(state): State<AppState>,
+    body: Option<Json<RunReportRequest>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match compliance_report::run_report(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        req.range_days,
+    )
+    .await
+    {
+        Ok(row) => Ok(Json(json!({
+            "id": row.id,
+            "generatedAt": row.generated_at,
+            "pdfPath": row.pdf_path,
+        }))),
+        Err(e) => {
+            tracing::error!("Test run-report failed: {e:#}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

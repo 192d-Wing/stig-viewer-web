@@ -18,7 +18,7 @@ const RESPONSE_SNIPPET_LIMIT: usize = 500;
 /// Allowed values for the `kinds` column. Anything outside this set is
 /// rejected with 400 by create/update so we don't end up with a webhook
 /// silently subscribed to a typo'd event name.
-const ALLOWED_KINDS: &[&str] = &["assigned", "overdue_digest"];
+const ALLOWED_KINDS: &[&str] = &["assigned", "overdue_digest", "compliance_report"];
 
 /// Maximum number of overdue findings included in a single digest
 /// payload. Slack incoming webhooks cap attachment size, and operators
@@ -368,6 +368,35 @@ pub fn build_assigned_payload(ev: &AssignedEvent) -> Value {
             "color": severity_color(&ev.severity),
         }]
     })
+}
+
+/// Fire a "compliance_report" event with a Slack-shaped payload pointing
+/// at the freshly-generated report. Best-effort — errors are logged but
+/// do not block the surrounding generate call.
+pub async fn fire_compliance_report(
+    pool: &PgPool,
+    row: &crate::api::compliance_report::ComplianceReportRow,
+) -> anyhow::Result<()> {
+    let s = &row.summary;
+    let payload = serde_json::json!({
+        "text": format!(
+            "Fleet compliance report ready — {:.1}% compliant, {} open, {} overdue",
+            s.compliance_score, s.open_findings, s.overdue_findings,
+        ),
+        "attachments": [{
+            "title": format!("Compliance report for {} assets", s.assets),
+            "text": format!(
+                "Top-risk system: {} — download at /api/reports/{}/report.pdf",
+                s.top_asset_name.as_deref().unwrap_or("(none)"),
+                row.id,
+            ),
+            "color": if s.compliance_score >= 80.0 { "good" }
+                     else if s.compliance_score >= 50.0 { "warning" }
+                     else { "danger" },
+        }],
+    });
+    dispatch_event(pool, "compliance_report", payload).await;
+    Ok(())
 }
 
 /// Fan an event out to every enabled webhook subscribed to `kind`.
