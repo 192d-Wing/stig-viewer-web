@@ -521,6 +521,18 @@ export default function Dashboard() {
             tone={totals.openFindings === 0 && totals.reviewedRules > 0 ? "ok" : null}
           />
           <KpiCard
+            label="Compliance"
+            value={`${(totals.complianceScore ?? 0).toFixed(1)}%`}
+            sub="NaF + N/A across all rules"
+            tone={
+              (totals.complianceScore ?? 0) >= 80
+                ? "ok"
+                : (totals.complianceScore ?? 0) < 50
+                  ? "warning"
+                  : null
+            }
+          />
+          <KpiCard
             label="Overdue"
             value={totals.overdueFindings}
             tone={totals.overdueFindings > 0 ? "warning" : null}
@@ -664,6 +676,51 @@ export default function Dashboard() {
           </Container>
         )}
 
+        {/* Compliance trend over time */}
+        {trend && trend.overall.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={`${trend.overall.length} snapshot${trend.overall.length === 1 ? "" : "s"} in the last 30 days`}
+              >
+                Compliance trend
+              </Header>
+            }
+          >
+            <LineChart
+              series={[
+                {
+                  title: "Compliance",
+                  type: "line",
+                  color: "#1d8102",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.complianceScore ?? 0,
+                  })),
+                },
+              ]}
+              xScaleType="time"
+              xTitle="Time"
+              yTitle="Compliance (%)"
+              yDomain={[0, 100]}
+              height={220}
+              hideFilter
+              ariaLabel="Compliance trend"
+              empty={
+                <Box textAlign="center" color="inherit">
+                  No snapshots yet
+                </Box>
+              }
+              noMatch={
+                <Box textAlign="center" color="inherit">
+                  No data in selected range
+                </Box>
+              }
+            />
+          </Container>
+        )}
+
         {/* Compliance heatmap: asset × STIG matrix */}
         {data.byAsset.length > 0 && <HeatmapSection byAsset={data.byAsset} />}
 
@@ -733,6 +790,19 @@ export default function Dashboard() {
                   {r.riskScore ?? 0}
                 </Badge>
               ),
+            },
+            {
+              id: "compliance",
+              header: "Compliance score",
+              cell: (r) =>
+                r.empty ? (
+                  <Box color="text-status-inactive">—</Box>
+                ) : (
+                  <ProgressBar
+                    value={r.complianceScore ?? 0}
+                    additionalInfo={`${(r.complianceScore ?? 0).toFixed(1)}%`}
+                  />
+                ),
             },
             {
               id: "weightedRisk",
