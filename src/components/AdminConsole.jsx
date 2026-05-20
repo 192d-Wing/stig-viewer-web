@@ -14,7 +14,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Alert from "@cloudscape-design/components/alert";
 import Container from "@cloudscape-design/components/container";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
-import { apiGet, apiJson, apiFetch } from "../utils/api.js";
+import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
   { label: "Author", value: "author" },
@@ -34,6 +34,7 @@ const ROLE_BADGE = {
 const KIND_OPTIONS = [
   { label: "Assigned", value: "assigned" },
   { label: "Overdue digest", value: "overdue_digest" },
+  { label: "Compliance report", value: "compliance_report" },
 ];
 
 function roleLabel(value) {
@@ -91,18 +92,23 @@ export default function AdminConsole() {
   const [deliveriesPanel, setDeliveriesPanel] = useState(null);
   const [testFlash, setTestFlash] = useState(null);
 
+  // Compliance reports
+  const [reports, setReports] = useState([]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w] = await Promise.all([
+      const [u, a, w, r] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
+        apiGet("/api/reports").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
       setWebhooks(w);
+      setReports(r);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -519,6 +525,67 @@ export default function AdminConsole() {
             }
           >
             Webhooks
+          </Header>
+        }
+      />
+
+      <Table
+        variant="container"
+        items={reports}
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No compliance reports yet. The scheduler runs weekly.
+            </Box>
+          </Box>
+        }
+        columnDefinitions={[
+          {
+            id: "generated",
+            header: "Generated",
+            cell: (r) => new Date(r.generatedAt).toLocaleString(),
+          },
+          {
+            id: "compliance",
+            header: "Compliance",
+            cell: (r) => `${r.summary?.complianceScore ?? 0}%`,
+          },
+          {
+            id: "assets",
+            header: "Assets",
+            cell: (r) => r.summary?.assets ?? 0,
+          },
+          {
+            id: "open",
+            header: "Open findings",
+            cell: (r) => r.summary?.openFindings ?? 0,
+          },
+          {
+            id: "top",
+            header: "Top-risk system",
+            cell: (r) => r.summary?.topAssetName ?? "—",
+          },
+          {
+            id: "download",
+            header: "",
+            cell: (r) => (
+              <Button
+                variant="inline-link"
+                href={`${BACKEND}/api/reports/${r.id}/report.pdf`}
+                iconName="download"
+                target="_blank"
+              >
+                PDF
+              </Button>
+            ),
+          },
+        ]}
+        header={
+          <Header
+            counter={`(${reports.length})`}
+            description="Fleet-wide compliance snapshots. Generated on the configured cadence and emitted to compliance_report webhooks."
+          >
+            Compliance reports
           </Header>
         }
       />
