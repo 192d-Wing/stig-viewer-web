@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use crate::db_assets;
 use crate::db_attachments;
 use crate::db_checklists;
+use crate::severity::weighted_score;
 use crate::AppState;
 
 // ── Layout constants ────────────────────────────────────────────────────────
@@ -103,6 +104,7 @@ pub async fn report_handler(
             .map(|r| (r.rule_id, r.count))
             .collect();
 
+        let today = Utc::now().date_naive();
         let mut rule_rows: Vec<RuleSummary> = Vec::new();
         let (mut open, mut naf, mut na, mut not_reviewed) = (0, 0, 0, 0);
         for rule in &rules {
@@ -121,9 +123,9 @@ pub async fn report_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("—")
                 .to_string();
-            let (status, finding_details) = match over_by_id.get(&rid) {
-                Some(o) => (o.status.clone(), o.finding_details.clone()),
-                None => ("not_reviewed".to_string(), String::new()),
+            let (status, finding_details, due_date) = match over_by_id.get(&rid) {
+                Some(o) => (o.status.clone(), o.finding_details.clone(), o.due_date),
+                None => ("not_reviewed".to_string(), String::new(), None),
             };
             match status.as_str() {
                 "open" => open += 1,
@@ -132,6 +134,13 @@ pub async fn report_handler(
                 _ => not_reviewed += 1,
             }
             let attachments = attachments_by_rule.get(&rid).copied().unwrap_or(0);
+            let weighted = weighted_score(
+                &severity,
+                &asset.classification,
+                &status,
+                due_date,
+                today,
+            );
             rule_rows.push(RuleSummary {
                 id: rid,
                 title,
@@ -139,6 +148,7 @@ pub async fn report_handler(
                 status,
                 finding_details,
                 attachments,
+                weighted_score: weighted,
             });
         }
 
@@ -189,6 +199,9 @@ struct RuleSummary {
     status: String,
     finding_details: String,
     attachments: i64,
+    /// SCAP-style weighted score (see `crate::severity::weighted_score`).
+    /// Rendered as a "weight: N.N" annotation in the body.
+    weighted_score: f64,
 }
 
 // ── PDF rendering ───────────────────────────────────────────────────────────
@@ -282,7 +295,10 @@ fn render_pdf(
                     );
                     state.advance(LH_BODY * 0.7);
                     state.text(
-                        &format!("Severity: {}", rule.severity),
+                        &format!(
+                            "Severity: {} · weight: {:.1}",
+                            rule.severity, rule.weighted_score
+                        ),
                         SIZE_SMALL,
                         &fonts.regular,
                     );

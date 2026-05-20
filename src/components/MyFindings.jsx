@@ -59,6 +59,16 @@ function FindingsTable({ title, items, tone, emptyText }) {
               <Box color="text-status-inactive">—</Box>
             ),
         },
+        {
+          id: "weight",
+          header: "Weight",
+          sortingField: "weightedScore",
+          cell: (f) => {
+            const w = f.weightedScore ?? 0;
+            const color = w > 20 ? "red" : w > 5 ? "blue" : "grey";
+            return <Badge color={color}>{w.toFixed(1)}</Badge>;
+          },
+        },
         { id: "system", header: "System", cell: (f) => f.assetName },
         { id: "stig", header: "STIG", cell: (f) => f.stigTitle },
         {
