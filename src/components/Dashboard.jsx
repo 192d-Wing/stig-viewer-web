@@ -1301,6 +1301,9 @@ function cellColor(c) {
 }
 
 function HeatmapSection({ byAsset }) {
+  const [hmState, setHmState] = useUrlState({ grpTag: false });
+  const groupByTag = hmState.grpTag;
+
   // Collect unique STIG titles across all assets, sorted alphabetically.
   const stigs = [];
   const seen = new Map();
@@ -1318,11 +1321,46 @@ function HeatmapSection({ byAsset }) {
     return null;
   }
 
-  const cellLookup = new Map(); // `${assetId}:${stigId}` → checklist
-  for (const a of byAsset) {
-    for (const c of a.checklists) {
-      cellLookup.set(`${a.id}:${c.stigId}`, c);
+  // Build display rows. In flat mode each row is one asset. In group-by-tag
+  // mode each row is a tag bucket whose cell aggregates open/reviewed/rule
+  // counts across all assets carrying that tag. Assets with no tags fall
+  // into an "(untagged)" bucket. An asset with multiple tags shows up
+  // under each.
+  let rows;
+  if (groupByTag) {
+    const buckets = new Map(); // tag → { name, assets: [] }
+    for (const a of byAsset) {
+      const tags = a.tags && a.tags.length > 0 ? a.tags : ["(untagged)"];
+      for (const t of tags) {
+        if (!buckets.has(t)) buckets.set(t, { name: t, assets: [] });
+        buckets.get(t).assets.push(a);
+      }
     }
+    rows = [...buckets.values()].sort((a, b) => a.name.localeCompare(b.name));
+  } else {
+    rows = byAsset.map((a) => ({ name: a.name, assets: [a] }));
+  }
+
+  // Aggregate the cell metrics across all assets in the row for a given STIG.
+  function aggregateCell(rowAssets, stigId) {
+    let any = false;
+    let openCount = 0;
+    let nafCount = 0;
+    let naCount = 0;
+    let reviewedCount = 0;
+    let ruleCount = 0;
+    for (const a of rowAssets) {
+      const c = a.checklists.find((cc) => cc.stigId === stigId);
+      if (!c) continue;
+      any = true;
+      openCount += c.openCount;
+      nafCount += c.nafCount;
+      naCount += c.naCount;
+      reviewedCount += c.reviewedCount;
+      ruleCount += c.ruleCount;
+    }
+    if (!any) return null;
+    return { openCount, nafCount, naCount, reviewedCount, ruleCount };
   }
 
   return (
@@ -1331,6 +1369,14 @@ function HeatmapSection({ byAsset }) {
         <Header
           variant="h2"
           description="Open count per (system, STIG). Green = all reviewed and compliant, yellow = in progress, red = open findings, grey = not started."
+          actions={
+            <Toggle
+              checked={groupByTag}
+              onChange={({ detail }) => setHmState({ grpTag: detail.checked })}
+            >
+              Group by tag
+            </Toggle>
+          }
         >
           Posture heatmap
         </Header>
@@ -1373,8 +1419,8 @@ function HeatmapSection({ byAsset }) {
             </tr>
           </thead>
           <tbody>
-            {byAsset.map((a) => (
-              <tr key={a.id}>
+            {rows.map((row) => (
+              <tr key={row.name}>
                 <td
                   style={{
                     padding: "6px 10px",
@@ -1384,14 +1430,29 @@ function HeatmapSection({ byAsset }) {
                     background: "var(--awsui-color-background-container-content)",
                   }}
                 >
-                  {a.name}
+                  {groupByTag ? (
+                    <Badge color="grey">{row.name}</Badge>
+                  ) : (
+                    row.name
+                  )}
+                  {groupByTag && (
+                    <span
+                      style={{
+                        marginLeft: 6,
+                        color: "var(--awsui-color-text-status-inactive)",
+                        fontSize: 11,
+                      }}
+                    >
+                      {row.assets.length}
+                    </span>
+                  )}
                 </td>
                 {stigs.map((s) => {
-                  const c = cellLookup.get(`${a.id}:${s.id}`);
+                  const c = aggregateCell(row.assets, s.id);
                   const { bg, fg, label } = cellColor(c);
                   const tip = c
-                    ? `${a.name} · ${s.title}\n${c.openCount} open / ${c.nafCount} NaF / ${c.naCount} N/A / ${c.reviewedCount} reviewed of ${c.ruleCount}`
-                    : `${a.name} · ${s.title} — not applied`;
+                    ? `${row.name} · ${s.title}\n${c.openCount} open / ${c.nafCount} NaF / ${c.naCount} N/A / ${c.reviewedCount} reviewed of ${c.ruleCount}`
+                    : `${row.name} · ${s.title} — not applied`;
                   return (
                     <td
                       key={s.id}

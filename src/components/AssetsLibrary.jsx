@@ -14,6 +14,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import TokenGroup from "@cloudscape-design/components/token-group";
 import { apiGet, apiJson, apiFetch } from "../utils/api.js";
+import { useUrlState } from "../hooks/useUrlState.js";
 import { AuthContext } from "./AuthGate.jsx";
 import AssetDetail from "./AssetDetail.jsx";
 import ChecklistView from "./ChecklistView.jsx";
@@ -62,6 +63,32 @@ export default function AssetsLibrary() {
   const [submitError, setSubmitError] = useState(null);
 
   const [deleteTarget, setDeleteTarget] = useState(null);
+
+  // Active tag filter lives in `?tag=a,b` (CSV). AND semantics.
+  const [urlState, setUrlState] = useUrlState({ tag: [] });
+  const activeTags = urlState.tag;
+  const toggleTag = useCallback(
+    (t) => {
+      setUrlState({
+        tag: activeTags.includes(t)
+          ? activeTags.filter((x) => x !== t)
+          : [...activeTags, t],
+      });
+    },
+    [activeTags, setUrlState],
+  );
+  const clearTags = useCallback(() => setUrlState({ tag: [] }), [setUrlState]);
+  const allTags = useMemo(() => {
+    const set = new Set();
+    for (const a of assets) for (const t of a.tags ?? []) set.add(t);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [assets]);
+  const filteredAssets = useMemo(() => {
+    if (activeTags.length === 0) return assets;
+    return assets.filter((a) =>
+      activeTags.every((t) => (a.tags ?? []).includes(t)),
+    );
+  }, [assets, activeTags]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -281,10 +308,33 @@ export default function AssetsLibrary() {
       <Table
         variant="full-page"
         stickyHeader
-        items={assets}
+        items={filteredAssets}
         columnDefinitions={columns}
         loading={loading}
         loadingText="Loading systems"
+        filter={
+          allTags.length > 0 ? (
+            <SpaceBetween direction="horizontal" size="xs">
+              <Box variant="span" color="text-status-inactive">
+                Filter by tag:
+              </Box>
+              {allTags.map((t) => (
+                <Button
+                  key={t}
+                  variant={activeTags.includes(t) ? "primary" : "normal"}
+                  onClick={() => toggleTag(t)}
+                >
+                  {t}
+                </Button>
+              ))}
+              {activeTags.length > 0 && (
+                <Button variant="inline-link" onClick={clearTags}>
+                  Clear
+                </Button>
+              )}
+            </SpaceBetween>
+          ) : null
+        }
         empty={
           <Box textAlign="center" padding="l">
             <SpaceBetween direction="vertical" size="m">
@@ -297,7 +347,11 @@ export default function AssetsLibrary() {
         }
         header={
           <Header
-            counter={`(${assets.length})`}
+            counter={
+              activeTags.length > 0
+                ? `(${filteredAssets.length}/${assets.length})`
+                : `(${assets.length})`
+            }
             actions={
               <SpaceBetween direction="horizontal" size="xs">
                 <Button
