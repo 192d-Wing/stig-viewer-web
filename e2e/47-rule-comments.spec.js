@@ -53,7 +53,15 @@ test.describe("Per-rule comments — API", () => {
     const row1 = await post1.json();
     expect(row1.body).toBe("first comment");
     expect(row1.userName).toBeTruthy();
-    expect(row1.userId).toBe("alice");
+    // user.id is a generated UUID, not the X-User-Id raw value.
+    const aliceId = (
+      await (
+        await request.get(`${BACKEND}/api/users/me`, {
+          headers: { "X-User-Id": "alice" },
+        })
+      ).json()
+    ).id;
+    expect(row1.userId).toBe(aliceId);
     expect(row1.editedAt).toBeNull();
     expect(row1.id).toBeTruthy();
 
@@ -233,8 +241,12 @@ test.describe("Per-rule comments — UI", () => {
     // No comments yet.
     await expect(page.getByText("No comments yet.")).toBeVisible();
 
-    // Add a comment.
-    await page.getByTestId("rule-comment-input").fill("hello thread");
+    // Add a comment. The testid lives on the Cloudscape Textarea wrapper;
+    // its inner textarea is what we actually type into.
+    await page
+      .getByTestId("rule-comment-input")
+      .locator("textarea")
+      .fill("hello thread");
     await page.getByTestId("rule-comment-add").click();
 
     await expect(page.getByText("hello thread")).toBeVisible({
