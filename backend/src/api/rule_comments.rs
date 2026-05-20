@@ -19,6 +19,104 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Scan a comment body for `@handle` tokens and return the unique handles
+/// (lowercased) in order of first appearance. The handle alphabet matches
+/// `[a-zA-Z0-9_.-]+` and must be preceded by start-of-string or a non-
+/// alphanumeric character so we don't pick up `foo@bar.com` style strings.
+fn extract_mention_handles(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let p = bytes[i - 1];
+                !p.is_ascii_alphanumeric() && p != b'_'
+            };
+            if prev_ok {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-' {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if j > start {
+                    let handle = body[start..j].to_ascii_lowercase();
+                    if !out.contains(&handle) {
+                        out.push(handle);
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Best-effort insert of `comment_mentions` rows for every distinct
+/// `@handle` token in `body`. A handle matches a user whose lowercased
+/// display name (with spaces stripped) equals the handle. Self-mentions
+/// (mentioned_user_id == author_id) are skipped. All DB errors are
+/// swallowed with a tracing warning — mentions are a notification
+/// nice-to-have, not part of the comment-create contract.
+async fn record_mentions(
+    pool: &sqlx::PgPool,
+    comment_id: &str,
+    author_id: &str,
+    body: &str,
+) {
+    let handles = extract_mention_handles(body);
+    if handles.is_empty() {
+        return;
+    }
+    for handle in handles {
+        let target: Result<Option<(String,)>, _> = sqlx::query_as(
+            r#"
+            SELECT id FROM users
+             WHERE LOWER(REPLACE(display_name, ' ', '')) = $1
+             LIMIT 1
+            "#,
+        )
+        .bind(&handle)
+        .fetch_optional(pool)
+        .await;
+        let user_id = match target {
+            Ok(Some((id,))) => id,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("mention lookup for @{handle} failed: {e:#}");
+                continue;
+            }
+        };
+        if user_id == author_id {
+            continue;
+        }
+        let mention_id = new_id();
+        let res = sqlx::query(
+            r#"
+            INSERT INTO comment_mentions (id, comment_id, mentioned_user_id)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(&mention_id)
+        .bind(comment_id)
+        .bind(&user_id)
+        .execute(pool)
+        .await;
+        if let Err(e) = res {
+            tracing::warn!("mention insert for @{handle} failed: {e:#}");
+        }
+    }
+}
+
 fn err_500(e: impl std::fmt::Display) -> (StatusCode, String) {
     tracing::error!("{e:#}");
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -108,6 +206,11 @@ pub async fn create_handler(
     .execute(state.pool.as_ref())
     .await
     .map_err(err_500)?;
+
+    // Best-effort: scan the body for @handles and record mention rows so
+    // mentioned users see them in their Notifications bell. Failures here
+    // are logged but do not surface to the caller.
+    record_mentions(state.pool.as_ref(), &id, &user.id, trimmed).await;
 
     let row = sqlx::query_as::<_, RuleCommentRow>(
         r#"

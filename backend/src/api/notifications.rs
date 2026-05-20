@@ -31,11 +31,33 @@ pub struct OverdueItem {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MentionItem {
+    pub comment_id: String,
+    pub checklist_id: String,
+    pub rule_id: String,
+    pub body: String,
+    pub by_name: String,
+    pub at: DateTime<Utc>,
+    pub unread: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationsResponse {
     pub assigned: Vec<AssignedItem>,
     pub overdue: Vec<OverdueItem>,
+    pub mentions: Vec<MentionItem>,
     pub unread_count: i64,
     pub last_seen: Option<DateTime<Utc>>,
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("…");
+    out
 }
 
 fn map_db(e: anyhow::Error) -> StatusCode {
@@ -152,9 +174,56 @@ pub async fn get_handler(
         .collect::<Result<Vec<_>, _>>()
         .map_err(map_sqlx)?;
 
+    // @-mentions for the current user. Mentions are "unread" until the
+    // user calls mark-read; once stamped, they still appear in the bucket
+    // (so users can scroll history) but no longer count toward the badge.
+    let mention_rows = sqlx::query(
+        r#"
+        SELECT
+            m.id              AS mention_id,
+            m.read_at         AS read_at,
+            rc.id             AS comment_id,
+            rc.checklist_id   AS checklist_id,
+            rc.rule_id        AS rule_id,
+            rc.body           AS body,
+            rc.created_at     AS at,
+            u.display_name    AS by_name
+          FROM comment_mentions m
+          JOIN rule_comments rc ON rc.id = m.comment_id
+          JOIN users u ON u.id = rc.user_id
+         WHERE m.mentioned_user_id = $1
+         ORDER BY rc.created_at DESC
+         LIMIT 50
+        "#,
+    )
+    .bind(&user.id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let mut mentions: Vec<MentionItem> = Vec::with_capacity(mention_rows.len());
+    for row in mention_rows {
+        let read_at: Option<DateTime<Utc>> = row.try_get("read_at").map_err(map_sqlx)?;
+        let unread = read_at.is_none();
+        if unread {
+            unread_count += 1;
+        }
+        let body: String = row.try_get("body").map_err(map_sqlx)?;
+        mentions.push(MentionItem {
+            comment_id: row.try_get("comment_id").map_err(map_sqlx)?,
+            checklist_id: row.try_get("checklist_id").map_err(map_sqlx)?,
+            rule_id: row.try_get("rule_id").map_err(map_sqlx)?,
+            body: truncate_chars(&body, 120),
+            by_name: row.try_get("by_name").map_err(map_sqlx)?,
+            at: row.try_get("at").map_err(map_sqlx)?,
+            unread,
+        });
+    }
+
     Ok(Json(NotificationsResponse {
         assigned,
         overdue,
+        mentions,
         unread_count,
         last_seen,
     }))
@@ -166,10 +235,25 @@ pub async fn mark_read_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<StatusCode, StatusCode> {
+    let pool = state.pool.as_ref();
     sqlx::query("UPDATE users SET notifications_last_seen = NOW() WHERE id = $1")
         .bind(&user.id)
-        .execute(state.pool.as_ref())
+        .execute(pool)
         .await
         .map_err(|e| map_db(anyhow::anyhow!(e)))?;
+    // Stamp read_at on any outstanding @-mentions for this user. Mirrors
+    // the assigned-row "watermark" behavior so the bell badge clears.
+    sqlx::query(
+        r#"
+        UPDATE comment_mentions
+           SET read_at = NOW()
+         WHERE mentioned_user_id = $1
+           AND read_at IS NULL
+        "#,
+    )
+    .bind(&user.id)
+    .execute(pool)
+    .await
+    .map_err(|e| map_db(anyhow::anyhow!(e)))?;
     Ok(StatusCode::NO_CONTENT)
 }
