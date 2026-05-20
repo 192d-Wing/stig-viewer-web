@@ -465,6 +465,14 @@ async fn create_session(pool: &PgPool, user_id: &str) -> Result<String> {
         .bind(expires_at)
         .execute(pool)
         .await?;
+    // Track activity for the admin console. Updating on every newly minted
+    // session captures real logins; the resolve path below also bumps it
+    // when an existing session is reused so "last_login" tracks ongoing
+    // activity rather than just first-ever auth.
+    let _ = sqlx::query("UPDATE users SET last_login = NOW() WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await;
     Ok(session_id)
 }
 
@@ -485,6 +493,16 @@ async fn resolve_session_user(pool: &PgPool, headers: &HeaderMap) -> Result<Opti
     .bind(&session_id)
     .fetch_optional(pool)
     .await?;
+
+    // Treat an authenticated request that extends an existing session as a
+    // "login" event for the admin console's last_login column. This keeps
+    // the column meaningful for users who stay logged in for days.
+    if let Some(u) = &row {
+        let _ = sqlx::query("UPDATE users SET last_login = NOW() WHERE id = $1")
+            .bind(&u.id)
+            .execute(pool)
+            .await;
+    }
     Ok(row)
 }
 
@@ -494,6 +512,12 @@ async fn test_header_user(pool: &PgPool, headers: &HeaderMap) -> Result<Option<A
         _ => return Ok(None),
     };
     let user = upsert_user(pool, "test", &raw, &raw, "").await?;
+    // X-User-Id auth doesn't go through create_session, so stamp the
+    // last_login here so E2E + admin-console scenarios still see activity.
+    let _ = sqlx::query("UPDATE users SET last_login = NOW() WHERE id = $1")
+        .bind(&user.id)
+        .execute(pool)
+        .await;
     Ok(Some(user))
 }
 

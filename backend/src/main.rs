@@ -17,6 +17,11 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
+    admin::{
+        list_users_handler as admin_list_users_handler,
+        update_asset_owner_handler as admin_update_asset_owner_handler,
+        update_user_role_handler as admin_update_user_role_handler,
+    },
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
         get_asset_handler, list_assets_handler, update_asset_handler,
@@ -205,6 +210,15 @@ async fn main() -> Result<()> {
         )
         .route("/api/baselines/:id", axum::routing::delete(delete_baseline_handler))
         .route("/api/baselines/:id/diff", get(baseline_diff_handler))
+        .route("/api/admin/users", get(admin_list_users_handler))
+        .route(
+            "/api/admin/users/:id/role",
+            axum::routing::patch(admin_update_user_role_handler),
+        )
+        .route(
+            "/api/admin/assets/:id/owner",
+            axum::routing::patch(admin_update_asset_owner_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

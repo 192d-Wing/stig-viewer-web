@@ -19,6 +19,7 @@ import STIGWriter from "./components/STIGWriter.jsx";
 import AssetsLibrary from "./components/AssetsLibrary.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import MyFindings from "./components/MyFindings.jsx";
+import AdminConsole from "./components/AdminConsole.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
 import { apiFetch, apiGet } from "./utils/api.js";
 
@@ -55,7 +56,14 @@ export default function App() {
   // params from the previous view.
   const [appMode, setAppMode] = useState(() => {
     const v = new URLSearchParams(window.location.search).get("view");
-    return ["viewer", "writer", "systems", "dashboard", "myfindings"].includes(v)
+    return [
+      "viewer",
+      "writer",
+      "systems",
+      "dashboard",
+      "myfindings",
+      "admin",
+    ].includes(v)
       ? v
       : "viewer";
   });
@@ -77,7 +85,14 @@ export default function App() {
     const onPop = () => {
       const v = new URLSearchParams(window.location.search).get("view");
       setAppMode(
-        ["viewer", "writer", "systems", "dashboard", "myfindings"].includes(v)
+        [
+          "viewer",
+          "writer",
+          "systems",
+          "dashboard",
+          "myfindings",
+          "admin",
+        ].includes(v)
           ? v
           : "viewer",
       );
@@ -96,7 +111,9 @@ export default function App() {
   const isSystems = appMode === "systems";
   const isDashboard = appMode === "dashboard";
   const isMyFindings = appMode === "myfindings";
-  const isLibraryMode = !isWriter && !isSystems && !isDashboard && !isMyFindings;
+  const isAdmin = appMode === "admin";
+  const isLibraryMode =
+    !isWriter && !isSystems && !isDashboard && !isMyFindings && !isAdmin;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isDiffMode = diffPair !== null;
@@ -216,6 +233,14 @@ export default function App() {
       onClick: () => navigateTo("myfindings"),
     },
   ];
+  if (currentUser?.role === "admin") {
+    utilities.push({
+      type: "button",
+      text: "Admin",
+      variant: isAdmin ? "primary-button" : undefined,
+      onClick: () => navigateTo("admin"),
+    });
+  }
   if (isLibraryMode && hasTabs) {
     utilities.push({
       type: "button",
@@ -293,7 +318,9 @@ export default function App() {
 
   // Determine content
   let content;
-  if (isDashboard) {
+  if (isAdmin) {
+    content = <AdminConsole />;
+  } else if (isDashboard) {
     content = <Dashboard />;
   } else if (isMyFindings) {
     content = <MyFindings />;
