@@ -78,6 +78,12 @@ use api::{
         mark_read_handler as mark_notifications_read_handler,
     },
     report::report_handler as asset_report_handler,
+    rule_comments::{
+        create_handler as create_rule_comment_handler,
+        delete_handler as delete_rule_comment_handler,
+        list_handler as list_rule_comments_handler,
+        update_handler as update_rule_comment_handler,
+    },
     saved_searches::{
         create_handler as create_saved_search_handler,
         delete_handler as delete_saved_search_handler,
@@ -217,6 +223,15 @@ async fn main() -> Result<()> {
             "/api/checklists/:id/rules/:rule_id/attachments",
             get(list_attachments_for_rule_handler)
                 .post(upload_attachment_handler),
+        )
+        .route(
+            "/api/checklists/:id/rules/:rule_id/comments",
+            get(list_rule_comments_handler).post(create_rule_comment_handler),
+        )
+        .route(
+            "/api/comments/:id",
+            axum::routing::patch(update_rule_comment_handler)
+                .delete(delete_rule_comment_handler),
         )
         .route(
             "/api/checklists/:id/attachments",
