@@ -50,6 +50,10 @@ use api::{
     },
     drafts::*,
     findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
+    notifications::{
+        get_handler as get_notifications_handler,
+        mark_read_handler as mark_notifications_read_handler,
+    },
     report::report_handler as asset_report_handler,
     stig::get_stig,
     test_support::{backdate_handler, bump_stig_handler, reset_handler, set_role_handler},
@@ -180,6 +184,11 @@ async fn main() -> Result<()> {
         .route(
             "/api/drafts/:id/comments",
             get(list_comments_handler).post(add_comment_handler),
+        )
+        .route("/api/notifications", get(get_notifications_handler))
+        .route(
+            "/api/notifications/mark-read",
+            post(mark_notifications_read_handler),
         )
         .route("/api/users", get(list_users_handler))
         .route("/api/users/me", get(me_handler))
