@@ -4,6 +4,7 @@ pub mod attachments;
 pub mod audit;
 pub mod auth;
 pub mod baselines;
+pub mod bundle;
 pub mod catalog;
 pub mod checklists;
 pub mod dashboard;

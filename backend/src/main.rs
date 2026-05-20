@@ -46,6 +46,7 @@ use api::{
         diff_handler as baseline_diff_handler,
         list_handler as list_baselines_handler,
     },
+    bundle::bundle_handler as asset_bundle_handler,
     catalog::{get_catalog, get_health},
     checklists::{
         bulk_reapply_handler as bulk_reapply_checklists_handler,
@@ -172,6 +173,7 @@ async fn main() -> Result<()> {
                 .delete(delete_asset_handler),
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
+        .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))
         .route("/api/assets/:id/trend", get(asset_trend_handler))
         .route(
             "/api/assets/:left/diff/:right",

@@ -146,14 +146,25 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
               variant="h1"
               description={asset.description || undefined}
               actions={
-                <Button
-                  iconName="download"
-                  href={`${BACKEND}/api/assets/${asset.id}/report.pdf`}
-                  target="_blank"
-                  download
-                >
-                  Download PDF report
-                </Button>
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button
+                    iconName="download"
+                    href={`${BACKEND}/api/assets/${asset.id}/report.pdf`}
+                    target="_blank"
+                    download
+                  >
+                    Download PDF report
+                  </Button>
+                  <Button
+                    iconName="download"
+                    href={`${BACKEND}/api/assets/${asset.id}/bundle.zip`}
+                    target="_blank"
+                    download
+                    ariaLabel="Download bundle (includes CKL files and evidence attachments)"
+                  >
+                    Download bundle
+                  </Button>
+                </SpaceBetween>
               }
             >
               {asset.name}
