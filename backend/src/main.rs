@@ -39,6 +39,7 @@ use api::{
     },
     catalog::{get_catalog, get_health},
     checklists::{
+        bulk_reapply_handler as bulk_reapply_checklists_handler,
         create_handler as create_checklist_handler,
         delete_handler as delete_checklist_handler,
         get_handler as get_checklist_handler,
@@ -167,6 +168,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/checklists/:id/reapply",
             post(reapply_checklist_handler),
+        )
+        .route(
+            "/api/checklists/bulk-reapply",
+            post(bulk_reapply_checklists_handler),
         )
         .route(
             "/api/checklists/:id/rules/:rule_id",
