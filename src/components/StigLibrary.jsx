@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { useUrlState } from "../hooks/useUrlState.js";
 import Table from "@cloudscape-design/components/table";
 import Header from "@cloudscape-design/components/header";
 import Button from "@cloudscape-design/components/button";
@@ -72,17 +73,55 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [catalogError, setCatalogError] = useState(null);
   const [loadingId, setLoadingId] = useState(null);
   const [draftingId, setDraftingId] = useState(null);
-  const [categoryFilter, setCategoryFilter] = useState(null);
-  const [searchText, setSearchText] = useState("");
-  const [showSuperseded, setShowSuperseded] = useState(false);
-  const [sortCol, setSortCol] = useState("title");
-  const [sortDir, setSortDir] = useState("asc");
-  const [currentPage, setCurrentPage] = useState(1);
-  const [preferences, setPreferences] = useState({
-    pageSize: 25,
-    stripedRows: true,
-    visibleContent: ["title", "version", "release", "category", "rules"],
+  // Filter + sort + columns + pagination all live in the URL so a library
+  // view is bookmarkable and shareable.
+  const [urlState, setUrlState] = useUrlState({
+    cat: "",
+    q: "",
+    super: false,
+    sort: "title",
+    dir: "asc",
+    page: 1,
+    size: 25,
+    cols: ["title", "version", "release", "category", "rules"],
   });
+  const categoryFilter = urlState.cat || null;
+  const searchText = urlState.q;
+  const showSuperseded = urlState.super;
+  const sortCol = urlState.sort;
+  const sortDir = urlState.dir;
+  const currentPage = urlState.page;
+  const preferences = useMemo(
+    () => ({
+      pageSize: urlState.size,
+      stripedRows: true,
+      visibleContent: urlState.cols,
+    }),
+    [urlState.size, urlState.cols],
+  );
+
+  const setCategoryFilter = useCallback(
+    (v) => setUrlState({ cat: v ?? "" }),
+    [setUrlState],
+  );
+  const setSearchText = useCallback(
+    (v) => setUrlState({ q: v }),
+    [setUrlState],
+  );
+  const setShowSuperseded = useCallback(
+    (v) => setUrlState({ super: !!v }),
+    [setUrlState],
+  );
+  const setSortCol = useCallback((v) => setUrlState({ sort: v }), [setUrlState]);
+  const setSortDir = useCallback((v) => setUrlState({ dir: v }), [setUrlState]);
+  const setCurrentPage = useCallback(
+    (v) => setUrlState({ page: v }),
+    [setUrlState],
+  );
+  const setPreferences = useCallback(
+    (p) => setUrlState({ size: p.pageSize, cols: p.visibleContent }),
+    [setUrlState],
+  );
 
   // Add-to-library form state (single STIG)
   const [addFiles, setAddFiles] = useState([]);
