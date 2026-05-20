@@ -204,8 +204,9 @@ test.describe("Evidence attachments — UI", () => {
     // Open the rule editor.
     await page.getByRole("button", { name: ruleId }).first().click();
 
-    // Evidence section is visible.
-    await expect(page.getByText("Evidence")).toBeVisible();
+    // Evidence section is visible. Use exact match — "evidence-host"
+    // substring matches the page subtitle and the FormField description.
+    await expect(page.getByText("Evidence", { exact: true })).toBeVisible();
     await expect(page.getByText("No attachments yet.")).toBeVisible();
 
     // Upload a small file via the file input.
