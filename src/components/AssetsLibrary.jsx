@@ -64,6 +64,107 @@ export default function AssetsLibrary() {
 
   const [deleteTarget, setDeleteTarget] = useState(null);
 
+  // CSV import modal state. `step` is "pick" (choose file + dry-run preview)
+  // or "preview" (review parsed rows, click Import to commit).
+  const [importOpen, setImportOpen] = useState(false);
+  const [importStep, setImportStep] = useState("pick");
+  const [importFile, setImportFile] = useState(null);
+  const [importPreview, setImportPreview] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importError, setImportError] = useState(null);
+  const [importSuccess, setImportSuccess] = useState(null);
+
+  const closeImport = useCallback(() => {
+    setImportOpen(false);
+    setImportStep("pick");
+    setImportFile(null);
+    setImportPreview(null);
+    setImportError(null);
+    setImportSuccess(null);
+    setImportBusy(false);
+  }, []);
+
+  const openImport = useCallback(() => {
+    closeImport();
+    setImportOpen(true);
+  }, [closeImport]);
+
+  const runImport = useCallback(
+    async (dryRun) => {
+      if (!importFile) return null;
+      const fd = new FormData();
+      fd.append("file", importFile, importFile.name);
+      const res = await apiFetch(
+        `/api/assets/import?dry_run=${dryRun ? "true" : "false"}`,
+        { method: "POST", body: fd },
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(text || `${res.status}`);
+      }
+      return res.json();
+    },
+    [importFile],
+  );
+
+  const onImportFileChange = useCallback(
+    async (file) => {
+      setImportFile(file);
+      setImportPreview(null);
+      setImportError(null);
+      setImportSuccess(null);
+      if (!file) return;
+      setImportBusy(true);
+      try {
+        // POST the file straight to dry-run so we can show the preview
+        // table without an extra "Preview" click.
+        const fd = new FormData();
+        fd.append("file", file, file.name);
+        const res = await apiFetch(`/api/assets/import?dry_run=true`, {
+          method: "POST",
+          body: fd,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => res.statusText);
+          throw new Error(text || `${res.status}`);
+        }
+        const data = await res.json();
+        setImportPreview(data);
+        setImportStep("preview");
+      } catch (err) {
+        setImportError(err.message);
+      } finally {
+        setImportBusy(false);
+      }
+    },
+    [],
+  );
+
+  const commitImport = useCallback(async () => {
+    setImportBusy(true);
+    setImportError(null);
+    try {
+      const data = await runImport(false);
+      setImportSuccess(data);
+      await refresh();
+      // Close after a short pause so the user sees the success Alert.
+      setTimeout(() => closeImport(), 800);
+    } catch (err) {
+      setImportError(err.message);
+    } finally {
+      setImportBusy(false);
+    }
+  }, [closeImport, refresh, runImport]);
+
+  // Data URL for the "Download template" link. Inline so we don't need a
+  // backend route or static asset.
+  const templateHref = useMemo(() => {
+    const csv =
+      "name,hostname,description,classification,tags\n" +
+      "web-1,web-1.example.com,Sample web host,unclassified,production;public-facing\n";
+    return `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
+  }, []);
+
   // Active tag filter lives in `?tag=a,b` (CSV). AND semantics.
   const [urlState, setUrlState] = useUrlState({ tag: [] });
   const activeTags = urlState.tag;
@@ -360,6 +461,9 @@ export default function AssetsLibrary() {
                 >
                   Compare
                 </Button>
+                <Button onClick={openImport} data-testid="import-csv-button">
+                  Import CSV
+                </Button>
                 <Button variant="primary" onClick={openCreate}>
                   Add system
                 </Button>
@@ -461,6 +565,131 @@ export default function AssetsLibrary() {
             </SpaceBetween>
           </FormField>
           {submitError && <Alert type="error">{submitError}</Alert>}
+        </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={importOpen}
+        onDismiss={closeImport}
+        header="Import systems from CSV"
+        size="large"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={closeImport}>
+                Cancel
+              </Button>
+              {importStep === "preview" && importPreview && (
+                <Button
+                  variant="primary"
+                  loading={importBusy}
+                  disabled={
+                    importBusy ||
+                    importPreview.rows.every((r) => r.status === "error")
+                  }
+                  onClick={commitImport}
+                  data-testid="import-csv-commit"
+                >
+                  {`Import ${importPreview.rows.filter((r) => r.status === "ok").length} rows`}
+                </Button>
+              )}
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          <Box>
+            CSV columns: <code>name, hostname, description, classification, tags</code>.
+            Separate tags within a cell with semicolons.{" "}
+            <a
+              href={templateHref}
+              download="assets-template.csv"
+              data-testid="import-csv-template"
+            >
+              Download template
+            </a>
+          </Box>
+          <FormField label="CSV file">
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              data-testid="import-csv-input"
+              onChange={(e) => {
+                const f = e.target.files && e.target.files[0];
+                if (f) onImportFileChange(f);
+              }}
+            />
+          </FormField>
+          {importBusy && importStep === "pick" && (
+            <StatusIndicator type="loading">Parsing…</StatusIndicator>
+          )}
+          {importError && <Alert type="error">{importError}</Alert>}
+          {importSuccess && (
+            <Alert type="success" data-testid="import-csv-success">
+              {`Imported ${importSuccess.createdCount} systems.`}
+            </Alert>
+          )}
+          {importPreview && (
+            <>
+              {importPreview.rows.some((r) => r.status === "error") && (
+                <Alert type="warning">
+                  {`${importPreview.rows.filter((r) => r.status === "error").length} rows have errors and will be skipped.`}
+                </Alert>
+              )}
+              <Table
+                variant="embedded"
+                items={importPreview.rows}
+                trackBy="rowNumber"
+                columnDefinitions={[
+                  {
+                    id: "row",
+                    header: "Row",
+                    cell: (r) => r.rowNumber,
+                  },
+                  { id: "name", header: "Name", cell: (r) => r.name || "—" },
+                  {
+                    id: "hostname",
+                    header: "Hostname",
+                    cell: (r) => r.hostname || "—",
+                  },
+                  {
+                    id: "classification",
+                    header: "Classification",
+                    cell: (r) => r.classification || "—",
+                  },
+                  {
+                    id: "tags",
+                    header: "Tags",
+                    cell: (r) =>
+                      r.tags && r.tags.length > 0 ? r.tags.join(", ") : "—",
+                  },
+                  {
+                    id: "status",
+                    header: "Status",
+                    cell: (r) => {
+                      const color =
+                        r.status === "ok"
+                          ? "green"
+                          : r.status === "skipped"
+                            ? "grey"
+                            : "red";
+                      return (
+                        <Badge color={color} data-testid={`import-status-${r.rowNumber}`}>
+                          {r.status}
+                        </Badge>
+                      );
+                    },
+                  },
+                  {
+                    id: "error",
+                    header: "Note",
+                    cell: (r) => r.error || "",
+                  },
+                ]}
+                empty={<Box>No rows.</Box>}
+              />
+            </>
+          )}
         </SpaceBetween>
       </Modal>
 

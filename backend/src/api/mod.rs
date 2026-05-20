@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod asset_import;
 pub mod assets;
 pub mod attachments;
 pub mod audit;
