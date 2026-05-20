@@ -112,6 +112,16 @@ export default function ChecklistView({ checklistId, onBack }) {
   const [editingCommentId, setEditingCommentId] = useState(null);
   const [editingCommentBody, setEditingCommentBody] = useState("");
 
+  // Bulk CSV import modal state. `step` is "pick" (choose file + dry-run)
+  // or "preview" (review parsed rows, click Import to commit).
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkStep, setBulkStep] = useState("pick");
+  const [bulkFile, setBulkFile] = useState(null);
+  const [bulkPreview, setBulkPreview] = useState(null);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState(null);
+  const [bulkSuccess, setBulkSuccess] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -358,6 +368,92 @@ export default function ChecklistView({ checklistId, onBack }) {
     [draft.status, draft.findingDetails],
   );
 
+  // Reset the bulk-import modal state. Memoised so the open callback can
+  // safely cycle the modal closed→open without races on the inner state.
+  const closeBulk = useCallback(() => {
+    setBulkOpen(false);
+    setBulkStep("pick");
+    setBulkFile(null);
+    setBulkPreview(null);
+    setBulkError(null);
+    setBulkSuccess(null);
+    setBulkBusy(false);
+  }, []);
+
+  const openBulk = useCallback(() => {
+    closeBulk();
+    setBulkOpen(true);
+  }, [closeBulk]);
+
+  // Upload + parse the chosen CSV via a dry-run POST. The response drives
+  // the preview table; commit re-uploads the same file with dry_run=false.
+  const onBulkFileChange = useCallback(
+    async (file) => {
+      setBulkFile(file);
+      setBulkPreview(null);
+      setBulkError(null);
+      setBulkSuccess(null);
+      if (!file) return;
+      setBulkBusy(true);
+      try {
+        const fd = new FormData();
+        fd.append("file", file, file.name);
+        const res = await apiFetch(
+          `/api/checklists/${checklistId}/rules/bulk-import?dry_run=true`,
+          { method: "POST", body: fd },
+        );
+        if (!res.ok) {
+          const text = await res.text().catch(() => res.statusText);
+          throw new Error(text || `${res.status}`);
+        }
+        const data = await res.json();
+        setBulkPreview(data);
+        setBulkStep("preview");
+      } catch (err) {
+        setBulkError(err.message);
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [checklistId],
+  );
+
+  const commitBulk = useCallback(async () => {
+    if (!bulkFile) return;
+    setBulkBusy(true);
+    setBulkError(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", bulkFile, bulkFile.name);
+      const res = await apiFetch(
+        `/api/checklists/${checklistId}/rules/bulk-import?dry_run=false`,
+        { method: "POST", body: fd },
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(text || `${res.status}`);
+      }
+      const data = await res.json();
+      setBulkSuccess(data);
+      await refresh();
+      // Auto-close shortly after success so the user sees the alert.
+      setTimeout(() => closeBulk(), 800);
+    } catch (err) {
+      setBulkError(err.message);
+    } finally {
+      setBulkBusy(false);
+    }
+  }, [bulkFile, checklistId, refresh, closeBulk]);
+
+  // Inline data: URL for the "Download template" link. Three columns +
+  // one example row keep the CSV tiny and self-documenting.
+  const bulkTemplateHref = useMemo(() => {
+    const csv =
+      "rule_id,status,finding_details\n" +
+      "V-12345,not_a_finding,Patched per vendor guidance.\n";
+    return `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
+  }, []);
+
   const saveEdit = useCallback(async () => {
     if (!editing) return;
     setSaving(true);
@@ -415,6 +511,17 @@ export default function ChecklistView({ checklistId, onBack }) {
             <Header
               variant="h1"
               description={`${detail.asset.name} · ${detail.rules.length} rules`}
+              actions={
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button
+                    onClick={openBulk}
+                    disabled={!isOwner}
+                    data-testid="bulk-import-button"
+                  >
+                    Bulk import
+                  </Button>
+                </SpaceBetween>
+              }
             >
               {detail.stig?.title || detail.checklist.stigId}
             </Header>
@@ -821,6 +928,129 @@ export default function ChecklistView({ checklistId, onBack }) {
             </FormField>
           </SpaceBetween>
         )}
+      </Modal>
+
+      <Modal
+        visible={bulkOpen}
+        onDismiss={closeBulk}
+        header="Bulk import rule statuses"
+        size="large"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={closeBulk}>
+                Cancel
+              </Button>
+              {bulkStep === "preview" && bulkPreview && (
+                <Button
+                  variant="primary"
+                  loading={bulkBusy}
+                  disabled={
+                    bulkBusy ||
+                    bulkPreview.rows.every((r) => r.status === "error")
+                  }
+                  onClick={commitBulk}
+                  data-testid="bulk-import-commit"
+                >
+                  {`Apply ${bulkPreview.rows.filter((r) => r.status === "ok").length} rows`}
+                </Button>
+              )}
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          <Box>
+            CSV columns: <code>rule_id, status, finding_details</code>.
+            Status must be one of <code>not_reviewed</code>,{" "}
+            <code>open</code>, <code>not_a_finding</code>,{" "}
+            <code>not_applicable</code>.{" "}
+            <a
+              href={bulkTemplateHref}
+              download="rule-bulk-import-template.csv"
+              data-testid="bulk-import-template"
+            >
+              Download template
+            </a>
+          </Box>
+          <FormField label="CSV file">
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              data-testid="bulk-import-input"
+              onChange={(e) => {
+                const f = e.target.files && e.target.files[0];
+                if (f) onBulkFileChange(f);
+              }}
+            />
+          </FormField>
+          {bulkBusy && bulkStep === "pick" && (
+            <StatusIndicator type="loading">Parsing…</StatusIndicator>
+          )}
+          {bulkError && <Alert type="error">{bulkError}</Alert>}
+          {bulkSuccess && (
+            <Alert type="success" data-testid="bulk-import-success">
+              {`Applied ${bulkSuccess.appliedCount} rule${bulkSuccess.appliedCount === 1 ? "" : "s"}.`}
+            </Alert>
+          )}
+          {bulkPreview && (
+            <>
+              {bulkPreview.rows.some((r) => r.status === "error") && (
+                <Alert type="warning">
+                  {`${bulkPreview.rows.filter((r) => r.status === "error").length} rows have errors and will be skipped.`}
+                </Alert>
+              )}
+              <Table
+                variant="embedded"
+                items={bulkPreview.rows}
+                trackBy="rowNumber"
+                columnDefinitions={[
+                  {
+                    id: "row",
+                    header: "Row",
+                    cell: (r) => r.rowNumber,
+                  },
+                  {
+                    id: "ruleId",
+                    header: "Rule",
+                    cell: (r) => r.ruleId || "—",
+                  },
+                  {
+                    id: "ruleStatus",
+                    header: "Status",
+                    cell: (r) => r.ruleStatus || "—",
+                  },
+                  {
+                    id: "findingDetails",
+                    header: "Finding details",
+                    cell: (r) => r.findingDetails || "—",
+                  },
+                  {
+                    id: "status",
+                    header: "Result",
+                    cell: (r) => {
+                      const color = r.status === "ok" ? "green" : "red";
+                      return (
+                        <Badge
+                          color={color}
+                          data-testid={`bulk-status-${r.rowNumber}`}
+                        >
+                          {r.status}
+                        </Badge>
+                      );
+                    },
+                  },
+                  {
+                    id: "error",
+                    header: "Note",
+                    cell: (r) => r.error || "",
+                  },
+                ]}
+                empty={<Box>No rows.</Box>}
+              />
+            </>
+          )}
+        </SpaceBetween>
       </Modal>
     </Box>
   );

@@ -78,6 +78,7 @@ use api::{
         mark_read_handler as mark_notifications_read_handler,
     },
     report::report_handler as asset_report_handler,
+    rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
     rule_comments::{
         create_handler as create_rule_comment_handler,
         delete_handler as delete_rule_comment_handler,
@@ -214,6 +215,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/checklists/:id/rules/:rule_id",
             axum::routing::patch(update_checklist_rule_handler),
+        )
+        .route(
+            "/api/checklists/:id/rules/bulk-import",
+            post(rule_bulk_import_handler),
         )
         .route(
             "/api/checklists/:id/rules/:rule_id/history",
