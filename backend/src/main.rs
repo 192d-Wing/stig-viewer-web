@@ -80,7 +80,7 @@ use api::{
     stig::get_stig,
     test_support::{
         backdate_baseline_handler, backdate_handler, bump_stig_handler, reset_handler,
-        set_role_handler,
+        run_digest_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -88,6 +88,7 @@ use api::{
         delete_handler as delete_webhook_handler,
         list_deliveries_handler as list_webhook_deliveries_handler,
         list_handler as list_webhooks_handler,
+        run_overdue_digest,
         test_handler as test_webhook_handler,
         update_handler as update_webhook_handler,
     },
@@ -313,6 +314,7 @@ async fn main() -> Result<()> {
             .route("/api/test/backdate-rule", post(backdate_handler))
             .route("/api/test/backdate-baseline", post(backdate_baseline_handler))
             .route("/api/test/bump-stig", post(bump_stig_handler))
+            .route("/api/test/run-digest", post(run_digest_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }
@@ -354,6 +356,29 @@ async fn main() -> Result<()> {
                 match take_snapshot(&db).await {
                     Ok(n) => tracing::info!("dashboard snapshot captured: {n} checklists"),
                     Err(e) => tracing::error!("dashboard snapshot failed: {e:#}"),
+                }
+            }
+        });
+    }
+
+    // Overdue-digest scheduler — fan a fleet-wide overdue summary out to
+    // any webhook subscribed to `overdue_digest`. The 23-hour cooldown
+    // lives inside `run_overdue_digest`, so the loop is safe to tick a
+    // little under 24h without spamming.
+    {
+        let digest_hours: u64 = std::env::var("OVERDUE_DIGEST_INTERVAL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let db = pool.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(digest_hours * 3600));
+            loop {
+                interval.tick().await;
+                match run_overdue_digest(&db).await {
+                    Ok(n) => tracing::info!("overdue digest sweep attempted {n} webhook(s)"),
+                    Err(e) => tracing::error!("overdue digest sweep failed: {e:#}"),
                 }
             }
         });
