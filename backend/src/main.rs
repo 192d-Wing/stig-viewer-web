@@ -1,4 +1,5 @@
 mod api;
+mod audit_retention;
 mod config;
 mod db;
 mod db_assets;
@@ -79,8 +80,8 @@ use api::{
     },
     stig::get_stig,
     test_support::{
-        backdate_baseline_handler, backdate_handler, bump_stig_handler, reset_handler,
-        run_digest_handler, set_role_handler,
+        backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
+        reset_handler, run_digest_handler, run_retention_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -315,6 +316,8 @@ async fn main() -> Result<()> {
             .route("/api/test/backdate-baseline", post(backdate_baseline_handler))
             .route("/api/test/bump-stig", post(bump_stig_handler))
             .route("/api/test/run-digest", post(run_digest_handler))
+            .route("/api/test/run-retention", post(run_retention_handler))
+            .route("/api/test/backdate-audit", post(backdate_audit_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }
@@ -379,6 +382,47 @@ async fn main() -> Result<()> {
                 match run_overdue_digest(&db).await {
                     Ok(n) => tracing::info!("overdue digest sweep attempted {n} webhook(s)"),
                     Err(e) => tracing::error!("overdue digest sweep failed: {e:#}"),
+                }
+            }
+        });
+    }
+
+    // Audit-retention scheduler — prunes `rule_audit` rows older than
+    // `AUDIT_RETENTION_DAYS` and (optionally) archives them as JSONL
+    // under `${data_dir}/audit_archive/`. Mirrors the other long-loop
+    // schedulers — interval is in hours so it lines up with the rest.
+    {
+        let retention_hours: u64 = std::env::var("AUDIT_RETENTION_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let retain_days: i64 = std::env::var("AUDIT_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(365);
+        let archive_enabled: bool = std::env::var("AUDIT_ARCHIVE_ENABLED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(true);
+        let db = pool.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(retention_hours * 3600));
+            loop {
+                interval.tick().await;
+                match audit_retention::run_prune(
+                    &db,
+                    &cfg.data_dir,
+                    retain_days,
+                    archive_enabled,
+                )
+                .await
+                {
+                    Ok(n) => tracing::info!(
+                        "audit retention pruned {n} rows (retain_days={retain_days}, archive={archive_enabled})"
+                    ),
+                    Err(e) => tracing::error!("audit retention failed: {e:#}"),
                 }
             }
         });

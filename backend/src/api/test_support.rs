@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::webhooks::run_overdue_digest;
+use crate::audit_retention;
 use crate::AppState;
 
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
@@ -133,6 +134,67 @@ pub async fn run_digest_handler(
         Err(e) => {
             tracing::error!("Test run-digest failed: {e:#}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RunRetentionRequest {
+    pub retain_days: i64,
+    pub archive: bool,
+}
+
+/// POST /api/test/run-retention — synchronously run the audit-retention
+/// prune once and return the row count deleted. Used by E2E to drive
+/// the housekeeping path without waiting for the 24h scheduler.
+pub async fn run_retention_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RunRetentionRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match audit_retention::run_prune(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        req.retain_days,
+        req.archive,
+    )
+    .await
+    {
+        Ok(pruned) => Ok(Json(json!({ "pruned": pruned }))),
+        Err(e) => {
+            tracing::error!("Test run-retention failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BackdateAuditRequest {
+    pub rule_id: String,
+    pub days: i64,
+}
+
+/// POST /api/test/backdate-audit — shift every `rule_audit` row whose
+/// `rule_id` matches into the past by N days. Used by the retention
+/// E2E spec to fabricate "old" audit rows without waiting a year.
+pub async fn backdate_audit_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BackdateAuditRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE rule_audit \
+         SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
+         WHERE rule_id = $2",
+    )
+    .bind(req.days.to_string())
+    .bind(&req.rule_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test backdate-audit failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
