@@ -15,6 +15,25 @@ use crate::AppState;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_SNIPPET_LIMIT: usize = 500;
 
+/// Allowed values for the `kinds` column. Anything outside this set is
+/// rejected with 400 by create/update so we don't end up with a webhook
+/// silently subscribed to a typo'd event name.
+const ALLOWED_KINDS: &[&str] = &["assigned", "overdue_digest"];
+
+/// Maximum number of overdue findings included in a single digest
+/// payload. Slack incoming webhooks cap attachment size, and operators
+/// only care about the top of the list anyway.
+const DIGEST_LIMIT: i64 = 50;
+
+fn validate_kinds(kinds: &[String]) -> Result<(), StatusCode> {
+    for k in kinds {
+        if !ALLOWED_KINDS.contains(&k.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(())
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -129,6 +148,7 @@ pub async fn create_handler(
         .kinds
         .filter(|k| !k.is_empty())
         .unwrap_or_else(|| vec!["assigned".to_string()]);
+    validate_kinds(&kinds)?;
 
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -194,6 +214,7 @@ pub async fn update_handler(
     };
     let secret = req.secret.unwrap_or(existing.secret);
     let kinds = req.kinds.unwrap_or(existing.kinds);
+    validate_kinds(&kinds)?;
     let enabled = req.enabled.unwrap_or(existing.enabled);
 
     let row = sqlx::query_as::<_, WebhookRow>(
@@ -444,6 +465,130 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     s[..end].to_string()
+}
+
+// ── Overdue digest ─────────────────────────────────────────────────────────
+
+/// One overdue row pulled from the fleet-wide query. Kept private — the
+/// shape only matters when building the Slack payload below.
+#[derive(Debug, sqlx::FromRow)]
+struct OverdueDigestRow {
+    rule_id: String,
+    asset_name: String,
+    stig_title: String,
+    due_date: Option<chrono::NaiveDate>,
+    days_overdue: Option<i32>,
+    assignee_name: Option<String>,
+}
+
+/// Build the Slack-shaped payload for the digest. Public so the test
+/// support endpoint and the scheduler can share the exact same code path.
+fn build_digest_payload(rows: &[OverdueDigestRow]) -> Value {
+    let total = rows.len();
+    let attachments: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let due_part = r
+                .due_date
+                .as_ref()
+                .map(|d| format!(" · Due: {}", d))
+                .unwrap_or_default();
+            let overdue_part = r
+                .days_overdue
+                .map(|d| format!(" · {} day(s) overdue", d))
+                .unwrap_or_default();
+            let who = r.assignee_name.clone().unwrap_or_else(|| "unassigned".to_string());
+            json!({
+                "title": format!("{} · {}", r.rule_id, r.asset_name),
+                "text": format!(
+                    "STIG: {} · Assignee: {}{}{}",
+                    r.stig_title, who, due_part, overdue_part
+                ),
+                "color": "#d13212",
+            })
+        })
+        .collect();
+    json!({
+        "text": format!("{} overdue findings across the fleet", total),
+        "attachments": attachments,
+    })
+}
+
+/// Sweep enabled `overdue_digest` webhooks that haven't fired in the
+/// last ~24h and deliver one digest each. Called by the background
+/// scheduler in main.rs and the test-only `/api/test/run-digest` route.
+///
+/// Returns the count of webhooks the sweep attempted. A webhook with no
+/// overdue findings to report is skipped (no delivery row written), but
+/// `last_digest_at` is still bumped so we don't re-check on every tick.
+pub async fn run_overdue_digest(pool: &PgPool) -> anyhow::Result<usize> {
+    // 23h fudge factor: when the scheduler ticks slightly under 24h the
+    // strict `> 24h` check would skip every other tick. 23h keeps the
+    // cadence honest while still preventing same-tick spam.
+    let webhooks = sqlx::query_as::<_, WebhookRow>(
+        r#"
+        SELECT id, name, url, secret, kinds, enabled, created_by, created_at
+          FROM webhooks
+         WHERE enabled = TRUE
+           AND 'overdue_digest' = ANY(kinds)
+           AND (last_digest_at IS NULL
+                OR last_digest_at < NOW() - INTERVAL '23 hours')
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if webhooks.is_empty() {
+        return Ok(0);
+    }
+
+    // Fleet-wide overdue snapshot. Built once and reused across every
+    // subscribed webhook so we hit the DB once per sweep, not N times.
+    let rows = sqlx::query_as::<_, OverdueDigestRow>(
+        r#"
+        SELECT
+            cr.rule_id                                AS rule_id,
+            a.name                                    AS asset_name,
+            COALESCE(sc.title, c.stig_id)             AS stig_title,
+            cr.due_date                               AS due_date,
+            (CURRENT_DATE - cr.due_date)::INT         AS days_overdue,
+            u.display_name                            AS assignee_name
+          FROM checklist_rules cr
+          JOIN checklists c     ON c.id = cr.checklist_id
+          JOIN assets a         ON a.id = c.asset_id
+          LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
+          LEFT JOIN users u          ON u.id = cr.assignee_id
+         WHERE cr.status = 'open'
+           AND cr.due_date IS NOT NULL
+           AND cr.due_date < CURRENT_DATE
+         ORDER BY cr.due_date ASC
+         LIMIT $1
+        "#,
+    )
+    .bind(DIGEST_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    let payload = build_digest_payload(&rows);
+    let attempted = webhooks.len();
+
+    for w in webhooks {
+        // Skip the POST entirely when there is nothing to report, but
+        // still stamp `last_digest_at` — the cron semantics are "we
+        // checked, nothing to do" rather than "we never ran."
+        if !rows.is_empty() {
+            deliver_one(pool, &w, "overdue_digest", &payload).await;
+        }
+        let stamp = sqlx::query("UPDATE webhooks SET last_digest_at = NOW() WHERE id = $1")
+            .bind(&w.id)
+            .execute(pool)
+            .await;
+        if let Err(e) = stamp {
+            tracing::error!("digest last_digest_at update failed for {}: {e:#}", w.id);
+        }
+    }
+
+    Ok(attempted)
 }
 
 async fn record_delivery(

@@ -28,9 +28,13 @@ const ROLE_BADGE = {
   admin: "red",
 };
 
-// Only 'assigned' fires today; the backend column is array-typed so we
-// can add more kinds (overdue, status_change, …) without a schema bump.
-const KIND_OPTIONS = [{ label: "Assigned", value: "assigned" }];
+// Event kinds the backend currently knows how to fire. Keep in sync
+// with ALLOWED_KINDS in backend/src/api/webhooks.rs — the create/update
+// handlers reject anything outside that set with a 400.
+const KIND_OPTIONS = [
+  { label: "Assigned", value: "assigned" },
+  { label: "Overdue digest", value: "overdue_digest" },
+];
 
 function roleLabel(value) {
   return ROLE_OPTIONS.find((o) => o.value === value)?.label ?? value;

@@ -1,6 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
+use serde_json::json;
 
+use crate::api::webhooks::run_overdue_digest;
 use crate::AppState;
 
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
@@ -116,6 +118,21 @@ pub async fn backdate_baseline_handler(
         Err(e) => {
             tracing::error!("Test backdate-baseline failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/run-digest — synchronously run the overdue-digest
+/// sweep once and return the number of webhooks attempted. Used by E2E
+/// to drive the digest path without waiting for the 24h scheduler.
+pub async fn run_digest_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match run_overdue_digest(state.pool.as_ref()).await {
+        Ok(count) => Ok(Json(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("Test run-digest failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
