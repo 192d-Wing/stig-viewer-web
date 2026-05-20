@@ -12,6 +12,14 @@ pub struct ChecklistRow {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Version + release that were current in the catalog when this
+    /// checklist was created. Compared against the live catalog row to
+    /// detect drift. Empty strings mean "unknown" (legacy rows) and the
+    /// drift check skips them.
+    #[serde(default)]
+    pub applied_version: String,
+    #[serde(default)]
+    pub applied_release: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -51,15 +59,32 @@ pub async fn get_checklist(pool: &PgPool, id: &str) -> Result<Option<ChecklistRo
 
 pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     sqlx::query(
-        "INSERT INTO checklists (id, asset_id, stig_id, status) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO checklists \
+            (id, asset_id, stig_id, status, applied_version, applied_release) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&row.id)
     .bind(&row.asset_id)
     .bind(&row.stig_id)
     .bind(&row.status)
+    .bind(&row.applied_version)
+    .bind(&row.applied_release)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Look up the current (version, release_info) for a STIG in the catalog.
+/// Returns ("", "") if not in the catalog so create_handler can still
+/// proceed for user-uploaded STIGs that don't sit in stigs_catalog.
+pub async fn catalog_version(pool: &PgPool, stig_id: &str) -> Result<(String, String)> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT version, release_info FROM stigs_catalog WHERE id = $1",
+    )
+    .bind(stig_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or_default())
 }
 
 pub async fn delete_checklist(pool: &PgPool, id: &str) -> Result<()> {

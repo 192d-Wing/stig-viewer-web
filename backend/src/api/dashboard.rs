@@ -30,6 +30,10 @@ pub struct Totals {
     pub total_rules: i64,      // sum of stig.rule_count across all checklists
     pub highest_risk_score: i64,
     pub highest_risk_asset_name: Option<String>,
+    /// Checklists whose recorded `applied_version` differs from the
+    /// current `stigs_catalog.version` (or release). Empty applied_*
+    /// values are skipped so legacy rows don't get flagged.
+    pub outdated_checklists: i64,
 }
 
 async fn load_severity_map(
@@ -115,6 +119,9 @@ pub struct ChecklistSummary {
     pub naf_count: i64,
     pub na_count: i64,
     pub reviewed_count: i64,
+    /// True when the checklist's recorded applied_version/release no
+    /// longer matches the current catalog row for the same stig_id.
+    pub outdated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -172,6 +179,17 @@ pub async fn get_handler(
         ),
     );
 
+    let outdated_count = count_one(
+        pool,
+        "SELECT COUNT(*) FROM checklists c \
+         JOIN stigs_catalog sc ON sc.id = c.stig_id \
+         WHERE c.applied_version <> '' \
+           AND (c.applied_version <> sc.version \
+                OR c.applied_release <> sc.release_info)",
+    )
+    .await
+    .map_err(map_db)?;
+
     let mut totals = Totals {
         assets: assets_count.map_err(map_db)?,
         checklists: checklists_count.map_err(map_db)?,
@@ -183,6 +201,7 @@ pub async fn get_handler(
         total_rules: total_rules.map_err(map_db)?,
         highest_risk_score: 0,
         highest_risk_asset_name: None,
+        outdated_checklists: outdated_count,
     };
 
     // Per-asset / per-checklist breakdown. One row per (asset, checklist);
@@ -198,6 +217,13 @@ pub async fn get_handler(
             c.stig_id         AS stig_id,
             COALESCE(sc.title, c.stig_id) AS stig_title,
             COALESCE(sc.rule_count, 0)::BIGINT AS rule_count,
+            -- Drift: checklist's applied_version/release differs from the
+            -- live catalog row. Empty applied_* (legacy rows) are treated
+            -- as not-outdated.
+            (c.applied_version <> '' AND
+             (c.applied_version <> COALESCE(sc.version, '')
+              OR c.applied_release <> COALESCE(sc.release_info, ''))
+            ) AS outdated,
             COALESCE(SUM(CASE WHEN cr.status = 'open' THEN 1 ELSE 0 END), 0)           AS open_count,
             COALESCE(SUM(CASE WHEN cr.status = 'open' AND cr.due_date IS NOT NULL
                                  AND cr.due_date < CURRENT_DATE THEN 1 ELSE 0 END), 0) AS overdue_count,
@@ -209,7 +235,8 @@ pub async fn get_handler(
         LEFT JOIN checklists c ON c.asset_id = a.id
         LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
         LEFT JOIN checklist_rules cr ON cr.checklist_id = c.id
-        GROUP BY a.id, a.name, u.display_name, c.id, c.stig_id, sc.title, sc.rule_count
+        GROUP BY a.id, a.name, u.display_name, c.id, c.stig_id, sc.title, sc.rule_count,
+                 c.applied_version, c.applied_release, sc.version, sc.release_info
         ORDER BY a.name, c.stig_id
         "#,
     )
@@ -253,6 +280,7 @@ pub async fn get_handler(
                 naf_count: row.try_get("naf_count").map_err(map_sqlx)?,
                 na_count: row.try_get("na_count").map_err(map_sqlx)?,
                 reviewed_count: row.try_get("reviewed_count").map_err(map_sqlx)?,
+                outdated: row.try_get::<bool, _>("outdated").unwrap_or(false),
             });
         }
     }
