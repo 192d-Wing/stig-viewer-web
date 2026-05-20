@@ -13,6 +13,16 @@ use crate::db_attachments;
 use crate::db_checklists;
 use crate::AppState;
 
+/// Snapshot of the asset captured at request-time so the blocking ZIP
+/// builder can stamp host/owner/etc. into the XCCDF TestResult without
+/// holding async handles.
+#[derive(Clone)]
+struct AssetCtx {
+    name: String,
+    hostname: String,
+    owner_display: String,
+}
+
 /// GET /api/assets/:id/bundle.zip — streams a ZIP bundle of a single
 /// asset's CKL files (one per applied STIG) plus all evidence
 /// attachments. Auth posture matches `report.rs`: any authenticated
@@ -80,7 +90,29 @@ pub async fn bundle_handler(
         asset.hostname.clone()
     };
 
-    let zip_bytes = tokio::task::spawn_blocking(move || build_zip(host, sections, attachment_entries))
+    // Owner display name for XCCDF <identity>. Falls back to the owner_id
+    // if the join fails so we never block the export on a missing user.
+    let owner_display: String = sqlx::query_scalar::<_, String>(
+        "SELECT display_name FROM users WHERE id = $1",
+    )
+    .bind(&asset.owner_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("bundle owner lookup: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .unwrap_or_else(|| asset.owner_id.clone());
+
+    let asset_ctx = AssetCtx {
+        name: asset.name.clone(),
+        hostname: asset.hostname.clone(),
+        owner_display,
+    };
+
+    let zip_bytes = tokio::task::spawn_blocking(move || {
+        build_zip(host, asset_ctx, sections, attachment_entries)
+    })
         .await
         .map_err(|e| {
             tracing::error!("bundle join error: {e:#}");
@@ -127,6 +159,7 @@ struct ManifestEntry {
 
 fn build_zip(
     host: String,
+    asset: AssetCtx,
     sections: Vec<ChecklistSection>,
     attachments: Vec<AttachmentEntry>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -141,15 +174,31 @@ fn build_zip(
 
     let mut manifest: Vec<ManifestEntry> = Vec::new();
 
-    // CKL files — one per applied STIG.
+    // CKL + XCCDF files — one of each per applied STIG, side by side.
+    // The CKL is the legacy DISA Viewer format; the XCCDF is the SCAP
+    // results-style XML expected by NIST tooling.
+    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     for section in &sections {
         let ckl_xml = render_ckl(&host, section);
-        let path = format!("checklists/{}.ckl", sanitize_segment(&section.stig_id));
-        zip.start_file(&path, options)?;
+        let ckl_path = format!("checklists/{}.ckl", sanitize_segment(&section.stig_id));
+        zip.start_file(&ckl_path, options)?;
         zip.write_all(ckl_xml.as_bytes())?;
         manifest.push(ManifestEntry {
-            path: path.clone(),
+            path: ckl_path,
             size: ckl_xml.len() as u64,
+            sha256: None,
+        });
+
+        let xccdf_xml = render_xccdf(&asset, section, &now_iso);
+        let xccdf_path = format!(
+            "checklists/{}.xccdf.xml",
+            sanitize_segment(&section.stig_id)
+        );
+        zip.start_file(&xccdf_path, options)?;
+        zip.write_all(xccdf_xml.as_bytes())?;
+        manifest.push(ManifestEntry {
+            path: xccdf_path,
+            size: xccdf_xml.len() as u64,
             sha256: None,
         });
     }
@@ -184,6 +233,7 @@ fn build_zip(
     }
 
     // MANIFEST.txt at the root — one line per file (path, size, sha256?).
+    // Lists CKL, XCCDF, and any evidence attachments included in this ZIP.
     let mut manifest_txt = String::new();
     manifest_txt.push_str("# STIG bundle manifest\n");
     manifest_txt.push_str("# path\tsize_bytes\tsha256\n");
@@ -369,6 +419,170 @@ fn esc_xml(s: &str) -> String {
         }
     }
     out
+}
+
+// ── XCCDF rendering ────────────────────────────────────────────────────────
+//
+// Results-style XCCDF 1.2 document. One Benchmark per applied STIG with
+// a Profile listing all selected rules, the Rule definitions themselves,
+// and a TestResult capturing the asset's current per-rule status. Field
+// order is loose since XCCDF readers index by element name, but we keep
+// it readable for humans.
+
+fn render_xccdf(asset: &AssetCtx, section: &ChecklistSection, ts: &str) -> String {
+    let stig_obj = section.stig_json.as_ref();
+    let title = stig_obj
+        .and_then(|v| v.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&section.stig_id);
+    let version = stig_obj
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let rules = stig_obj
+        .and_then(|v| v.get("rules"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let bench_id = format!(
+        "xccdf_mil.disa.stig_benchmark_{}",
+        sanitize_segment(&section.stig_id)
+    );
+
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(&format!(
+        "<Benchmark xmlns=\"http://checklists.nist.gov/xccdf/1.2\" id=\"{}\">\n",
+        esc_xml(&bench_id),
+    ));
+    out.push_str(&format!("  <title>{}</title>\n", esc_xml(title)));
+    out.push_str(&format!("  <version>{}</version>\n", esc_xml(version)));
+
+    // Profile: a single "Mission Critical Classified" profile that
+    // selects every rule defined in the benchmark.
+    out.push_str(
+        "  <Profile id=\"xccdf_mil.disa.stig_profile_MAC-1_Classified\">\n",
+    );
+    out.push_str("    <title>I - Mission Critical Classified</title>\n");
+    for rule in &rules {
+        if let Some(rid) = rule.get("id").and_then(|v| v.as_str()) {
+            out.push_str(&format!(
+                "    <select idref=\"{}\" selected=\"true\"/>\n",
+                esc_xml(rid),
+            ));
+        }
+    }
+    out.push_str("  </Profile>\n");
+
+    // Rule definitions.
+    for rule in &rules {
+        let get = |k: &str| -> String {
+            rule.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let rid = get("id");
+        if rid.is_empty() {
+            continue;
+        }
+        let severity = sev_to_xccdf(&get("severity"));
+        let rule_title = get("title");
+        let description = get("description");
+        let check_text = get("checkText");
+        let fix_text = get("fixText");
+
+        out.push_str(&format!(
+            "  <Rule id=\"{}\" severity=\"{}\" weight=\"10.0\">\n",
+            esc_xml(&rid),
+            severity,
+        ));
+        out.push_str(&format!("    <title>{}</title>\n", esc_xml(&rule_title)));
+        out.push_str(&format!(
+            "    <description>{}</description>\n",
+            esc_xml(&description),
+        ));
+        out.push_str(&format!(
+            "    <fixtext>{}</fixtext>\n",
+            esc_xml(&fix_text),
+        ));
+        out.push_str(
+            "    <check system=\"http://scap.nist.gov/schema/ocil/2\">",
+        );
+        out.push_str(&format!(
+            "<check-content>{}</check-content></check>\n",
+            esc_xml(&check_text),
+        ));
+        out.push_str("  </Rule>\n");
+    }
+
+    // TestResult: one rule-result per rule, derived from override status
+    // (defaulting to "not_reviewed" → notchecked when missing).
+    out.push_str(&format!(
+        "  <TestResult id=\"xccdf_test_result_default\" start-time=\"{}\" end-time=\"{}\">\n",
+        esc_xml(ts),
+        esc_xml(ts),
+    ));
+    out.push_str(&format!(
+        "    <target>{}</target>\n",
+        esc_xml(&asset.name),
+    ));
+    out.push_str(&format!(
+        "    <target-address>{}</target-address>\n",
+        esc_xml(&asset.hostname),
+    ));
+    out.push_str(&format!(
+        "    <identity authenticated=\"false\">{}</identity>\n",
+        esc_xml(&asset.owner_display),
+    ));
+    for rule in &rules {
+        let rid = match rule.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let status = section
+            .overrides
+            .get(&rid)
+            .map(|o| o.status.as_str())
+            .unwrap_or("not_reviewed");
+        out.push_str(&format!(
+            "    <rule-result idref=\"{}\" time=\"{}\">\n",
+            esc_xml(&rid),
+            esc_xml(ts),
+        ));
+        out.push_str(&format!(
+            "      <result>{}</result>\n",
+            status_to_xccdf(status),
+        ));
+        out.push_str("    </rule-result>\n");
+    }
+    out.push_str("  </TestResult>\n");
+    out.push_str("</Benchmark>\n");
+    out
+}
+
+/// Map STIG severity ("CAT I"/"CAT II"/"CAT III") to XCCDF severity.
+/// Anything we don't recognize falls through to "low" per spec to keep
+/// downstream tooling from blowing up on legacy/blank rows.
+fn sev_to_xccdf(sev: &str) -> &'static str {
+    match sev {
+        "CAT I" => "high",
+        "CAT II" => "medium",
+        "CAT III" => "low",
+        _ => "low",
+    }
+}
+
+/// Map our internal status to XCCDF rule-result `<result>` token.
+fn status_to_xccdf(status: &str) -> &'static str {
+    match status {
+        "open" => "fail",
+        "not_a_finding" => "pass",
+        "not_applicable" => "notapplicable",
+        "not_reviewed" => "notchecked",
+        _ => "notchecked",
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
