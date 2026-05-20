@@ -60,6 +60,11 @@ use api::{
         mark_read_handler as mark_notifications_read_handler,
     },
     report::report_handler as asset_report_handler,
+    saved_searches::{
+        create_handler as create_saved_search_handler,
+        delete_handler as delete_saved_search_handler,
+        list_handler as list_saved_searches_handler,
+    },
     stig::get_stig,
     test_support::{backdate_handler, bump_stig_handler, reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
@@ -218,6 +223,14 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/assets/:id/owner",
             axum::routing::patch(admin_update_asset_owner_handler),
+        )
+        .route(
+            "/api/saved-searches",
+            get(list_saved_searches_handler).post(create_saved_search_handler),
+        )
+        .route(
+            "/api/saved-searches/:id",
+            axum::routing::delete(delete_saved_search_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
