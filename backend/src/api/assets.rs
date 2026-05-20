@@ -41,11 +41,11 @@ pub struct UpdateAssetRequest {
     pub tags: Vec<String>,
 }
 
-const MAX_TAG_LEN: usize = 50;
+pub const MAX_TAG_LEN: usize = 50;
 
 /// Trim, dedup, and validate-length a user-supplied tag list. Returns
 /// 400 if any tag is too long after trimming. Empty strings dropped.
-fn normalize_tags(input: &[String]) -> Result<Vec<String>, StatusCode> {
+pub fn normalize_tags(input: &[String]) -> Result<Vec<String>, StatusCode> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in input {

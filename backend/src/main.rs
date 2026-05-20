@@ -24,6 +24,7 @@ use api::{
         update_asset_owner_handler as admin_update_asset_owner_handler,
         update_user_role_handler as admin_update_user_role_handler,
     },
+    asset_import::import_handler as import_assets_handler,
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
         get_asset_handler, list_assets_handler, update_asset_handler,
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
     // Draft + asset + /api/users/me routes — require an authenticated session.
     let draft_routes = Router::new()
         .route("/api/assets", get(list_assets_handler).post(create_asset_handler))
+        .route("/api/assets/import", post(import_assets_handler))
         .route(
             "/api/assets/:id",
             get(get_asset_handler)
