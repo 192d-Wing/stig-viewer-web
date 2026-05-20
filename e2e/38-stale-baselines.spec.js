@@ -108,9 +108,10 @@ test.describe("Stale baseline reminders", () => {
     // The KPI sub-label echoes the threshold in days.
     await expect(page.getByText(">90d").first()).toBeVisible();
 
-    // The selected baseline triggers the stale warning Alert.
+    // The selected baseline triggers the stale warning Alert. The Alert
+    // header is rendered as a styled span, not a semantic heading.
     await expect(
-      page.getByRole("heading", { name: /Stale baseline/i }).first(),
+      page.getByText(/This baseline is \d+ days old/),
     ).toBeVisible({ timeout: 10_000 });
   });
 });
