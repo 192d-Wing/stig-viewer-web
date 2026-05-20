@@ -14,6 +14,7 @@ pub mod drafts;
 pub mod findings;
 pub mod notifications;
 pub mod report;
+pub mod rule_bulk_import;
 pub mod rule_comments;
 pub mod saved_searches;
 pub mod stig;
