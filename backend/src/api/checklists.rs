@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use crate::api::auth::AuthUser;
+use crate::api::webhooks;
 use crate::db_assets;
 use crate::db_checklists;
 use crate::AppState;
@@ -394,6 +395,22 @@ pub async fn update_rule_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Snapshot the prior assignee so we can detect a transition for the
+    // outbound 'assigned' webhook event after the upsert succeeds.
+    let prev_assignee: Option<String> = sqlx::query_scalar(
+        "SELECT assignee_id FROM checklist_rules \
+         WHERE checklist_id = $1 AND rule_id = $2",
+    )
+    .bind(&id)
+    .bind(&rule_id)
+    .fetch_optional(state.pool.as_ref())
+    .await
+    .map_err(|e| {
+        tracing::error!("checklists prev-assignee lookup: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .flatten();
+
     let row = db_checklists::upsert_rule(
         state.pool.as_ref(),
         &id,
@@ -407,7 +424,109 @@ pub async fn update_rule_handler(
     )
     .await
     .map_err(map_db)?;
+
+    // Fire the webhook only when the assignee actually changed and the
+    // new value is non-null — null means "unassigned", which we treat
+    // as a no-op for outbound notifications.
+    let new_assignee = req.assignee_id.clone();
+    let changed = new_assignee != prev_assignee;
+    if changed {
+        if let Some(assignee_id) = new_assignee {
+            let pool = state.pool.clone();
+            let state_clone = state.clone();
+            let checklist_id = id.clone();
+            let rule_id_clone = rule_id.clone();
+            let due_date = req.due_date;
+            tokio::spawn(async move {
+                fire_assigned_event(
+                    &state_clone,
+                    pool.as_ref(),
+                    &checklist_id,
+                    &rule_id_clone,
+                    &assignee_id,
+                    due_date,
+                )
+                .await;
+            });
+        }
+    }
+
     Ok(Json(row))
+}
+
+/// Resolve event metadata + dispatch an `assigned` webhook event for a
+/// single rule. Runs inside `tokio::spawn` from `update_rule_handler`;
+/// any failure here is logged but never bubbles back to the caller.
+async fn fire_assigned_event(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    checklist_id: &str,
+    rule_id: &str,
+    assignee_id: &str,
+    due_date: Option<chrono::NaiveDate>,
+) {
+    // Asset name + stig_id + stig title in one round-trip.
+    let meta: Option<(String, String, Option<String>)> = match sqlx::query_as(
+        r#"
+        SELECT a.name, c.stig_id, sc.title
+          FROM checklists c
+          JOIN assets a         ON a.id = c.asset_id
+          LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
+         WHERE c.id = $1
+        "#,
+    )
+    .bind(checklist_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!("webhook meta lookup failed: {e:#}");
+            return;
+        }
+    };
+    let (asset_name, stig_id, stig_title) = match meta {
+        Some((a, sid, t)) => (a, sid.clone(), t.unwrap_or(sid)),
+        None => return,
+    };
+
+    // Assignee display name — fall back to id if missing.
+    let assignee_name: String =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(assignee_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| assignee_id.to_string());
+
+    // Severity lives in the STIG JSON. Best-effort lookup — if the file
+    // is missing or the rule doesn't carry one we just send "unknown".
+    let severity = match load_stig_json(state, &stig_id).await {
+        Ok(stig) => stig
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|r| {
+                    r.get("id").and_then(|i| i.as_str()) == Some(rule_id)
+                })
+            })
+            .and_then(|r| r.get("severity").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string(),
+        Err(_) => "unknown".to_string(),
+    };
+
+    let event = webhooks::AssignedEvent {
+        rule_id: rule_id.to_string(),
+        assignee_name,
+        asset_name,
+        stig_title,
+        severity,
+        due_date: due_date.map(|d| d.to_string()),
+    };
+    let payload = webhooks::build_assigned_payload(&event);
+    webhooks::dispatch_event(pool, "assigned", payload).await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

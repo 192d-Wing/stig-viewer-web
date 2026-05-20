@@ -78,6 +78,14 @@ use api::{
     stig::get_stig,
     test_support::{backdate_handler, bump_stig_handler, reset_handler, set_role_handler},
     upload::{upload_library, upload_stig},
+    webhooks::{
+        create_handler as create_webhook_handler,
+        delete_handler as delete_webhook_handler,
+        list_deliveries_handler as list_webhook_deliveries_handler,
+        list_handler as list_webhooks_handler,
+        test_handler as test_webhook_handler,
+        update_handler as update_webhook_handler,
+    },
 };
 use config::{load_sources, Config};
 use db::init_pool;
@@ -260,6 +268,20 @@ async fn main() -> Result<()> {
             "/api/saved-searches/:id",
             axum::routing::delete(delete_saved_search_handler),
         )
+        .route(
+            "/api/webhooks",
+            get(list_webhooks_handler).post(create_webhook_handler),
+        )
+        .route(
+            "/api/webhooks/:id",
+            axum::routing::patch(update_webhook_handler)
+                .delete(delete_webhook_handler),
+        )
+        .route(
+            "/api/webhooks/:id/deliveries",
+            get(list_webhook_deliveries_handler),
+        )
+        .route("/api/webhooks/:id/test", post(test_webhook_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
