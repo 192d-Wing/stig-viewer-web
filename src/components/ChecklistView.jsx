@@ -16,8 +16,15 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import TextFilter from "@cloudscape-design/components/text-filter";
 import Select from "@cloudscape-design/components/select";
 import DatePicker from "@cloudscape-design/components/date-picker";
-import { apiGet, apiJson } from "../utils/api.js";
+import { apiFetch, apiGet, apiJson, apiUpload, BACKEND } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
+
+function formatBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 const STATUSES = [
   { value: "not_reviewed", label: "Not reviewed", color: "grey" },
@@ -61,6 +68,15 @@ export default function ChecklistView({ checklistId, onBack }) {
 
   const [filter, setFilter] = useState("");
 
+  // Attachment state — both the per-rule list shown in the Evidence
+  // section of the editor modal, and a checklist-wide count map used
+  // to decorate the rule list with a paperclip indicator.
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+  const [counts2, setCounts2] = useState({}); // ruleId -> count
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -74,9 +90,45 @@ export default function ChecklistView({ checklistId, onBack }) {
     }
   }, [checklistId]);
 
+  const refreshCounts = useCallback(async () => {
+    try {
+      const rows = await apiGet(`/api/checklists/${checklistId}/attachments`);
+      const map = {};
+      for (const r of rows) map[r.ruleId] = r.count;
+      setCounts2(map);
+    } catch {
+      // Non-fatal — just leave counts empty.
+    }
+  }, [checklistId]);
+
+  const refreshAttachments = useCallback(
+    async (ruleId) => {
+      if (!ruleId) return;
+      setAttachmentsLoading(true);
+      try {
+        const rows = await apiGet(
+          `/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/attachments`,
+        );
+        setAttachments(rows);
+      } catch (err) {
+        setAttachments([]);
+        setUploadError(err.message);
+      } finally {
+        setAttachmentsLoading(false);
+      }
+    },
+    [checklistId],
+  );
+
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Load attachment counts once per checklist for the paperclip
+  // indicator in the rule list.
+  useEffect(() => {
+    refreshCounts();
+  }, [refreshCounts]);
 
   // Load the user list once for the Assignee Select.
   useEffect(() => {
@@ -114,17 +166,66 @@ export default function ChecklistView({ checklistId, onBack }) {
     );
   }, [detail, filter]);
 
-  const startEdit = useCallback((rule) => {
-    setDraft({
-      status: rule.state.status,
-      findingDetails: rule.state.findingDetails,
-      comments: rule.state.comments,
-      assigneeId: rule.state.assigneeId ?? null,
-      dueDate: rule.state.dueDate ?? "",
-    });
-    setSaveError(null);
-    setEditing(rule);
-  }, []);
+  const startEdit = useCallback(
+    (rule) => {
+      setDraft({
+        status: rule.state.status,
+        findingDetails: rule.state.findingDetails,
+        comments: rule.state.comments,
+        assigneeId: rule.state.assigneeId ?? null,
+        dueDate: rule.state.dueDate ?? "",
+      });
+      setSaveError(null);
+      setUploadError(null);
+      setAttachments([]);
+      setEditing(rule);
+      refreshAttachments(rule.id);
+    },
+    [refreshAttachments],
+  );
+
+  const uploadAttachment = useCallback(
+    async (file) => {
+      if (!editing || !file) return;
+      setUploading(true);
+      setUploadError(null);
+      try {
+        await apiUpload(
+          `/api/checklists/${checklistId}/rules/${encodeURIComponent(editing.id)}/attachments`,
+          file,
+        );
+        await refreshAttachments(editing.id);
+        await refreshCounts();
+      } catch (err) {
+        // The backend returns 413 for files over the size cap; surface a
+        // friendlier message in that case.
+        const msg = /413/.test(err.message)
+          ? "File too large (max 25 MB)."
+          : err.message;
+        setUploadError(msg);
+      } finally {
+        setUploading(false);
+      }
+    },
+    [checklistId, editing, refreshAttachments, refreshCounts],
+  );
+
+  const deleteAttachment = useCallback(
+    async (attachmentId) => {
+      if (!editing) return;
+      try {
+        const res = await apiFetch(`/api/attachments/${attachmentId}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) throw new Error(`${res.status}`);
+        await refreshAttachments(editing.id);
+        await refreshCounts();
+      } catch (err) {
+        setUploadError(err.message);
+      }
+    },
+    [editing, refreshAttachments, refreshCounts],
+  );
 
   const saveEdit = useCallback(async () => {
     if (!editing) return;
@@ -206,11 +307,27 @@ export default function ChecklistView({ checklistId, onBack }) {
             {
               id: "id",
               header: "Rule",
-              cell: (r) => (
-                <Button variant="inline-link" onClick={() => startEdit(r)}>
-                  {r.id}
-                </Button>
-              ),
+              cell: (r) => {
+                const n = counts2[r.id] || 0;
+                return (
+                  <SpaceBetween direction="horizontal" size="xxs">
+                    <Button variant="inline-link" onClick={() => startEdit(r)}>
+                      {r.id}
+                    </Button>
+                    {n > 0 && (
+                      <span
+                        title={`${n} attachment${n === 1 ? "" : "s"}`}
+                        aria-label={`${n} attachment${n === 1 ? "" : "s"}`}
+                        data-testid="attachment-indicator"
+                        style={{ opacity: 0.7 }}
+                      >
+                        {"\u{1F4CE}"}
+                        {n > 1 ? ` ${n}` : ""}
+                      </span>
+                    )}
+                  </SpaceBetween>
+                );
+              },
             },
             {
               id: "severity",
@@ -356,6 +473,100 @@ export default function ChecklistView({ checklistId, onBack }) {
               />
             </FormField>
             {saveError && <Alert type="error">{saveError}</Alert>}
+
+            <FormField
+              label="Evidence"
+              description="Attach screenshots, logs, or scan output as supporting evidence."
+            >
+              <SpaceBetween direction="vertical" size="s">
+                {attachmentsLoading ? (
+                  <StatusIndicator type="loading">
+                    Loading attachments
+                  </StatusIndicator>
+                ) : attachments.length === 0 ? (
+                  <Box variant="small" color="text-body-secondary">
+                    No attachments yet.
+                  </Box>
+                ) : (
+                  <Table
+                    variant="embedded"
+                    items={attachments}
+                    trackBy="id"
+                    columnDefinitions={[
+                      {
+                        id: "filename",
+                        header: "File",
+                        cell: (a) => a.filename,
+                      },
+                      {
+                        id: "size",
+                        header: "Size",
+                        cell: (a) => formatBytes(a.sizeBytes),
+                      },
+                      {
+                        id: "uploaded",
+                        header: "Uploaded",
+                        cell: (a) =>
+                          new Date(a.uploadedAt).toLocaleString(),
+                      },
+                      {
+                        id: "actions",
+                        header: "",
+                        cell: (a) => (
+                          <SpaceBetween direction="horizontal" size="xxs">
+                            <Button
+                              variant="inline-link"
+                              iconName="download"
+                              ariaLabel={`Download ${a.filename}`}
+                              href={`${BACKEND}/api/attachments/${a.id}`}
+                              target="_blank"
+                              data-testid="attachment-download"
+                            >
+                              Download
+                            </Button>
+                            <Button
+                              variant="inline-link"
+                              iconName="close"
+                              ariaLabel={`Delete ${a.filename}`}
+                              disabled={!isOwner}
+                              onClick={() => deleteAttachment(a.id)}
+                              data-testid="attachment-delete"
+                            >
+                              Delete
+                            </Button>
+                          </SpaceBetween>
+                        ),
+                      },
+                    ]}
+                  />
+                )}
+                {isOwner && (
+                  <Box>
+                    <input
+                      type="file"
+                      data-testid="attachment-file-input"
+                      disabled={uploading}
+                      onChange={(e) => {
+                        const f = e.target.files && e.target.files[0];
+                        if (f) {
+                          uploadAttachment(f);
+                          // Reset so the same file can be picked again.
+                          e.target.value = "";
+                        }
+                      }}
+                    />
+                    {uploading && (
+                      <Box variant="small" padding={{ top: "xs" }}>
+                        <StatusIndicator type="in-progress">
+                          Uploading…
+                        </StatusIndicator>
+                      </Box>
+                    )}
+                  </Box>
+                )}
+                {uploadError && <Alert type="error">{uploadError}</Alert>}
+              </SpaceBetween>
+            </FormField>
           </SpaceBetween>
         )}
       </Modal>

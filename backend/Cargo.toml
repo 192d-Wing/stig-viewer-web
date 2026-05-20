@@ -28,3 +28,5 @@ axum-extra         = { version = "0.9", features = ["cookie"] }
 url                = "2"
 time               = "0.3"
 printpdf           = "0.7"
+sha2               = "0.10"
+hex                = "0.4"

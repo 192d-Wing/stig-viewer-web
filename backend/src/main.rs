@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod db;
 mod db_assets;
+mod db_attachments;
 mod db_checklists;
 mod db_drafts;
 mod parser;
@@ -25,6 +26,13 @@ use api::{
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
         get_asset_handler, list_assets_handler, update_asset_handler,
+    },
+    attachments::{
+        counts_for_checklist_handler as attachments_counts_for_checklist_handler,
+        delete_handler as delete_attachment_handler,
+        download_handler as download_attachment_handler,
+        list_for_rule_handler as list_attachments_for_rule_handler,
+        upload_handler as upload_attachment_handler,
     },
     audit::{activity_handler, rule_history_handler},
     auth::{
@@ -180,6 +188,20 @@ async fn main() -> Result<()> {
         .route(
             "/api/checklists/:id/rules/:rule_id/history",
             get(rule_history_handler),
+        )
+        .route(
+            "/api/checklists/:id/rules/:rule_id/attachments",
+            get(list_attachments_for_rule_handler)
+                .post(upload_attachment_handler),
+        )
+        .route(
+            "/api/checklists/:id/attachments",
+            get(attachments_counts_for_checklist_handler),
+        )
+        .route(
+            "/api/attachments/:id",
+            get(download_attachment_handler)
+                .delete(delete_attachment_handler),
         )
         .route("/api/activity", get(activity_handler))
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))

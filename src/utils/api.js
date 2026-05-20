@@ -39,3 +39,18 @@ export async function apiJson(path, method, body) {
   }
   return res.json()
 }
+
+/**
+ * Convenience: POST a single file as multipart/form-data with the field
+ * name 'file'. Returns the parsed JSON response.
+ */
+export async function apiUpload(path, file) {
+  const fd = new FormData()
+  fd.append('file', file, file.name)
+  const res = await apiFetch(path, { method: 'POST', body: fd })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(text || `${res.status}`)
+  }
+  return res.json()
+}
