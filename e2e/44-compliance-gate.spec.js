@@ -188,8 +188,7 @@ test.describe("Compliance gate — finding_details required for closing status",
 
     // Type a justification — error clears, Save enabled, modal closes after save.
     await editModal
-      .getByRole("textbox")
-      .first()
+      .getByRole("textbox", { name: /finding details/i })
       .fill("compensating control documented in ticket #123");
     await expect(
       editModal.getByText("Required when closing this finding."),

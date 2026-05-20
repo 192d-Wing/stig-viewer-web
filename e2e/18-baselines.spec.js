@@ -27,11 +27,19 @@ async function seedAssetWithTwoRules(request) {
 }
 
 async function patch(request, checklistId, ruleId, body) {
+  // Compliance gate requires a justification for closing statuses;
+  // auto-supply one when caller hasn't.
+  const closing =
+    body.status === "not_a_finding" || body.status === "not_applicable";
+  const data =
+    closing && !body.findingDetails
+      ? { ...body, findingDetails: "auto-justified for test" }
+      : body;
   await request.patch(
     `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}`,
     {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: body,
+      data,
     },
   );
 }

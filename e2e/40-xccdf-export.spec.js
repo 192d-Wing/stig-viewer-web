@@ -91,11 +91,17 @@ async function applyStig(request, assetId, stigId, user = "alice") {
 }
 
 async function setRuleStatus(request, checklistId, ruleId, status, user = "alice") {
+  // Closing statuses require a justification — supply one so the
+  // compliance gate accepts the transition.
+  const findingDetails =
+    status === "not_a_finding" || status === "not_applicable"
+      ? "auto-justified for test"
+      : "";
   const res = await request.patch(
     `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}`,
     {
       headers: { "X-User-Id": user, "Content-Type": "application/json" },
-      data: { status, findingDetails: "", comments: "" },
+      data: { status, findingDetails, comments: "" },
     },
   );
   expect(res.status()).toBe(200);
