@@ -6,6 +6,7 @@ mod db_attachments;
 mod db_checklists;
 mod db_drafts;
 mod parser;
+mod severity;
 mod sync;
 
 use anyhow::Result;

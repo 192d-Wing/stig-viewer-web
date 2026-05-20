@@ -404,6 +404,7 @@ export default function Dashboard() {
               assetName: a.name,
               ownerName: a.ownerName,
               riskScore: a.riskScore,
+              weightedRiskScore: a.weightedRiskScore ?? 0,
               empty: true,
             },
           ]
@@ -412,6 +413,7 @@ export default function Dashboard() {
             assetName: a.name,
             ownerName: a.ownerName,
             riskScore: a.riskScore,
+            weightedRiskScore: a.weightedRiskScore ?? 0,
             ...c,
           })),
     );
@@ -551,6 +553,18 @@ export default function Dashboard() {
                 : undefined
             }
             tone={totals.highestRiskScore > 0 ? "warning" : "ok"}
+          />
+          <KpiCard
+            label="Top weighted"
+            value={(totals.highestWeightedScore ?? 0).toFixed(1)}
+            sub={
+              totals.highestWeightedAssetName
+                ? totals.highestWeightedRuleId
+                  ? `${totals.highestWeightedRuleId} on ${totals.highestWeightedAssetName}`
+                  : `on ${totals.highestWeightedAssetName}`
+                : undefined
+            }
+            tone={(totals.highestWeightedScore ?? 0) > 20 ? "warning" : "ok"}
           />
           <KpiCard
             label="STIG updates"
@@ -715,6 +729,18 @@ export default function Dashboard() {
               ),
             },
             {
+              id: "weightedRisk",
+              header: "Weighted risk",
+              cell: (r) => {
+                const w = r.weightedRiskScore ?? 0;
+                // Match the formula's natural range:
+                //   single CAT II open finding on unclassified ≈ 3.0
+                //   anything ≥ 20 implies a CAT I on a classified system
+                const color = w > 20 ? "red" : w > 5 ? "blue" : "grey";
+                return <Badge color={color}>{w.toFixed(1)}</Badge>;
+              },
+            },
+            {
               id: "naf",
               header: "NaF",
               cell: (r) =>
@@ -832,6 +858,18 @@ export default function Dashboard() {
                   ) : (
                     <Box color="text-status-inactive">—</Box>
                   ),
+              },
+              {
+                id: "weight",
+                header: "Weight",
+                // Sortable so an auditor can pick the highest-impact
+                // findings out of a large drill-down list.
+                sortingField: "weightedScore",
+                cell: (f) => {
+                  const w = f.weightedScore ?? 0;
+                  const color = w > 20 ? "red" : w > 5 ? "blue" : "grey";
+                  return <Badge color={color}>{w.toFixed(1)}</Badge>;
+                },
               },
               { id: "asset", header: "System", cell: (f) => f.assetName },
               { id: "stig", header: "STIG", cell: (f) => f.stigTitle },

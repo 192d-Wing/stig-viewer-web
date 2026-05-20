@@ -3,11 +3,19 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+use crate::severity::{load_severity_map, severity_weight, weighted_score};
 use crate::AppState;
+
+/// Round a float to one decimal place. Used so weighted scores serialize
+/// to tidy JSON (e.g. 20.0 instead of 20.000000000000004 after multiple
+/// f64 multiplications).
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,60 +38,20 @@ pub struct Totals {
     pub total_rules: i64,      // sum of stig.rule_count across all checklists
     pub highest_risk_score: i64,
     pub highest_risk_asset_name: Option<String>,
+    /// SCAP-style score for the single worst open finding across the
+    /// fleet. See `crate::severity::weighted_score` for the formula.
+    /// Sits beside `highest_risk_score` rather than replacing it —
+    /// the existing aggregate is still surfaced unchanged.
+    pub highest_weighted_score: f64,
+    /// Asset that owns the rule with `highest_weighted_score`.
+    pub highest_weighted_asset_name: Option<String>,
+    /// Rule id that yielded `highest_weighted_score` (so the UI can
+    /// surface "rule X on asset Y" without a follow-up findings query).
+    pub highest_weighted_rule_id: Option<String>,
     /// Checklists whose recorded `applied_version` differs from the
     /// current `stigs_catalog.version` (or release). Empty applied_*
     /// values are skipped so legacy rows don't get flagged.
     pub outdated_checklists: i64,
-}
-
-async fn load_severity_map(
-    state: &AppState,
-    stig_id: &str,
-) -> std::collections::HashMap<String, String> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
-        return std::collections::HashMap::new();
-    }
-    let path = state
-        .config
-        .data_dir
-        .join("stigs")
-        .join(format!("{stig_id}.json"));
-    let contents = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
-        Err(_) => return std::collections::HashMap::new(),
-    };
-    let value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => return std::collections::HashMap::new(),
-    };
-    let rules = match value.get("rules").and_then(|v| v.as_array()) {
-        Some(r) => r,
-        None => return std::collections::HashMap::new(),
-    };
-    rules
-        .iter()
-        .filter_map(|r| {
-            let id = r.get("id")?.as_str()?.to_string();
-            let sev = r.get("severity")?.as_str()?.to_string();
-            Some((id, sev))
-        })
-        .collect()
-}
-
-// Risk weighting — open findings weighted by severity. CAT I findings hurt
-// 10× more than CAT III. Unknown severity gets the lowest weight so it
-// never inflates the score artificially.
-fn severity_weight(sev: &str) -> i64 {
-    let s = sev.to_ascii_uppercase();
-    if s.contains("CAT I") && !s.contains("CAT II") {
-        10 // CAT I
-    } else if s.contains("CAT II") && !s.contains("CAT III") {
-        3 // CAT II
-    } else if s.contains("CAT III") {
-        1 // CAT III
-    } else {
-        1 // unknown — treat as low
-    }
 }
 
 fn stale_threshold_days() -> i64 {
@@ -100,9 +68,16 @@ pub struct AssetSummary {
     pub id: String,
     pub name: String,
     pub owner_name: String,
+    /// Asset classification (unclassified / cui / secret / top-secret).
+    /// Surfaced here so the dashboard UI can colour rows without an
+    /// extra round-trip to the assets API.
+    pub classification: String,
     /// Weighted open-finding count. CAT I × 10, CAT II × 3, CAT III × 1.
     /// Raw (unbounded); higher = worse posture.
     pub risk_score: i64,
+    /// SCAP-style aggregate score — sum of per-finding `weighted_score`
+    /// across this asset's open rules. Rounded to one decimal.
+    pub weighted_risk_score: f64,
     pub tags: Vec<String>,
     pub checklists: Vec<ChecklistSummary>,
 }
@@ -201,6 +176,9 @@ pub async fn get_handler(
         total_rules: total_rules.map_err(map_db)?,
         highest_risk_score: 0,
         highest_risk_asset_name: None,
+        highest_weighted_score: 0.0,
+        highest_weighted_asset_name: None,
+        highest_weighted_rule_id: None,
         outdated_checklists: outdated_count,
     };
 
@@ -212,6 +190,7 @@ pub async fn get_handler(
         SELECT
             a.id              AS asset_id,
             a.name            AS asset_name,
+            a.classification  AS classification,
             u.display_name    AS owner_name,
             c.id              AS checklist_id,
             c.stig_id         AS stig_id,
@@ -235,7 +214,7 @@ pub async fn get_handler(
         LEFT JOIN checklists c ON c.asset_id = a.id
         LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
         LEFT JOIN checklist_rules cr ON cr.checklist_id = c.id
-        GROUP BY a.id, a.name, u.display_name, c.id, c.stig_id, sc.title, sc.rule_count,
+        GROUP BY a.id, a.name, a.classification, u.display_name, c.id, c.stig_id, sc.title, sc.rule_count,
                  c.applied_version, c.applied_release, sc.version, sc.release_info
         ORDER BY a.name, c.stig_id
         "#,
@@ -251,6 +230,7 @@ pub async fn get_handler(
     for row in rows {
         let asset_id: String = row.try_get("asset_id").map_err(map_sqlx)?;
         let asset_name: String = row.try_get("asset_name").map_err(map_sqlx)?;
+        let classification: String = row.try_get("classification").map_err(map_sqlx)?;
         let owner_name: String = row.try_get("owner_name").map_err(map_sqlx)?;
         let checklist_id: Option<String> = row.try_get("checklist_id").map_err(map_sqlx)?;
 
@@ -261,7 +241,9 @@ pub async fn get_handler(
                     id: asset_id.clone(),
                     name: asset_name,
                     owner_name,
+                    classification,
                     risk_score: 0,
+                    weighted_risk_score: 0.0,
                     tags: Vec::new(),
                     checklists: Vec::new(),
                 });
@@ -310,13 +292,19 @@ pub async fn get_handler(
 
     // ── Risk scores ────────────────────────────────────────────────────────
     // Pull all currently-open rules with their parent asset + stig, then
-    // look up severity from each STIG's JSON to compute a weighted score
-    // per asset. One STIG JSON read per unique stig_id in the result set.
+    // look up severity from each STIG's JSON to compute two scores per
+    // asset:
+    //   * `risk_score` — legacy Σ severity_weight.
+    //   * `weighted_risk_score` — SCAP-style Σ weighted_score (severity
+    //     × classification × overdue bonus).
+    // One STIG JSON read per unique stig_id in the result set.
     let open_rules = sqlx::query(
         r#"
-        SELECT c.asset_id, c.stig_id, cr.rule_id
+        SELECT c.asset_id, a.classification, c.stig_id, cr.rule_id,
+               cr.status, cr.due_date
           FROM checklist_rules cr
           JOIN checklists c ON c.id = cr.checklist_id
+          JOIN assets a     ON a.id = c.asset_id
          WHERE cr.status = 'open'
         "#,
     )
@@ -327,13 +315,19 @@ pub async fn get_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let today: NaiveDate = Utc::now().date_naive();
     let mut sev_by_stig: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
         std::collections::HashMap::new();
     let mut risk_by_asset: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut weighted_by_asset: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
     for row in open_rules {
         let asset_id: String = row.try_get("asset_id").map_err(map_sqlx)?;
+        let classification: String = row.try_get("classification").map_err(map_sqlx)?;
         let stig_id: String = row.try_get("stig_id").map_err(map_sqlx)?;
         let rule_id: String = row.try_get("rule_id").map_err(map_sqlx)?;
+        let status: String = row.try_get("status").map_err(map_sqlx)?;
+        let due_date: Option<NaiveDate> = row.try_get("due_date").map_err(map_sqlx)?;
         if !sev_by_stig.contains_key(&stig_id) {
             sev_by_stig.insert(stig_id.clone(), load_severity_map(&state, &stig_id).await);
         }
@@ -342,11 +336,32 @@ pub async fn get_handler(
             .and_then(|m| m.get(&rule_id))
             .cloned()
             .unwrap_or_default();
-        *risk_by_asset.entry(asset_id).or_insert(0) += severity_weight(&sev);
+        *risk_by_asset.entry(asset_id.clone()).or_insert(0) += severity_weight(&sev);
+
+        let w = weighted_score(&sev, &classification, &status, due_date, today);
+        *weighted_by_asset.entry(asset_id.clone()).or_insert(0.0) += w;
+        if w > totals.highest_weighted_score {
+            totals.highest_weighted_score = w;
+            totals.highest_weighted_rule_id = Some(rule_id);
+            // asset name is looked up below once we walk by_asset.
+            // Use asset_id as a placeholder so we can resolve to the
+            // friendly name without another DB hit.
+            totals.highest_weighted_asset_name = Some(asset_id.clone());
+        }
     }
+    // Resolve the highest_weighted_asset_name placeholder (asset_id) to
+    // the human-friendly asset name.
+    if let Some(placeholder) = totals.highest_weighted_asset_name.clone() {
+        if let Some(a) = by_asset.iter().find(|a| a.id == placeholder) {
+            totals.highest_weighted_asset_name = Some(a.name.clone());
+        }
+    }
+    totals.highest_weighted_score = round1(totals.highest_weighted_score);
     for entry in &mut by_asset {
         let score = risk_by_asset.get(&entry.id).copied().unwrap_or(0);
         entry.risk_score = score;
+        entry.weighted_risk_score =
+            round1(weighted_by_asset.get(&entry.id).copied().unwrap_or(0.0));
         if score > totals.highest_risk_score {
             totals.highest_risk_score = score;
             totals.highest_risk_asset_name = Some(entry.name.clone());

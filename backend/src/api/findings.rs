@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::auth::AuthUser;
+use crate::severity::weighted_score;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +49,10 @@ pub struct Finding {
     pub stig_title: String,
     pub asset_id: String,
     pub asset_name: String,
+    /// Owning asset's classification. Pulled into the row so we can
+    /// compute `weighted_score` without an extra round-trip and so the
+    /// frontend can colour-by-classification if it wants to.
+    pub classification: String,
     pub owner_name: String,
     pub assignee_id: Option<String>,
     pub assignee_name: Option<String>,
@@ -64,6 +69,10 @@ pub struct Finding {
     pub check_text: Option<String>,
     #[sqlx(default)]
     pub fix_text: Option<String>,
+    /// SCAP-style score for this finding. Filled in alongside `severity`
+    /// after the rule meta lookup; 0.0 when severity is unknown.
+    #[sqlx(default)]
+    pub weighted_score: f64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -108,6 +117,7 @@ pub async fn list_handler(
             COALESCE(sc.title, c.stig_id) AS stig_title,
             c.asset_id,
             a.name           AS asset_name,
+            a.classification AS classification,
             u.display_name   AS owner_name,
             cr.assignee_id,
             au.display_name  AS assignee_name,
@@ -151,6 +161,7 @@ pub async fn list_handler(
         let map = load_rule_meta_map(&state, &f.stig_id).await;
         meta_by_stig.insert(f.stig_id.clone(), map);
     }
+    let today: NaiveDate = Utc::now().date_naive();
     for f in &mut rows {
         if let Some(map) = meta_by_stig.get(&f.stig_id) {
             if let Some(m) = map.get(&f.rule_id) {
@@ -161,6 +172,18 @@ pub async fn list_handler(
                 f.fix_text = m.fix_text.clone();
             }
         }
+        // SCAP-style score per finding. Severity strings of "" (unknown)
+        // fall through to a weight of 1, which keeps the value non-zero
+        // even when the STIG JSON is missing — matches the dashboard's
+        // legacy behaviour.
+        let sev = f.severity.as_deref().unwrap_or("");
+        f.weighted_score = weighted_score(
+            sev,
+            &f.classification,
+            &f.status,
+            f.due_date,
+            today,
+        );
     }
 
     if let Some(sev) = params.severity.as_deref() {
