@@ -53,8 +53,11 @@ test.describe("Posture trend", () => {
     await expect(
       page.getByRole("heading", { name: /Posture over time/i }),
     ).toBeVisible();
-    // Two snapshots in the description text
-    await expect(page.getByText(/2 snapshots in the last 30 days/i)).toBeVisible();
+    // Two snapshots in the description text. Both Posture and Compliance
+    // charts share the same "N snapshots…" caption, so use .first().
+    await expect(
+      page.getByText(/2 snapshots in the last 30 days/i).first(),
+    ).toBeVisible();
   });
 
   test("no trend section before any snapshots exist", async ({ page }) => {
