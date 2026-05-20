@@ -158,6 +158,12 @@ export default function Dashboard() {
   // Recent activity (loaded with the rest of the dashboard).
   const [activity, setActivity] = useState([]);
 
+  // Bulk re-apply
+  const [bulkReapplyOpen, setBulkReapplyOpen] = useState(false);
+  const [bulkReapplyRunning, setBulkReapplyRunning] = useState(false);
+  const [bulkReapplyError, setBulkReapplyError] = useState(null);
+  const [bulkReapplyResults, setBulkReapplyResults] = useState(null);
+
   // Baselines
   const [baselines, setBaselines] = useState([]);
   const [selectedBaselineId, setSelectedBaselineId] = useState(null);
@@ -255,6 +261,21 @@ export default function Dashboard() {
       setSavingBaseline(false);
     }
   }, [newBaselineName, refreshBaselines]);
+
+  const runBulkReapply = useCallback(async () => {
+    setBulkReapplyRunning(true);
+    setBulkReapplyError(null);
+    try {
+      const res = await apiJson("/api/checklists/bulk-reapply", "POST", {});
+      setBulkReapplyResults(res.results ?? []);
+      setBulkReapplyOpen(false);
+      await refresh();
+    } catch (err) {
+      setBulkReapplyError(err.message);
+    } finally {
+      setBulkReapplyRunning(false);
+    }
+  }, [refresh]);
 
   const deleteBaseline = useCallback(
     async (id) => {
@@ -448,6 +469,17 @@ export default function Dashboard() {
           variant="h1"
           actions={
             <SpaceBetween direction="horizontal" size="xs">
+              <Button
+                disabled={(data?.totals?.outdatedChecklists ?? 0) === 0}
+                onClick={() => {
+                  setBulkReapplyError(null);
+                  setBulkReapplyOpen(true);
+                }}
+              >
+                {(data?.totals?.outdatedChecklists ?? 0) > 0
+                  ? `Re-apply all (${data.totals.outdatedChecklists})`
+                  : "Re-apply all"}
+              </Button>
               <Button
                 onClick={() => {
                   setNewBaselineName("");
@@ -1224,6 +1256,135 @@ export default function Dashboard() {
               <Alert type="error">{saveBaselineError}</Alert>
             )}
           </SpaceBetween>
+        </Modal>
+
+        {/* Bulk re-apply confirm modal */}
+        <Modal
+          visible={bulkReapplyOpen}
+          onDismiss={() => setBulkReapplyOpen(false)}
+          header="Re-apply all outdated STIGs"
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="link"
+                  onClick={() => setBulkReapplyOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={bulkReapplyRunning}
+                  onClick={runBulkReapply}
+                  data-testid="bulk-reapply-confirm"
+                >
+                  Re-apply
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="p">
+              This will re-apply the current catalog version onto{" "}
+              <strong>
+                {data?.totals?.outdatedChecklists ?? 0} checklist
+                {(data?.totals?.outdatedChecklists ?? 0) === 1 ? "" : "s"}
+              </strong>{" "}
+              you own. Rule overrides for rules that still exist are
+              preserved; overrides for rules removed in the new revision
+              are pruned.
+            </Box>
+            {bulkReapplyError && <Alert type="error">{bulkReapplyError}</Alert>}
+          </SpaceBetween>
+        </Modal>
+
+        {/* Bulk re-apply results modal */}
+        <Modal
+          visible={bulkReapplyResults !== null}
+          onDismiss={() => setBulkReapplyResults(null)}
+          header={`Re-apply complete — ${bulkReapplyResults?.length ?? 0} checklist${(bulkReapplyResults?.length ?? 0) === 1 ? "" : "s"}`}
+          size="large"
+          footer={
+            <Box float="right">
+              <Button
+                variant="primary"
+                onClick={() => setBulkReapplyResults(null)}
+              >
+                Close
+              </Button>
+            </Box>
+          }
+        >
+          <Table
+            variant="embedded"
+            items={bulkReapplyResults ?? []}
+            trackBy="checklistId"
+            columnDefinitions={[
+              {
+                id: "asset",
+                header: "System",
+                cell: (r) => r.assetName,
+              },
+              {
+                id: "stig",
+                header: "STIG",
+                cell: (r) => r.stigTitle,
+              },
+              {
+                id: "version",
+                header: "Version",
+                cell: (r) =>
+                  r.toVersion ? (
+                    <span>
+                      <span style={{ opacity: 0.7 }}>{r.fromVersion || "—"}</span>
+                      {" → "}
+                      <strong>{r.toVersion}</strong>
+                    </span>
+                  ) : (
+                    <Box color="text-status-inactive">{r.fromVersion || "—"}</Box>
+                  ),
+              },
+              {
+                id: "pruned",
+                header: "Pruned rules",
+                cell: (r) => (
+                  <Badge color={r.prunedRules > 0 ? "blue" : "grey"}>
+                    {r.prunedRules}
+                  </Badge>
+                ),
+              },
+              {
+                id: "status",
+                header: "Status",
+                cell: (r) => {
+                  const color =
+                    r.status === "reapplied"
+                      ? "green"
+                      : r.status === "skipped"
+                        ? "grey"
+                        : "red";
+                  return (
+                    <SpaceBetween direction="horizontal" size="xs">
+                      <Badge color={color}>{r.status}</Badge>
+                      {r.error && (
+                        <Box variant="small" color="text-status-inactive">
+                          {r.error}
+                        </Box>
+                      )}
+                    </SpaceBetween>
+                  );
+                },
+              },
+            ]}
+            empty={
+              <Box textAlign="center" padding="l">
+                <Box variant="p" color="text-body-secondary">
+                  No outdated checklists were found.
+                </Box>
+              </Box>
+            }
+          />
         </Modal>
       </SpaceBetween>
     </Box>

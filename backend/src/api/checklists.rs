@@ -221,6 +221,154 @@ pub async fn reapply_handler(
     }))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkReapplyResult {
+    pub checklist_id: String,
+    pub asset_name: String,
+    pub stig_title: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub pruned_rules: u64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkReapplyResponse {
+    pub results: Vec<BulkReapplyResult>,
+}
+
+/// POST /api/checklists/bulk-reapply — re-apply the current catalog
+/// version onto every outdated checklist owned by the calling user.
+/// Per-row failures are collected and reported instead of aborting the
+/// whole batch.
+pub async fn bulk_reapply_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<BulkReapplyResponse>, StatusCode> {
+    // Mirrors the dashboard's drift predicate, scoped to this user's assets.
+    let rows = sqlx::query(
+        r#"
+        SELECT c.id              AS checklist_id,
+               c.stig_id         AS stig_id,
+               c.applied_version AS from_version,
+               c.applied_release AS from_release,
+               a.name            AS asset_name,
+               COALESCE(sc.title, c.stig_id) AS stig_title
+          FROM checklists c
+          JOIN assets a ON a.id = c.asset_id
+          JOIN stigs_catalog sc ON sc.id = c.stig_id
+         WHERE a.owner_id = $1
+           AND c.applied_version <> ''
+           AND (c.applied_version <> sc.version
+                OR c.applied_release <> sc.release_info)
+         ORDER BY a.name, sc.title
+        "#,
+    )
+    .bind(&user.id)
+    .fetch_all(state.pool.as_ref())
+    .await
+    .map_err(|e| {
+        tracing::error!("bulk-reapply query failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut results: Vec<BulkReapplyResult> = Vec::with_capacity(rows.len());
+    for row in rows {
+        use sqlx::Row;
+        let checklist_id: String = row.try_get("checklist_id").unwrap_or_default();
+        let stig_id: String = row.try_get("stig_id").unwrap_or_default();
+        let from_version: String = row.try_get("from_version").unwrap_or_default();
+        let asset_name: String = row.try_get("asset_name").unwrap_or_default();
+        let stig_title: String = row.try_get("stig_title").unwrap_or_default();
+
+        match reapply_one(&state, &checklist_id, &stig_id).await {
+            Ok((to_version, pruned)) => {
+                results.push(BulkReapplyResult {
+                    checklist_id,
+                    asset_name,
+                    stig_title,
+                    from_version,
+                    to_version,
+                    pruned_rules: pruned,
+                    status: "reapplied".into(),
+                    error: None,
+                });
+            }
+            Err(BulkReapplyErr::Skipped) => {
+                results.push(BulkReapplyResult {
+                    checklist_id,
+                    asset_name,
+                    stig_title,
+                    from_version,
+                    to_version: String::new(),
+                    pruned_rules: 0,
+                    status: "skipped".into(),
+                    error: Some("catalog version is empty".into()),
+                });
+            }
+            Err(BulkReapplyErr::Failed(msg)) => {
+                results.push(BulkReapplyResult {
+                    checklist_id,
+                    asset_name,
+                    stig_title,
+                    from_version,
+                    to_version: String::new(),
+                    pruned_rules: 0,
+                    status: "error".into(),
+                    error: Some(msg),
+                });
+            }
+        }
+    }
+
+    Ok(Json(BulkReapplyResponse { results }))
+}
+
+enum BulkReapplyErr {
+    Skipped,
+    Failed(String),
+}
+
+/// Inner per-row helper for `bulk_reapply_handler`. Performs the same
+/// catalog-stamp + prune steps as `reapply_handler` but reports
+/// recoverable failures so the batch can continue.
+async fn reapply_one(
+    state: &AppState,
+    checklist_id: &str,
+    stig_id: &str,
+) -> Result<(String, u64), BulkReapplyErr> {
+    let (version, release) = db_checklists::catalog_version(state.pool.as_ref(), stig_id)
+        .await
+        .map_err(|e| BulkReapplyErr::Failed(format!("catalog lookup failed: {e}")))?;
+
+    if version.is_empty() {
+        return Err(BulkReapplyErr::Skipped);
+    }
+
+    let mut stig = load_stig_json(state, stig_id)
+        .await
+        .map_err(|s| BulkReapplyErr::Failed(format!("load_stig_json: {s}")))?;
+    let rules = take_rules(&mut stig);
+    let keep: Vec<String> = rules
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let pruned =
+        db_checklists::prune_orphan_rule_overrides(state.pool.as_ref(), checklist_id, &keep)
+            .await
+            .map_err(|e| BulkReapplyErr::Failed(format!("prune failed: {e}")))?;
+    db_checklists::set_applied_version(state.pool.as_ref(), checklist_id, &version, &release)
+        .await
+        .map_err(|e| BulkReapplyErr::Failed(format!("stamp failed: {e}")))?;
+
+    Ok((version, pruned))
+}
+
 /// PATCH /api/checklists/:id/rules/:rule_id — update one rule's state.
 pub async fn update_rule_handler(
     State(state): State<AppState>,
@@ -275,7 +423,7 @@ fn is_valid_status(status: &str) -> bool {
     )
 }
 
-async fn load_stig_json(state: &AppState, stig_id: &str) -> Result<Value, StatusCode> {
+pub(crate) async fn load_stig_json(state: &AppState, stig_id: &str) -> Result<Value, StatusCode> {
     if !is_valid_stig_id(stig_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -298,7 +446,7 @@ async fn load_stig_json(state: &AppState, stig_id: &str) -> Result<Value, Status
     })
 }
 
-fn take_rules(stig: &mut Value) -> Vec<Value> {
+pub(crate) fn take_rules(stig: &mut Value) -> Vec<Value> {
     let obj = match stig.as_object_mut() {
         Some(o) => o,
         None => return Vec::new(),
