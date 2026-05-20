@@ -99,6 +99,7 @@ pub struct AssetSummary {
     /// Weighted open-finding count. CAT I × 10, CAT II × 3, CAT III × 1.
     /// Raw (unbounded); higher = worse posture.
     pub risk_score: i64,
+    pub tags: Vec<String>,
     pub checklists: Vec<ChecklistSummary>,
 }
 
@@ -234,6 +235,7 @@ pub async fn get_handler(
                     name: asset_name,
                     owner_name,
                     risk_score: 0,
+                    tags: Vec::new(),
                     checklists: Vec::new(),
                 });
                 by_asset.last_mut().unwrap()
@@ -252,6 +254,29 @@ pub async fn get_handler(
                 na_count: row.try_get("na_count").map_err(map_sqlx)?,
                 reviewed_count: row.try_get("reviewed_count").map_err(map_sqlx)?,
             });
+        }
+    }
+
+    // ── Tags per asset ─────────────────────────────────────────────────────
+    // Attach the asset_tags rows in one grouped query — small table, fine
+    // to fetch all rows and bucket client-side.
+    let tag_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("dashboard tag query failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut tags_by_asset: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (asset_id, tag) in tag_rows {
+        tags_by_asset.entry(asset_id).or_default().push(tag);
+    }
+    for entry in &mut by_asset {
+        if let Some(t) = tags_by_asset.remove(&entry.id) {
+            entry.tags = t;
         }
     }
 
