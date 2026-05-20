@@ -20,7 +20,7 @@ import AssetsLibrary from "./components/AssetsLibrary.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import MyFindings from "./components/MyFindings.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
-import { apiFetch } from "./utils/api.js";
+import { apiFetch, apiGet } from "./utils/api.js";
 
 export default function App() {
   const currentUser = useContext(AuthContext);
@@ -139,6 +139,50 @@ export default function App() {
   // Open split panel automatically when a rule is selected
   const effectiveSplitOpen = selectedRule ? splitPanelOpen : false;
 
+  // ── Notifications ────────────────────────────────────────────────────────
+  // Poll the bell endpoint every 30s so the badge stays roughly fresh.
+  // Opening the panel calls /mark-read, which clears the unread counter
+  // server-side and lets future events count as unread again.
+  const [notifData, setNotifData] = useState({
+    assigned: [],
+    overdue: [],
+    unreadCount: 0,
+  });
+  const [notifOpen, setNotifOpen] = useState(false);
+
+  const refreshNotifications = useCallback(async () => {
+    try {
+      const d = await apiGet("/api/notifications");
+      setNotifData(d);
+    } catch {
+      // non-fatal; bell stays empty
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return undefined;
+    refreshNotifications();
+    const t = setInterval(refreshNotifications, 30_000);
+    return () => clearInterval(t);
+  }, [currentUser, refreshNotifications]);
+
+  const openNotifications = useCallback(async () => {
+    setNotifOpen(true);
+    // Use apiFetch (not apiJson) — mark-read returns 204 No Content and
+    // apiJson would throw trying to parse an empty body, swallowing the
+    // local state update that clears the bell counter.
+    try {
+      await apiFetch("/api/notifications/mark-read", { method: "POST" });
+    } catch {
+      // non-fatal — local clear below still runs
+    }
+    setNotifData((d) => ({
+      ...d,
+      unreadCount: 0,
+      assigned: d.assigned.map((a) => ({ ...a, unread: false })),
+    }));
+  }, []);
+
   // Build TopNavigation utilities
   const utilities = [
     {
@@ -189,15 +233,27 @@ export default function App() {
     }
   }
   if (currentUser) {
-    utilities.push({
-      type: "menu-dropdown",
-      text: currentUser.display_name || "Account",
-      iconName: "user-profile",
-      items: [{ id: "signout", text: "Sign out" }],
-      onItemClick: ({ detail }) => {
-        if (detail.id === "signout") handleSignOut();
+    utilities.push(
+      {
+        type: "button",
+        ariaLabel: "Notifications",
+        iconName: "notification",
+        text:
+          notifData.unreadCount > 0
+            ? `Notifications (${notifData.unreadCount})`
+            : "Notifications",
+        onClick: openNotifications,
       },
-    });
+      {
+        type: "menu-dropdown",
+        text: currentUser.display_name || "Account",
+        iconName: "user-profile",
+        items: [{ id: "signout", text: "Sign out" }],
+        onItemClick: ({ detail }) => {
+          if (detail.id === "signout") handleSignOut();
+        },
+      },
+    );
   }
 
   const handleLoadFromLibrary = useCallback(
@@ -427,6 +483,60 @@ export default function App() {
           Any unsaved progress on this checklist will be lost. Export your work
           first if you need to keep it.
         </Alert>
+      </Modal>
+
+      <Modal
+        visible={notifOpen}
+        onDismiss={() => setNotifOpen(false)}
+        header="Notifications"
+        size="medium"
+      >
+        <SpaceBetween direction="vertical" size="l">
+          <Box>
+            <Box variant="h4">Newly assigned</Box>
+            {notifData.assigned.length === 0 ? (
+              <Box color="text-status-inactive" padding={{ top: "xs" }}>
+                Nothing assigned to you recently.
+              </Box>
+            ) : (
+              <ul style={{ paddingLeft: 18, margin: 0 }}>
+                {notifData.assigned.map((a) => (
+                  <li key={`${a.checklistId}:${a.ruleId}:${a.occurredAt}`}>
+                    <strong>{a.ruleId}</strong> on{" "}
+                    <em>{a.assetName}</em> · {a.stigTitle}
+                    <Box variant="span" color="text-status-inactive">
+                      {" "}— {new Date(a.occurredAt).toLocaleString()}
+                    </Box>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Box>
+          <Box>
+            <Box variant="h4">
+              Overdue
+              {notifData.overdue.length > 0 &&
+                ` (${notifData.overdue.length})`}
+            </Box>
+            {notifData.overdue.length === 0 ? (
+              <Box color="text-status-inactive" padding={{ top: "xs" }}>
+                Nothing assigned to you is past due.
+              </Box>
+            ) : (
+              <ul style={{ paddingLeft: 18, margin: 0 }}>
+                {notifData.overdue.map((o) => (
+                  <li key={`${o.checklistId}:${o.ruleId}`}>
+                    <strong>{o.ruleId}</strong> on{" "}
+                    <em>{o.assetName}</em> · {o.stigTitle}
+                    <Box variant="span" color="text-status-inactive">
+                      {" "}— due {o.dueDate}
+                    </Box>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Box>
+        </SpaceBetween>
       </Modal>
     </>
   );
