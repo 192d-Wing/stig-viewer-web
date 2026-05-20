@@ -1,10 +1,11 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use crate::api::auth::AuthUser;
@@ -376,23 +377,37 @@ pub async fn update_rule_handler(
     Extension(user): Extension<AuthUser>,
     Path((id, rule_id)): Path<(String, String)>,
     Json(req): Json<UpdateRuleRequest>,
-) -> Result<Json<db_checklists::ChecklistRuleRow>, StatusCode> {
+) -> Result<Json<db_checklists::ChecklistRuleRow>, Response> {
     let checklist = db_checklists::get_checklist(state.pool.as_ref(), &id)
         .await
-        .map_err(map_db)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(map_db)
+        .map_err(|s| s.into_response())?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
 
     let asset = db_assets::get_asset(state.pool.as_ref(), &checklist.asset_id)
         .await
-        .map_err(map_db)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(map_db)
+        .map_err(|s| s.into_response())?
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
 
     if asset.owner_id != user.id {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into_response());
     }
 
     if !is_valid_status(&req.status) {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+
+    // Compliance gate: closing a finding (not_a_finding / not_applicable)
+    // requires a written justification in finding_details.
+    if requires_finding_details(&req.status) && req.finding_details.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("finding_details required for status {}", req.status)
+            })),
+        )
+            .into_response());
     }
 
     // Snapshot the prior assignee so we can detect a transition for the
@@ -407,7 +422,7 @@ pub async fn update_rule_handler(
     .await
     .map_err(|e| {
         tracing::error!("checklists prev-assignee lookup: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?
     .flatten();
 
@@ -423,7 +438,8 @@ pub async fn update_rule_handler(
         req.due_date,
     )
     .await
-    .map_err(map_db)?;
+    .map_err(map_db)
+    .map_err(|s| s.into_response())?;
 
     // Fire the webhook only when the assignee actually changed and the
     // new value is non-null — null means "unassigned", which we treat
@@ -540,6 +556,12 @@ fn is_valid_status(status: &str) -> bool {
         status,
         "not_reviewed" | "open" | "not_a_finding" | "not_applicable"
     )
+}
+
+/// Closing-status transitions (`not_a_finding`, `not_applicable`) require a
+/// written justification in `finding_details`. Other statuses are unrestricted.
+fn requires_finding_details(status: &str) -> bool {
+    matches!(status, "not_a_finding" | "not_applicable")
 }
 
 pub(crate) async fn load_stig_json(state: &AppState, stig_id: &str) -> Result<Value, StatusCode> {
