@@ -64,8 +64,53 @@ export default function AssetsLibrary() {
 
   const [deleteTarget, setDeleteTarget] = useState(null);
 
+  // Active tag filter lives in `?tag=a,b` (CSV). AND semantics.
+  const [urlState, setUrlState] = useUrlState({ tag: [] });
+  const activeTags = urlState.tag;
+  const toggleTag = useCallback(
+    (t) => {
+      setUrlState({
+        tag: activeTags.includes(t)
+          ? activeTags.filter((x) => x !== t)
+          : [...activeTags, t],
+      });
+    },
+    [activeTags, setUrlState],
+  );
+  const clearTags = useCallback(() => setUrlState({ tag: [] }), [setUrlState]);
+  const allTags = useMemo(() => {
+    const set = new Set();
+    for (const a of assets) for (const t of a.tags ?? []) set.add(t);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [assets]);
+  const filteredAssets = useMemo(() => {
+    if (activeTags.length === 0) return assets;
+    return assets.filter((a) =>
+      activeTags.every((t) => (a.tags ?? []).includes(t)),
+    );
+  }, [assets, activeTags]);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const rows = await apiGet("/api/assets");
+      setAssets(rows);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
   // CSV import modal state. `step` is "pick" (choose file + dry-run preview)
-  // or "preview" (review parsed rows, click Import to commit).
+  // or "preview" (review parsed rows, click Import to commit). Defined
+  // after `refresh` so commitImport's dependency array doesn't hit the
+  // temporal dead zone.
   const [importOpen, setImportOpen] = useState(false);
   const [importStep, setImportStep] = useState("pick");
   const [importFile, setImportFile] = useState(null);
@@ -116,8 +161,6 @@ export default function AssetsLibrary() {
       if (!file) return;
       setImportBusy(true);
       try {
-        // POST the file straight to dry-run so we can show the preview
-        // table without an extra "Preview" click.
         const fd = new FormData();
         fd.append("file", file, file.name);
         const res = await apiFetch(`/api/assets/import?dry_run=true`, {
@@ -147,7 +190,6 @@ export default function AssetsLibrary() {
       const data = await runImport(false);
       setImportSuccess(data);
       await refresh();
-      // Close after a short pause so the user sees the success Alert.
       setTimeout(() => closeImport(), 800);
     } catch (err) {
       setImportError(err.message);
@@ -164,49 +206,6 @@ export default function AssetsLibrary() {
       "web-1,web-1.example.com,Sample web host,unclassified,production;public-facing\n";
     return `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
   }, []);
-
-  // Active tag filter lives in `?tag=a,b` (CSV). AND semantics.
-  const [urlState, setUrlState] = useUrlState({ tag: [] });
-  const activeTags = urlState.tag;
-  const toggleTag = useCallback(
-    (t) => {
-      setUrlState({
-        tag: activeTags.includes(t)
-          ? activeTags.filter((x) => x !== t)
-          : [...activeTags, t],
-      });
-    },
-    [activeTags, setUrlState],
-  );
-  const clearTags = useCallback(() => setUrlState({ tag: [] }), [setUrlState]);
-  const allTags = useMemo(() => {
-    const set = new Set();
-    for (const a of assets) for (const t of a.tags ?? []) set.add(t);
-    return [...set].sort((a, b) => a.localeCompare(b));
-  }, [assets]);
-  const filteredAssets = useMemo(() => {
-    if (activeTags.length === 0) return assets;
-    return assets.filter((a) =>
-      activeTags.every((t) => (a.tags ?? []).includes(t)),
-    );
-  }, [assets, activeTags]);
-
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const rows = await apiGet("/api/assets");
-      setAssets(rows);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
 
   const openCreate = useCallback(() => {
     setForm(EMPTY_FORM);
