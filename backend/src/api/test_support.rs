@@ -32,6 +32,13 @@ pub struct BackdateRequest {
     pub days: i64,
 }
 
+#[derive(Deserialize)]
+pub struct BumpStigRequest {
+    pub stig_id: String,
+    pub version: String,
+    pub release_info: String,
+}
+
 /// POST /api/test/set-role — update a user's role for E2E workflow testing.
 pub async fn set_role_handler(
     State(state): State<AppState>,
@@ -76,6 +83,34 @@ pub async fn backdate_handler(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(e) => {
             tracing::error!("Test backdate failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/bump-stig — change a `stigs_catalog` row's version +
+/// release_info to simulate a newer revision landing from DISA. Used by
+/// the drift E2E spec to flip a checklist's `outdated` flag without
+/// running a real sync.
+pub async fn bump_stig_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BumpStigRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE stigs_catalog \
+         SET version = $1, release_info = $2, last_updated = NOW() \
+         WHERE id = $3",
+    )
+    .bind(&req.version)
+    .bind(&req.release_info)
+    .bind(&req.stig_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test bump-stig failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

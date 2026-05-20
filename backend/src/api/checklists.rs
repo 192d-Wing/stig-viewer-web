@@ -61,6 +61,10 @@ pub async fn create_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let (applied_version, applied_release) =
+        db_checklists::catalog_version(state.pool.as_ref(), &req.stig_id)
+            .await
+            .map_err(map_db)?;
     let now = chrono::Utc::now();
     let row = db_checklists::ChecklistRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -69,6 +73,8 @@ pub async fn create_handler(
         status: "in_progress".into(),
         created_at: now,
         updated_at: now,
+        applied_version,
+        applied_release,
     };
     db_checklists::insert_checklist(state.pool.as_ref(), &row)
         .await

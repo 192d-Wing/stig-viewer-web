@@ -520,6 +520,18 @@ export default function Dashboard() {
             }
             tone={totals.highestRiskScore > 0 ? "warning" : "ok"}
           />
+          <KpiCard
+            label="STIG updates"
+            value={totals.outdatedChecklists ?? 0}
+            sub={
+              (totals.outdatedChecklists ?? 0) > 0
+                ? "checklists out of date"
+                : "all up to date"
+            }
+            tone={
+              (totals.outdatedChecklists ?? 0) > 0 ? "warning" : "ok"
+            }
+          />
         </ColumnLayout>
 
         {/* Status breakdown chart */}
@@ -617,7 +629,16 @@ export default function Dashboard() {
             {
               id: "stig",
               header: "STIG",
-              cell: (r) => (r.empty ? "—" : r.stigTitle),
+              cell: (r) => {
+                if (r.empty) return "—";
+                if (!r.outdated) return r.stigTitle;
+                return (
+                  <SpaceBetween direction="horizontal" size="xs">
+                    <span>{r.stigTitle}</span>
+                    <Badge color="red">Out of date</Badge>
+                  </SpaceBetween>
+                );
+              },
             },
             {
               id: "progress",

@@ -217,13 +217,21 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
               header: "STIG",
               cell: (c) => {
                 const meta = catalog.find((s) => s.id === c.stigId);
+                const outdated =
+                  c.appliedVersion &&
+                  meta &&
+                  (meta.version !== c.appliedVersion ||
+                    meta.releaseInfo !== c.appliedRelease);
                 return (
-                  <Button
-                    variant="inline-link"
-                    onClick={() => onOpenChecklist(c.id)}
-                  >
-                    {meta?.title || c.stigId}
-                  </Button>
+                  <SpaceBetween direction="horizontal" size="xs">
+                    <Button
+                      variant="inline-link"
+                      onClick={() => onOpenChecklist(c.id)}
+                    >
+                      {meta?.title || c.stigId}
+                    </Button>
+                    {outdated && <Badge color="red">Out of date</Badge>}
+                  </SpaceBetween>
                 );
               },
             },
