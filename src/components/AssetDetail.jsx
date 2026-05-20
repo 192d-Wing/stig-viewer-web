@@ -92,6 +92,26 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     [refresh],
   );
 
+  const [reapplyTarget, setReapplyTarget] = useState(null);
+  const [reapplying, setReapplying] = useState(false);
+  const reapply = useCallback(async () => {
+    if (!reapplyTarget) return;
+    setReapplying(true);
+    try {
+      await apiJson(
+        `/api/checklists/${reapplyTarget.id}/reapply`,
+        "POST",
+        {},
+      );
+      setReapplyTarget(null);
+      await refresh();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setReapplying(false);
+    }
+  }, [reapplyTarget, refresh]);
+
   if (loading) {
     return (
       <Box padding="xxl" textAlign="center">
@@ -230,7 +250,27 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
                     >
                       {meta?.title || c.stigId}
                     </Button>
-                    {outdated && <Badge color="red">Out of date</Badge>}
+                    {outdated && (
+                      <>
+                        <Badge color="red">Out of date</Badge>
+                        <Button
+                          variant="inline-link"
+                          disabled={!isOwner}
+                          onClick={() =>
+                            setReapplyTarget({
+                              id: c.id,
+                              title: meta?.title || c.stigId,
+                              fromVersion: c.appliedVersion,
+                              fromRelease: c.appliedRelease,
+                              toVersion: meta?.version ?? "",
+                              toRelease: meta?.releaseInfo ?? "",
+                            })
+                          }
+                        >
+                          Re-apply
+                        </Button>
+                      </>
+                    )}
                   </SpaceBetween>
                 );
               },
@@ -328,6 +368,44 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
           </FormField>
           {applyError && <Alert type="error">{applyError}</Alert>}
         </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={reapplyTarget !== null}
+        onDismiss={() => setReapplyTarget(null)}
+        header="Re-apply STIG"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setReapplyTarget(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={reapplying}
+                onClick={reapply}
+              >
+                Re-apply
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        {reapplyTarget && (
+          <SpaceBetween direction="vertical" size="m">
+            <Box>
+              <strong>{reapplyTarget.title}</strong>
+              <Box variant="p" color="text-body-secondary">
+                {`v${reapplyTarget.fromVersion} (${reapplyTarget.fromRelease}) → v${reapplyTarget.toVersion} (${reapplyTarget.toRelease})`}
+              </Box>
+            </Box>
+            <Alert type="info">
+              Existing rule statuses are preserved where rule IDs still exist
+              in the new revision. Overrides for rules that no longer exist
+              will be dropped.
+            </Alert>
+          </SpaceBetween>
+        )}
       </Modal>
     </Box>
   );

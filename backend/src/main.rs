@@ -38,6 +38,7 @@ use api::{
         delete_handler as delete_checklist_handler,
         get_handler as get_checklist_handler,
         list_for_asset_handler as list_checklists_for_asset_handler,
+        reapply_handler as reapply_checklist_handler,
         update_rule_handler as update_checklist_rule_handler,
     },
     dashboard::{
@@ -148,6 +149,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/checklists/:id",
             get(get_checklist_handler).delete(delete_checklist_handler),
+        )
+        .route(
+            "/api/checklists/:id/reapply",
+            post(reapply_checklist_handler),
         )
         .route(
             "/api/checklists/:id/rules/:rule_id",
