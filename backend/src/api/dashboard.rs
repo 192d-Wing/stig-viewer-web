@@ -17,6 +17,16 @@ fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// Compliance score in percent: (naf + na) / rule_count × 100, rounded to
+/// one decimal. Returns 0.0 when rule_count is zero so the formula is
+/// well-defined for empty checklists / assets / fleets.
+fn compliance_pct(naf: i64, na: i64, rule_count: i64) -> f64 {
+    if rule_count <= 0 {
+        return 0.0;
+    }
+    round1((naf + na) as f64 / rule_count as f64 * 100.0)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardResponse {
@@ -59,6 +69,10 @@ pub struct Totals {
     /// `stale_threshold_days` pattern so the UI can render the sub-label
     /// without hard-coding a value.
     pub stale_baseline_days: i64,
+    /// Fleet-wide compliance score: Σ(naf + na) / Σ(rule_count) × 100,
+    /// rounded to one decimal. 0.0 when no rules exist across any
+    /// checklist.
+    pub compliance_score: f64,
 }
 
 fn stale_threshold_days() -> i64 {
@@ -93,6 +107,10 @@ pub struct AssetSummary {
     /// SCAP-style aggregate score — sum of per-finding `weighted_score`
     /// across this asset's open rules. Rounded to one decimal.
     pub weighted_risk_score: f64,
+    /// Compliance score across this asset's checklists:
+    /// Σ(naf + na) / Σ(rule_count) × 100, rounded to one decimal.
+    /// 0.0 when this asset has no rules at all.
+    pub compliance_score: f64,
     pub tags: Vec<String>,
     pub checklists: Vec<ChecklistSummary>,
 }
@@ -112,6 +130,9 @@ pub struct ChecklistSummary {
     /// True when the checklist's recorded applied_version/release no
     /// longer matches the current catalog row for the same stig_id.
     pub outdated: bool,
+    /// Per-checklist compliance score: (naf + na) / rule_count × 100,
+    /// rounded to one decimal. 0.0 when rule_count is 0.
+    pub compliance_score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,6 +226,8 @@ pub async fn get_handler(
         outdated_checklists: outdated_count,
         stale_baselines: stale_baselines_count.map_err(map_db)?,
         stale_baseline_days,
+        // Filled in below once we've folded the per-checklist counts.
+        compliance_score: 0.0,
     };
 
     // Per-asset / per-checklist breakdown. One row per (asset, checklist);
@@ -269,6 +292,8 @@ pub async fn get_handler(
                     classification,
                     risk_score: 0,
                     weighted_risk_score: 0.0,
+                    // Filled in once the asset's checklists are folded.
+                    compliance_score: 0.0,
                     tags: Vec::new(),
                     checklists: Vec::new(),
                 });
@@ -277,20 +302,44 @@ pub async fn get_handler(
         };
 
         if let Some(cid) = checklist_id {
+            let rule_count: i64 = row.try_get("rule_count").map_err(map_sqlx)?;
+            let naf_count: i64 = row.try_get("naf_count").map_err(map_sqlx)?;
+            let na_count: i64 = row.try_get("na_count").map_err(map_sqlx)?;
             entry.checklists.push(ChecklistSummary {
                 id: cid,
                 stig_id: row.try_get("stig_id").map_err(map_sqlx)?,
                 stig_title: row.try_get("stig_title").map_err(map_sqlx)?,
-                rule_count: row.try_get("rule_count").map_err(map_sqlx)?,
+                rule_count,
                 open_count: row.try_get("open_count").map_err(map_sqlx)?,
                 overdue_count: row.try_get("overdue_count").map_err(map_sqlx)?,
-                naf_count: row.try_get("naf_count").map_err(map_sqlx)?,
-                na_count: row.try_get("na_count").map_err(map_sqlx)?,
+                naf_count,
+                na_count,
                 reviewed_count: row.try_get("reviewed_count").map_err(map_sqlx)?,
                 outdated: row.try_get::<bool, _>("outdated").unwrap_or(false),
+                compliance_score: compliance_pct(naf_count, na_count, rule_count),
             });
         }
     }
+
+    // Roll up per-asset compliance from each asset's checklists and the
+    // fleet-wide total across all checklists. Aggregate is sum of
+    // (naf + na) / sum(rule_count) — *not* an average of per-checklist
+    // percentages, so a checklist with more rules has proportionally
+    // more weight.
+    let mut fleet_compliant: i64 = 0;
+    let mut fleet_rules: i64 = 0;
+    for asset in &mut by_asset {
+        let mut compliant = 0i64;
+        let mut rules = 0i64;
+        for c in &asset.checklists {
+            compliant += c.naf_count + c.na_count;
+            rules += c.rule_count;
+        }
+        asset.compliance_score = compliance_pct(compliant, 0, rules);
+        fleet_compliant += compliant;
+        fleet_rules += rules;
+    }
+    totals.compliance_score = compliance_pct(fleet_compliant, 0, fleet_rules);
 
     // ── Tags per asset ─────────────────────────────────────────────────────
     // Attach the asset_tags rows in one grouped query — small table, fine
@@ -509,6 +558,10 @@ pub struct TrendPoint {
     pub na: i64,
     pub reviewed: i64,
     pub total: i64,
+    /// Per-snapshot compliance score, computed downstream from
+    /// (naf + na) / total × 100. Stored only so the dashboard doesn't
+    /// have to re-derive on the JS side.
+    pub compliance_score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -554,13 +607,17 @@ pub async fn trend_handler(
     let overall = overall_rows
         .into_iter()
         .map(|r| -> Result<TrendPoint, sqlx::Error> {
+            let naf: i64 = r.try_get("naf")?;
+            let na: i64 = r.try_get("na")?;
+            let total: i64 = r.try_get("total")?;
             Ok(TrendPoint {
                 captured_at: r.try_get("captured_at")?,
                 open: r.try_get("open")?,
-                naf: r.try_get("naf")?,
-                na: r.try_get("na")?,
+                naf,
+                na,
                 reviewed: r.try_get("reviewed")?,
-                total: r.try_get("total")?,
+                total,
+                compliance_score: compliance_pct(naf, na, total),
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -595,13 +652,17 @@ pub async fn trend_handler(
     for r in asset_rows {
         let asset_id: String = r.try_get("asset_id").map_err(map_db)?;
         let asset_name: String = r.try_get("asset_name").map_err(map_db)?;
+        let naf: i64 = r.try_get("naf").map_err(map_db)?;
+        let na: i64 = r.try_get("na").map_err(map_db)?;
+        let total: i64 = r.try_get("total").map_err(map_db)?;
         let point = TrendPoint {
             captured_at: r.try_get("captured_at").map_err(map_db)?,
             open: r.try_get("open").map_err(map_db)?,
-            naf: r.try_get("naf").map_err(map_db)?,
-            na: r.try_get("na").map_err(map_db)?,
+            naf,
+            na,
             reviewed: r.try_get("reviewed").map_err(map_db)?,
-            total: r.try_get("total").map_err(map_db)?,
+            total,
+            compliance_score: compliance_pct(naf, na, total),
         };
         match by_asset.last_mut() {
             Some(t) if t.asset_id == asset_id => t.series.push(point),
@@ -658,13 +719,17 @@ pub async fn asset_trend_handler(
     let overall = rows
         .into_iter()
         .map(|r| -> Result<TrendPoint, sqlx::Error> {
+            let naf: i64 = r.try_get("naf")?;
+            let na: i64 = r.try_get("na")?;
+            let total: i64 = r.try_get("total")?;
             Ok(TrendPoint {
                 captured_at: r.try_get("captured_at")?,
                 open: r.try_get("open")?,
-                naf: r.try_get("naf")?,
-                na: r.try_get("na")?,
+                naf,
+                na,
                 reviewed: r.try_get("reviewed")?,
-                total: r.try_get("total")?,
+                total,
+                compliance_score: compliance_pct(naf, na, total),
             })
         })
         .collect::<Result<Vec<_>, _>>()
