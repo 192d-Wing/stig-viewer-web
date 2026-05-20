@@ -39,6 +39,12 @@ pub struct BumpStigRequest {
     pub release_info: String,
 }
 
+#[derive(Deserialize)]
+pub struct BackdateBaselineRequest {
+    pub baseline_id: String,
+    pub days: i64,
+}
+
 /// POST /api/test/set-role — update a user's role for E2E workflow testing.
 pub async fn set_role_handler(
     State(state): State<AppState>,
@@ -83,6 +89,32 @@ pub async fn backdate_handler(
         Ok(_) => StatusCode::NO_CONTENT,
         Err(e) => {
             tracing::error!("Test backdate failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/backdate-baseline — shift a baseline's `created_at`
+/// into the past so the "stale baseline" reminder can be exercised
+/// without sleeping for 90 days. Used by E2E only.
+pub async fn backdate_baseline_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BackdateBaselineRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE baselines \
+         SET created_at = NOW() - ($1 || ' days')::INTERVAL \
+         WHERE id = $2",
+    )
+    .bind(req.days.to_string())
+    .bind(&req.baseline_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test backdate-baseline failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

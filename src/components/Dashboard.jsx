@@ -578,6 +578,12 @@ export default function Dashboard() {
               (totals.outdatedChecklists ?? 0) > 0 ? "warning" : "ok"
             }
           />
+          <KpiCard
+            label="Stale baselines"
+            value={totals.staleBaselines ?? 0}
+            sub={`>${totals.staleBaselineDays ?? 90}d`}
+            tone={(totals.staleBaselines ?? 0) > 0 ? "warning" : "ok"}
+          />
         </ColumnLayout>
 
         {/* Status breakdown chart */}
@@ -1072,13 +1078,19 @@ export default function Dashboard() {
                     <Select
                       selectedOption={
                         selectedBaselineId
-                          ? {
-                              value: selectedBaselineId,
-                              label:
-                                baselines.find(
-                                  (b) => b.id === selectedBaselineId,
-                                )?.name ?? selectedBaselineId,
-                            }
+                          ? (() => {
+                              const sel = baselines.find(
+                                (b) => b.id === selectedBaselineId,
+                              );
+                              return {
+                                value: selectedBaselineId,
+                                label: sel
+                                  ? sel.isStale
+                                    ? `${sel.name} (stale)`
+                                    : sel.name
+                                  : selectedBaselineId,
+                              };
+                            })()
                           : null
                       }
                       onChange={({ detail }) =>
@@ -1086,8 +1098,10 @@ export default function Dashboard() {
                       }
                       options={baselines.map((b) => ({
                         value: b.id,
-                        label: b.name,
-                        description: `by ${b.createdByName} · ${b.ruleCount} rules`,
+                        label: b.isStale ? `${b.name} (stale)` : b.name,
+                        description: b.isStale
+                          ? `by ${b.createdByName} · ${b.ruleCount} rules · STALE`
+                          : `by ${b.createdByName} · ${b.ruleCount} rules`,
                       }))}
                       placeholder="Choose a baseline"
                     />
@@ -1117,18 +1131,36 @@ export default function Dashboard() {
               <StatusIndicator type="loading">Loading…</StatusIndicator>
             )}
             {baselineDiff && (
-              <ColumnLayout columns={2}>
-                <DiffTable
-                  title="Regressed"
-                  tone="red"
-                  rows={baselineDiff.regressed}
-                />
-                <DiffTable
-                  title="Improved"
-                  tone="green"
-                  rows={baselineDiff.improved}
-                />
-              </ColumnLayout>
+              <SpaceBetween direction="vertical" size="m">
+                {(() => {
+                  const sel = baselines.find(
+                    (b) => b.id === selectedBaselineId,
+                  );
+                  if (!sel?.isStale) return null;
+                  const ageDays = Math.floor(
+                    (Date.now() - new Date(sel.createdAt).getTime()) /
+                      (1000 * 60 * 60 * 24),
+                  );
+                  return (
+                    <Alert type="warning" header="Stale baseline">
+                      This baseline is {ageDays} days old. Consider saving a
+                      fresh one.
+                    </Alert>
+                  );
+                })()}
+                <ColumnLayout columns={2}>
+                  <DiffTable
+                    title="Regressed"
+                    tone="red"
+                    rows={baselineDiff.regressed}
+                  />
+                  <DiffTable
+                    title="Improved"
+                    tone="green"
+                    rows={baselineDiff.improved}
+                  />
+                </ColumnLayout>
+              </SpaceBetween>
             )}
           </Container>
         )}

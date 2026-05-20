@@ -18,6 +18,18 @@ pub struct BaselineRow {
     pub created_by_name: String,
     pub created_at: DateTime<Utc>,
     pub rule_count: i64,
+    /// True when `created_at` is older than the `STALE_BASELINE_DAYS`
+    /// threshold (default 90 days). Computed in SQL via the same predicate
+    /// the dashboard uses to count stale baselines.
+    pub is_stale: bool,
+}
+
+fn stale_baseline_days() -> i64 {
+    std::env::var("STALE_BASELINE_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &i64| n > 0)
+        .unwrap_or(90)
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +102,7 @@ pub async fn create_handler(
 pub async fn list_handler(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<BaselineRow>>, StatusCode> {
+    let threshold = stale_baseline_days();
     let rows = sqlx::query_as::<_, BaselineRow>(
         r#"
         SELECT
@@ -99,12 +112,14 @@ pub async fn list_handler(
             u.display_name AS created_by_name,
             b.created_at,
             COALESCE((SELECT COUNT(*) FROM baseline_rules br WHERE br.baseline_id = b.id), 0)
-                ::BIGINT AS rule_count
+                ::BIGINT AS rule_count,
+            (b.created_at < NOW() - ($1 || ' days')::INTERVAL) AS is_stale
           FROM baselines b
           JOIN users u ON u.id = b.created_by
          ORDER BY b.created_at DESC
         "#,
     )
+    .bind(threshold.to_string())
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(|e| {
@@ -272,6 +287,7 @@ pub async fn diff_handler(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 async fn fetch_one(pool: &sqlx::PgPool, id: &str) -> Result<BaselineRow, StatusCode> {
+    let threshold = stale_baseline_days();
     sqlx::query_as::<_, BaselineRow>(
         r#"
         SELECT
@@ -281,13 +297,15 @@ async fn fetch_one(pool: &sqlx::PgPool, id: &str) -> Result<BaselineRow, StatusC
             u.display_name AS created_by_name,
             b.created_at,
             COALESCE((SELECT COUNT(*) FROM baseline_rules br WHERE br.baseline_id = b.id), 0)
-                ::BIGINT AS rule_count
+                ::BIGINT AS rule_count,
+            (b.created_at < NOW() - ($2 || ' days')::INTERVAL) AS is_stale
           FROM baselines b
           JOIN users u ON u.id = b.created_by
          WHERE b.id = $1
         "#,
     )
     .bind(id)
+    .bind(threshold.to_string())
     .fetch_optional(pool)
     .await
     .map_err(|e| {
