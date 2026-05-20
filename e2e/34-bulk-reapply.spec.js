@@ -46,7 +46,7 @@ async function fetchDashboard(request, userName) {
 async function seedTwoDrifted(request) {
   // Establish baseline catalog rows for both STIGs.
   await bumpStig(request, "edge", "1", "01 Jan 2026");
-  await bumpStig(request, "rhel-9", "1", "01 Jan 2026");
+  await bumpStig(request, "windows-10", "1", "01 Jan 2026");
 
   const assetA = await createAsset(request, "alice", "fleet-host-a");
   const checklistA = await applyChecklist(request, "alice", assetA.id, "edge");
@@ -56,12 +56,12 @@ async function seedTwoDrifted(request) {
     request,
     "alice",
     assetB.id,
-    "rhel-9",
+    "windows-10",
   );
 
   // Bump both so the checklists drift.
   await bumpStig(request, "edge", "99", "99 Dec 2099");
-  await bumpStig(request, "rhel-9", "99", "99 Dec 2099");
+  await bumpStig(request, "windows-10", "99", "99 Dec 2099");
 
   return { assetA, assetB, checklistA, checklistB };
 }
@@ -98,18 +98,18 @@ test.describe("Bulk re-apply STIG", () => {
     request,
   }) => {
     // Alice has one drifted checklist on `edge`. Bob also has one on
-    // `rhel-9`. Alice's bulk-reapply must not touch Bob's row.
+    // `windows-10`. Alice's bulk-reapply must not touch Bob's row.
     await bumpStig(request, "edge", "1", "01 Jan 2026");
-    await bumpStig(request, "rhel-9", "1", "01 Jan 2026");
+    await bumpStig(request, "windows-10", "1", "01 Jan 2026");
 
     const aliceAsset = await createAsset(request, "alice", "alice-host");
     await applyChecklist(request, "alice", aliceAsset.id, "edge");
 
     const bobAsset = await createAsset(request, "bob", "bob-host");
-    await applyChecklist(request, "bob", bobAsset.id, "rhel-9");
+    await applyChecklist(request, "bob", bobAsset.id, "windows-10");
 
     await bumpStig(request, "edge", "99", "99 Dec 2099");
-    await bumpStig(request, "rhel-9", "99", "99 Dec 2099");
+    await bumpStig(request, "windows-10", "99", "99 Dec 2099");
 
     // Global drift before: 2 outdated checklists.
     const globalBefore = await fetchDashboard(request, "alice");
