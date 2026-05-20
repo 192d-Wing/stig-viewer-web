@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { inflateRawSync } from "node:zlib";
 import { resetDb, BACKEND } from "./helpers.js";
 
 /**
@@ -66,9 +67,7 @@ function readEntryText(buf, entry) {
     return raw.toString("utf-8");
   }
   if (entry.compMethod === 8) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const zlib = require("node:zlib");
-    return zlib.inflateRawSync(raw).toString("utf-8");
+    return inflateRawSync(raw).toString("utf-8");
   }
   throw new Error(`unsupported zip compression method ${entry.compMethod}`);
 }
