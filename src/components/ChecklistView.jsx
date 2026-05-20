@@ -101,6 +101,17 @@ export default function ChecklistView({ checklistId, onBack }) {
   const [uploadError, setUploadError] = useState(null);
   const [counts2, setCounts2] = useState({}); // ruleId -> count
 
+  // Per-rule comment thread state — keyed off (checklistId, ruleId).
+  // `comments` lives independently of the status-note `comments` field on
+  // checklist_rules; this is the threaded discussion.
+  const [comments, setComments] = useState([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [postingComment, setPostingComment] = useState(false);
+  const [commentError, setCommentError] = useState(null);
+  const [editingCommentId, setEditingCommentId] = useState(null);
+  const [editingCommentBody, setEditingCommentBody] = useState("");
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -190,6 +201,25 @@ export default function ChecklistView({ checklistId, onBack }) {
     );
   }, [detail, filter]);
 
+  const refreshComments = useCallback(
+    async (ruleId) => {
+      if (!ruleId) return;
+      setCommentsLoading(true);
+      try {
+        const rows = await apiGet(
+          `/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/comments`,
+        );
+        setComments(rows);
+      } catch (err) {
+        setComments([]);
+        setCommentError(err.message);
+      } finally {
+        setCommentsLoading(false);
+      }
+    },
+    [checklistId],
+  );
+
   const startEdit = useCallback(
     (rule) => {
       setDraft({
@@ -202,10 +232,82 @@ export default function ChecklistView({ checklistId, onBack }) {
       setSaveError(null);
       setUploadError(null);
       setAttachments([]);
+      setComments([]);
+      setCommentDraft("");
+      setCommentError(null);
+      setEditingCommentId(null);
+      setEditingCommentBody("");
       setEditing(rule);
       refreshAttachments(rule.id);
+      refreshComments(rule.id);
     },
-    [refreshAttachments],
+    [refreshAttachments, refreshComments],
+  );
+
+  const postComment = useCallback(async () => {
+    if (!editing) return;
+    const trimmed = commentDraft.trim();
+    if (!trimmed) return;
+    setPostingComment(true);
+    setCommentError(null);
+    try {
+      await apiJson(
+        `/api/checklists/${checklistId}/rules/${encodeURIComponent(editing.id)}/comments`,
+        "POST",
+        { body: trimmed },
+      );
+      setCommentDraft("");
+      await refreshComments(editing.id);
+    } catch (err) {
+      setCommentError(parseSaveError(err.message));
+    } finally {
+      setPostingComment(false);
+    }
+  }, [checklistId, editing, commentDraft, refreshComments]);
+
+  const startEditComment = useCallback((comment) => {
+    setEditingCommentId(comment.id);
+    setEditingCommentBody(comment.body);
+    setCommentError(null);
+  }, []);
+
+  const cancelEditComment = useCallback(() => {
+    setEditingCommentId(null);
+    setEditingCommentBody("");
+  }, []);
+
+  const saveEditComment = useCallback(async () => {
+    if (!editing || !editingCommentId) return;
+    const trimmed = editingCommentBody.trim();
+    if (!trimmed) return;
+    setCommentError(null);
+    try {
+      await apiJson(`/api/comments/${editingCommentId}`, "PATCH", {
+        body: trimmed,
+      });
+      setEditingCommentId(null);
+      setEditingCommentBody("");
+      await refreshComments(editing.id);
+    } catch (err) {
+      setCommentError(parseSaveError(err.message));
+    }
+  }, [editing, editingCommentId, editingCommentBody, refreshComments]);
+
+  const deleteComment = useCallback(
+    async (commentId) => {
+      if (!editing) return;
+      setCommentError(null);
+      try {
+        const res = await apiFetch(`/api/comments/${commentId}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) throw new Error(`${res.status}`);
+        await refreshComments(editing.id);
+      } catch (err) {
+        setCommentError(err.message);
+      }
+    },
+    [editing, refreshComments],
   );
 
   const uploadAttachment = useCallback(
@@ -601,6 +703,120 @@ export default function ChecklistView({ checklistId, onBack }) {
                   </Box>
                 )}
                 {uploadError && <Alert type="error">{uploadError}</Alert>}
+              </SpaceBetween>
+            </FormField>
+
+            <FormField
+              label="Comments"
+              description="Threaded discussion for this rule."
+            >
+              <SpaceBetween direction="vertical" size="s">
+                {commentsLoading ? (
+                  <StatusIndicator type="loading">
+                    Loading comments
+                  </StatusIndicator>
+                ) : comments.length === 0 ? (
+                  <Box variant="small" color="text-body-secondary">
+                    No comments yet.
+                  </Box>
+                ) : (
+                  <SpaceBetween direction="vertical" size="xs">
+                    {comments.map((c) => {
+                      const isAuthor = currentUser?.id === c.userId;
+                      const isEditingThis = editingCommentId === c.id;
+                      return (
+                        <Box
+                          key={c.id}
+                          padding="s"
+                          data-testid="rule-comment"
+                        >
+                          <SpaceBetween direction="vertical" size="xxs">
+                            <Box variant="small" color="text-body-secondary">
+                              <strong>{c.userName}</strong>
+                              {" · "}
+                              {new Date(c.createdAt).toLocaleString()}
+                              {c.editedAt ? " (edited)" : ""}
+                            </Box>
+                            {isEditingThis ? (
+                              <SpaceBetween direction="vertical" size="xs">
+                                <Textarea
+                                  value={editingCommentBody}
+                                  onChange={({ detail: d }) =>
+                                    setEditingCommentBody(d.value)
+                                  }
+                                  rows={3}
+                                />
+                                <SpaceBetween
+                                  direction="horizontal"
+                                  size="xs"
+                                >
+                                  <Button
+                                    variant="primary"
+                                    onClick={saveEditComment}
+                                    data-testid="rule-comment-save-edit"
+                                  >
+                                    Save
+                                  </Button>
+                                  <Button
+                                    variant="link"
+                                    onClick={cancelEditComment}
+                                  >
+                                    Cancel
+                                  </Button>
+                                </SpaceBetween>
+                              </SpaceBetween>
+                            ) : (
+                              <>
+                                <Box>{c.body}</Box>
+                                <SpaceBetween
+                                  direction="horizontal"
+                                  size="xxs"
+                                >
+                                  <Button
+                                    variant="inline-link"
+                                    disabled={!isAuthor}
+                                    onClick={() => startEditComment(c)}
+                                    data-testid="rule-comment-edit"
+                                  >
+                                    Edit
+                                  </Button>
+                                  <Button
+                                    variant="inline-link"
+                                    disabled={!isAuthor}
+                                    onClick={() => deleteComment(c.id)}
+                                    data-testid="rule-comment-delete"
+                                  >
+                                    Delete
+                                  </Button>
+                                </SpaceBetween>
+                              </>
+                            )}
+                          </SpaceBetween>
+                        </Box>
+                      );
+                    })}
+                  </SpaceBetween>
+                )}
+
+                <Textarea
+                  value={commentDraft}
+                  onChange={({ detail: d }) => setCommentDraft(d.value)}
+                  placeholder="Add a comment…"
+                  rows={3}
+                  data-testid="rule-comment-input"
+                />
+                <Box>
+                  <Button
+                    variant="primary"
+                    loading={postingComment}
+                    disabled={!commentDraft.trim()}
+                    onClick={postComment}
+                    data-testid="rule-comment-add"
+                  >
+                    Add comment
+                  </Button>
+                </Box>
+                {commentError && <Alert type="error">{commentError}</Alert>}
               </SpaceBetween>
             </FormField>
           </SpaceBetween>
