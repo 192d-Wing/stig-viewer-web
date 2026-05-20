@@ -35,6 +35,30 @@ const STATUSES = [
 
 const STATUS_BY_VALUE = Object.fromEntries(STATUSES.map((s) => [s.value, s]));
 
+// Closing statuses require a written justification in `findingDetails`.
+// Keep in sync with `requires_finding_details` in
+// backend/src/api/checklists.rs.
+const CLOSING_STATUSES = new Set(["not_a_finding", "not_applicable"]);
+
+function findingDetailsRequired(status, findingDetails) {
+  return (
+    CLOSING_STATUSES.has(status) && (findingDetails ?? "").trim().length === 0
+  );
+}
+
+// Try to parse the JSON error body thrown by apiJson; fall back to the raw
+// message if the server didn't return JSON.
+function parseSaveError(message) {
+  if (!message) return null;
+  try {
+    const obj = JSON.parse(message);
+    if (obj && typeof obj.error === "string") return obj.error;
+  } catch {
+    // not JSON — use as-is
+  }
+  return message;
+}
+
 function severityLabel(sev) {
   if (!sev) return "—";
   return sev.toUpperCase();
@@ -227,6 +251,11 @@ export default function ChecklistView({ checklistId, onBack }) {
     [editing, refreshAttachments, refreshCounts],
   );
 
+  const gateViolated = useMemo(
+    () => findingDetailsRequired(draft.status, draft.findingDetails),
+    [draft.status, draft.findingDetails],
+  );
+
   const saveEdit = useCallback(async () => {
     if (!editing) return;
     setSaving(true);
@@ -245,7 +274,7 @@ export default function ChecklistView({ checklistId, onBack }) {
       setEditing(null);
       await refresh();
     } catch (err) {
-      setSaveError(err.message);
+      setSaveError(parseSaveError(err.message));
     } finally {
       setSaving(false);
     }
@@ -381,7 +410,7 @@ export default function ChecklistView({ checklistId, onBack }) {
               <Button
                 variant="primary"
                 loading={saving}
-                disabled={!isOwner}
+                disabled={!isOwner || gateViolated}
                 onClick={saveEdit}
               >
                 Save
@@ -452,7 +481,13 @@ export default function ChecklistView({ checklistId, onBack }) {
                 />
               </FormField>
             </ColumnLayout>
-            <FormField label="Finding details" description="What was observed?">
+            <FormField
+              label="Finding details"
+              description="What was observed?"
+              errorText={
+                gateViolated ? "Required when closing this finding." : undefined
+              }
+            >
               <Textarea
                 value={draft.findingDetails}
                 disabled={!isOwner}
@@ -460,6 +495,7 @@ export default function ChecklistView({ checklistId, onBack }) {
                   setDraft((f) => ({ ...f, findingDetails: d.value }))
                 }
                 rows={4}
+                invalid={gateViolated}
               />
             </FormField>
             <FormField label="Comments" description="Notes for future reviewers">
