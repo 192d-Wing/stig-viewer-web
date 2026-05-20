@@ -34,7 +34,7 @@ async function seedTwoEdgeAssets(request) {
     `${BACKEND}/api/checklists/${c1.id}/rules/${encodeURIComponent(r2)}`,
     {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: { status: "not_a_finding" },
+      data: { status: "not_a_finding", findingDetails: "test justification" },
     },
   );
 
@@ -56,14 +56,14 @@ async function seedTwoEdgeAssets(request) {
     `${BACKEND}/api/checklists/${c2.id}/rules/${encodeURIComponent(r1)}`,
     {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: { status: "not_a_finding" },
+      data: { status: "not_a_finding", findingDetails: "test justification" },
     },
   );
   await request.patch(
     `${BACKEND}/api/checklists/${c2.id}/rules/${encodeURIComponent(r2)}`,
     {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: { status: "not_a_finding" },
+      data: { status: "not_a_finding", findingDetails: "test justification" },
     },
   );
 

@@ -81,7 +81,13 @@ test.describe("Systems / per-asset checklists", () => {
     await expect(editModal).toBeVisible();
     await editModal.getByRole("radio", { name: "Not a finding" }).click();
 
-    // Confirm Save isn't disabled (owner check)
+    // Compliance gate requires a justification for closing statuses —
+    // fill the Finding details textarea so Save becomes enabled.
+    await editModal
+      .getByRole("textbox", { name: /finding details/i })
+      .fill("test justification");
+
+    // Confirm Save isn't disabled (owner check + gate)
     const saveBtn = editModal.getByRole("button", { name: "Save", exact: true });
     await expect(saveBtn).toBeEnabled();
     await saveBtn.click();

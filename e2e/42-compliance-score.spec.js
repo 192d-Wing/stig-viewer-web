@@ -41,11 +41,16 @@ async function applyStig(request, assetId, stigId = "edge") {
 }
 
 async function setRuleStatus(request, checklistId, ruleId, status) {
+  // Compliance gate requires a justification for closing statuses.
+  const findingDetails =
+    status === "not_a_finding" || status === "not_applicable"
+      ? "auto-justified for test"
+      : "";
   const r = await request.patch(
     `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}`,
     {
       headers: HEADERS(),
-      data: { status },
+      data: { status, findingDetails },
     },
   );
   expect(r.ok()).toBeTruthy();

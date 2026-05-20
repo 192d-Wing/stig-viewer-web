@@ -34,7 +34,7 @@ async function seedDriftedChecklist(request) {
     `${BACKEND}/api/checklists/${checklist.id}/rules/${encodeURIComponent(firstRuleId)}`,
     {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: { status: "not_a_finding" },
+      data: { status: "not_a_finding", findingDetails: "test justification" },
     },
   );
   await bumpStig(request, "edge", "99", "99 Dec 2099");
