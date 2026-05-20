@@ -76,7 +76,10 @@ use api::{
         list_handler as list_saved_searches_handler,
     },
     stig::get_stig,
-    test_support::{backdate_handler, bump_stig_handler, reset_handler, set_role_handler},
+    test_support::{
+        backdate_baseline_handler, backdate_handler, bump_stig_handler, reset_handler,
+        set_role_handler,
+    },
     upload::{upload_library, upload_stig},
     webhooks::{
         create_handler as create_webhook_handler,
@@ -304,6 +307,7 @@ async fn main() -> Result<()> {
             .route("/api/test/set-role", post(set_role_handler))
             .route("/api/test/snapshot", post(snapshot_trigger_handler))
             .route("/api/test/backdate-rule", post(backdate_handler))
+            .route("/api/test/backdate-baseline", post(backdate_baseline_handler))
             .route("/api/test/bump-stig", post(bump_stig_handler))
             .with_state(state.clone());
         app = app.merge(test_router);

@@ -52,6 +52,13 @@ pub struct Totals {
     /// current `stigs_catalog.version` (or release). Empty applied_*
     /// values are skipped so legacy rows don't get flagged.
     pub outdated_checklists: i64,
+    /// Baselines whose `created_at` is older than `stale_baseline_days`.
+    /// Surfaced as a reminder to capture a fresh snapshot.
+    pub stale_baselines: i64,
+    /// Threshold (days) used to compute `stale_baselines`. Mirrors the
+    /// `stale_threshold_days` pattern so the UI can render the sub-label
+    /// without hard-coding a value.
+    pub stale_baseline_days: i64,
 }
 
 fn stale_threshold_days() -> i64 {
@@ -60,6 +67,14 @@ fn stale_threshold_days() -> i64 {
         .and_then(|s| s.parse().ok())
         .filter(|&n: &i64| n > 0)
         .unwrap_or(30)
+}
+
+fn stale_baseline_days_threshold() -> i64 {
+    std::env::var("STALE_BASELINE_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n: &i64| n > 0)
+        .unwrap_or(90)
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +128,7 @@ pub async fn get_handler(
     let pool = state.pool.as_ref();
 
     let stale_days = stale_threshold_days();
+    let stale_baseline_days = stale_baseline_days_threshold();
 
     // Totals — independent, can run in parallel.
     let (
@@ -123,6 +139,7 @@ pub async fn get_handler(
         stale_count,
         reviewed_count,
         total_rules,
+        stale_baselines_count,
     ) = tokio::join!(
         count_one(pool, "SELECT COUNT(*) FROM assets"),
         count_one(pool, "SELECT COUNT(*) FROM checklists"),
@@ -152,6 +169,12 @@ pub async fn get_handler(
               LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
             "#,
         ),
+        count_one_with(
+            pool,
+            "SELECT COUNT(*) FROM baselines \
+             WHERE created_at < NOW() - ($1 || ' days')::INTERVAL",
+            stale_baseline_days.to_string(),
+        ),
     );
 
     let outdated_count = count_one(
@@ -180,6 +203,8 @@ pub async fn get_handler(
         highest_weighted_asset_name: None,
         highest_weighted_rule_id: None,
         outdated_checklists: outdated_count,
+        stale_baselines: stale_baselines_count.map_err(map_db)?,
+        stale_baseline_days,
     };
 
     // Per-asset / per-checklist breakdown. One row per (asset, checklist);
