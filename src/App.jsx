@@ -163,6 +163,7 @@ export default function App() {
   const [notifData, setNotifData] = useState({
     assigned: [],
     overdue: [],
+    mentions: [],
     unreadCount: 0,
   });
   const [notifOpen, setNotifOpen] = useState(false);
@@ -170,7 +171,15 @@ export default function App() {
   const refreshNotifications = useCallback(async () => {
     try {
       const d = await apiGet("/api/notifications");
-      setNotifData(d);
+      // Defensive defaults in case an older backend doesn't include the
+      // mentions bucket yet.
+      setNotifData({
+        assigned: d.assigned ?? [],
+        overdue: d.overdue ?? [],
+        mentions: d.mentions ?? [],
+        unreadCount: d.unreadCount ?? 0,
+        lastSeen: d.lastSeen ?? null,
+      });
     } catch {
       // non-fatal; bell stays empty
     }
@@ -197,6 +206,7 @@ export default function App() {
       ...d,
       unreadCount: 0,
       assigned: d.assigned.map((a) => ({ ...a, unread: false })),
+      mentions: (d.mentions ?? []).map((m) => ({ ...m, unread: false })),
     }));
   }, []);
 
@@ -557,6 +567,41 @@ export default function App() {
                     <em>{o.assetName}</em> · {o.stigTitle}
                     <Box variant="span" color="text-status-inactive">
                       {" "}— due {o.dueDate}
+                    </Box>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Box>
+          <Box>
+            <Box variant="h4">
+              Mentions
+              {(notifData.mentions?.length ?? 0) > 0 &&
+                ` (${notifData.mentions.length})`}
+            </Box>
+            {(notifData.mentions?.length ?? 0) === 0 ? (
+              <Box color="text-status-inactive" padding={{ top: "xs" }}>
+                No one has @-mentioned you in a comment.
+              </Box>
+            ) : (
+              <ul
+                style={{ paddingLeft: 18, margin: 0 }}
+                data-testid="mentions-list"
+              >
+                {notifData.mentions.map((m) => (
+                  <li
+                    key={m.commentId}
+                    data-testid="mention-item"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => {
+                      setNotifOpen(false);
+                      navigateTo("systems");
+                    }}
+                  >
+                    <strong>{m.byName}</strong> mentioned you on{" "}
+                    <em>{m.ruleId}</em>: "{m.body}"
+                    <Box variant="span" color="text-status-inactive">
+                      {" "}— {new Date(m.at).toLocaleString()}
                     </Box>
                   </li>
                 ))}
