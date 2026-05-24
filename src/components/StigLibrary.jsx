@@ -20,8 +20,40 @@ import CollectionPreferences from "@cloudscape-design/components/collection-pref
 import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
+import Modal from "@cloudscape-design/components/modal";
 import { BACKEND, apiJson } from "../utils/api.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
+
+/** Trim long body fields for the diff table cells so a 4 KB
+ * description doesn't blow up the row height. The full text is still
+ * available in the API response if a future "expand" UI wants it. */
+function truncate(s, max = 80) {
+  if (!s) return "—";
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** One section of the diff modal — Added / Removed / Changed each get
+ * a labeled mini-table that renders an em-dash when empty. */
+function DiffSection({ title, testId, items, columns, colorBadge: _color }) {
+  return (
+    <Box data-testid={testId}>
+      <Header variant="h3">{title}</Header>
+      {items.length === 0 ? (
+        <Box padding={{ vertical: "s" }}>—</Box>
+      ) : (
+        <Table
+          variant="embedded"
+          items={items}
+          columnDefinitions={columns}
+          ariaLabels={{
+            tableLabel: title,
+          }}
+        />
+      )}
+    </Box>
+  );
+}
+
 const CATEGORY_OPTIONS = CATEGORIES.map((c) => ({ label: c, value: c }));
 
 const CATEGORY_BADGE_COLOR = {
@@ -139,6 +171,47 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [libFiles, setLibFiles] = useState([]);
   const [libStatus, setLibStatus] = useState("idle");
   const [libResult, setLibResult] = useState(null);
+
+  // Catalog version diff modal — opened from the per-row "Diff vs
+  // previous" button. `diffStigId` is the STIG being diffed; status is
+  // "loading" while the GET is in flight, "ready" once we have data,
+  // "empty" when the backend says there's no archived version yet,
+  // "error" on transport / 500 failures.
+  const [diffStigId, setDiffStigId] = useState(null);
+  const [diffStatus, setDiffStatus] = useState("idle");
+  const [diffData, setDiffData] = useState(null);
+  const [diffError, setDiffError] = useState(null);
+
+  const openDiff = useCallback(async (stigId) => {
+    setDiffStigId(stigId);
+    setDiffStatus("loading");
+    setDiffData(null);
+    setDiffError(null);
+    try {
+      const r = await fetch(
+        `${BACKEND}/api/stigs/${encodeURIComponent(stigId)}/diff`,
+        { credentials: "include" },
+      );
+      if (r.status === 404) {
+        setDiffStatus("empty");
+        return;
+      }
+      if (!r.ok) throw new Error(`Backend returned ${r.status}`);
+      const data = await r.json();
+      setDiffData(data);
+      setDiffStatus("ready");
+    } catch (err) {
+      setDiffError(err.message);
+      setDiffStatus("error");
+    }
+  }, []);
+
+  const closeDiff = useCallback(() => {
+    setDiffStigId(null);
+    setDiffStatus("idle");
+    setDiffData(null);
+    setDiffError(null);
+  }, []);
 
   const fetchCatalog = useCallback(() => {
     setCatalogLoading(true);
@@ -425,6 +498,24 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
       sortingComparator: (a, b) => a.ruleCount - b.ruleCount,
       width: 110,
     },
+    {
+      id: "diff",
+      header: "Diff",
+      cell: (item) => (
+        <Button
+          variant="inline-link"
+          loading={diffStigId === item.id && diffStatus === "loading"}
+          onClick={(e) => {
+            e.stopPropagation();
+            openDiff(item.id);
+          }}
+          data-testid={`diff-button-${item.id}`}
+        >
+          Diff vs previous
+        </Button>
+      ),
+      width: 160,
+    },
     ...(onStartDraft
       ? [
           {
@@ -449,12 +540,92 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   ];
 
   const visibleColumns = columnDefinitions.filter(
-    (c) => preferences.visibleContent.includes(c.id) || c.id === "actions",
+    (c) =>
+      preferences.visibleContent.includes(c.id) ||
+      c.id === "actions" ||
+      c.id === "diff",
   );
   const sortingColumn = columnDefinitions.find((c) => c.id === sortCol);
 
+  // Renders the diff modal. Identical in both library / form views so
+  // it lives in a local helper. Cloudscape Modal mounts via a portal so
+  // it doesn't disrupt the AppLayout `full-page` Table contract.
+  const renderDiffModal = () => (
+    <Modal
+      visible={diffStigId != null}
+      onDismiss={closeDiff}
+      header={`Diff vs previous — ${diffStigId ?? ""}`}
+      size="large"
+      data-testid="catalog-diff-modal"
+    >
+      {diffStatus === "loading" && <Box>Loading diff…</Box>}
+      {diffStatus === "empty" && (
+        <Alert
+          type="info"
+          data-testid="catalog-diff-empty"
+        >
+          No previous version archived for this STIG yet.
+        </Alert>
+      )}
+      {diffStatus === "error" && (
+        <Alert type="error">Failed to load diff: {diffError}</Alert>
+      )}
+      {diffStatus === "ready" && diffData && (
+        <SpaceBetween size="l">
+          <Box>
+            <strong>From:</strong> v{diffData.fromVersion} ·{" "}
+            {diffData.fromReleaseInfo} → <strong>To:</strong>{" "}
+            v{diffData.toVersion} · {diffData.toReleaseInfo}
+          </Box>
+          <DiffSection
+            title={`Added (${diffData.added.length})`}
+            testId="catalog-diff-added"
+            items={diffData.added}
+            columns={[
+              { id: "id", header: "Rule", cell: (r) => r.id },
+              { id: "title", header: "Title", cell: (r) => r.title },
+              {
+                id: "severity",
+                header: "Severity",
+                cell: (r) => r.severity,
+              },
+            ]}
+            colorBadge="green"
+          />
+          <DiffSection
+            title={`Removed (${diffData.removed.length})`}
+            testId="catalog-diff-removed"
+            items={diffData.removed}
+            columns={[
+              { id: "id", header: "Rule", cell: (r) => r.id },
+              { id: "title", header: "Title", cell: (r) => r.title },
+            ]}
+            colorBadge="red"
+          />
+          <DiffSection
+            title={`Changed (${diffData.changed.length})`}
+            testId="catalog-diff-changed"
+            items={diffData.changed}
+            columns={[
+              { id: "id", header: "Rule", cell: (r) => r.id },
+              { id: "field", header: "Field", cell: (r) => r.field },
+              {
+                id: "from",
+                header: "From",
+                cell: (r) => truncate(r.from),
+              },
+              { id: "to", header: "To", cell: (r) => truncate(r.to) },
+            ]}
+            colorBadge="grey"
+          />
+        </SpaceBetween>
+      )}
+    </Modal>
+  );
+
   if (activeTab === "library") {
     return (
+      <>
       <Table
         variant="full-page"
         stickyHeader
@@ -596,6 +767,8 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
           </Box>
         }
       />
+      {renderDiffModal()}
+      </>
     );
   }
 
