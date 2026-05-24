@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 use crate::api::auth::AuthUser;
+use crate::api::finding_approvals;
 use crate::api::webhooks;
 use crate::db_assets;
 use crate::db_checklists;
@@ -372,12 +373,17 @@ async fn reapply_one(
 }
 
 /// PATCH /api/checklists/:id/rules/:rule_id — update one rule's state.
+///
+/// Returns the upserted rule on the direct-write path. When the asset
+/// has `requires_approval = TRUE` and the proposed status is a closing
+/// one, returns 202 Accepted with the new approval row's id (the rule
+/// row itself is NOT modified).
 pub async fn update_rule_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Path((id, rule_id)): Path<(String, String)>,
     Json(req): Json<UpdateRuleRequest>,
-) -> Result<Json<db_checklists::ChecklistRuleRow>, Response> {
+) -> Result<Response, Response> {
     let checklist = db_checklists::get_checklist(state.pool.as_ref(), &id)
         .await
         .map_err(map_db)
@@ -408,6 +414,76 @@ pub async fn update_rule_handler(
             })),
         )
             .into_response());
+    }
+
+    // Per-asset approval workflow. When asset.requires_approval = TRUE
+    // and the proposed status is a closing one AND the rule's current
+    // status is NOT already that target value, divert into the
+    // finding_approvals queue instead of writing the rule row. The
+    // rule's status stays untouched (typically 'open') until a reviewer
+    // or admin approves. requires_approval defaults to FALSE so the
+    // existing direct-close behavior the bulk of the E2E suite depends
+    // on is unaffected.
+    if asset.requires_approval && finding_approvals::is_closing_status(&req.status) {
+        let current_status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM checklist_rules \
+             WHERE checklist_id = $1 AND rule_id = $2",
+        )
+        .bind(&id)
+        .bind(&rule_id)
+        .fetch_optional(state.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!("approval current-status lookup: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+        let already_closed = current_status.as_deref() == Some(req.status.as_str());
+        if !already_closed {
+            // Idempotency: if a pending request already exists for this
+            // rule, return 202 without filing a duplicate row.
+            let pending_exists = finding_approvals::has_pending(
+                state.pool.as_ref(),
+                &id,
+                &rule_id,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("approval pending check: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?;
+            if pending_exists {
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending_approval",
+                        "message": "an approval request is already pending for this rule",
+                    })),
+                )
+                    .into_response());
+            }
+            let row = finding_approvals::create_pending(
+                state.pool.as_ref(),
+                &id,
+                &rule_id,
+                &user.id,
+                &req.status,
+                &req.finding_details,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("approval create_pending: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "pending_approval",
+                    "approvalId": row.id,
+                    "proposedStatus": row.proposed_status,
+                })),
+            )
+                .into_response());
+        }
     }
 
     // Snapshot the prior assignee so we can detect a transition for the
@@ -467,7 +543,7 @@ pub async fn update_rule_handler(
         }
     }
 
-    Ok(Json(row))
+    Ok(Json(row).into_response())
 }
 
 /// Resolve event metadata + dispatch an `assigned` webhook event for a

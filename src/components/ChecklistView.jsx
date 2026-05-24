@@ -122,12 +122,29 @@ export default function ChecklistView({ checklistId, onBack }) {
   const [bulkError, setBulkError] = useState(null);
   const [bulkSuccess, setBulkSuccess] = useState(null);
 
+  // Rule IDs in this checklist that currently have an open approval
+  // request. Used to render a "Pending review" pill in the rule list.
+  const [pendingApprovalIds, setPendingApprovalIds] = useState(new Set());
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const d = await apiGet(`/api/checklists/${checklistId}`);
       setDetail(d);
+      // Best-effort fetch of pending approvals scoped to this checklist.
+      // Non-fatal — the rule list still renders without the pill.
+      try {
+        const rows = await apiGet(`/api/approvals?status=pending`);
+        const ids = new Set(
+          (Array.isArray(rows) ? rows : [])
+            .filter((r) => r.checklistId === checklistId)
+            .map((r) => r.ruleId),
+        );
+        setPendingApprovalIds(ids);
+      } catch {
+        setPendingApprovalIds(new Set());
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -454,23 +471,35 @@ export default function ChecklistView({ checklistId, onBack }) {
     return `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
   }, []);
 
+  const [pendingApproval, setPendingApproval] = useState(null);
+
   const saveEdit = useCallback(async () => {
     if (!editing) return;
     setSaving(true);
     setSaveError(null);
+    setPendingApproval(null);
     try {
       // DatePicker yields YYYY/MM/DD or YYYY-MM-DD; backend wants YYYY-MM-DD,
       // and an empty string should mean "no due date" → null.
       const dueDate = draft.dueDate
         ? draft.dueDate.replace(/\//g, "-")
         : null;
-      await apiJson(
+      const result = await apiJson(
         `/api/checklists/${checklistId}/rules/${encodeURIComponent(editing.id)}`,
         "PATCH",
         { ...draft, dueDate },
       );
-      setEditing(null);
-      await refresh();
+      // The server returns 202 + { status: 'pending_approval', ... } when
+      // the asset has requires_approval = TRUE and the proposed status is
+      // a closing one. Keep the editor open and surface a banner instead
+      // of closing it like a normal save.
+      if (result && result.status === "pending_approval") {
+        setPendingApproval(result);
+        await refresh();
+      } else {
+        setEditing(null);
+        await refresh();
+      }
     } catch (err) {
       setSaveError(parseSaveError(err.message));
     } finally {
@@ -585,6 +614,13 @@ export default function ChecklistView({ checklistId, onBack }) {
               id: "status",
               header: "Status",
               cell: (r) => {
+                if (pendingApprovalIds.has(r.id)) {
+                  return (
+                    <Badge color="blue" data-testid="status-pending-review">
+                      Pending review
+                    </Badge>
+                  );
+                }
                 const s = STATUS_BY_VALUE[r.state.status] ?? STATUSES[0];
                 return <Badge color={s.color}>{s.label}</Badge>;
               },
@@ -718,6 +754,17 @@ export default function ChecklistView({ checklistId, onBack }) {
               />
             </FormField>
             {saveError && <Alert type="error">{saveError}</Alert>}
+            {pendingApproval && (
+              <Alert
+                type="success"
+                header="Submitted for review"
+                data-testid="pending-approval-alert"
+              >
+                This asset requires reviewer approval before closing findings.
+                Your request has been queued and a reviewer will see it in
+                the approvals queue.
+              </Alert>
+            )}
 
             <FormField
               label="Evidence"

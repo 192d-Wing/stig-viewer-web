@@ -14,6 +14,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Alert from "@cloudscape-design/components/alert";
 import Container from "@cloudscape-design/components/container";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
+import Textarea from "@cloudscape-design/components/textarea";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
@@ -100,22 +101,34 @@ export default function AdminConsole() {
   // Outbound email deliveries (compliance-report emails, dryrun + sent)
   const [emails, setEmails] = useState([]);
 
+  // Pending finding-close approval queue. Reviewer/admin only — for
+  // anyone else the GET returns just their own rows (which is fine,
+  // AdminConsole is gated by an admin route anyway).
+  const [approvals, setApprovals] = useState([]);
+  const [rejectModal, setRejectModal] = useState(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [rejectBusy, setRejectBusy] = useState(false);
+  const [rejectError, setRejectError] = useState(null);
+  const [approveBusyId, setApproveBusyId] = useState(null);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w, r, e] = await Promise.all([
+      const [u, a, w, r, e, ap] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
         apiGet("/api/reports").catch(() => []),
         apiGet("/api/admin/email-deliveries").catch(() => []),
+        apiGet("/api/approvals?status=pending").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
       setWebhooks(w);
       setReports(r);
       setEmails(e);
+      setApprovals(ap);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -177,6 +190,52 @@ export default function AdminConsole() {
       setOwnerSubmitting(false);
     }
   }, [ownerAsset, ownerUser, refresh]);
+
+  // ── Approval queue helpers ─────────────────────────────────────────────
+
+  const approveRow = useCallback(
+    async (row) => {
+      setApproveBusyId(row.id);
+      try {
+        await apiJson(`/api/approvals/${row.id}/approve`, "POST", {});
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setApproveBusyId(null);
+      }
+    },
+    [refresh],
+  );
+
+  const openRejectModal = useCallback((row) => {
+    setRejectModal(row);
+    setRejectReason("");
+    setRejectError(null);
+  }, []);
+
+  const submitReject = useCallback(async () => {
+    if (!rejectModal) return;
+    const reason = rejectReason.trim();
+    if (!reason) {
+      setRejectError("A reason is required to reject an approval.");
+      return;
+    }
+    setRejectBusy(true);
+    setRejectError(null);
+    try {
+      await apiJson(`/api/approvals/${rejectModal.id}/reject`, "POST", {
+        reason,
+      });
+      setRejectModal(null);
+      setRejectReason("");
+      await refresh();
+    } catch (err) {
+      setRejectError(err.message);
+    } finally {
+      setRejectBusy(false);
+    }
+  }, [rejectModal, rejectReason, refresh]);
 
   // ── Webhook helpers ────────────────────────────────────────────────────
 
@@ -464,6 +523,82 @@ export default function AdminConsole() {
             Users
           </Header>
         }
+      />
+
+      <Table
+        items={approvals}
+        loading={loading}
+        loadingText="Loading approvals"
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No pending approvals.
+            </Box>
+          </Box>
+        }
+        columnDefinitions={[
+          {
+            id: "asset",
+            header: "Asset",
+            cell: (r) => r.assetName,
+          },
+          {
+            id: "stig",
+            header: "STIG",
+            cell: (r) => r.stigTitle,
+          },
+          {
+            id: "rule",
+            header: "Rule",
+            cell: (r) => r.ruleId,
+          },
+          {
+            id: "proposed",
+            header: "Proposed status",
+            cell: (r) => <Badge>{r.proposedStatus}</Badge>,
+          },
+          {
+            id: "requested_by",
+            header: "Requested by",
+            cell: (r) => r.requestedByName,
+          },
+          {
+            id: "requested_at",
+            header: "Requested",
+            cell: (r) => relativeTime(r.requestedAt),
+          },
+          {
+            id: "actions",
+            header: "",
+            cell: (r) => (
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button
+                  variant="primary"
+                  loading={approveBusyId === r.id}
+                  onClick={() => approveRow(r)}
+                  data-testid={`approve-${r.id}`}
+                >
+                  Approve
+                </Button>
+                <Button
+                  onClick={() => openRejectModal(r)}
+                  data-testid={`reject-${r.id}`}
+                >
+                  Reject
+                </Button>
+              </SpaceBetween>
+            ),
+          },
+        ]}
+        header={
+          <Header
+            counter={`(${approvals.length})`}
+            description="Closing transitions on assets with the approval policy enabled. Approve to apply the proposed status; reject with a reason to keep the rule open."
+          >
+            Pending finding-close approvals
+          </Header>
+        }
+        data-testid="approvals-table"
       />
 
       <Container
@@ -849,6 +984,50 @@ export default function AdminConsole() {
             ]}
           />
         )}
+      </Modal>
+
+      <Modal
+        visible={rejectModal !== null}
+        onDismiss={() => setRejectModal(null)}
+        header="Reject approval request"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setRejectModal(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={rejectBusy}
+                onClick={submitReject}
+                data-testid="reject-submit"
+              >
+                Reject
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          {rejectModal && (
+            <Box>
+              {rejectModal.assetName} · {rejectModal.stigTitle} ·{" "}
+              {rejectModal.ruleId}
+            </Box>
+          )}
+          <FormField
+            label="Reason"
+            description="The requester will see this reason in their notifications."
+          >
+            <Textarea
+              value={rejectReason}
+              onChange={({ detail }) => setRejectReason(detail.value)}
+              rows={4}
+              data-testid="reject-reason"
+            />
+          </FormField>
+          {rejectError && <Alert type="error">{rejectError}</Alert>}
+        </SpaceBetween>
       </Modal>
     </SpaceBetween>
   );
