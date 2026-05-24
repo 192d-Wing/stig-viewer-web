@@ -403,13 +403,21 @@ test.describe("Per-asset finding-close approval workflow", () => {
       )
       .toBe(true);
 
-    // Open the checklist and the first rule's editor.
-    const stigLink = page.locator("table").last().getByRole("button").first();
+    // Open the checklist and the first rule's editor. Scope by table
+    // accessible name so the AssetDetail Sharing table doesn't shadow.
+    const stigLink = page
+      .getByRole("table", { name: /Applied STIGs/i })
+      .getByRole("button")
+      .first();
     await stigLink.click();
     await expect(page.getByRole("heading", { name: /^Rules/ })).toBeVisible({
       timeout: 10_000,
     });
-    await page.locator("table").last().getByRole("button").first().click();
+    await page
+      .getByRole("table", { name: /Rules/i })
+      .getByRole("button")
+      .first()
+      .click();
     const editModal = page.getByRole("dialog").last();
     await expect(editModal).toBeVisible();
 

@@ -60,8 +60,13 @@ test.describe("Systems / per-asset checklists", () => {
     await page.getByRole("option").first().click();
     await applyModal.getByRole("button", { name: "Apply", exact: true }).click();
 
-    // Click into the checklist (the STIG link in the table)
-    const stigLink = page.locator("table").last().getByRole("button").first();
+    // Click into the checklist (the STIG link in the Applied STIGs table).
+    // Scope by the table's accessible name so the new Sharing table on
+    // AssetDetail doesn't shadow this selector.
+    const stigLink = page
+      .getByRole("table", { name: /Applied STIGs/i })
+      .getByRole("button")
+      .first();
     await stigLink.click();
 
     await expect(
