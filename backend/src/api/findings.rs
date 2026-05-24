@@ -4,8 +4,20 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// Tri-state for PATCH-style fields: absent (leave alone), null (clear), or
+/// some new value. Encoded as `Option<Option<T>>`; serde's `default` makes a
+/// missing field deserialize to `None`, while an explicit `null` lands as
+/// `Some(None)` thanks to this helper.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 use crate::api::auth::AuthUser;
 use crate::severity::weighted_score;
@@ -271,12 +283,15 @@ pub struct BulkPatch {
     pub status: Option<String>,
     pub finding_details: Option<String>,
     pub comments: Option<String>,
-    /// Present = set assignee to this user_id. Absent = leave each target's
-    /// existing assignee alone. Clearing an existing assignee via bulk is
-    /// not supported in MVP (would need null-vs-absent distinction).
-    pub assignee_id: Option<String>,
-    /// Same semantics as assigneeId.
-    pub due_date: Option<NaiveDate>,
+    /// Tri-state: absent = leave each target's existing assignee alone,
+    /// `Some(Some(uuid))` = reassign to that user, `Some(None)` = unassign
+    /// (clear) the field. The `deserialize_some` helper preserves the
+    /// null-vs-missing distinction that vanilla `Option<String>` collapses.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub assignee_id: Option<Option<String>>,
+    /// Tri-state with the same semantics as `assignee_id`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub due_date: Option<Option<NaiveDate>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,15 +387,18 @@ pub async fn bulk_handler(
             .clone()
             .or_else(|| existing.as_ref().map(|e| e.comments.clone()))
             .unwrap_or_default();
-        let assignee_id = req
-            .patch
-            .assignee_id
-            .clone()
-            .or_else(|| existing.as_ref().and_then(|e| e.assignee_id.clone()));
-        let due_date = req
-            .patch
-            .due_date
-            .or_else(|| existing.as_ref().and_then(|e| e.due_date));
+        // Tri-state: None = field absent from request (keep existing),
+        // Some(None) = explicit null (clear it), Some(Some(v)) = set it.
+        let assignee_id = match &req.patch.assignee_id {
+            None => existing.as_ref().and_then(|e| e.assignee_id.clone()),
+            Some(None) => None,
+            Some(Some(v)) => Some(v.clone()),
+        };
+        let due_date = match &req.patch.due_date {
+            None => existing.as_ref().and_then(|e| e.due_date),
+            Some(None) => None,
+            Some(Some(d)) => Some(*d),
+        };
 
         crate::db_checklists::upsert_rule(
             pool,
