@@ -18,6 +18,7 @@ import DiffView from "./components/DiffView.jsx";
 import RuleDetail from "./components/RuleDetail.jsx";
 import STIGWriter from "./components/STIGWriter.jsx";
 import AssetsLibrary from "./components/AssetsLibrary.jsx";
+import AssetGroupsPage from "./components/AssetGroupsPage.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import MyFindings from "./components/MyFindings.jsx";
 import AdminConsole from "./components/AdminConsole.jsx";
@@ -61,6 +62,7 @@ export default function App() {
       "viewer",
       "writer",
       "systems",
+      "groups",
       "dashboard",
       "myfindings",
       "admin",
@@ -90,6 +92,7 @@ export default function App() {
           "viewer",
           "writer",
           "systems",
+          "groups",
           "dashboard",
           "myfindings",
           "admin",
@@ -110,11 +113,17 @@ export default function App() {
 
   const isWriter = appMode === "writer";
   const isSystems = appMode === "systems";
+  const isGroups = appMode === "groups";
   const isDashboard = appMode === "dashboard";
   const isMyFindings = appMode === "myfindings";
   const isAdmin = appMode === "admin";
   const isLibraryMode =
-    !isWriter && !isSystems && !isDashboard && !isMyFindings && !isAdmin;
+    !isWriter &&
+    !isSystems &&
+    !isGroups &&
+    !isDashboard &&
+    !isMyFindings &&
+    !isAdmin;
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isDiffMode = diffPair !== null;
@@ -233,6 +242,12 @@ export default function App() {
     },
     {
       type: "button",
+      text: "Groups",
+      variant: isGroups ? "primary-button" : undefined,
+      onClick: () => navigateTo("groups"),
+    },
+    {
+      type: "button",
       text: "Dashboard",
       variant: isDashboard ? "primary-button" : undefined,
       onClick: () => navigateTo("dashboard"),
@@ -338,6 +353,8 @@ export default function App() {
     content = <MyFindings />;
   } else if (isSystems) {
     content = <AssetsLibrary />;
+  } else if (isGroups) {
+    content = <AssetGroupsPage />;
   } else if (isWriter) {
     content = (
       <STIGWriter
