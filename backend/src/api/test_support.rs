@@ -1,0 +1,274 @@
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::api::compliance_report;
+use crate::api::webhooks::run_overdue_digest;
+use crate::audit_retention;
+use crate::AppState;
+
+/// Roles the system understands. Kept in sync with the allowlist in
+/// `api::admin::update_user_role_handler` so the test-bypass set-role
+/// endpoint can't be used to sneak in an unrecognized value.
+const VALID_ROLES: &[&str] = &["author", "reviewer", "admin", "viewer"];
+
+/// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
+/// Only registered when STIG_ENV != "production".
+pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
+    let result = sqlx::query("TRUNCATE draft_comments, stig_drafts, users CASCADE")
+        .execute(state.pool.as_ref())
+        .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test reset failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetRoleRequest {
+    pub user_id: String,
+    pub role: String,
+}
+
+#[derive(Deserialize)]
+pub struct BackdateRequest {
+    pub checklist_id: String,
+    pub rule_id: String,
+    pub days: i64,
+}
+
+#[derive(Deserialize)]
+pub struct BumpStigRequest {
+    pub stig_id: String,
+    pub version: String,
+    pub release_info: String,
+}
+
+#[derive(Deserialize)]
+pub struct BackdateBaselineRequest {
+    pub baseline_id: String,
+    pub days: i64,
+}
+
+/// POST /api/test/set-role — update a user's role for E2E workflow testing.
+pub async fn set_role_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SetRoleRequest>,
+) -> StatusCode {
+    if !VALID_ROLES.contains(&req.role.as_str()) {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Test-bypass users are inserted with provider='test' and sub=<X-User-Id>.
+    // E2E specs pass the same X-User-Id string here, so match on (provider, sub).
+    let result = sqlx::query("UPDATE users SET role = $1 WHERE provider = 'test' AND sub = $2")
+        .bind(&req.role)
+        .bind(&req.user_id)
+        .execute(state.pool.as_ref())
+        .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test set-role failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/backdate-rule — shift a checklist_rule's updated_at into
+/// the past so the "stale" filter can be exercised without sleeping. Used
+/// by E2E only.
+pub async fn backdate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BackdateRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE checklist_rules \
+         SET updated_at = NOW() - ($1 || ' days')::INTERVAL \
+         WHERE checklist_id = $2 AND rule_id = $3",
+    )
+    .bind(req.days.to_string())
+    .bind(&req.checklist_id)
+    .bind(&req.rule_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test backdate failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/backdate-baseline — shift a baseline's `created_at`
+/// into the past so the "stale baseline" reminder can be exercised
+/// without sleeping for 90 days. Used by E2E only.
+pub async fn backdate_baseline_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BackdateBaselineRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE baselines \
+         SET created_at = NOW() - ($1 || ' days')::INTERVAL \
+         WHERE id = $2",
+    )
+    .bind(req.days.to_string())
+    .bind(&req.baseline_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test backdate-baseline failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/run-digest — synchronously run the overdue-digest
+/// sweep once and return the number of webhooks attempted. Used by E2E
+/// to drive the digest path without waiting for the 24h scheduler.
+pub async fn run_digest_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match run_overdue_digest(state.pool.as_ref()).await {
+        Ok(count) => Ok(Json(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("Test run-digest failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct RunReportRequest {
+    #[serde(default = "default_report_days")]
+    pub range_days: i32,
+}
+
+fn default_report_days() -> i32 {
+    7
+}
+
+/// POST /api/test/run-report — synchronously generate a compliance
+/// report once and return its id. Used by E2E to drive the report
+/// path without waiting for the weekly scheduler.
+pub async fn run_report_handler(
+    State(state): State<AppState>,
+    body: Option<Json<RunReportRequest>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match compliance_report::run_report(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        req.range_days,
+    )
+    .await
+    {
+        Ok(row) => Ok(Json(json!({
+            "id": row.id,
+            "generatedAt": row.generated_at,
+            "pdfPath": row.pdf_path,
+        }))),
+        Err(e) => {
+            tracing::error!("Test run-report failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RunRetentionRequest {
+    pub retain_days: i64,
+    pub archive: bool,
+}
+
+/// POST /api/test/run-retention — synchronously run the audit-retention
+/// prune once and return the row count deleted. Used by E2E to drive
+/// the housekeeping path without waiting for the 24h scheduler.
+pub async fn run_retention_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RunRetentionRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match audit_retention::run_prune(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        req.retain_days,
+        req.archive,
+    )
+    .await
+    {
+        Ok(pruned) => Ok(Json(json!({ "pruned": pruned }))),
+        Err(e) => {
+            tracing::error!("Test run-retention failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BackdateAuditRequest {
+    pub rule_id: String,
+    pub days: i64,
+}
+
+/// POST /api/test/backdate-audit — shift every `rule_audit` row whose
+/// `rule_id` matches into the past by N days. Used by the retention
+/// E2E spec to fabricate "old" audit rows without waiting a year.
+pub async fn backdate_audit_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BackdateAuditRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE rule_audit \
+         SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
+         WHERE rule_id = $2",
+    )
+    .bind(req.days.to_string())
+    .bind(&req.rule_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test backdate-audit failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// POST /api/test/bump-stig — change a `stigs_catalog` row's version +
+/// release_info to simulate a newer revision landing from DISA. Used by
+/// the drift E2E spec to flip a checklist's `outdated` flag without
+/// running a real sync.
+pub async fn bump_stig_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BumpStigRequest>,
+) -> StatusCode {
+    let result = sqlx::query(
+        "UPDATE stigs_catalog \
+         SET version = $1, release_info = $2, last_updated = NOW() \
+         WHERE id = $3",
+    )
+    .bind(&req.version)
+    .bind(&req.release_info)
+    .bind(&req.stig_id)
+    .execute(state.pool.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(e) => {
+            tracing::error!("Test bump-stig failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}

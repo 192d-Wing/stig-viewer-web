@@ -1,0 +1,105 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8081"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+    command: start-dev --import-realm
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./dev/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8081 && printf 'GET /realms/stig-viewer/.well-known/openid-configuration HTTP/1.1\\r\\nHost: localhost:8081\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: stig
+      POSTGRES_PASSWORD: stig_local
+      POSTGRES_DB: stig_viewer
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stig -d stig_viewer"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    environment:
+      DATABASE_URL: postgres://stig:stig_local@postgres:5432/stig_viewer
+      PORT: "8080"
+      RUST_LOG: info
+      STIG_ENV: development
+      # Hours between DISA sync runs; set to a huge number to effectively disable
+      # (used by CI to keep startup fast and avoid hitting external URLs).
+      STIG_SYNC_INTERVAL_HOURS: ${STIG_SYNC_INTERVAL_HOURS:-24}
+      # OIDC config. Two URLs because the IdP is reached on two networks:
+      #   OIDC_INTERNAL_URL — backend-to-Keycloak via the docker network.
+      #                       Used for discovery, token exchange, JWKS fetch.
+      #   OIDC_PUBLIC_URL   — Keycloak as the browser sees it on the host.
+      #                       Used to rewrite the auth-endpoint URL we redirect
+      #                       the user to, and as the expected token issuer.
+      # Override either from the shell to point at a different IdP, e.g.:
+      #   OIDC_INTERNAL_URL=https://idp.example.com/realms/foo \
+      #   OIDC_PUBLIC_URL=https://idp.example.com \
+      #   docker compose up
+      OIDC_INTERNAL_URL: ${OIDC_INTERNAL_URL:-http://keycloak:8081/realms/stig-viewer}
+      OIDC_PUBLIC_URL:   ${OIDC_PUBLIC_URL:-http://localhost:8081}
+      OIDC_CLIENT_ID:    ${OIDC_CLIENT_ID:-stig-viewer-app}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-dev-only-not-a-real-secret}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}
+      FRONTEND_URL: ${VITE_API_URL_FRONTEND:-http://localhost:5173}
+      # Allow the X-User-Id test bypass. Production deployments MUST leave
+      # this unset (the backend additionally refuses it when STIG_ENV=production).
+      ALLOW_TEST_AUTH_HEADER: ${ALLOW_TEST_AUTH_HEADER:-true}
+      CARGO_TARGET_DIR: /target
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend:/app
+      - backend_target:/target
+      - cargo_registry:/usr/local/cargo/registry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    command: cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      # Backend origin embedded into the Vite bundle + CSP connect-src.
+      # Override from the host shell to point at a non-localhost backend, e.g.:
+      #   VITE_API_URL=http://192.168.1.5:8080 docker compose up
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8080}
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./:/app
+      - /app/backend
+      - /app/node_modules
+      - /app/dist
+    command: npm run dev -- --host 0.0.0.0
+
+volumes:
+  postgres_data:
+  backend_target:
+  cargo_registry:
