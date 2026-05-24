@@ -21,4 +21,5 @@ pub mod saved_searches;
 pub mod stig;
 pub mod test_support;
 pub mod upload;
+pub mod viewer_guard;
 pub mod webhooks;
