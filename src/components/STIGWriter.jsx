@@ -112,6 +112,17 @@ function DraftsTable({ onOpenDraft, onRefresh }) {
       width: 160,
     },
     {
+      id: 'assignedReviewer',
+      header: 'Reviewer',
+      cell: (item) =>
+        item.assignedReviewerId ? (
+          <Badge color="blue">Assigned to {item.assignedReviewerName || 'reviewer'}</Badge>
+        ) : (
+          <Badge color="grey">Open for review</Badge>
+        ),
+      width: 220,
+    },
+    {
       id: 'version',
       header: 'Version',
       cell: (item) => item.version || '—',
@@ -415,10 +426,42 @@ function DraftEditor({ draftId, onBack }) {
     }
   }, [draftId, fetchComments])
 
-  const handleSubmit = useCallback(() => doTransition('submit'), [doTransition])
   const handleWithdraw = useCallback(() => doTransition('revise'), [doTransition])
   const handleReview = useCallback(() => doTransition('review'), [doTransition])
   const handleRevise = useCallback(() => doTransition('revise'), [doTransition])
+
+  // Submit-with-reviewer modal state. Reviewer options are fetched lazily
+  // the first time the modal opens to avoid an extra API call on every
+  // draft view.
+  const [showSubmitModal, setShowSubmitModal] = useState(false)
+  const [reviewerOptions, setReviewerOptions] = useState([])
+  const [selectedReviewer, setSelectedReviewer] = useState(null)
+
+  const openSubmitModal = useCallback(async () => {
+    setShowSubmitModal(true)
+    setSelectedReviewer(null)
+    try {
+      const users = await apiGet('/api/users')
+      const eligible = (users || []).filter(
+        (u) => u.role === 'reviewer' || u.role === 'admin',
+      )
+      setReviewerOptions([
+        { label: 'Any reviewer', value: '' },
+        ...eligible.map((u) => ({ label: u.displayName, value: u.id })),
+      ])
+    } catch {
+      setReviewerOptions([{ label: 'Any reviewer', value: '' }])
+    }
+  }, [])
+
+  const handleSubmit = useCallback(async () => {
+    const body = selectedReviewer && selectedReviewer.value
+      ? { assignedReviewerId: selectedReviewer.value }
+      : undefined
+    await doTransition('submit', body)
+    setShowSubmitModal(false)
+    setSelectedReviewer(null)
+  }, [doTransition, selectedReviewer])
 
   const [showApproveModal, setShowApproveModal] = useState(false)
   const [showRejectModal, setShowRejectModal] = useState(false)
@@ -507,7 +550,7 @@ function DraftEditor({ draftId, onBack }) {
 
   if (status === 'draft') {
     workflowActions.push(
-      <Button key="submit" variant="primary" onClick={handleSubmit}>
+      <Button key="submit" variant="primary" onClick={openSubmitModal}>
         Submit for Review
       </Button>,
     )
@@ -964,6 +1007,36 @@ function DraftEditor({ draftId, onBack }) {
           },
         ]}
       />
+
+      {/* Submit modal — optional reviewer selection */}
+      <Modal
+        visible={showSubmitModal}
+        onDismiss={() => setShowSubmitModal(false)}
+        header="Submit Draft for Review"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button onClick={() => setShowSubmitModal(false)}>Cancel</Button>
+              <Button variant="primary" onClick={handleSubmit} data-testid="confirm-submit">
+                Submit
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <FormField
+          label="Send to reviewer"
+          description="Leave on 'Any reviewer' to let any reviewer claim this draft."
+        >
+          <Select
+            data-testid="reviewer-select"
+            selectedOption={selectedReviewer || { label: 'Any reviewer', value: '' }}
+            onChange={({ detail }) => setSelectedReviewer(detail.selectedOption)}
+            options={reviewerOptions}
+            placeholder="Any reviewer"
+          />
+        </FormField>
+      </Modal>
 
       {/* Approve modal */}
       <Modal

@@ -174,6 +174,7 @@ export default function App() {
     assigned: [],
     overdue: [],
     mentions: [],
+    assignedDrafts: [],
     unreadCount: 0,
   });
   const [notifOpen, setNotifOpen] = useState(false);
@@ -187,6 +188,7 @@ export default function App() {
         assigned: d.assigned ?? [],
         overdue: d.overdue ?? [],
         mentions: d.mentions ?? [],
+        assignedDrafts: d.assignedDrafts ?? [],
         unreadCount: d.unreadCount ?? 0,
         lastSeen: d.lastSeen ?? null,
       });
@@ -600,6 +602,47 @@ export default function App() {
                     <em>{o.assetName}</em> · {o.stigTitle}
                     <Box variant="span" color="text-status-inactive">
                       {" "}— due {o.dueDate}
+                    </Box>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Box>
+          <Box>
+            <Box variant="h4">
+              Drafts waiting on you
+              {(notifData.assignedDrafts?.length ?? 0) > 0 &&
+                ` (${notifData.assignedDrafts.length})`}
+            </Box>
+            {(notifData.assignedDrafts?.length ?? 0) === 0 ? (
+              <Box color="text-status-inactive" padding={{ top: "xs" }}>
+                No drafts are awaiting your review.
+              </Box>
+            ) : (
+              <ul
+                style={{ paddingLeft: 18, margin: 0 }}
+                data-testid="assigned-drafts-list"
+              >
+                {notifData.assignedDrafts.map((d) => (
+                  <li
+                    key={d.draftId}
+                    data-testid="assigned-draft-item"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => {
+                      setNotifOpen(false);
+                      // Best-effort: switch to writer view. The writer
+                      // landing page lists drafts; ideally we'd open the
+                      // draft directly but that requires plumbing the
+                      // draftId through STIGWriter and is outside the
+                      // scope of this view.
+                      setWriterDraftId(d.draftId);
+                      navigateTo("writer");
+                    }}
+                  >
+                    <strong>{d.title || "(untitled draft)"}</strong> from{" "}
+                    <em>{d.byName}</em>
+                    <Box variant="span" color="text-status-inactive">
+                      {" "}— {new Date(d.at).toLocaleString()}
                     </Box>
                   </li>
                 ))}
