@@ -29,10 +29,13 @@ test.describe("Approval Workflow", () => {
     await page.getByRole("button", { name: "Open" }).first().click();
     await expect(page.getByRole("button", { name: /back/i })).toBeVisible();
 
-    // Submit for review
+    // Submit for review — this now opens a reviewer-picker modal first.
+    // Default option is "Any reviewer", so confirming submits without an
+    // assignee.
     await page
       .getByRole("button", { name: /submit for review/i })
       .click();
+    await page.getByTestId("confirm-submit").click();
 
     // Status badge should show "Submitted" (exact match to avoid flash message)
     await expect(page.getByText("Submitted", { exact: true })).toBeVisible();
