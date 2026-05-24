@@ -8,13 +8,19 @@ test.describe("Auth Gate", () => {
 
   test("unauthenticated visit shows Sign in screen", async ({ page }) => {
     await page.goto("/");
-    await expect(page.getByRole("button", { name: /sign in/i })).toBeVisible();
+    // Both Keycloak and SAML sign-in buttons render; assert the primary
+    // Keycloak path specifically rather than matching /sign in/.
+    await expect(
+      page.getByRole("button", { name: /sign in with keycloak/i }),
+    ).toBeVisible();
     await expect(page.getByText("STIG Tools").first()).toBeVisible();
   });
 
   test("clicking Sign in redirects to the IdP login page", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("button", { name: /sign in/i }).click();
+    await page
+      .getByRole("button", { name: /sign in with keycloak/i })
+      .click();
     // Backend issues a 303 to Keycloak; browser ends up on Keycloak's login form.
     await expect(page).toHaveURL(/keycloak|realms\/stig-viewer/i, {
       timeout: 10_000,
