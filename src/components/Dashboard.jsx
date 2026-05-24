@@ -156,6 +156,17 @@ export default function Dashboard() {
   const [bulkSaving, setBulkSaving] = useState(false);
   const [bulkError, setBulkError] = useState(null);
 
+  // Streamlined "Reassign" preset modal — covers the common "just change the
+  // assignee" workflow without making power-users wade through the full
+  // bulk-update form. Uses the same PATCH /api/findings/bulk endpoint with
+  // an assignee-only patch (null = unassign).
+  const [reassignOpen, setReassignOpen] = useState(false);
+  const [reassignAssigneeId, setReassignAssigneeId] = useState(null);
+  const [reassignSaving, setReassignSaving] = useState(false);
+  const [reassignError, setReassignError] = useState(null);
+  const [reassignFlash, setReassignFlash] = useState(null);
+  const [users, setUsers] = useState([]);
+
   // Recent activity (loaded with the rest of the dashboard).
   const [activity, setActivity] = useState([]);
 
@@ -292,6 +303,22 @@ export default function Dashboard() {
     setSelectedFindings([]);
   }, [drilldown, severityFilter, mineOnly]);
 
+  // Load the user list for the Reassign modal's Select. One-shot — the user
+  // directory is small and the dashboard is short-lived.
+  useEffect(() => {
+    let cancelled = false;
+    apiGet("/api/users")
+      .then((rows) => {
+        if (!cancelled) setUsers(rows);
+      })
+      .catch(() => {
+        // Non-fatal — the Select will just have an empty options list.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const openBulkModal = useCallback(() => {
     setBulkDraft({ status: "", findingDetails: "", comments: "" });
     setBulkError(null);
@@ -330,6 +357,49 @@ export default function Dashboard() {
       setBulkSaving(false);
     }
   }, [selectedFindings, bulkDraft, refresh]);
+
+  const openReassignModal = useCallback(() => {
+    setReassignAssigneeId(null);
+    setReassignError(null);
+    setReassignOpen(true);
+  }, []);
+
+  const saveReassign = useCallback(async () => {
+    if (selectedFindings.length === 0) return;
+    setReassignSaving(true);
+    setReassignError(null);
+    try {
+      // Explicit `null` reaches the backend as the JSON literal null, which
+      // the bulk endpoint's tri-state assignee_id treats as "unassign". A
+      // selected user id reassigns. `undefined` would be omitted by JSON.
+      await apiJson("/api/findings/bulk", "PATCH", {
+        targets: selectedFindings.map((f) => ({
+          checklistId: f.checklistId,
+          ruleId: f.ruleId,
+        })),
+        patch: { assigneeId: reassignAssigneeId },
+      });
+      const count = selectedFindings.length;
+      const name = reassignAssigneeId
+        ? users.find((u) => u.id === reassignAssigneeId)?.displayName ??
+          "selected user"
+        : null;
+      setReassignFlash({
+        count,
+        text: name
+          ? `Reassigned ${count} finding${count === 1 ? "" : "s"} to ${name}.`
+          : `Unassigned ${count} finding${count === 1 ? "" : "s"}.`,
+      });
+      setReassignOpen(false);
+      setSelectedFindings([]);
+      setRefreshTick((n) => n + 1);
+      await refresh();
+    } catch (err) {
+      setReassignError(err.message);
+    } finally {
+      setReassignSaving(false);
+    }
+  }, [selectedFindings, reassignAssigneeId, users, refresh]);
 
   // Close the expanded panel whenever the drill-down/filter changes.
   useEffect(() => {
@@ -500,6 +570,17 @@ export default function Dashboard() {
         >
           Compliance dashboard
         </Header>
+
+        {reassignFlash && (
+          <Alert
+            type="success"
+            dismissible
+            onDismiss={() => setReassignFlash(null)}
+            data-testid="reassign-flash"
+          >
+            {reassignFlash.text}
+          </Alert>
+        )}
 
         {/* KPI row — 4-column grid; 7 cards wrap to 4 + 3. */}
         <ColumnLayout columns={4} variant="text-grid">
@@ -1001,6 +1082,16 @@ export default function Dashboard() {
                         ? ` (${selectedFindings.length})`
                         : ""}
                     </Button>
+                    <Button
+                      disabled={selectedFindings.length === 0}
+                      onClick={openReassignModal}
+                      data-testid="reassign-open"
+                    >
+                      Reassign
+                      {selectedFindings.length > 0
+                        ? ` (${selectedFindings.length})`
+                        : ""}
+                    </Button>
                     <Button onClick={() => setDrilldown(null)}>Close</Button>
                   </SpaceBetween>
                 }
@@ -1354,6 +1445,64 @@ export default function Dashboard() {
               />
             </FormField>
             {bulkError && <Alert type="error">{bulkError}</Alert>}
+          </SpaceBetween>
+        </Modal>
+
+        {/* Reassign-only preset modal — single field, one action. */}
+        <Modal
+          visible={reassignOpen}
+          onDismiss={() => setReassignOpen(false)}
+          header={`Reassign ${selectedFindings.length} finding${selectedFindings.length === 1 ? "" : "s"}`}
+          data-testid="reassign-modal"
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button variant="link" onClick={() => setReassignOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={reassignSaving}
+                  onClick={saveReassign}
+                  data-testid="reassign-submit"
+                >
+                  Reassign
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="p" color="text-body-secondary">
+              Pick a new assignee for every selected finding, or choose
+              "Unassign" to clear the field.
+            </Box>
+            <FormField label="Assignee">
+              <Select
+                selectedOption={
+                  reassignAssigneeId
+                    ? {
+                        value: reassignAssigneeId,
+                        label:
+                          users.find((u) => u.id === reassignAssigneeId)
+                            ?.displayName ?? reassignAssigneeId,
+                      }
+                    : { value: "", label: "Unassign" }
+                }
+                onChange={({ detail }) =>
+                  setReassignAssigneeId(detail.selectedOption.value || null)
+                }
+                options={[
+                  { value: "", label: "Unassign" },
+                  ...users.map((u) => ({
+                    value: u.id,
+                    label: u.displayName,
+                  })),
+                ]}
+                data-testid="reassign-select"
+              />
+            </FormField>
+            {reassignError && <Alert type="error">{reassignError}</Alert>}
           </SpaceBetween>
         </Modal>
 
