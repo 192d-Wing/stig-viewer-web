@@ -16,6 +16,13 @@ pub struct AssetRow {
     pub updated_at: DateTime<Utc>,
     #[sqlx(default)]
     pub tags: Vec<String>,
+    /// When true, transitions to a closing finding status
+    /// (`not_a_finding` / `not_applicable`) on this asset's checklists do
+    /// NOT apply directly. They instead create a `finding_approvals` row
+    /// that a reviewer/admin must approve before the rule's status
+    /// actually changes. Default FALSE preserves legacy behavior.
+    #[sqlx(default)]
+    pub requires_approval: bool,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -139,6 +146,24 @@ pub async fn update_asset(
     .bind(hostname)
     .bind(description)
     .bind(classification)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update the per-asset approval-policy flag.
+pub async fn set_requires_approval(
+    pool: &PgPool,
+    id: &str,
+    requires_approval: bool,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE assets \
+         SET requires_approval = $1, updated_at = NOW() \
+         WHERE id = $2",
+    )
+    .bind(requires_approval)
     .bind(id)
     .execute(pool)
     .await?;

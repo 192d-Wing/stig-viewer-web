@@ -94,6 +94,7 @@ pub async fn create_asset_handler(
         created_at: now,
         updated_at: now,
         tags: tags.clone(),
+        requires_approval: false,
     };
     db_assets::insert_asset(state.pool.as_ref(), &asset)
         .await
