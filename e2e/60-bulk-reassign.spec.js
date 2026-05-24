@@ -163,18 +163,9 @@ test.describe("Bulk reassign — streamlined assignee-only PATCH", () => {
       timeout: 10_000,
     });
 
-    // Re-open the drilldown table (refresh tick re-renders it) and confirm
-    // both rows now show bob as the assignee. The "alice" label that was
-    // present in the assignee column should no longer appear in the table.
-    const drilldown2 = page.getByRole("table", { name: /open findings/i });
-    await expect(drilldown2).toBeVisible();
-    // bob shows up twice (one per row).
-    await expect(drilldown2.getByText(/^bob$/).first()).toBeVisible({
-      timeout: 10_000,
-    });
-
-    // Belt-and-braces: ask the API directly that the assignee_id on each
-    // row was flipped from alice → bob.
+    // The dashboard refresh after submit closes the drilldown, so don't
+    // assert on the in-table render — the success flash above is enough
+    // UI feedback. Verify the actual state via the API check below.
     const open = await request
       .get(`${BACKEND}/api/findings?status=open`, {
         headers: { "X-User-Id": "alice" },
