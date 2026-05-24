@@ -129,6 +129,11 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [addCategory, setAddCategory] = useState("Windows");
   const [addStatus, setAddStatus] = useState("idle");
   const [addResult, setAddResult] = useState(null);
+  // Lint state for the staged JSON file. `lintReport` is null when nothing
+  // has been linted yet (e.g. file is a .zip, or no file picked).
+  const [lintReport, setLintReport] = useState(null);
+  const [lintStatus, setLintStatus] = useState("idle");
+  const [lintExpanded, setLintExpanded] = useState(false);
 
   // Library bundle import state
   const [libFiles, setLibFiles] = useState([]);
@@ -251,6 +256,48 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
     [onStartDraft],
   );
 
+  // Lint a staged JSON file via /api/stigs/lint. Only runs for *.json — ZIP
+  // uploads still go through the XCCDF parser server-side. Sets
+  // `lintReport` so the UI can render the issue list and decide whether to
+  // disable the upload button.
+  const runLint = useCallback(async (file) => {
+    if (!file) {
+      setLintReport(null);
+      setLintStatus("idle");
+      return;
+    }
+    const isJson =
+      file.name.toLowerCase().endsWith(".json") ||
+      file.type === "application/json";
+    if (!isJson) {
+      setLintReport(null);
+      setLintStatus("idle");
+      return;
+    }
+    setLintStatus("loading");
+    setLintReport(null);
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const r = await fetch(`${BACKEND}/api/stigs/lint`, {
+        method: "POST",
+        body,
+        credentials: "include",
+      });
+      if (!r.ok) throw new Error(`Lint failed: ${r.status}`);
+      const report = await r.json();
+      setLintReport(report);
+      setLintStatus("done");
+    } catch (err) {
+      setLintReport({
+        rulesCount: 0,
+        errors: [{ severity: "error", path: "", message: err.message }],
+        warnings: [],
+      });
+      setLintStatus("done");
+    }
+  }, []);
+
   const handleAddSubmit = useCallback(
     async (e) => {
       e.preventDefault();
@@ -273,6 +320,9 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
         setAddStatus("success");
         setAddFiles([]);
         setAddId("");
+        setLintReport(null);
+        setLintStatus("idle");
+        setLintExpanded(false);
         fetchCatalog();
       } catch (err) {
         setAddResult({ error: err.message });
@@ -620,8 +670,11 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
                 <SpaceBetween size="l">
                   <FileUpload
                     value={addFiles}
-                    onChange={({ detail }) => setAddFiles(detail.value)}
-                    accept=".zip"
+                    onChange={({ detail }) => {
+                      setAddFiles(detail.value);
+                      runLint(detail.value[0]);
+                    }}
+                    accept=".zip,.json"
                     showFileSize
                     showFileLastModified
                     i18nStrings={{
@@ -632,7 +685,72 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
                       limitShowMore: "Show more files",
                       errorIconAriaLabel: "Error",
                     }}
+                    data-testid="add-stig-file-input"
                   />
+                  {lintStatus === "loading" && (
+                    <Alert type="info" data-testid="stig-lint-loading">
+                      Validating STIG JSON…
+                    </Alert>
+                  )}
+                  {lintStatus === "done" && lintReport &&
+                    lintReport.errors.length === 0 &&
+                    lintReport.warnings.length === 0 && (
+                      <Alert type="success" data-testid="stig-lint-clean">
+                        {lintReport.rulesCount} rules · no issues
+                      </Alert>
+                    )}
+                  {lintStatus === "done" && lintReport &&
+                    (lintReport.errors.length > 0 ||
+                      lintReport.warnings.length > 0) && (
+                      <Alert
+                        type={lintReport.errors.length > 0 ? "error" : "warning"}
+                        data-testid={
+                          lintReport.errors.length > 0
+                            ? "stig-lint-errors"
+                            : "stig-lint-warnings"
+                        }
+                        header={
+                          <span>
+                            {lintReport.errors.length} errors,{" "}
+                            {lintReport.warnings.length} warnings
+                          </span>
+                        }
+                        action={
+                          <Button
+                            variant="inline-link"
+                            onClick={() => setLintExpanded((v) => !v)}
+                          >
+                            {lintExpanded ? "Hide details" : "Show details"}
+                          </Button>
+                        }
+                      >
+                        {lintExpanded && (
+                          <Box data-testid="stig-lint-details">
+                            <ul style={{ margin: 0, paddingLeft: 20 }}>
+                              {[
+                                ...lintReport.errors.map((i) => ({
+                                  ...i,
+                                  kind: "error",
+                                })),
+                                ...lintReport.warnings.map((i) => ({
+                                  ...i,
+                                  kind: "warning",
+                                })),
+                              ].map((issue, idx) => (
+                                <li
+                                  key={idx}
+                                  data-testid={`stig-lint-issue-${idx}`}
+                                >
+                                  <strong>{issue.kind}</strong>{" "}
+                                  <code>{issue.path || "/"}</code> ·{" "}
+                                  {issue.message}
+                                </li>
+                              ))}
+                            </ul>
+                          </Box>
+                        )}
+                      </Alert>
+                    )}
                   <ColumnLayout columns={2}>
                     <FormField label="ID" description="Slug, e.g. windows-11">
                       <Input
@@ -657,8 +775,14 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
                   <Button
                     variant="primary"
                     loading={addStatus === "loading"}
-                    disabled={addFiles.length === 0 || !addId.trim()}
+                    disabled={
+                      addFiles.length === 0 ||
+                      !addId.trim() ||
+                      (lintReport && lintReport.errors.length > 0) ||
+                      lintStatus === "loading"
+                    }
                     formAction="submit"
+                    data-testid="add-stig-upload-button"
                   >
                     Upload to Library
                   </Button>

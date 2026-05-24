@@ -6,6 +6,7 @@ use axum::{
 use chrono::Utc;
 
 use crate::{
+    api::stig_validator::lint_stig,
     db::{upsert_catalog, CatalogEntry},
     parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf},
     AppState,
@@ -74,6 +75,22 @@ pub async fn upload_stig(
     let stig = parse_xccdf(&xccdf).map_err(|e| {
         (StatusCode::UNPROCESSABLE_ENTITY, format!("XCCDF parse failed: {e}"))
     })?;
+
+    // Lint the JSON shape *before* we write anything. We feed in the
+    // multipart-supplied `id` + `category` alongside the parsed STIG so the
+    // lint pass sees the full top-level shape it expects.
+    let mut lint_value = serde_json::to_value(&stig).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Lint pre-serialise failed: {e}"))
+    })?;
+    if let Some(obj) = lint_value.as_object_mut() {
+        obj.insert("id".into(), serde_json::Value::String(id.clone()));
+        obj.insert("category".into(), serde_json::Value::String(category.clone()));
+    }
+    let lint_report = lint_stig(&lint_value);
+    if !lint_report.errors.is_empty() {
+        let body = serde_json::to_string(&lint_report).unwrap_or_else(|_| "{}".into());
+        return Err((StatusCode::BAD_REQUEST, body));
+    }
 
     // Write JSON file
     let stigs_dir = state.config.data_dir.join("stigs");
