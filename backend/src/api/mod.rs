@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod checklists;
 pub mod compliance_report;
 pub mod dashboard;
+pub mod diff;
 pub mod drafts;
 pub mod findings;
 pub mod notifications;

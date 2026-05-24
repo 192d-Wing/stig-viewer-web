@@ -17,6 +17,7 @@ import Toggle from "@cloudscape-design/components/toggle";
 import Modal from "@cloudscape-design/components/modal";
 import FormField from "@cloudscape-design/components/form-field";
 import Input from "@cloudscape-design/components/input";
+import DatePicker from "@cloudscape-design/components/date-picker";
 import { apiFetch, apiGet, apiJson } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 import { useUrlState } from "../hooks/useUrlState.js";
@@ -723,6 +724,9 @@ export default function Dashboard() {
 
         {/* Compliance heatmap: asset × STIG matrix */}
         {data.byAsset.length > 0 && <HeatmapSection byAsset={data.byAsset} />}
+
+        {/* Rule-level diff: "what changed on every system since <date>" */}
+        <DiffSection />
 
         {/* Per-asset / per-checklist progress */}
         <Table
@@ -1620,6 +1624,163 @@ function cellColor(c) {
     return { bg: "#7a5e1c", fg: "#fff", label: "↻" };
   }
   return { bg: "#1c5e2d", fg: "#fff", label: "✓" };
+}
+
+// Cloudscape DatePicker emits YYYY-MM-DD strings; default to 7 days ago.
+function defaultDiffSince() {
+  const d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+const DIFF_FIELD_LABELS = {
+  status: "Status",
+  finding_details: "Finding details",
+  comments: "Comments",
+  assignee_id: "Assignee",
+  due_date: "Due date",
+};
+
+function diffValueDisplay(field, value) {
+  if (value === null || value === undefined || value === "") return "(unset)";
+  if (field === "status") {
+    return STATUS_LABEL[value] ?? value;
+  }
+  if (value.length > 80) return value.slice(0, 80) + "…";
+  return value;
+}
+
+const STATUS_LABEL = {
+  open: "Open",
+  not_a_finding: "Not a finding",
+  not_applicable: "Not applicable",
+  not_reviewed: "Not reviewed",
+};
+
+function DiffSection() {
+  const [since, setSince] = useUrlState({ diffSince: defaultDiffSince() });
+  const [rules, setRules] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!since.diffSince) return undefined;
+    setLoading(true);
+    setError(null);
+    apiGet(`/api/diff?since=${encodeURIComponent(since.diffSince)}`)
+      .then((res) => {
+        if (!cancelled) setRules(res.rules ?? []);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [since.diffSince]);
+
+  // Flatten rules → per-field rows for the Table.
+  const flatRows = useMemo(() => {
+    const out = [];
+    for (const r of rules) {
+      for (const c of r.changes) {
+        out.push({
+          key: `${r.checklistId}:${r.ruleId}:${c.field}`,
+          assetName: r.assetName,
+          stigTitle: r.stigTitle,
+          ruleId: r.ruleId,
+          field: c.field,
+          from: c.from,
+          to: c.to,
+          by: c.by,
+          at: c.at,
+        });
+      }
+    }
+    return out;
+  }, [rules]);
+
+  return (
+    <Container
+      header={
+        <Header
+          variant="h2"
+          description="Every rule whose status, assignee, due date, finding details, or comments changed inside the window. Repeated flips collapse to first → latest."
+          actions={
+            <Box float="right" padding={{ top: "xxs" }}>
+              <DatePicker
+                value={since.diffSince ?? ""}
+                onChange={({ detail }) =>
+                  setSince({ diffSince: detail.value || defaultDiffSince() })
+                }
+                placeholder="YYYY/MM/DD"
+                data-testid="diff-since-picker"
+              />
+            </Box>
+          }
+        >
+          Changes since {since.diffSince}
+        </Header>
+      }
+    >
+      {error && <Alert type="error">{error}</Alert>}
+      <Table
+        variant="embedded"
+        items={flatRows}
+        trackBy="key"
+        loading={loading}
+        loadingText="Loading diff…"
+        empty={
+          <Box textAlign="center" padding="l" color="text-body-secondary">
+            No changes in the selected window.
+          </Box>
+        }
+        columnDefinitions={[
+          { id: "asset", header: "System", cell: (r) => r.assetName },
+          { id: "stig", header: "STIG", cell: (r) => r.stigTitle },
+          { id: "rule", header: "Rule", cell: (r) => r.ruleId },
+          {
+            id: "field",
+            header: "Field",
+            cell: (r) => DIFF_FIELD_LABELS[r.field] ?? r.field,
+          },
+          {
+            id: "from",
+            header: "From",
+            cell: (r) =>
+              r.field === "status" ? (
+                <Badge color={STATUS_COLORS[STATUS_LABEL[r.from] ?? r.from] ?? "grey"}>
+                  {diffValueDisplay(r.field, r.from)}
+                </Badge>
+              ) : (
+                diffValueDisplay(r.field, r.from)
+              ),
+          },
+          {
+            id: "to",
+            header: "To",
+            cell: (r) =>
+              r.field === "status" ? (
+                <Badge color={STATUS_COLORS[STATUS_LABEL[r.to] ?? r.to] ?? "grey"}>
+                  {diffValueDisplay(r.field, r.to)}
+                </Badge>
+              ) : (
+                diffValueDisplay(r.field, r.to)
+              ),
+          },
+          { id: "by", header: "By", cell: (r) => r.by },
+          {
+            id: "at",
+            header: "When",
+            cell: (r) => new Date(r.at).toLocaleString(),
+          },
+        ]}
+      />
+    </Container>
+  );
 }
 
 function HeatmapSection({ byAsset }) {
