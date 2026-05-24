@@ -159,7 +159,15 @@ test.describe("Per-asset finding-close approval workflow", () => {
     expect(decide.status()).toBe(200);
     const row = await decide.json();
     expect(row.status).toBe("approved");
-    expect(row.decidedBy).toBe("reviewer-bob");
+    // decidedBy is the user's generated UUID, not the X-User-Id raw value.
+    const bobId = (
+      await (
+        await request.get(`${BACKEND}/api/users/me`, {
+          headers: { "X-User-Id": "reviewer-bob" },
+        })
+      ).json()
+    ).id;
+    expect(row.decidedBy).toBe(bobId);
 
     const state = await getRuleState(request, "alice", checklistId, ruleId);
     expect(state.status).toBe("not_a_finding");
@@ -374,9 +382,11 @@ test.describe("Per-asset finding-close approval workflow", () => {
     await page.getByRole("button", { name: "approval-host" }).click();
     await expect(page.getByText("Applied STIGs")).toBeVisible();
 
+    // Cloudscape Toggle forwards data-testid to its wrapper; click the
+    // inner checkbox input so the state change actually fires.
     const toggleScope = page.getByTestId("approval-policy-toggle");
     await expect(toggleScope).toBeVisible();
-    await toggleScope.click();
+    await toggleScope.locator('input[type="checkbox"]').click();
 
     // Confirm via API the flag actually flipped before driving the UI.
     await expect
