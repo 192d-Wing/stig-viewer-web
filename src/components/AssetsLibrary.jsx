@@ -64,9 +64,12 @@ export default function AssetsLibrary() {
 
   const [deleteTarget, setDeleteTarget] = useState(null);
 
-  // Active tag filter lives in `?tag=a,b` (CSV). AND semantics.
-  const [urlState, setUrlState] = useUrlState({ tag: [] });
+  // Active filters live in the URL. `tag` is CSV with AND semantics;
+  // `group` is a single group id and narrows the list to that group's
+  // membership. Both are independent and stack with each other.
+  const [urlState, setUrlState] = useUrlState({ tag: [], group: "" });
   const activeTags = urlState.tag;
+  const activeGroup = urlState.group;
   const toggleTag = useCallback(
     (t) => {
       setUrlState({
@@ -78,17 +81,63 @@ export default function AssetsLibrary() {
     [activeTags, setUrlState],
   );
   const clearTags = useCallback(() => setUrlState({ tag: [] }), [setUrlState]);
+
+  // Available groups for the filter Select. Loaded once on mount —
+  // changes from the Groups page are rare and a refresh button isn't
+  // worth the toolbar real estate.
+  const [groups, setGroups] = useState([]);
+  const [groupMemberIds, setGroupMemberIds] = useState(null);
+
+  useEffect(() => {
+    apiGet("/api/asset-groups")
+      .then(setGroups)
+      .catch(() => {
+        // Non-fatal — groups filter just stays empty.
+        setGroups([]);
+      });
+  }, []);
+
+  // When a group is selected, fetch its membership and project down to a
+  // Set of asset ids for fast filtering. Falls back to "show nothing"
+  // (rather than "show everything") if the fetch errors so the user
+  // notices a stale selection rather than getting silently misled.
+  useEffect(() => {
+    if (!activeGroup) {
+      setGroupMemberIds(null);
+      return;
+    }
+    let cancelled = false;
+    apiGet(`/api/asset-groups/${activeGroup}/members`)
+      .then((rows) => {
+        if (!cancelled) {
+          setGroupMemberIds(new Set(rows.map((r) => r.assetId)));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGroupMemberIds(new Set());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeGroup]);
+
   const allTags = useMemo(() => {
     const set = new Set();
     for (const a of assets) for (const t of a.tags ?? []) set.add(t);
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [assets]);
   const filteredAssets = useMemo(() => {
-    if (activeTags.length === 0) return assets;
-    return assets.filter((a) =>
-      activeTags.every((t) => (a.tags ?? []).includes(t)),
-    );
-  }, [assets, activeTags]);
+    let rows = assets;
+    if (activeTags.length > 0) {
+      rows = rows.filter((a) =>
+        activeTags.every((t) => (a.tags ?? []).includes(t)),
+      );
+    }
+    if (activeGroup && groupMemberIds) {
+      rows = rows.filter((a) => groupMemberIds.has(a.id));
+    }
+    return rows;
+  }, [assets, activeTags, activeGroup, groupMemberIds]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -413,24 +462,67 @@ export default function AssetsLibrary() {
         loading={loading}
         loadingText="Loading systems"
         filter={
-          allTags.length > 0 ? (
-            <SpaceBetween direction="horizontal" size="xs">
-              <Box variant="span" color="text-status-inactive">
-                Filter by tag:
-              </Box>
-              {allTags.map((t) => (
-                <Button
-                  key={t}
-                  variant={activeTags.includes(t) ? "primary" : "normal"}
-                  onClick={() => toggleTag(t)}
-                >
-                  {t}
-                </Button>
-              ))}
-              {activeTags.length > 0 && (
-                <Button variant="inline-link" onClick={clearTags}>
-                  Clear
-                </Button>
+          allTags.length > 0 || groups.length > 0 ? (
+            <SpaceBetween direction="vertical" size="xs">
+              {allTags.length > 0 && (
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Box variant="span" color="text-status-inactive">
+                    Filter by tag:
+                  </Box>
+                  {allTags.map((t) => (
+                    <Button
+                      key={t}
+                      variant={activeTags.includes(t) ? "primary" : "normal"}
+                      onClick={() => toggleTag(t)}
+                    >
+                      {t}
+                    </Button>
+                  ))}
+                  {activeTags.length > 0 && (
+                    <Button variant="inline-link" onClick={clearTags}>
+                      Clear
+                    </Button>
+                  )}
+                </SpaceBetween>
+              )}
+              {groups.length > 0 && (
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Box variant="span" color="text-status-inactive">
+                    Filter by group:
+                  </Box>
+                  <div
+                    style={{ minWidth: 240 }}
+                    data-testid="asset-group-filter"
+                  >
+                    <Select
+                      selectedOption={
+                        activeGroup
+                          ? (groups
+                              .filter((g) => g.id === activeGroup)
+                              .map((g) => ({ label: g.name, value: g.id }))[0] ?? {
+                              label: "All groups",
+                              value: "",
+                            })
+                          : { label: "All groups", value: "" }
+                      }
+                      onChange={({ detail }) =>
+                        setUrlState({ group: detail.selectedOption.value })
+                      }
+                      options={[
+                        { label: "All groups", value: "" },
+                        ...groups.map((g) => ({ label: g.name, value: g.id })),
+                      ]}
+                    />
+                  </div>
+                  {activeGroup && (
+                    <Button
+                      variant="inline-link"
+                      onClick={() => setUrlState({ group: "" })}
+                    >
+                      Clear
+                    </Button>
+                  )}
+                </SpaceBetween>
               )}
             </SpaceBetween>
           ) : null
@@ -448,7 +540,7 @@ export default function AssetsLibrary() {
         header={
           <Header
             counter={
-              activeTags.length > 0
+              activeTags.length > 0 || activeGroup
                 ? `(${filteredAssets.length}/${assets.length})`
                 : `(${assets.length})`
             }
