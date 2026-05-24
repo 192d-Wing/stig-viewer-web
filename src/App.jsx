@@ -9,6 +9,7 @@ import Modal from "@cloudscape-design/components/modal";
 import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Alert from "@cloudscape-design/components/alert";
+import Badge from "@cloudscape-design/components/badge";
 import { exportCKL } from "./utils/exportCKL.js";
 import DropZone from "./components/DropZone.jsx";
 import StigLibrary from "./components/StigLibrary.jsx";
@@ -267,6 +268,7 @@ export default function App() {
       });
     }
   }
+  const isViewer = currentUser?.role === "viewer";
   if (currentUser) {
     utilities.push(
       {
@@ -399,6 +401,20 @@ export default function App() {
           }}
           utilities={utilities}
         />
+        {isViewer && (
+          <div
+            data-testid="viewer-badge"
+            style={{
+              position: "absolute",
+              top: 14,
+              right: 220,
+              zIndex: 1001,
+              pointerEvents: "none",
+            }}
+          >
+            <Badge color="grey">Read-only</Badge>
+          </div>
+        )}
       </div>
 
       {/* Hidden file input for Open File utility */}

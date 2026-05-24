@@ -7,6 +7,11 @@ use crate::api::webhooks::run_overdue_digest;
 use crate::audit_retention;
 use crate::AppState;
 
+/// Roles the system understands. Kept in sync with the allowlist in
+/// `api::admin::update_user_role_handler` so the test-bypass set-role
+/// endpoint can't be used to sneak in an unrecognized value.
+const VALID_ROLES: &[&str] = &["author", "reviewer", "admin", "viewer"];
+
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
 /// Only registered when STIG_ENV != "production".
 pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
@@ -54,6 +59,9 @@ pub async fn set_role_handler(
     State(state): State<AppState>,
     Json(req): Json<SetRoleRequest>,
 ) -> StatusCode {
+    if !VALID_ROLES.contains(&req.role.as_str()) {
+        return StatusCode::BAD_REQUEST;
+    }
     // Test-bypass users are inserted with provider='test' and sub=<X-User-Id>.
     // E2E specs pass the same X-User-Id string here, so match on (provider, sub).
     let result = sqlx::query("UPDATE users SET role = $1 WHERE provider = 'test' AND sub = $2")

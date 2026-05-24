@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::auth::AuthUser;
 use crate::AppState;
 
-const VALID_ROLES: &[&str] = &["author", "reviewer", "admin"];
+const VALID_ROLES: &[&str] = &["author", "reviewer", "admin", "viewer"];
 
 fn ensure_admin(user: &AuthUser) -> Result<(), StatusCode> {
     if user.role == "admin" {

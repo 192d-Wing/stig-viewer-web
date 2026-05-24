@@ -324,6 +324,10 @@ async fn main() -> Result<()> {
             get(list_webhook_deliveries_handler),
         )
         .route("/api/webhooks/:id/test", post(test_webhook_handler))
+        // Viewer-role read-only gate. Sits inside the auth layer so the
+        // `AuthUser` extension is populated before it runs (outer layer runs
+        // first, so `auth_middleware` is added LAST below).
+        .route_layer(middleware::from_fn(api::viewer_guard::viewer_guard))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

@@ -20,12 +20,14 @@ const ROLE_OPTIONS = [
   { label: "Author", value: "author" },
   { label: "Reviewer", value: "reviewer" },
   { label: "Admin", value: "admin" },
+  { label: "Viewer", value: "viewer" },
 ];
 
 const ROLE_BADGE = {
   author: "blue",
   reviewer: "green",
   admin: "red",
+  viewer: "grey",
 };
 
 // Event kinds the backend currently knows how to fire. Keep in sync
