@@ -73,6 +73,7 @@ use api::{
     },
     diff::diff_handler,
     drafts::*,
+    email::list_deliveries_handler as list_email_deliveries_handler,
     findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
     notifications::{
         get_handler as get_notifications_handler,
@@ -328,6 +329,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/assets/:id/owner",
             axum::routing::patch(admin_update_asset_owner_handler),
+        )
+        .route(
+            "/api/admin/email-deliveries",
+            get(list_email_deliveries_handler),
         )
         .route(
             "/api/saved-searches",
