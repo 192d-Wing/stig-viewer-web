@@ -26,6 +26,11 @@ use api::{
         update_asset_owner_handler as admin_update_asset_owner_handler,
         update_user_role_handler as admin_update_user_role_handler,
     },
+    asset_acl::{
+        create_handler as create_asset_acl_handler,
+        delete_handler as delete_asset_acl_handler,
+        list_handler as list_asset_acl_handler,
+    },
     asset_import::import_handler as import_assets_handler,
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
@@ -226,6 +231,14 @@ async fn main() -> Result<()> {
             get(get_asset_handler)
                 .put(update_asset_handler)
                 .delete(delete_asset_handler),
+        )
+        .route(
+            "/api/assets/:id/acl",
+            get(list_asset_acl_handler).post(create_asset_acl_handler),
+        )
+        .route(
+            "/api/assets/:id/acl/:user_id",
+            axum::routing::delete(delete_asset_acl_handler),
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
         .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))

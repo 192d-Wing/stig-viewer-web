@@ -8,6 +8,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::db_assets;
 use crate::db_attachments::{self, AttachmentRow};
@@ -56,7 +57,7 @@ pub async fn upload_handler(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<AttachmentRow>), StatusCode> {
     let (_checklist, asset) = load_checklist_and_asset(&state, &checklist_id).await?;
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -239,7 +240,7 @@ pub async fn delete_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let (_checklist, asset) = load_checklist_and_asset(&state, &row.checklist_id).await?;
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
