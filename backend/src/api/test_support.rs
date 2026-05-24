@@ -1,8 +1,10 @@
 use axum::{extract::State, http::StatusCode, Json};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::compliance_report;
+use crate::api::saml::saml_login_user;
 use crate::api::webhooks::run_overdue_digest;
 use crate::audit_retention;
 use crate::AppState;
@@ -243,6 +245,67 @@ pub async fn backdate_audit_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamlLoginRequest {
+    pub name_id: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub display_name: String,
+}
+
+/// POST /api/test/saml-login — exercise the SAML "find or create user +
+/// mint session" path without a real IdP. Returns the session cookie via
+/// `Set-Cookie` so subsequent requests with the same cookie jar are
+/// authenticated. Gated by STIG_ENV != "production" like the other test
+/// helpers.
+pub async fn saml_login_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Json(req): Json<SamlLoginRequest>,
+) -> Result<(CookieJar, Json<serde_json::Value>), StatusCode> {
+    if req.name_id.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let display = if req.display_name.is_empty() {
+        if !req.email.is_empty() {
+            req.email.clone()
+        } else {
+            req.name_id.clone()
+        }
+    } else {
+        req.display_name.clone()
+    };
+
+    let (user_id, session_id) = saml_login_user(
+        state.pool.as_ref(),
+        &req.name_id,
+        &req.email,
+        &display,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("test saml-login failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let cookie = Cookie::build(("stig_session", session_id.clone()))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .max_age(time::Duration::hours(8))
+        .build();
+
+    Ok((
+        jar.add(cookie),
+        Json(json!({
+            "userId": user_id,
+            "sessionId": session_id,
+        })),
+    ))
 }
 
 /// POST /api/test/bump-stig — change a `stigs_catalog` row's version +
