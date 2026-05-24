@@ -74,6 +74,12 @@ use api::{
     diff::diff_handler,
     drafts::*,
     email::list_deliveries_handler as list_email_deliveries_handler,
+    finding_approvals::{
+        approve_handler as approve_finding_handler,
+        list_handler as list_approvals_handler,
+        reject_handler as reject_finding_handler,
+        update_policy_handler as update_asset_approval_policy_handler,
+    },
     findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
     notifications::{
         get_handler as get_notifications_handler,
@@ -295,6 +301,19 @@ async fn main() -> Result<()> {
         .route(
             "/api/drafts/:id/comments",
             get(list_comments_handler).post(add_comment_handler),
+        )
+        .route("/api/approvals", get(list_approvals_handler))
+        .route(
+            "/api/approvals/:id/approve",
+            post(approve_finding_handler),
+        )
+        .route(
+            "/api/approvals/:id/reject",
+            post(reject_finding_handler),
+        )
+        .route(
+            "/api/assets/:id/approval-policy",
+            axum::routing::patch(update_asset_approval_policy_handler),
         )
         .route("/api/notifications", get(get_notifications_handler))
         .route(

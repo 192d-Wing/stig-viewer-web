@@ -43,10 +43,41 @@ pub struct MentionItem {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ApprovalItem {
+    pub approval_id: String,
+    pub checklist_id: String,
+    pub rule_id: String,
+    pub asset_name: String,
+    pub stig_title: String,
+    pub requested_by_name: String,
+    pub proposed_status: String,
+    pub requested_at: DateTime<Utc>,
+    pub unread: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionItem {
+    pub approval_id: String,
+    pub checklist_id: String,
+    pub rule_id: String,
+    pub asset_name: String,
+    pub stig_title: String,
+    pub status: String,
+    pub proposed_status: String,
+    pub decided_at: DateTime<Utc>,
+    pub decision_reason: Option<String>,
+    pub unread: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationsResponse {
     pub assigned: Vec<AssignedItem>,
     pub overdue: Vec<OverdueItem>,
     pub mentions: Vec<MentionItem>,
+    pub approvals: Vec<ApprovalItem>,
+    pub decisions: Vec<DecisionItem>,
     pub unread_count: i64,
     pub last_seen: Option<DateTime<Utc>>,
 }
@@ -220,10 +251,117 @@ pub async fn get_handler(
         });
     }
 
+    // Pending approvals visible to reviewers/admins. For other roles
+    // this bucket stays empty — only the decisions bucket below applies.
+    let is_reviewer = user.role == "reviewer" || user.role == "admin";
+    let approvals: Vec<ApprovalItem> = if is_reviewer {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                fa.id              AS approval_id,
+                fa.checklist_id,
+                fa.rule_id,
+                fa.proposed_status,
+                fa.requested_at,
+                a.name             AS asset_name,
+                COALESCE(sc.title, c.stig_id) AS stig_title,
+                u.display_name     AS requested_by_name
+              FROM finding_approvals fa
+              JOIN checklists c     ON c.id = fa.checklist_id
+              JOIN assets a         ON a.id = c.asset_id
+              LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
+              JOIN users u          ON u.id = fa.requested_by
+             WHERE fa.status = 'pending'
+             ORDER BY fa.requested_at DESC
+             LIMIT 50
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut out: Vec<ApprovalItem> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let requested_at: DateTime<Utc> = row.try_get("requested_at").map_err(map_sqlx)?;
+            let unread = last_seen.is_none_or(|t| requested_at > t);
+            if unread {
+                unread_count += 1;
+            }
+            out.push(ApprovalItem {
+                approval_id: row.try_get("approval_id").map_err(map_sqlx)?,
+                checklist_id: row.try_get("checklist_id").map_err(map_sqlx)?,
+                rule_id: row.try_get("rule_id").map_err(map_sqlx)?,
+                asset_name: row.try_get("asset_name").map_err(map_sqlx)?,
+                stig_title: row.try_get("stig_title").map_err(map_sqlx)?,
+                requested_by_name: row.try_get("requested_by_name").map_err(map_sqlx)?,
+                proposed_status: row.try_get("proposed_status").map_err(map_sqlx)?,
+                requested_at,
+                unread,
+            });
+        }
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Decisions on rows the caller requested. Always shown to the
+    // requester regardless of role; they need to know an approval was
+    // approved or rejected.
+    let decision_rows = sqlx::query(
+        r#"
+        SELECT
+            fa.id              AS approval_id,
+            fa.checklist_id,
+            fa.rule_id,
+            fa.proposed_status,
+            fa.status          AS status,
+            fa.decided_at      AS decided_at,
+            fa.decision_reason AS decision_reason,
+            a.name             AS asset_name,
+            COALESCE(sc.title, c.stig_id) AS stig_title
+          FROM finding_approvals fa
+          JOIN checklists c     ON c.id = fa.checklist_id
+          JOIN assets a         ON a.id = c.asset_id
+          LEFT JOIN stigs_catalog sc ON sc.id = c.stig_id
+         WHERE fa.requested_by = $1
+           AND fa.status IN ('approved', 'rejected')
+           AND fa.decided_at IS NOT NULL
+         ORDER BY fa.decided_at DESC
+         LIMIT 50
+        "#,
+    )
+    .bind(&user.id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let mut decisions: Vec<DecisionItem> = Vec::with_capacity(decision_rows.len());
+    for row in decision_rows {
+        let decided_at: DateTime<Utc> = row.try_get("decided_at").map_err(map_sqlx)?;
+        let unread = last_seen.is_none_or(|t| decided_at > t);
+        if unread {
+            unread_count += 1;
+        }
+        decisions.push(DecisionItem {
+            approval_id: row.try_get("approval_id").map_err(map_sqlx)?,
+            checklist_id: row.try_get("checklist_id").map_err(map_sqlx)?,
+            rule_id: row.try_get("rule_id").map_err(map_sqlx)?,
+            asset_name: row.try_get("asset_name").map_err(map_sqlx)?,
+            stig_title: row.try_get("stig_title").map_err(map_sqlx)?,
+            status: row.try_get("status").map_err(map_sqlx)?,
+            proposed_status: row.try_get("proposed_status").map_err(map_sqlx)?,
+            decided_at,
+            decision_reason: row.try_get("decision_reason").map_err(map_sqlx)?,
+            unread,
+        });
+    }
+
     Ok(Json(NotificationsResponse {
         assigned,
         overdue,
         mentions,
+        approvals,
+        decisions,
         unread_count,
         last_seen,
     }))

@@ -13,6 +13,7 @@ pub mod dashboard;
 pub mod diff;
 pub mod drafts;
 pub mod email;
+pub mod finding_approvals;
 pub mod findings;
 pub mod notifications;
 pub mod report;
