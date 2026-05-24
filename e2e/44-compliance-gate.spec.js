@@ -166,15 +166,24 @@ test.describe("Compliance gate — finding_details required for closing status",
     await page.getByRole("button", { name: "gate-host" }).click();
     await expect(page.getByText("Applied STIGs")).toBeVisible();
 
-    // Open the checklist (single STIG, single button in the last table).
-    const stigLink = page.locator("table").last().getByRole("button").first();
+    // Open the checklist (single STIG, single button in the Applied STIGs
+    // table — scope by accessible name so the new Sharing table on
+    // AssetDetail doesn't shadow this selector).
+    const stigLink = page
+      .getByRole("table", { name: /Applied STIGs/i })
+      .getByRole("button")
+      .first();
     await stigLink.click();
     await expect(page.getByRole("heading", { name: /^Rules/ })).toBeVisible({
       timeout: 10_000,
     });
 
     // Open the rule editor for the first rule.
-    await page.locator("table").last().getByRole("button").first().click();
+    await page
+      .getByRole("table", { name: /Rules/i })
+      .getByRole("button")
+      .first()
+      .click();
     const editModal = page.getByRole("dialog").last();
     await expect(editModal).toBeVisible();
 
