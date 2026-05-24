@@ -157,22 +157,26 @@ pub async fn acs_handler(
     let xml = std::str::from_utf8(&xml_bytes)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("SAMLResponse not UTF-8: {e}")))?;
 
-    // Production gate: require a configured cert AND a Signature element.
-    // Actual cryptographic verification is out of scope for this hand-rolled
-    // path — we surface the requirement so an ops error doesn't fail open.
-    if state.config.is_production {
-        if state.config.idp_cert_pem.is_none() {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "SAML_IDP_CERT_PEM is required in production".into(),
-            ));
-        }
-        if !xml.contains("Signature") {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "SAMLResponse is missing Signature element".into(),
-            ));
-        }
+    // Production gate: require a configured cert and a verified signature.
+    // The `SAML_INSECURE_SKIP_VERIFY=true` escape hatch is honored only in
+    // non-production builds (gated by STIG_ENV); production ignores it.
+    let skip_verify = !state.config.is_production
+        && std::env::var("SAML_INSECURE_SKIP_VERIFY").ok().as_deref() == Some("true");
+
+    if !skip_verify {
+        let cert_pem = state.config.idp_cert_pem.as_deref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SAML_IDP_CERT_PEM is required for signature verification".to_string(),
+        ))?;
+        crate::api::saml_verify::verify_response_signature(xml.as_bytes(), cert_pem).map_err(
+            |e| {
+                tracing::warn!("SAML signature verification failed: {e:#}");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    format!("SAMLResponse signature verification failed: {e}"),
+                )
+            },
+        )?;
     }
 
     let assertion = parse_assertion(xml).map_err(|e| {
