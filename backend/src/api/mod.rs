@@ -22,6 +22,7 @@ pub mod rule_comments;
 pub mod saml;
 pub mod saml_verify;
 pub mod saved_searches;
+pub mod scheduler_status;
 pub mod stig;
 pub mod stig_validator;
 pub mod test_support;
