@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
+use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::api::finding_approvals;
 use crate::api::webhooks;
@@ -51,12 +52,14 @@ pub async fn create_handler(
     Path(asset_id): Path<String>,
     Json(req): Json<CreateChecklistRequest>,
 ) -> Result<(StatusCode, Json<db_checklists::ChecklistRow>), StatusCode> {
-    let asset = db_assets::get_asset(state.pool.as_ref(), &asset_id)
+    // 404 if the asset itself is missing — keep that distinct from the
+    // 403 the ACL check below produces.
+    let _asset = db_assets::get_asset(state.pool.as_ref(), &asset_id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset_id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -152,7 +155,7 @@ pub async fn delete_handler(
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -189,7 +192,7 @@ pub async fn reapply_handler(
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -252,10 +255,19 @@ pub async fn bulk_reapply_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<BulkReapplyResponse>, StatusCode> {
-    // Mirrors the dashboard's drift predicate, scoped to this user's assets.
+    // Mirrors the dashboard's drift predicate, scoped to checklists the
+    // calling user is allowed to mutate. The scope includes:
+    //   - assets they own
+    //   - assets where they have a write|admin ACL grant
+    //   - everything (when their global role is `admin`)
+    // The per-row `user_can(..., "write")` check below is the source of
+    // truth; the SQL `WHERE` is a coarse filter to avoid loading rows we
+    // would only discard.
+    let is_admin = user.role == "admin";
     let rows = sqlx::query(
         r#"
         SELECT c.id              AS checklist_id,
+               c.asset_id        AS asset_id,
                c.stig_id         AS stig_id,
                c.applied_version AS from_version,
                c.applied_release AS from_release,
@@ -264,7 +276,16 @@ pub async fn bulk_reapply_handler(
           FROM checklists c
           JOIN assets a ON a.id = c.asset_id
           JOIN stigs_catalog sc ON sc.id = c.stig_id
-         WHERE a.owner_id = $1
+         WHERE (
+                $2
+                OR a.owner_id = $1
+                OR EXISTS (
+                    SELECT 1 FROM asset_acl acl
+                     WHERE acl.asset_id = a.id
+                       AND acl.user_id  = $1
+                       AND acl.permission IN ('write','admin')
+                )
+               )
            AND c.applied_version <> ''
            AND (c.applied_version <> sc.version
                 OR c.applied_release <> sc.release_info)
@@ -272,6 +293,7 @@ pub async fn bulk_reapply_handler(
         "#,
     )
     .bind(&user.id)
+    .bind(is_admin)
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(|e| {
@@ -283,10 +305,18 @@ pub async fn bulk_reapply_handler(
     for row in rows {
         use sqlx::Row;
         let checklist_id: String = row.try_get("checklist_id").unwrap_or_default();
+        let asset_id: String = row.try_get("asset_id").unwrap_or_default();
         let stig_id: String = row.try_get("stig_id").unwrap_or_default();
         let from_version: String = row.try_get("from_version").unwrap_or_default();
         let asset_name: String = row.try_get("asset_name").unwrap_or_default();
         let stig_title: String = row.try_get("stig_title").unwrap_or_default();
+
+        // Per-row authorization gate — keeps the handler safe even if the
+        // outer SQL is loosened later, and gives a single source of
+        // truth in `asset_acl::user_can`.
+        if !asset_acl::user_can(state.pool.as_ref(), &asset_id, &user, "write").await {
+            continue;
+        }
 
         match reapply_one(&state, &checklist_id, &stig_id).await {
             Ok((to_version, pruned)) => {
@@ -396,7 +426,7 @@ pub async fn update_rule_handler(
         .map_err(|s| s.into_response())?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
 
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN.into_response());
     }
 

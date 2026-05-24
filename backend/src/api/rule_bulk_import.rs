@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::db_assets;
 use crate::db_checklists;
@@ -86,7 +87,8 @@ pub async fn bulk_import_handler(
     Query(query): Query<BulkImportQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
-    // Owner-only — only the asset owner can bulk-patch its checklist.
+    // Must hold write (owner / write-ACL / admin role / acl-admin) on
+    // the underlying asset to bulk-patch its checklist.
     let checklist = db_checklists::get_checklist(state.pool.as_ref(), &checklist_id)
         .await
         .map_err(map_db)?
@@ -97,7 +99,7 @@ pub async fn bulk_import_handler(
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if asset.owner_id != user.id {
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, &user, "write").await {
         return Err(StatusCode::FORBIDDEN);
     }
 

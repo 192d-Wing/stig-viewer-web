@@ -6,6 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::db_assets;
 use crate::AppState;
@@ -124,12 +125,15 @@ pub async fn update_asset_handler(
     Path(id): Path<String>,
     Json(req): Json<UpdateAssetRequest>,
 ) -> Result<Json<db_assets::AssetRow>, StatusCode> {
-    let existing = db_assets::get_asset(state.pool.as_ref(), &id)
+    let _existing = db_assets::get_asset(state.pool.as_ref(), &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if existing.owner_id != user.id {
+    // Renaming / reclassifying / retagging the asset row itself is a
+    // structural change — require ACL `admin` (which the owner and any
+    // global admin role automatically satisfy).
+    if !asset_acl::user_can(state.pool.as_ref(), &id, &user, "admin").await {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -165,12 +169,14 @@ pub async fn delete_asset_handler(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let existing = db_assets::get_asset(state.pool.as_ref(), &id)
+    let _existing = db_assets::get_asset(state.pool.as_ref(), &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if existing.owner_id != user.id {
+    // Destroying the asset is the most destructive op — require ACL
+    // `admin` level (owner + global admin role still satisfy this).
+    if !asset_acl::user_can(state.pool.as_ref(), &id, &user, "admin").await {
         return Err(StatusCode::FORBIDDEN);
     }
 

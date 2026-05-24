@@ -32,6 +32,21 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
   const [applyError, setApplyError] = useState(null);
   const [applying, setApplying] = useState(false);
 
+  // ── Sharing (ACL) state ────────────────────────────────────────────
+  // Loaded lazily — the ACL list endpoint 403s for non-managers, so we
+  // probe it once and surface the section only when the response was
+  // 200. `aclVisible` is the gate (owner / global admin / acl-admin).
+  const [aclRows, setAclRows] = useState([]);
+  const [aclVisible, setAclVisible] = useState(false);
+  const [allUsers, setAllUsers] = useState([]);
+  const [aclTarget, setAclTarget] = useState(null);
+  const [aclPermission, setAclPermission] = useState({
+    label: "Write",
+    value: "write",
+  });
+  const [aclError, setAclError] = useState(null);
+  const [aclBusy, setAclBusy] = useState(false);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -54,9 +69,84 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     }
   }, [assetId]);
 
+  /// Probe + load the ACL roster. The backend 403s when the caller can't
+  /// manage sharing on the asset, which is exactly the signal we want for
+  /// hiding the section UI. We swallow the 403 and leave `aclVisible`
+  /// false so the section stays hidden.
+  const refreshAcl = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/assets/${assetId}/acl`);
+      if (res.status === 403) {
+        setAclVisible(false);
+        return;
+      }
+      if (!res.ok) {
+        setAclVisible(false);
+        return;
+      }
+      const rows = await res.json();
+      setAclRows(rows);
+      setAclVisible(true);
+      // Lazy-load the user picker too — only needed inside the section.
+      try {
+        const users = await apiGet("/api/users");
+        setAllUsers(users);
+      } catch {
+        // Picker just won't have options if this fails; surface via the
+        // shared error path so it's visible to operators.
+        setAllUsers([]);
+      }
+    } catch {
+      // Network-level failure — keep the section hidden rather than
+      // leaking auth state via an alarming alert.
+      setAclVisible(false);
+    }
+  }, [assetId]);
+
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Re-probe ACL access whenever the asset changes. Done after `refresh`
+  // so the owner-id is already populated client-side and the section
+  // shows up promptly for the obvious case (you own the asset).
+  useEffect(() => {
+    refreshAcl();
+  }, [refreshAcl]);
+
+  const grantAcl = useCallback(async () => {
+    if (!aclTarget) return;
+    setAclBusy(true);
+    setAclError(null);
+    try {
+      await apiJson(`/api/assets/${assetId}/acl`, "POST", {
+        userId: aclTarget.value,
+        permission: aclPermission.value,
+      });
+      setAclTarget(null);
+      setAclPermission({ label: "Write", value: "write" });
+      await refreshAcl();
+    } catch (err) {
+      setAclError(err.message);
+    } finally {
+      setAclBusy(false);
+    }
+  }, [aclTarget, aclPermission, assetId, refreshAcl]);
+
+  const revokeAcl = useCallback(
+    async (userId) => {
+      const res = await apiFetch(
+        `/api/assets/${assetId}/acl/${encodeURIComponent(userId)}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok && res.status !== 204) {
+        setAclError(`Revoke failed: ${res.status}`);
+        return;
+      }
+      await refreshAcl();
+    },
+    [assetId, refreshAcl],
+  );
 
   const isOwner = asset && currentUser?.id === asset.ownerId;
 
@@ -419,6 +509,122 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
             </Header>
           }
         />
+
+        {aclVisible && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                counter={`(${aclRows.length})`}
+                description="Owner and global admins always have full access. Add a user below to grant additional read/write/admin permission on this system."
+              >
+                Sharing
+              </Header>
+            }
+            data-testid="sharing-section"
+          >
+            <SpaceBetween direction="vertical" size="m">
+              {aclError && (
+                <Alert type="error" onDismiss={() => setAclError(null)} dismissible>
+                  {aclError}
+                </Alert>
+              )}
+              <Table
+                variant="embedded"
+                items={aclRows}
+                data-testid="sharing-table"
+                columnDefinitions={[
+                  {
+                    id: "user",
+                    header: "User",
+                    cell: (r) => r.displayName || r.userId,
+                  },
+                  {
+                    id: "permission",
+                    header: "Permission",
+                    cell: (r) => <Badge>{r.permission}</Badge>,
+                  },
+                  {
+                    id: "grantedAt",
+                    header: "Granted",
+                    cell: (r) => new Date(r.grantedAt).toLocaleString(),
+                  },
+                  {
+                    id: "actions",
+                    header: "",
+                    cell: (r) => (
+                      <Button
+                        variant="inline-link"
+                        onClick={() => revokeAcl(r.userId)}
+                        data-testid={`sharing-remove-${r.userId}`}
+                      >
+                        Remove
+                      </Button>
+                    ),
+                  },
+                ]}
+                empty={
+                  <Box textAlign="center" padding="m">
+                    <Box variant="p" color="text-body-secondary">
+                      No additional users have been granted access.
+                    </Box>
+                  </Box>
+                }
+              />
+              <ColumnLayout columns={3}>
+                <FormField label="User">
+                  <Select
+                    selectedOption={aclTarget}
+                    onChange={({ detail }) =>
+                      setAclTarget(detail.selectedOption)
+                    }
+                    placeholder="Choose a user"
+                    filteringType="auto"
+                    data-testid="sharing-user-select"
+                    options={allUsers
+                      // Hide the owner and anyone already in the roster
+                      // — re-adding them is either a no-op or rejected
+                      // by the backend.
+                      .filter(
+                        (u) =>
+                          u.id !== asset?.ownerId &&
+                          !aclRows.some((r) => r.userId === u.id),
+                      )
+                      .map((u) => ({
+                        label: u.displayName,
+                        value: u.id,
+                      }))}
+                  />
+                </FormField>
+                <FormField label="Permission">
+                  <Select
+                    selectedOption={aclPermission}
+                    onChange={({ detail }) =>
+                      setAclPermission(detail.selectedOption)
+                    }
+                    data-testid="sharing-permission-select"
+                    options={[
+                      { label: "Read", value: "read" },
+                      { label: "Write", value: "write" },
+                      { label: "Admin", value: "admin" },
+                    ]}
+                  />
+                </FormField>
+                <FormField label="&nbsp;">
+                  <Button
+                    variant="primary"
+                    loading={aclBusy}
+                    disabled={!aclTarget}
+                    onClick={grantAcl}
+                    data-testid="sharing-add-button"
+                  >
+                    Add
+                  </Button>
+                </FormField>
+              </ColumnLayout>
+            </SpaceBetween>
+          </Container>
+        )}
       </SpaceBetween>
 
       <Modal
