@@ -21,7 +21,7 @@ import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Modal from "@cloudscape-design/components/modal";
-import { BACKEND, apiJson } from "../utils/api.js";
+import { BACKEND, apiJson, apiFetch } from "../utils/api.js";
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 
 /** Trim long body fields for the diff table cells so a 4 KB
@@ -188,9 +188,10 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
     setDiffData(null);
     setDiffError(null);
     try {
-      const r = await fetch(
-        `${BACKEND}/api/stigs/${encodeURIComponent(stigId)}/diff`,
-        { credentials: "include" },
+      // Use apiFetch so the X-User-Id test-bypass header is sent in E2E,
+      // not just the session cookie that real OIDC sessions carry.
+      const r = await apiFetch(
+        `/api/stigs/${encodeURIComponent(stigId)}/diff`,
       );
       if (r.status === 404) {
         setDiffStatus("empty");

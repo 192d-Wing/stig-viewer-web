@@ -21,7 +21,12 @@ const VALID_ROLES: &[&str] = &["author", "reviewer", "admin", "viewer"];
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
 /// Only registered when STIG_ENV != "production".
 pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
-    let result = sqlx::query("TRUNCATE draft_comments, stig_drafts, users CASCADE")
+    // catalog_archive has no FK linkage to user tables, so CASCADE doesn't
+    // reach it from `users`. List it explicitly so per-test archive seeds
+    // don't leak between specs.
+    let result = sqlx::query(
+        "TRUNCATE draft_comments, stig_drafts, users, catalog_archive CASCADE",
+    )
         .execute(state.pool.as_ref())
         .await;
 
