@@ -97,20 +97,25 @@ export default function AdminConsole() {
   // Compliance reports
   const [reports, setReports] = useState([]);
 
+  // Outbound email deliveries (compliance-report emails, dryrun + sent)
+  const [emails, setEmails] = useState([]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w, r] = await Promise.all([
+      const [u, a, w, r, e] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
         apiGet("/api/reports").catch(() => []),
+        apiGet("/api/admin/email-deliveries").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
       setWebhooks(w);
       setReports(r);
+      setEmails(e);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -588,6 +593,76 @@ export default function AdminConsole() {
             description="Fleet-wide compliance snapshots. Generated on the configured cadence and emitted to compliance_report webhooks."
           >
             Compliance reports
+          </Header>
+        }
+      />
+
+      <Table
+        variant="container"
+        items={emails}
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No email deliveries yet. SMTP is unconfigured by default —
+              set SMTP_HOST + COMPLIANCE_REPORT_RECIPIENTS to send for real.
+            </Box>
+          </Box>
+        }
+        columnDefinitions={[
+          {
+            id: "when",
+            header: "When",
+            cell: (e) => relativeTime(e.attemptedAt),
+          },
+          {
+            id: "kind",
+            header: "Kind",
+            cell: (e) => e.kind,
+          },
+          {
+            id: "to",
+            header: "To",
+            cell: (e) => (
+              <span title={e.toAddresses}>
+                {e.toAddresses ? truncateUrl(e.toAddresses, 40) : "—"}
+              </span>
+            ),
+          },
+          {
+            id: "subject",
+            header: "Subject",
+            cell: (e) => (
+              <span title={e.subject}>{truncateUrl(e.subject, 60)}</span>
+            ),
+          },
+          {
+            id: "mode",
+            header: "Mode",
+            cell: (e) => {
+              if (e.error) return <Badge color="red">error</Badge>;
+              if (e.mode === "sent") return <Badge color="green">sent</Badge>;
+              return <Badge color="grey">{e.mode}</Badge>;
+            },
+          },
+          {
+            id: "error",
+            header: "Error",
+            cell: (e) =>
+              e.error ? (
+                <Box variant="code" title={e.error}>
+                  {e.error.slice(0, 80)}
+                </Box>
+              ) : (
+                "—"
+              ),
+          },
+        ]}
+        header={
+          <Header
+            counter={`(${emails.length})`}
+            description="Outbound email audit log. Dryrun rows are recorded when SMTP isn't configured so ops can verify the path fires."
+          >
+            Email deliveries
           </Header>
         }
       />

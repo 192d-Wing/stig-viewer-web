@@ -9,6 +9,13 @@
 //!      list and link to each generated report.
 //!   5. Optionally fires a `compliance_report` webhook event so Slack /
 //!      receivers can pick up the link.
+//!   6. Optionally emails the freshly-generated PDF to the configured
+//!      recipient list (`COMPLIANCE_REPORT_RECIPIENTS`). The email path
+//!      is independent of webhooks — both fire per generation. We
+//!      re-read `EmailConfig::from_env()` here rather than threading
+//!      SMTP credentials through `AppState`, because (a) email is
+//!      best-effort and lives at the edge, and (b) operators can swap
+//!      SMTP credentials with just a restart.
 
 use anyhow::Result;
 use axum::{
@@ -204,6 +211,17 @@ pub async fn run_report(
 
     // Fire a webhook event for downstream Slack/etc. integrations.
     let _ = crate::api::webhooks::fire_compliance_report(pool, &row).await;
+
+    // Email path is independent of the webhook fan-out. Best-effort —
+    // any SMTP failure is recorded into `email_deliveries` with the
+    // error column populated and never propagated to the caller.
+    let _ = crate::api::email::send_compliance_report(
+        pool,
+        data_dir,
+        crate::api::email::EmailConfig::from_env(),
+        &row,
+    )
+    .await;
 
     Ok(row)
 }
