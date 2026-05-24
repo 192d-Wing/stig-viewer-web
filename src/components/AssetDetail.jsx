@@ -239,6 +239,50 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
           </Container>
         )}
 
+        {trend && trend.overall.length > 0 && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                description={`${trend.overall.length} snapshot${trend.overall.length === 1 ? "" : "s"} in the last 30 days`}
+              >
+                Compliance trend
+              </Header>
+            }
+          >
+            <LineChart
+              series={[
+                {
+                  title: "Compliance",
+                  type: "line",
+                  color: "#1d8102",
+                  data: trend.overall.map((p) => ({
+                    x: new Date(p.capturedAt),
+                    y: p.complianceScore ?? 0,
+                  })),
+                },
+              ]}
+              xScaleType="time"
+              xTitle="Time"
+              yTitle="Compliance (%)"
+              yDomain={[0, 100]}
+              height={220}
+              hideFilter
+              ariaLabel={`${asset.name} compliance trend`}
+              empty={
+                <Box textAlign="center" color="inherit">
+                  No snapshots yet
+                </Box>
+              }
+              noMatch={
+                <Box textAlign="center" color="inherit">
+                  No data in selected range
+                </Box>
+              }
+            />
+          </Container>
+        )}
+
         <Table
           variant="container"
           items={checklists}
