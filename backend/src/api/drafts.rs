@@ -27,6 +27,23 @@ fn err_403(msg: &str) -> (StatusCode, String) {
     (StatusCode::FORBIDDEN, msg.to_string())
 }
 
+/// 403 with a structured JSON body — used for reviewer-assignment guards
+/// so the frontend can render a specific message.
+fn err_403_json(msg: &str) -> (StatusCode, String) {
+    (
+        StatusCode::FORBIDDEN,
+        serde_json::json!({ "error": msg }).to_string(),
+    )
+}
+
+/// 400 with a structured JSON body for client-supplied validation errors.
+fn err_400_json(msg: &str) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({ "error": msg }).to_string(),
+    )
+}
+
 fn err_404() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "Not found".to_string())
 }
@@ -51,6 +68,18 @@ pub async fn list_drafts_handler(
     )
     .await
     .map_err(err_500)?;
+    Ok(Json(rows))
+}
+
+/// GET /api/drafts/pending-for-me — drafts in 'submitted' state where
+/// the caller is the assigned reviewer. Newest first.
+pub async fn pending_for_me_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<DraftSummary>>, (StatusCode, String)> {
+    let rows = list_pending_for_reviewer(&state.pool, &user.id)
+        .await
+        .map_err(err_500)?;
     Ok(Json(rows))
 }
 
@@ -91,6 +120,7 @@ pub async fn create_draft_handler(
         json_path: json_path_str,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        assigned_reviewer_id: None,
     };
 
     insert_draft(&state.pool, &draft).await.map_err(err_500)?;
@@ -170,6 +200,7 @@ pub async fn fork_from_stig_handler(
         json_path: json_path_str,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        assigned_reviewer_id: None,
     };
 
     insert_draft(&state.pool, &draft).await.map_err(err_500)?;
@@ -212,6 +243,7 @@ pub async fn get_draft_handler(
         "rules": rules,
         "createdAt": draft.created_at,
         "updatedAt": draft.updated_at,
+        "assignedReviewerId": draft.assigned_reviewer_id,
     })))
 }
 
@@ -315,10 +347,19 @@ pub async fn next_vuln_id_handler(
 
 // ── Workflow transitions ────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitBody {
+    /// Optional explicit reviewer. If null/missing the draft remains
+    /// open for any reviewer to claim.
+    pub assigned_reviewer_id: Option<String>,
+}
+
 pub async fn submit_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
+    body: Option<Json<SubmitBody>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let draft = get_draft(&state.pool, &id)
         .await
@@ -327,10 +368,59 @@ pub async fn submit_handler(
     if draft.author_id != user.id {
         return Err(err_403("Only the author can submit"));
     }
+
+    // Optional `assignedReviewerId` — validate it points at a real user
+    // whose role is `reviewer` or `admin`. Anything else is a 400.
+    let assigned: Option<String> = body.and_then(|Json(b)| b.assigned_reviewer_id);
+    if let Some(reviewer_id) = &assigned {
+        let role: Option<String> =
+            sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+                .bind(reviewer_id)
+                .fetch_optional(state.pool.as_ref())
+                .await
+                .map_err(err_500)?;
+        match role.as_deref() {
+            Some("reviewer") | Some("admin") => {}
+            _ => {
+                return Err(err_400_json(
+                    "assignedReviewerId must reference a user with role reviewer or admin",
+                ));
+            }
+        }
+    }
+
     transition_status(&state.pool, &id, &draft.status, "submitted")
         .await
         .map_err(|e| err_400(&e.to_string()))?;
-    Ok(Json(serde_json::json!({"status": "submitted"})))
+
+    // Persist (or clear) the assignee regardless of whether one was
+    // supplied — re-submission after a rejection may legitimately want
+    // to unset the prior assignment.
+    set_assigned_reviewer(&state.pool, &id, assigned.as_deref())
+        .await
+        .map_err(err_500)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "submitted",
+        "assignedReviewerId": assigned,
+    })))
+}
+
+/// Common guard: if the draft has an `assigned_reviewer_id` set, only
+/// that user (or an admin) may act on it. Returns Ok if the caller is
+/// allowed, Err(403 JSON) otherwise.
+fn check_assignment_guard(
+    draft: &DraftRow,
+    user: &AuthUser,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(target) = &draft.assigned_reviewer_id {
+        if user.id != *target && user.role != "admin" {
+            return Err(err_403_json(
+                "this draft is assigned to a specific reviewer",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub async fn review_handler(
@@ -341,6 +431,11 @@ pub async fn review_handler(
     if user.role != "reviewer" && user.role != "admin" {
         return Err(err_403("Only reviewers can pick up reviews"));
     }
+    let draft = get_draft(&state.pool, &id)
+        .await
+        .map_err(err_500)?
+        .ok_or_else(err_404)?;
+    check_assignment_guard(&draft, &user)?;
     transition_status(&state.pool, &id, "submitted", "in_review")
         .await
         .map_err(|e| err_400(&e.to_string()))?;
@@ -360,6 +455,26 @@ pub async fn approve_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if user.role != "reviewer" && user.role != "admin" {
         return Err(err_403("Only reviewers can approve"));
+    }
+    let draft = get_draft(&state.pool, &id)
+        .await
+        .map_err(err_500)?
+        .ok_or_else(err_404)?;
+    check_assignment_guard(&draft, &user)?;
+    // If the draft is still 'submitted' (i.e. the assignee did not bother
+    // claiming it via review_handler first) allow approval directly. Both
+    // 'submitted' and 'in_review' are valid origin states.
+    let from = if draft.status == "submitted" {
+        "submitted"
+    } else {
+        "in_review"
+    };
+    // For 'submitted' → 'approved' we need a two-step transition since
+    // TRANSITIONS doesn't allow that jump. Step via in_review.
+    if from == "submitted" {
+        transition_status(&state.pool, &id, "submitted", "in_review")
+            .await
+            .map_err(|e| err_400(&e.to_string()))?;
     }
     transition_status(&state.pool, &id, "in_review", "approved")
         .await
@@ -381,6 +496,16 @@ pub async fn reject_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if user.role != "reviewer" && user.role != "admin" {
         return Err(err_403("Only reviewers can reject"));
+    }
+    let draft = get_draft(&state.pool, &id)
+        .await
+        .map_err(err_500)?
+        .ok_or_else(err_404)?;
+    check_assignment_guard(&draft, &user)?;
+    if draft.status == "submitted" {
+        transition_status(&state.pool, &id, "submitted", "in_review")
+            .await
+            .map_err(|e| err_400(&e.to_string()))?;
     }
     transition_status(&state.pool, &id, "in_review", "rejected")
         .await
