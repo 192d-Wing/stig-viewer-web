@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.DS_Store
+backend/target
+backend/data
+test-results
+playwright-report
+blob-report
+.claude

@@ -1,0 +1,17 @@
+node_modules
+dist
+
+# Rust
+backend/target
+backend/data/
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+
+# macOS
+.DS_Store
+
+# Editor / tool state
+.claude/
