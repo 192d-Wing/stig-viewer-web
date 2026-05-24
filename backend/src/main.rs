@@ -71,6 +71,7 @@ use api::{
         take_snapshot,
         trend_handler as get_dashboard_trend_handler,
     },
+    diff::diff_handler,
     drafts::*,
     findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
     notifications::{
@@ -274,6 +275,7 @@ async fn main() -> Result<()> {
         .route("/api/users", get(list_users_handler))
         .route("/api/users/me", get(me_handler))
         .route("/api/dashboard", get(get_dashboard_handler))
+        .route("/api/diff", get(diff_handler))
         .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
         .route("/api/findings", get(list_findings_handler))
         .route(
