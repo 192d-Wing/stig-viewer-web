@@ -101,6 +101,14 @@ export default function AdminConsole() {
   // Outbound email deliveries (compliance-report emails, dryrun + sent)
   const [emails, setEmails] = useState([]);
 
+  // Background-job dashboard state: { latest: {name->row}, history: [row] }.
+  // Auto-refreshed on a 10s interval below so admins watch ticks land
+  // without manually hitting "Refresh".
+  const [schedulerRuns, setSchedulerRuns] = useState({
+    latest: {},
+    history: [],
+  });
+
   // Pending finding-close approval queue. Reviewer/admin only — for
   // anyone else the GET returns just their own rows (which is fine,
   // AdminConsole is gated by an admin route anyway).
@@ -115,13 +123,17 @@ export default function AdminConsole() {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w, r, e, ap] = await Promise.all([
+      const [u, a, w, r, e, ap, sr] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
         apiGet("/api/reports").catch(() => []),
         apiGet("/api/admin/email-deliveries").catch(() => []),
         apiGet("/api/approvals?status=pending").catch(() => []),
+        apiGet("/api/admin/scheduler-runs").catch(() => ({
+          latest: {},
+          history: [],
+        })),
       ]);
       setUsers(u);
       setAssets(a);
@@ -129,6 +141,7 @@ export default function AdminConsole() {
       setReports(r);
       setEmails(e);
       setApprovals(ap);
+      setSchedulerRuns(sr);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -139,6 +152,22 @@ export default function AdminConsole() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Poll the background-job feed every 10s so the admin sees ticks
+  // land without manually refreshing. We only re-fetch the scheduler
+  // endpoint here (not the whole console) to keep this cheap.
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        const sr = await apiGet("/api/admin/scheduler-runs");
+        setSchedulerRuns(sr);
+      } catch {
+        // Silently ignore — the manual Refresh surfaces real errors.
+      }
+    };
+    const handle = setInterval(tick, 10_000);
+    return () => clearInterval(handle);
+  }, []);
 
   const openRoleModal = useCallback((user) => {
     setRoleModal({ user, role: user.role });
@@ -492,6 +521,60 @@ export default function AdminConsole() {
     ? KIND_OPTIONS.filter((o) => (hookModal.kinds ?? []).includes(o.value))
     : [];
 
+  // Five known scheduler names, ordered the way ops scan them. We
+  // render a row per name even if no run has happened yet so the
+  // dashboard is recognizable as soon as the table loads.
+  const SCHEDULER_NAMES = [
+    "sync",
+    "snapshot",
+    "overdue_digest",
+    "audit_retention",
+    "compliance_report",
+  ];
+
+  const latestRows = SCHEDULER_NAMES.map(
+    (name) => schedulerRuns.latest?.[name] ?? { name, status: "—" },
+  );
+
+  const statusBadge = (status) => {
+    if (status === "ok") return <Badge color="green">ok</Badge>;
+    if (status === "error") return <Badge color="red">error</Badge>;
+    if (status === "running") return <Badge color="blue">running</Badge>;
+    return <Badge color="grey">{status}</Badge>;
+  };
+
+  const schedulerColumns = [
+    {
+      id: "name",
+      header: "Scheduler",
+      cell: (r) => r.name,
+    },
+    {
+      id: "started",
+      header: "Started",
+      cell: (r) => (r.startedAt ? relativeTime(r.startedAt) : "—"),
+    },
+    {
+      id: "finished",
+      header: "Finished",
+      cell: (r) => (r.finishedAt ? relativeTime(r.finishedAt) : "—"),
+    },
+    {
+      id: "status",
+      header: "Status",
+      cell: (r) => statusBadge(r.status),
+    },
+    {
+      id: "message",
+      header: "Message",
+      cell: (r) => (
+        <Box variant="code" title={r.message ?? ""}>
+          {(r.message ?? "").slice(0, 80)}
+        </Box>
+      ),
+    },
+  ];
+
   return (
     <SpaceBetween direction="vertical" size="l">
       {error && <Alert type="error">{error}</Alert>}
@@ -500,6 +583,50 @@ export default function AdminConsole() {
           {testFlash}
         </Alert>
       )}
+
+      <Table
+        variant="container"
+        items={latestRows}
+        columnDefinitions={schedulerColumns}
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No scheduler runs yet.
+            </Box>
+          </Box>
+        }
+        header={
+          <Header
+            counter={`(${Object.keys(schedulerRuns.latest ?? {}).length}/${SCHEDULER_NAMES.length})`}
+            description="Latest tick per background scheduler. Auto-refreshes every 10 seconds."
+          >
+            Background jobs
+          </Header>
+        }
+        data-testid="scheduler-latest-table"
+      />
+
+      <Table
+        variant="container"
+        items={schedulerRuns.history ?? []}
+        columnDefinitions={schedulerColumns}
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No run history yet.
+            </Box>
+          </Box>
+        }
+        header={
+          <Header
+            counter={`(${(schedulerRuns.history ?? []).length})`}
+            description="Most recent 10 scheduler ticks across every job, newest first."
+          >
+            Recent scheduler history
+          </Header>
+        }
+        data-testid="scheduler-history-table"
+      />
 
       <Table
         items={users}

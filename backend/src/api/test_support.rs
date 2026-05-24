@@ -4,9 +4,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::compliance_report;
+use crate::api::dashboard::take_snapshot;
 use crate::api::saml::saml_login_user;
 use crate::api::webhooks::run_overdue_digest;
 use crate::audit_retention;
+use crate::config::load_sources;
+use crate::scheduler_log;
+use crate::sync;
 use crate::AppState;
 
 /// Roles the system understands. Kept in sync with the allowlist in
@@ -332,6 +336,91 @@ pub async fn bump_stig_handler(
         Err(e) => {
             tracing::error!("Test bump-stig failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RunSchedulerRequest {
+    pub name: String,
+}
+
+/// POST /api/test/run-scheduler — synchronously execute one tick of the
+/// named background scheduler via the same `scheduler_log::record`
+/// helper used by the production loops. The tick records a
+/// `scheduler_runs` row exactly as it would on a real interval — E2E
+/// asserts against that surface.
+///
+/// Body: `{ "name": "sync" | "snapshot" | "overdue_digest" | "audit_retention" | "compliance_report" }`.
+pub async fn run_scheduler_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RunSchedulerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let pool = state.pool.as_ref();
+    let data_dir = state.config.data_dir.clone();
+
+    let result: anyhow::Result<String> = match req.name.as_str() {
+        "sync" => {
+            // `sync::run_sync` needs a parsed sources manifest. We
+            // re-read it on demand here so the test endpoint doesn't
+            // require threading it through AppState.
+            let sources = load_sources().map_err(|e| {
+                tracing::error!("run-scheduler: load_sources failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            scheduler_log::record(pool, "sync", || async {
+                sync::run_sync(&state.config, &std::sync::Arc::new(sources.clone()), pool).await?;
+                Ok::<String, anyhow::Error>(format!("synced {} source(s)", sources.len()))
+            })
+            .await
+        }
+        "snapshot" => {
+            scheduler_log::record(pool, "snapshot", || async {
+                let n = take_snapshot(pool).await.map_err(anyhow::Error::from)?;
+                Ok::<String, anyhow::Error>(format!("captured {n} checklists"))
+            })
+            .await
+        }
+        "overdue_digest" => {
+            scheduler_log::record(pool, "overdue_digest", || async {
+                let n = run_overdue_digest(pool).await?;
+                Ok::<String, anyhow::Error>(format!("attempted {n} webhook(s)"))
+            })
+            .await
+        }
+        "audit_retention" => {
+            scheduler_log::record(pool, "audit_retention", || async {
+                let n = audit_retention::run_prune(pool, &data_dir, 365, false).await?;
+                Ok::<String, anyhow::Error>(format!("pruned {n} rows"))
+            })
+            .await
+        }
+        "compliance_report" => {
+            scheduler_log::record(pool, "compliance_report", || async {
+                let row = compliance_report::run_report(pool, &data_dir, 7).await?;
+                Ok::<String, anyhow::Error>(format!(
+                    "generated id={} pdf={}",
+                    row.id, row.pdf_path
+                ))
+            })
+            .await
+        }
+        other => {
+            tracing::warn!("run-scheduler: unknown name {other:?}");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    match result {
+        Ok(msg) => Ok(Json(json!({ "ok": true, "message": msg }))),
+        Err(e) => {
+            tracing::error!("run-scheduler failed: {e:#}");
+            // We don't return 500 here — the row was already written
+            // with status='error', and E2E wants to inspect the failure
+            // via /api/admin/scheduler-runs. Surface the error string
+            // in the body but with a 200 so the dashboard fetch path
+            // is the source of truth.
+            Ok(Json(json!({ "ok": false, "error": format!("{e:#}") })))
         }
     }
 }

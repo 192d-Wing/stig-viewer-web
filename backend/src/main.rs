@@ -7,6 +7,7 @@ mod db_attachments;
 mod db_checklists;
 mod db_drafts;
 mod parser;
+mod scheduler_log;
 mod severity;
 mod sync;
 
@@ -104,12 +105,13 @@ use api::{
         delete_handler as delete_saved_search_handler,
         list_handler as list_saved_searches_handler,
     },
+    scheduler_status::list_handler as list_scheduler_runs_handler,
     stig::get_stig,
     stig_validator::lint_handler as stig_lint_handler,
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
         reset_handler, run_digest_handler, run_report_handler, run_retention_handler,
-        saml_login_handler as test_saml_login_handler, set_role_handler,
+        run_scheduler_handler, saml_login_handler as test_saml_login_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -355,6 +357,10 @@ async fn main() -> Result<()> {
             get(list_email_deliveries_handler),
         )
         .route(
+            "/api/admin/scheduler-runs",
+            get(list_scheduler_runs_handler),
+        )
+        .route(
             "/api/saved-searches",
             get(list_saved_searches_handler).post(create_saved_search_handler),
         )
@@ -410,6 +416,7 @@ async fn main() -> Result<()> {
             .route("/api/test/run-report", post(run_report_handler))
             .route("/api/test/run-retention", post(run_retention_handler))
             .route("/api/test/backdate-audit", post(backdate_audit_handler))
+            .route("/api/test/run-scheduler", post(run_scheduler_handler))
             .route("/api/test/saml-login", post(test_saml_login_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
@@ -428,7 +435,12 @@ async fn main() -> Result<()> {
                 tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
             loop {
                 interval.tick().await;
-                if let Err(e) = sync::run_sync(&cfg, &src, &db).await {
+                let result = scheduler_log::record(&db, "sync", || async {
+                    sync::run_sync(&cfg, &src, &db).await?;
+                    Ok::<String, anyhow::Error>(format!("synced {} source(s)", src.len()))
+                })
+                .await;
+                if let Err(e) = result {
                     tracing::error!("Sync error: {e:#}");
                 }
             }
@@ -449,8 +461,15 @@ async fn main() -> Result<()> {
                 tokio::time::interval(Duration::from_secs(snap_hours * 3600));
             loop {
                 interval.tick().await;
-                match take_snapshot(&db).await {
-                    Ok(n) => tracing::info!("dashboard snapshot captured: {n} checklists"),
+                let result = scheduler_log::record(&db, "snapshot", || async {
+                    let n = take_snapshot(&db)
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                    Ok::<String, anyhow::Error>(format!("captured {n} checklists"))
+                })
+                .await;
+                match result {
+                    Ok(msg) => tracing::info!("dashboard snapshot: {msg}"),
                     Err(e) => tracing::error!("dashboard snapshot failed: {e:#}"),
                 }
             }
@@ -472,8 +491,13 @@ async fn main() -> Result<()> {
                 tokio::time::interval(Duration::from_secs(digest_hours * 3600));
             loop {
                 interval.tick().await;
-                match run_overdue_digest(&db).await {
-                    Ok(n) => tracing::info!("overdue digest sweep attempted {n} webhook(s)"),
+                let result = scheduler_log::record(&db, "overdue_digest", || async {
+                    let n = run_overdue_digest(&db).await?;
+                    Ok::<String, anyhow::Error>(format!("attempted {n} webhook(s)"))
+                })
+                .await;
+                match result {
+                    Ok(msg) => tracing::info!("overdue digest: {msg}"),
                     Err(e) => tracing::error!("overdue digest sweep failed: {e:#}"),
                 }
             }
@@ -504,17 +528,21 @@ async fn main() -> Result<()> {
                 tokio::time::interval(Duration::from_secs(retention_hours * 3600));
             loop {
                 interval.tick().await;
-                match audit_retention::run_prune(
-                    &db,
-                    &cfg.data_dir,
-                    retain_days,
-                    archive_enabled,
-                )
-                .await
-                {
-                    Ok(n) => tracing::info!(
-                        "audit retention pruned {n} rows (retain_days={retain_days}, archive={archive_enabled})"
-                    ),
+                let result = scheduler_log::record(&db, "audit_retention", || async {
+                    let n = audit_retention::run_prune(
+                        &db,
+                        &cfg.data_dir,
+                        retain_days,
+                        archive_enabled,
+                    )
+                    .await?;
+                    Ok::<String, anyhow::Error>(format!(
+                        "pruned {n} rows (retain_days={retain_days}, archive={archive_enabled})"
+                    ))
+                })
+                .await;
+                match result {
+                    Ok(msg) => tracing::info!("audit retention: {msg}"),
                     Err(e) => tracing::error!("audit retention failed: {e:#}"),
                 }
             }
@@ -541,12 +569,16 @@ async fn main() -> Result<()> {
                 tokio::time::interval(Duration::from_secs(report_hours * 3600));
             loop {
                 interval.tick().await;
-                match run_compliance_report(&db, &cfg.data_dir, range_days).await {
-                    Ok(row) => tracing::info!(
-                        "compliance report generated: id={} pdf={}",
-                        row.id,
-                        row.pdf_path
-                    ),
+                let result = scheduler_log::record(&db, "compliance_report", || async {
+                    let row = run_compliance_report(&db, &cfg.data_dir, range_days).await?;
+                    Ok::<String, anyhow::Error>(format!(
+                        "generated id={} pdf={}",
+                        row.id, row.pdf_path
+                    ))
+                })
+                .await;
+                match result {
+                    Ok(msg) => tracing::info!("compliance report: {msg}"),
                     Err(e) => tracing::error!("compliance report failed: {e:#}"),
                 }
             }
