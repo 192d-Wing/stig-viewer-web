@@ -86,6 +86,12 @@ use api::{
         list_handler as list_rule_comments_handler,
         update_handler as update_rule_comment_handler,
     },
+    saml::{
+        acs_handler as saml_acs_handler,
+        login_handler as saml_login_handler,
+        metadata_handler as saml_metadata_handler,
+        AppSamlState, SamlConfig,
+    },
     saved_searches::{
         create_handler as create_saved_search_handler,
         delete_handler as delete_saved_search_handler,
@@ -95,7 +101,7 @@ use api::{
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
         reset_handler, run_digest_handler, run_report_handler, run_retention_handler,
-        set_role_handler,
+        saml_login_handler as test_saml_login_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -179,6 +185,27 @@ async fn main() -> Result<()> {
         .route("/auth/callback", get(callback_handler))
         .route("/auth/logout", post(logout_handler))
         .with_state(auth_state.clone());
+
+    // SAML SP routes — also public. Built statically from env; if no IdP
+    // SSO URL is configured the login route returns 503 with a helpful
+    // message but /metadata still works (useful when handing the SP
+    // metadata to an IdP admin to register us).
+    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin));
+    info!(
+        "SAML SP ready (configured={}, sp_entity_id={}, acs_url={})",
+        saml_config.is_configured(),
+        saml_config.sp_entity_id,
+        saml_config.sp_acs_url,
+    );
+    let saml_state = AppSamlState {
+        pool: pool.clone(),
+        config: saml_config.clone(),
+    };
+    let saml_routes: Router = Router::new()
+        .route("/auth/saml/login", get(saml_login_handler))
+        .route("/auth/saml/acs", post(saml_acs_handler))
+        .route("/auth/saml/metadata", get(saml_metadata_handler))
+        .with_state(saml_state);
 
     // Draft + asset + /api/users/me routes — require an authenticated session.
     let draft_routes = Router::new()
@@ -342,6 +369,7 @@ async fn main() -> Result<()> {
         .route("/api/upload/library", post(upload_library))
         .with_state(state.clone())
         .merge(auth_routes)
+        .merge(saml_routes)
         .merge(draft_routes);
 
     if std::env::var("STIG_ENV").unwrap_or_default() != "production" {
@@ -356,6 +384,7 @@ async fn main() -> Result<()> {
             .route("/api/test/run-report", post(run_report_handler))
             .route("/api/test/run-retention", post(run_retention_handler))
             .route("/api/test/backdate-audit", post(backdate_audit_handler))
+            .route("/api/test/saml-login", post(test_saml_login_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }

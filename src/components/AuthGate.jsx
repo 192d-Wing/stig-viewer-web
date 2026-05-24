@@ -74,14 +74,24 @@ export default function AuthGate({ children }) {
           <Box variant="p" color="text-body-secondary">
             Sign in with your organization account.
           </Box>
-          <Button
-            variant="primary"
-            onClick={() => {
-              window.location.href = `${BACKEND}/auth/login`;
-            }}
-          >
-            Sign in
-          </Button>
+          <SpaceBetween direction="horizontal" size="s">
+            <Button
+              variant="primary"
+              onClick={() => {
+                window.location.href = `${BACKEND}/auth/login`;
+              }}
+            >
+              Sign in with Keycloak
+            </Button>
+            <Button
+              variant="normal"
+              onClick={() => {
+                window.location.href = `${BACKEND}/auth/saml/login`;
+              }}
+            >
+              Sign in with SAML
+            </Button>
+          </SpaceBetween>
         </SpaceBetween>
       </Box>
     );

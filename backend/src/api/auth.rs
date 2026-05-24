@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-const SESSION_COOKIE: &str = "stig_session";
+pub(crate) const SESSION_COOKIE: &str = "stig_session";
 const STATE_COOKIE: &str = "stig_oidc_state";
-const SESSION_LIFETIME_HOURS: i64 = 8;
+pub(crate) const SESSION_LIFETIME_HOURS: i64 = 8;
 
 // ── User & config types ─────────────────────────────────────────────────────
 
@@ -406,7 +406,7 @@ pub async fn auth_middleware(
 
 // ── DB helpers ──────────────────────────────────────────────────────────────
 
-async fn upsert_user(
+pub(crate) async fn upsert_user(
     pool: &PgPool,
     provider: &str,
     sub: &str,
@@ -456,7 +456,7 @@ async fn upsert_user(
     })
 }
 
-async fn create_session(pool: &PgPool, user_id: &str) -> Result<String> {
+pub(crate) async fn create_session(pool: &PgPool, user_id: &str) -> Result<String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let expires_at: DateTime<Utc> = Utc::now() + Duration::hours(SESSION_LIFETIME_HOURS);
     sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)")
