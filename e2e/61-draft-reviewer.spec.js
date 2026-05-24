@@ -235,8 +235,10 @@ test.describe("Draft reviewer assignment", () => {
     // Modal opens with the "Drafts waiting on you" section.
     const draftsList = page.getByTestId("assigned-drafts-list");
     await expect(draftsList).toBeVisible({ timeout: 10_000 });
-    // List renders the draft title; assert on that, not on the UUID.
-    await expect(draftsList).toContainText("UI Reviewer Path");
+    // Draft titles default to empty on create (filled by edit) so the
+    // bell renders "(untitled draft) from <author>". Assert on the
+    // author hint, which is stable regardless of title state.
+    await expect(draftsList).toContainText(`from ${ALICE}`);
     void draft; // satisfy linters that flag unused locals
   });
 });
