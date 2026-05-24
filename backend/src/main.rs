@@ -31,6 +31,15 @@ use api::{
         delete_handler as delete_asset_acl_handler,
         list_handler as list_asset_acl_handler,
     },
+    asset_groups::{
+        add_member_handler as add_asset_group_member_handler,
+        create_handler as create_asset_group_handler,
+        delete_handler as delete_asset_group_handler,
+        list_handler as list_asset_groups_handler,
+        list_members_handler as list_asset_group_members_handler,
+        remove_member_handler as remove_asset_group_member_handler,
+        update_handler as update_asset_group_handler,
+    },
     asset_import::import_handler as import_assets_handler,
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
@@ -239,6 +248,23 @@ async fn main() -> Result<()> {
         .route(
             "/api/assets/:id/acl/:user_id",
             axum::routing::delete(delete_asset_acl_handler),
+        )
+        .route(
+            "/api/asset-groups",
+            get(list_asset_groups_handler).post(create_asset_group_handler),
+        )
+        .route(
+            "/api/asset-groups/:id",
+            axum::routing::patch(update_asset_group_handler)
+                .delete(delete_asset_group_handler),
+        )
+        .route(
+            "/api/asset-groups/:id/members",
+            get(list_asset_group_members_handler).post(add_asset_group_member_handler),
+        )
+        .route(
+            "/api/asset-groups/:id/members/:asset_id",
+            axum::routing::delete(remove_asset_group_member_handler),
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
         .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))
