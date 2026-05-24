@@ -13,6 +13,7 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import LineChart from "@cloudscape-design/components/line-chart";
+import Toggle from "@cloudscape-design/components/toggle";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 import { AuthContext } from "./AuthGate.jsx";
 
@@ -90,6 +91,27 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
       await refresh();
     },
     [refresh],
+  );
+
+  const [approvalToggleBusy, setApprovalToggleBusy] = useState(false);
+  const toggleApprovalPolicy = useCallback(
+    async (next) => {
+      if (!asset) return;
+      setApprovalToggleBusy(true);
+      try {
+        const updated = await apiJson(
+          `/api/assets/${asset.id}/approval-policy`,
+          "PATCH",
+          { requiresApproval: next },
+        );
+        setAsset(updated);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setApprovalToggleBusy(false);
+      }
+    },
+    [asset],
   );
 
   const [reapplyTarget, setReapplyTarget] = useState(null);
@@ -171,7 +193,7 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
             </Header>
           }
         >
-          <ColumnLayout columns={3} variant="text-grid">
+          <ColumnLayout columns={4} variant="text-grid">
             <div>
               <Box variant="awsui-key-label">Hostname</Box>
               <div>{asset.hostname || "—"}</div>
@@ -183,6 +205,21 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
             <div>
               <Box variant="awsui-key-label">Owner</Box>
               <div>{isOwner ? "You" : asset.ownerId}</div>
+            </div>
+            <div>
+              <Box variant="awsui-key-label">
+                Require approval to close findings
+              </Box>
+              <Toggle
+                checked={!!asset.requiresApproval}
+                disabled={!isOwner || approvalToggleBusy}
+                onChange={({ detail }) =>
+                  toggleApprovalPolicy(detail.checked)
+                }
+                data-testid="approval-policy-toggle"
+              >
+                {asset.requiresApproval ? "Enabled" : "Disabled"}
+              </Toggle>
             </div>
           </ColumnLayout>
         </Container>
