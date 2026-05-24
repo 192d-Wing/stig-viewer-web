@@ -19,6 +19,7 @@ pub mod report;
 pub mod rule_bulk_import;
 pub mod rule_comments;
 pub mod saml;
+pub mod saml_verify;
 pub mod saved_searches;
 pub mod stig;
 pub mod test_support;
