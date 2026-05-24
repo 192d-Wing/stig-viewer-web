@@ -65,6 +65,11 @@ use api::{
     },
     bundle::bundle_handler as asset_bundle_handler,
     catalog::{get_catalog, get_health},
+    catalog_diff::{
+        diff_handler as catalog_diff_handler,
+        list_archive_handler as list_catalog_archive_handler,
+        seed_archive_handler as seed_catalog_archive_handler,
+    },
     compliance_report::{
         download_handler as download_compliance_report_handler,
         list_handler as list_compliance_reports_handler,
@@ -422,6 +427,8 @@ async fn main() -> Result<()> {
         )
         .route("/api/webhooks/:id/test", post(test_webhook_handler))
         .route("/api/stigs/lint", post(stig_lint_handler))
+        .route("/api/stigs/:id/diff", get(catalog_diff_handler))
+        .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
@@ -457,6 +464,7 @@ async fn main() -> Result<()> {
             .route("/api/test/backdate-audit", post(backdate_audit_handler))
             .route("/api/test/run-scheduler", post(run_scheduler_handler))
             .route("/api/test/saml-login", post(test_saml_login_handler))
+            .route("/api/test/seed-archive", post(seed_catalog_archive_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }
