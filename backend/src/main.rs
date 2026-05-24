@@ -99,6 +99,7 @@ use api::{
         list_handler as list_saved_searches_handler,
     },
     stig::get_stig,
+    stig_validator::lint_handler as stig_lint_handler,
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
         reset_handler, run_digest_handler, run_report_handler, run_retention_handler,
@@ -356,6 +357,7 @@ async fn main() -> Result<()> {
             get(list_webhook_deliveries_handler),
         )
         .route("/api/webhooks/:id/test", post(test_webhook_handler))
+        .route("/api/stigs/lint", post(stig_lint_handler))
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
