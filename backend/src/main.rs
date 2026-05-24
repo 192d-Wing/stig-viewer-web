@@ -331,6 +331,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/activity", get(activity_handler))
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
+        .route("/api/drafts/pending-for-me", get(pending_for_me_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
         .route(
             "/api/drafts/:id",

@@ -20,6 +20,7 @@ pub struct DraftRow {
     pub json_path: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub assigned_reviewer_id: Option<String>,
 }
 
 /// Summary row for the drafts list (joins author display name).
@@ -34,6 +35,8 @@ pub struct DraftSummary {
     pub status: String,
     pub version: String,
     pub updated_at: DateTime<Utc>,
+    pub assigned_reviewer_id: Option<String>,
+    pub assigned_reviewer_name: Option<String>,
 }
 
 // ── Comment row ─────────────────────────────────────────────────────────────
@@ -61,9 +64,12 @@ pub async fn list_drafts(
     let rows = sqlx::query_as::<_, DraftSummary>(
         r#"
         SELECT d.id, d.title, d.author_id, u.display_name AS author_name,
-               d.based_on_stig, d.status, d.version, d.updated_at
+               d.based_on_stig, d.status, d.version, d.updated_at,
+               d.assigned_reviewer_id,
+               r.display_name AS assigned_reviewer_name
         FROM stig_drafts d
         JOIN users u ON u.id = d.author_id
+        LEFT JOIN users r ON r.id = d.assigned_reviewer_id
         WHERE ($1::text IS NULL OR d.status = $1)
           AND ($2::text IS NULL OR d.author_id = $2)
         ORDER BY d.updated_at DESC
@@ -71,6 +77,32 @@ pub async fn list_drafts(
     )
     .bind(status)
     .bind(author_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Drafts in 'submitted' state assigned specifically to `reviewer_id`.
+/// Used by the "pending for me" endpoint and notifications bell.
+pub async fn list_pending_for_reviewer(
+    pool: &PgPool,
+    reviewer_id: &str,
+) -> Result<Vec<DraftSummary>> {
+    let rows = sqlx::query_as::<_, DraftSummary>(
+        r#"
+        SELECT d.id, d.title, d.author_id, u.display_name AS author_name,
+               d.based_on_stig, d.status, d.version, d.updated_at,
+               d.assigned_reviewer_id,
+               r.display_name AS assigned_reviewer_name
+        FROM stig_drafts d
+        JOIN users u ON u.id = d.author_id
+        LEFT JOIN users r ON r.id = d.assigned_reviewer_id
+        WHERE d.assigned_reviewer_id = $1
+          AND d.status = 'submitted'
+        ORDER BY d.updated_at DESC
+        "#,
+    )
+    .bind(reviewer_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -89,8 +121,8 @@ pub async fn insert_draft(pool: &PgPool, draft: &DraftRow) -> Result<()> {
         r#"
         INSERT INTO stig_drafts
             (id, title, author_id, based_on_stig, status, version, release_info,
-             description, next_vuln_id, json_path)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             description, next_vuln_id, json_path, assigned_reviewer_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(&draft.id)
@@ -103,6 +135,23 @@ pub async fn insert_draft(pool: &PgPool, draft: &DraftRow) -> Result<()> {
     .bind(&draft.description)
     .bind(draft.next_vuln_id)
     .bind(&draft.json_path)
+    .bind(&draft.assigned_reviewer_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set/clear the assigned reviewer on a draft.
+pub async fn set_assigned_reviewer(
+    pool: &PgPool,
+    draft_id: &str,
+    reviewer_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE stig_drafts SET assigned_reviewer_id = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(draft_id)
+    .bind(reviewer_id)
     .execute(pool)
     .await?;
     Ok(())

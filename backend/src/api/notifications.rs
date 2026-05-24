@@ -72,12 +72,22 @@ pub struct DecisionItem {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AssignedDraftItem {
+    pub draft_id: String,
+    pub title: String,
+    pub by_name: String,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationsResponse {
     pub assigned: Vec<AssignedItem>,
     pub overdue: Vec<OverdueItem>,
     pub mentions: Vec<MentionItem>,
     pub approvals: Vec<ApprovalItem>,
     pub decisions: Vec<DecisionItem>,
+    pub assigned_drafts: Vec<AssignedDraftItem>,
     pub unread_count: i64,
     pub last_seen: Option<DateTime<Utc>>,
 }
@@ -356,12 +366,57 @@ pub async fn get_handler(
         });
     }
 
+    // Drafts in 'submitted' state explicitly assigned to the caller.
+    // These are inherently transient — once the reviewer acts (approve,
+    // reject, claim) they leave the bucket. No separate notifications
+    // table needed; the draft row IS the notification.
+    let assigned_draft_rows = sqlx::query(
+        r#"
+        SELECT
+            d.id            AS draft_id,
+            d.title         AS title,
+            d.updated_at    AS at,
+            u.display_name  AS by_name
+          FROM stig_drafts d
+          JOIN users u ON u.id = d.author_id
+         WHERE d.assigned_reviewer_id = $1
+           AND d.status = 'submitted'
+         ORDER BY d.updated_at DESC
+         LIMIT 50
+        "#,
+    )
+    .bind(&user.id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let mut assigned_drafts: Vec<AssignedDraftItem> =
+        Vec::with_capacity(assigned_draft_rows.len());
+    for row in assigned_draft_rows {
+        let at: DateTime<Utc> = row.try_get("at").map_err(map_sqlx)?;
+        // Treat any submitted-and-still-assigned draft as unread — there
+        // is no per-row read state, so the bell badge mirrors the live
+        // queue. mark-read clears `last_seen` but the bucket itself is
+        // self-clearing when the reviewer acts on the draft.
+        let unread = last_seen.is_none_or(|t| at > t);
+        if unread {
+            unread_count += 1;
+        }
+        assigned_drafts.push(AssignedDraftItem {
+            draft_id: row.try_get("draft_id").map_err(map_sqlx)?,
+            title: row.try_get("title").map_err(map_sqlx)?,
+            by_name: row.try_get("by_name").map_err(map_sqlx)?,
+            at,
+        });
+    }
+
     Ok(Json(NotificationsResponse {
         assigned,
         overdue,
         mentions,
         approvals,
         decisions,
+        assigned_drafts,
         unread_count,
         last_seen,
     }))
