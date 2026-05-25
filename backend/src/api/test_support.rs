@@ -24,6 +24,18 @@ use crate::AppState;
 /// endpoint can't be used to sneak in an unrecognized value.
 const VALID_ROLES: &[&str] = &["author", "reviewer", "admin", "viewer"];
 
+/// The five known background schedulers wired up in `main.rs`. Kept in
+/// sync with the match arms in `run_scheduler_handler` so the
+/// inject-error endpoint can't arm a failure for a name nothing will
+/// ever consume.
+const VALID_SCHEDULERS: &[&str] = &[
+    "sync",
+    "snapshot",
+    "overdue_digest",
+    "audit_retention",
+    "compliance_report",
+];
+
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
 /// Only registered when STIG_ENV != "production".
 pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
@@ -448,5 +460,30 @@ pub async fn run_scheduler_handler(
 /// `STIG_ENV != "production"` at registration time.
 pub async fn reset_ratelimit_handler() -> StatusCode {
     rate_limit::reset();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+pub struct InjectSchedulerErrorRequest {
+    pub name: String,
+}
+
+/// POST /api/test/inject-scheduler-error — arm a one-shot failure for
+/// the named scheduler. The next call to `scheduler_log::record` for
+/// that name short-circuits with `status='error'` /
+/// `message='injected test failure'`. The flag is consumed after one
+/// tick, so subsequent ticks return to normal behaviour.
+///
+/// Exists so the admin job dashboard's error path is reachable from
+/// E2E — nothing in the real system errors reliably on demand. Body:
+/// `{ "name": "sync" | "snapshot" | "overdue_digest" | "audit_retention" | "compliance_report" }`.
+pub async fn inject_scheduler_error_handler(
+    Json(req): Json<InjectSchedulerErrorRequest>,
+) -> StatusCode {
+    if !VALID_SCHEDULERS.contains(&req.name.as_str()) {
+        tracing::warn!("inject-scheduler-error: unknown name {:?}", req.name);
+        return StatusCode::BAD_REQUEST;
+    }
+    scheduler_log::inject_failure(&req.name);
     StatusCode::NO_CONTENT
 }
