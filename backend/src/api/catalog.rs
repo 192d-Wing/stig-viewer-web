@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::db::{count_catalog, list_catalog};
+use crate::db::list_catalog;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -25,13 +25,4 @@ pub async fn get_catalog(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Json(entries))
-}
-
-/// GET /api/health
-pub async fn get_health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let count = count_catalog(&state.pool).await.unwrap_or(0);
-    Json(serde_json::json!({
-        "status": "ok",
-        "stig_count": count,
-    }))
 }
