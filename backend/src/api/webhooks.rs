@@ -384,6 +384,172 @@ pub async fn test_handler(
     Ok(StatusCode::ACCEPTED)
 }
 
+// ── Verify recipe (copy/paste receiver snippets) ───────────────────────────
+
+/// Response payload for `GET /api/webhooks/:id/verify-recipe`.
+///
+/// Renders the same HMAC verification logic documented at the top of
+/// this module as ready-to-paste curl / Python / Node snippets, with the
+/// webhook's actual URL + secret + a canned sample payload pre-filled so
+/// an operator can validate a receiver end-to-end without having to copy
+/// individual values around. When the webhook's secret is empty we emit
+/// "unsigned" snippets instead of fabricating a meaningless signature.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyRecipe {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// The literal HTTP header name receivers should validate. Kept in
+    /// the response so a future header rename doesn't silently break
+    /// every existing copy/paste recipe out in the wild.
+    #[serde(rename = "headerName")]
+    pub header_name: String,
+    /// Pretty-printed canonical sample body — matches what
+    /// `build_assigned_payload` produces for the synthetic /test event.
+    #[serde(rename = "samplePayload")]
+    pub sample_payload: String,
+    pub snippets: VerifyRecipeSnippets,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyRecipeSnippets {
+    pub curl: String,
+    pub python: String,
+    pub node: String,
+}
+
+/// Build the curl/Python/Node snippets for one webhook. Pulled out so
+/// it's unit-testable in isolation from the HTTP layer.
+fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
+    // Canonical sample event — kept compact on purpose so the snippets
+    // fit in a Slack/Discord message without scrolling.
+    let sample = json!({
+        "text": "Finding SV-SAMPLE assigned to Demo User",
+        "attachments": [{
+            "title": "Asset: demo-host · STIG: Sample STIG",
+            "text": "Severity: CAT II",
+            "color": "#df8b08",
+        }]
+    });
+    // Compact serialization keeps the body identical to what the
+    // outbound dispatcher actually signs, so the precomputed HMAC below
+    // is byte-accurate against the wire format.
+    let sample_payload = serde_json::to_string(&sample).expect("sample payload serialises");
+
+    let header_name = "X-Webhook-Signature";
+    let snippets = if webhook.secret.is_empty() {
+        VerifyRecipeSnippets {
+            curl: unsigned_curl_snippet(&webhook.url, &sample_payload),
+            python: unsigned_python_snippet(),
+            node: unsigned_node_snippet(),
+        }
+    } else {
+        let sig = sign_body(&webhook.secret, sample_payload.as_bytes())
+            .expect("non-empty secret always signs");
+        VerifyRecipeSnippets {
+            curl: signed_curl_snippet(&webhook.url, &sample_payload, &sig, header_name),
+            python: signed_python_snippet(&webhook.secret, header_name),
+            node: signed_node_snippet(&webhook.secret, header_name),
+        }
+    };
+
+    VerifyRecipe {
+        id: webhook.id.clone(),
+        name: webhook.name.clone(),
+        url: webhook.url.clone(),
+        header_name: header_name.to_string(),
+        sample_payload,
+        snippets,
+    }
+}
+
+fn signed_curl_snippet(url: &str, body: &str, sig: &str, header: &str) -> String {
+    // Single-line curl that demonstrates exactly what the dispatcher
+    // emits on the wire. The signature is pre-computed for the literal
+    // sample body so a paste-and-run actually validates downstream.
+    format!(
+        "curl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n  -H '{header}: {sig}' \\\n  -d '{body}'"
+    )
+}
+
+fn unsigned_curl_snippet(url: &str, body: &str) -> String {
+    format!(
+        "# This webhook is configured as unsigned (no secret set) — no signature header is sent.\ncurl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n  -d '{body}'"
+    )
+}
+
+fn signed_python_snippet(secret: &str, header: &str) -> String {
+    // Receiver-side verification recipe. The secret is embedded so the
+    // operator can paste-and-run; in production they'd load it from a
+    // secrets manager.
+    format!(
+        "# Python receiver — verify the X-Webhook-Signature header.\nimport hmac, hashlib\n\nSECRET = {secret_lit}.encode()\nHEADER = {header_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = 'sha256=' + hmac.new(SECRET, raw_body, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify(request.get_data(), request.headers[HEADER])\n",
+        secret_lit = python_string_literal(secret),
+        header_lit = python_string_literal(header),
+    )
+}
+
+fn unsigned_python_snippet() -> String {
+    // Explicit signal that the body is unauthenticated — anyone who can
+    // reach the URL can forge events. Operators should add a secret if
+    // they want replay protection.
+    "# This webhook is configured as unsigned (no secret set).\n# Receivers cannot verify the body's authenticity — there is no signature header.\n# Set a secret on the webhook in the Admin Console to enable HMAC verification.\n".to_string()
+}
+
+fn signed_node_snippet(secret: &str, header: &str) -> String {
+    format!(
+        "// Node.js receiver — verify the X-Webhook-Signature header.\nconst crypto = require('crypto');\n\nconst SECRET = {secret_lit};\nconst HEADER = {header_lit};\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = 'sha256=' + crypto.createHmac('sha256', SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verify(req.body, req.get(HEADER))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
+        secret_lit = js_string_literal(secret),
+        header_lit = js_string_literal(header),
+    )
+}
+
+fn unsigned_node_snippet() -> String {
+    "// This webhook is configured as unsigned (no secret set).\n// Receivers cannot verify the body's authenticity — there is no signature header.\n// Set a secret on the webhook in the Admin Console to enable HMAC verification.\n".to_string()
+}
+
+/// Escape a string for safe inclusion in a Python single-quoted literal.
+/// We use single quotes throughout the snippet so we only need to deal
+/// with backslashes and the quote character itself.
+fn python_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+/// Same idea as `python_string_literal` but for JavaScript single-quoted
+/// literals. Forward slashes and control chars don't need escaping for
+/// the values we feed in (URLs, hex header names, opaque secrets).
+fn js_string_literal(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+/// GET /api/webhooks/:id/verify-recipe — admin-only. Returns the curl /
+/// Python / Node receiver-verification snippets for one webhook, with
+/// the actual URL/secret/sample-body pre-filled. 404 if the webhook is
+/// gone (so a typo'd id in the Admin UI surfaces as an error toast
+/// rather than a blank modal).
+pub async fn verify_recipe_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Result<Json<VerifyRecipe>, StatusCode> {
+    ensure_admin(&user)?;
+
+    let webhook = sqlx::query_as::<_, WebhookRow>(
+        "SELECT id, name, url, secret, kinds, enabled, created_by, created_at \
+         FROM webhooks WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(state.pool.as_ref())
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(build_verify_recipe(&webhook)))
+}
+
 // ── Event payload + dispatch ───────────────────────────────────────────────
 
 /// Snapshot of just enough state to render an assigned-event Slack body.

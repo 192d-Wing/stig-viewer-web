@@ -164,6 +164,7 @@ use api::{
         run_overdue_digest,
         test_handler as test_webhook_handler,
         update_handler as update_webhook_handler,
+        verify_recipe_handler as webhook_verify_recipe_handler,
     },
 };
 use config::{load_sources, Config};
@@ -489,6 +490,10 @@ async fn main() -> Result<()> {
             get(list_webhook_deliveries_handler),
         )
         .route("/api/webhooks/:id/test", post(test_webhook_handler))
+        .route(
+            "/api/webhooks/:id/verify-recipe",
+            get(webhook_verify_recipe_handler),
+        )
         .route("/api/stigs/lint", post(stig_lint_handler))
         .route("/api/stigs/:id/diff", get(catalog_diff_handler))
         .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
