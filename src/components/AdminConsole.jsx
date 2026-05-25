@@ -109,6 +109,11 @@ export default function AdminConsole() {
     history: [],
   });
 
+  // Active sessions audit. Populated from /api/admin/sessions and
+  // pruned when the admin clicks Revoke on a row.
+  const [sessions, setSessions] = useState([]);
+  const [revokeBusyId, setRevokeBusyId] = useState(null);
+
   // Pending finding-close approval queue. Reviewer/admin only — for
   // anyone else the GET returns just their own rows (which is fine,
   // AdminConsole is gated by an admin route anyway).
@@ -123,7 +128,7 @@ export default function AdminConsole() {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w, r, e, ap, sr] = await Promise.all([
+      const [u, a, w, r, e, ap, sr, sess] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
@@ -134,6 +139,7 @@ export default function AdminConsole() {
           latest: {},
           history: [],
         })),
+        apiGet("/api/admin/sessions").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
@@ -142,6 +148,7 @@ export default function AdminConsole() {
       setEmails(e);
       setApprovals(ap);
       setSchedulerRuns(sr);
+      setSessions(sess);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -168,6 +175,26 @@ export default function AdminConsole() {
     const handle = setInterval(tick, 10_000);
     return () => clearInterval(handle);
   }, []);
+
+  const revokeSession = useCallback(
+    async (row) => {
+      setRevokeBusyId(row.id);
+      try {
+        const res = await apiFetch(`/api/admin/sessions/${row.id}`, {
+          method: "DELETE",
+        });
+        if (!res.ok && res.status !== 204) {
+          throw new Error(`Revoke failed: ${res.status}`);
+        }
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setRevokeBusyId(null);
+      }
+    },
+    [refresh],
+  );
 
   const openRoleModal = useCallback((user) => {
     setRoleModal({ user, role: user.role });
@@ -626,6 +653,75 @@ export default function AdminConsole() {
           </Header>
         }
         data-testid="scheduler-history-table"
+      />
+
+      <Table
+        variant="container"
+        items={sessions}
+        loading={loading}
+        loadingText="Loading active sessions"
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No active sessions.
+            </Box>
+          </Box>
+        }
+        columnDefinitions={[
+          {
+            id: "user",
+            header: "User",
+            cell: (s) => s.userName,
+          },
+          {
+            id: "ip",
+            header: "IP",
+            cell: (s) => s.ip || "—",
+          },
+          {
+            id: "user_agent",
+            header: "User-Agent",
+            cell: (s) => (
+              <span title={s.userAgent || ""}>
+                {s.userAgent ? truncateUrl(s.userAgent, 60) : "—"}
+              </span>
+            ),
+          },
+          {
+            id: "created",
+            header: "Created",
+            cell: (s) => relativeTime(s.createdAt),
+          },
+          {
+            id: "expires",
+            header: "Expires",
+            cell: (s) =>
+              s.expiresAt ? new Date(s.expiresAt).toLocaleString() : "—",
+          },
+          {
+            id: "actions",
+            header: "",
+            cell: (s) => (
+              <Button
+                variant="inline-link"
+                loading={revokeBusyId === s.id}
+                onClick={() => revokeSession(s)}
+                data-testid={`revoke-session-${s.id}`}
+              >
+                Revoke
+              </Button>
+            ),
+          },
+        ]}
+        header={
+          <Header
+            counter={`(${sessions.length})`}
+            description="Currently-active sessions across every user. Revoke forces a re-login on the next request without touching the audit row."
+          >
+            Active sessions
+          </Header>
+        }
+        data-testid="active-sessions-table"
       />
 
       <Table

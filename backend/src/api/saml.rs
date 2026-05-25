@@ -29,7 +29,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::api::auth::{
-    create_session, upsert_user, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
+    client_ip, create_session, upsert_user, user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
 };
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -148,9 +148,12 @@ pub struct AcsForm {
 /// a session via the same helper the OIDC callback uses.
 pub async fn acs_handler(
     State(state): State<AppSamlState>,
+    headers: HeaderMap,
     jar: CookieJar,
     Form(form): Form<AcsForm>,
 ) -> Result<(CookieJar, Redirect), (StatusCode, String)> {
+    let ip = client_ip(&headers);
+    let ua = user_agent(&headers);
     let xml_bytes = B64
         .decode(form.saml_response.as_bytes())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("SAMLResponse not base64: {e}")))?;
@@ -191,7 +194,7 @@ pub async fn acs_handler(
         .await
         .map_err(|e| internal(&format!("upsert_user failed: {e}")))?;
 
-    let session_id = create_session(state.pool.as_ref(), &user.id)
+    let session_id = create_session(state.pool.as_ref(), &user.id, &ip, &ua)
         .await
         .map_err(|e| internal(&format!("create_session failed: {e}")))?;
 
@@ -245,9 +248,11 @@ pub(crate) async fn saml_login_user(
     name_id: &str,
     email: &str,
     display_name: &str,
+    ip: &str,
+    user_agent: &str,
 ) -> Result<(String, String)> {
     let user = upsert_user(pool, "saml", name_id, display_name, email).await?;
-    let session_id = create_session(pool, &user.id).await?;
+    let session_id = create_session(pool, &user.id, ip, user_agent).await?;
     Ok((user.id, session_id))
 }
 
