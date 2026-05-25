@@ -302,6 +302,39 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     [asset],
   );
 
+  // OSCAL JSON download — fetched via apiFetch so we carry the
+  // X-User-Id header through, then triggered as a blob download in the
+  // browser. The filename comes from the server's Content-Disposition
+  // when present (which is the case here — see backend/src/api/oscal.rs).
+  const downloadOscal = useCallback(async () => {
+    if (!asset) return;
+    try {
+      const res = await apiFetch(`/api/assets/${asset.id}/oscal.json`);
+      if (!res.ok) {
+        setError(`OSCAL download failed: ${res.status}`);
+        return;
+      }
+      const blob = await res.blob();
+      // Pull filename out of Content-Disposition if the server sent one;
+      // fall back to a sensible default so we don't end up with "download".
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename="?([^";]+)"?/i);
+      const filename = m ? m[1] : `oscal-${asset.name}.json`;
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Defer revoke so the click has time to start the download.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setError(err.message || "OSCAL download failed");
+    }
+  }, [asset]);
+
   const [reapplyTarget, setReapplyTarget] = useState(null);
   const [reapplying, setReapplying] = useState(false);
   const reapply = useCallback(async () => {
@@ -373,6 +406,13 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
                     ariaLabel="Download bundle (includes CKL files and evidence attachments)"
                   >
                     Download bundle
+                  </Button>
+                  <Button
+                    iconName="download"
+                    onClick={downloadOscal}
+                    ariaLabel="Download OSCAL assessment-results JSON"
+                  >
+                    Download OSCAL
                   </Button>
                 </SpaceBetween>
               }
