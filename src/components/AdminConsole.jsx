@@ -1531,7 +1531,7 @@ export default function AdminConsole() {
           </FormField>
           <FormField
             label="Secret"
-            description="Optional. Sent as the X-Webhook-Secret header on each delivery."
+            description="Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned."
           >
             <Input
               value={hookModal?.secret ?? ""}

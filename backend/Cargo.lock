@@ -2845,6 +2845,7 @@ dependencies = [
  "csv",
  "flate2",
  "hex",
+ "hmac",
  "lettre",
  "openidconnect",
  "printpdf",
