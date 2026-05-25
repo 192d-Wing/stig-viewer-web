@@ -41,6 +41,7 @@ use api::{
         create_handler as create_asset_email_cc_handler,
         delete_handler as delete_asset_email_cc_handler,
         list_handler as list_asset_email_cc_handler,
+        run_asset_email_schedules,
         send_handler as send_asset_email_report_handler,
     },
     asset_groups::{
@@ -55,7 +56,7 @@ use api::{
     asset_import::import_handler as import_assets_handler,
     assets::{
         compare_handler as compare_assets_handler, create_asset_handler, delete_asset_handler,
-        get_asset_handler, list_assets_handler, update_asset_handler,
+        get_asset_handler, list_assets_handler, patch_asset_handler, update_asset_handler,
     },
     attachments::{
         counts_for_checklist_handler as attachments_counts_for_checklist_handler,
@@ -150,7 +151,8 @@ use api::{
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
         inject_scheduler_error_handler, reset_handler, reset_ratelimit_handler,
-        run_digest_handler, run_report_handler, run_retention_handler, run_scheduler_handler,
+        run_asset_email_schedules_handler, run_digest_handler, run_report_handler,
+        run_retention_handler, run_scheduler_handler,
         saml_login_handler as test_saml_login_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
@@ -265,6 +267,7 @@ async fn main() -> Result<()> {
             "/api/assets/:id",
             get(get_asset_handler)
                 .put(update_asset_handler)
+                .patch(patch_asset_handler)
                 .delete(delete_asset_handler),
         )
         .route(
@@ -529,6 +532,10 @@ async fn main() -> Result<()> {
             .route("/api/test/run-digest", post(run_digest_handler))
             .route("/api/test/run-report", post(run_report_handler))
             .route("/api/test/run-retention", post(run_retention_handler))
+            .route(
+                "/api/test/run-asset-email-schedules",
+                post(run_asset_email_schedules_handler),
+            )
             .route("/api/test/backdate-audit", post(backdate_audit_handler))
             .route("/api/test/run-scheduler", post(run_scheduler_handler))
             .route(
@@ -700,6 +707,37 @@ async fn main() -> Result<()> {
                 match result {
                     Ok(msg) => tracing::info!("compliance report: {msg}"),
                     Err(e) => tracing::error!("compliance report failed: {e:#}"),
+                }
+            }
+        });
+    }
+
+    // Per-asset scheduled email scheduler — fires the existing per-asset
+    // compliance-report email path on a daily / weekly / monthly cadence
+    // chosen by each asset's owner. The cadence-interval check lives in
+    // `run_asset_email_schedules` (SQL `INTERVAL`-driven), so the loop
+    // itself can tick on a coarse hourly default and let assets that
+    // aren't yet due fall out via the SELECT.
+    {
+        let interval_hours: u64 = std::env::var("ASSET_EMAIL_SCHEDULE_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let db = pool.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(interval_hours * 3600));
+            loop {
+                interval.tick().await;
+                let result = scheduler_log::record(&db, "asset_email_schedule", || async {
+                    let n = run_asset_email_schedules(&db, &cfg.data_dir).await?;
+                    Ok::<String, anyhow::Error>(format!("emailed {n} asset(s)"))
+                })
+                .await;
+                match result {
+                    Ok(msg) => tracing::info!("asset email schedule: {msg}"),
+                    Err(e) => tracing::error!("asset email schedule failed: {e:#}"),
                 }
             }
         });

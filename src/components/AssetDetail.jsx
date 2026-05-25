@@ -221,6 +221,38 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     [assetId, refreshCc],
   );
 
+  // ── Scheduled email cadence ────────────────────────────────────────
+  // Re-uses the same write-ACL gate the on-demand send already uses
+  // (ccVisible). Persists via the asset PATCH endpoint and re-reads the
+  // asset row so `emailLastSentAt` reflects whatever the scheduler last
+  // stamped.
+  const CADENCE_OPTIONS = [
+    { label: "Off", value: "off" },
+    { label: "Daily", value: "daily" },
+    { label: "Weekly", value: "weekly" },
+    { label: "Monthly", value: "monthly" },
+  ];
+  const [cadenceBusy, setCadenceBusy] = useState(false);
+  const setCadence = useCallback(
+    async (next) => {
+      if (!asset) return;
+      setCadenceBusy(true);
+      try {
+        const updated = await apiJson(
+          `/api/assets/${asset.id}`,
+          "PATCH",
+          { emailCadence: next },
+        );
+        setAsset(updated);
+      } catch (err) {
+        setCcError(err.message || "Failed to update cadence.");
+      } finally {
+        setCadenceBusy(false);
+      }
+    },
+    [asset],
+  );
+
   const emailReportNow = useCallback(async () => {
     setEmailSending(true);
     setEmailSendStatus(null);
@@ -823,6 +855,36 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
                   {emailSendStatus.message}
                 </Alert>
               )}
+              <ColumnLayout columns={2}>
+                <FormField
+                  label="Scheduled cadence"
+                  description="Auto-mail the per-asset compliance PDF to the recipients above on this cadence. ‘Off’ disables scheduled sends; the on-demand button above still works."
+                >
+                  <Select
+                    selectedOption={
+                      CADENCE_OPTIONS.find(
+                        (o) => o.value === (asset?.emailCadence || "off"),
+                      ) || CADENCE_OPTIONS[0]
+                    }
+                    onChange={({ detail }) =>
+                      setCadence(detail.selectedOption.value)
+                    }
+                    options={CADENCE_OPTIONS}
+                    disabled={cadenceBusy}
+                    data-testid="email-cadence-select"
+                  />
+                </FormField>
+                <FormField label="Last sent">
+                  <Box
+                    data-testid="email-last-sent"
+                    color="text-body-secondary"
+                  >
+                    {asset?.emailLastSentAt
+                      ? new Date(asset.emailLastSentAt).toLocaleString()
+                      : "Never"}
+                  </Box>
+                </FormField>
+              </ColumnLayout>
               <Table
                 variant="embedded"
                 items={ccRows}
