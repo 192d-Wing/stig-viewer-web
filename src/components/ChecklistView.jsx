@@ -35,6 +35,15 @@ const STATUSES = [
 
 const STATUS_BY_VALUE = Object.fromEntries(STATUSES.map((s) => [s.value, s]));
 
+// Emoji-style reactions surfaced under each rule comment. Keep the
+// `key` values in sync with the allowlist in
+// backend/src/api/rule_comments.rs (ALLOWED_REACTIONS).
+const REACTION_TYPES = [
+  { key: "thumbs_up", emoji: "\u{1F44D}" },
+  { key: "check", emoji: "✅" },
+  { key: "question", emoji: "❓" },
+];
+
 // Closing statuses require a written justification in `findingDetails`.
 // Keep in sync with `requires_finding_details` in
 // backend/src/api/checklists.rs.
@@ -332,6 +341,33 @@ export default function ChecklistView({ checklistId, onBack }) {
         await refreshComments(editing.id);
       } catch (err) {
         setCommentError(err.message);
+      }
+    },
+    [editing, refreshComments],
+  );
+
+  // Toggle one of the three emoji reactions on a comment. If `mine` is
+  // true we DELETE; otherwise we POST. After the request we refresh the
+  // comment list so the new count/mine flag are reflected.
+  const toggleReaction = useCallback(
+    async (commentId, reaction, mine) => {
+      if (!editing) return;
+      setCommentError(null);
+      try {
+        if (mine) {
+          const res = await apiFetch(
+            `/api/comments/${commentId}/reactions/${reaction}`,
+            { method: "DELETE" },
+          );
+          if (!res.ok) throw new Error(`${res.status}`);
+        } else {
+          await apiJson(`/api/comments/${commentId}/reactions`, "POST", {
+            reaction,
+          });
+        }
+        await refreshComments(editing.id);
+      } catch (err) {
+        setCommentError(parseSaveError(err.message));
       }
     },
     [editing, refreshComments],
@@ -922,6 +958,38 @@ export default function ChecklistView({ checklistId, onBack }) {
                             ) : (
                               <>
                                 <Box>{c.body}</Box>
+                                <SpaceBetween
+                                  direction="horizontal"
+                                  size="xxs"
+                                >
+                                  {REACTION_TYPES.map((rt) => {
+                                    const summary =
+                                      c.reactions?.[rt.key] ?? {
+                                        count: 0,
+                                        mine: false,
+                                      };
+                                    return (
+                                      <Button
+                                        key={rt.key}
+                                        variant={
+                                          summary.mine
+                                            ? "primary"
+                                            : "inline-link"
+                                        }
+                                        onClick={() =>
+                                          toggleReaction(
+                                            c.id,
+                                            rt.key,
+                                            summary.mine,
+                                          )
+                                        }
+                                        data-testid={`rule-comment-reaction-${rt.key}`}
+                                      >
+                                        {rt.emoji} {summary.count}
+                                      </Button>
+                                    );
+                                  })}
+                                </SpaceBetween>
                                 <SpaceBetween
                                   direction="horizontal"
                                   size="xxs"
