@@ -109,9 +109,11 @@ use api::{
     report::report_handler as asset_report_handler,
     rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
     rule_comments::{
+        add_reaction_handler as add_comment_reaction_handler,
         create_handler as create_rule_comment_handler,
         delete_handler as delete_rule_comment_handler,
         list_handler as list_rule_comments_handler,
+        remove_reaction_handler as remove_comment_reaction_handler,
         update_handler as update_rule_comment_handler,
     },
     saml::{
@@ -325,6 +327,14 @@ async fn main() -> Result<()> {
             "/api/comments/:id",
             axum::routing::patch(update_rule_comment_handler)
                 .delete(delete_rule_comment_handler),
+        )
+        .route(
+            "/api/comments/:id/reactions",
+            post(add_comment_reaction_handler),
+        )
+        .route(
+            "/api/comments/:id/reactions/:reaction",
+            axum::routing::delete(remove_comment_reaction_handler),
         )
         .route(
             "/api/checklists/:id/attachments",

@@ -147,35 +147,134 @@ pub struct RuleCommentRow {
     pub edited_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionSummary {
+    pub count: i64,
+    pub mine: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionsBlock {
+    pub thumbs_up: ReactionSummary,
+    pub check: ReactionSummary,
+    pub question: ReactionSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleCommentWithReactions {
+    pub id: String,
+    pub checklist_id: String,
+    pub rule_id: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub edited_at: Option<DateTime<Utc>>,
+    pub reactions: ReactionsBlock,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CommentBody {
     pub body: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReactionBody {
+    pub reaction: String,
+}
+
+/// Allowed reaction-type values. The schema is open (TEXT) but the API
+/// is the gatekeeper so that adding a new reaction type doesn't need a
+/// migration.
+const ALLOWED_REACTIONS: &[&str] = &["thumbs_up", "check", "question"];
+
+fn is_allowed_reaction(value: &str) -> bool {
+    ALLOWED_REACTIONS.iter().any(|r| *r == value)
+}
+
 // ── List ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, sqlx::FromRow)]
+struct ListCommentRow {
+    id: String,
+    checklist_id: String,
+    rule_id: String,
+    user_id: String,
+    user_name: String,
+    body: String,
+    created_at: DateTime<Utc>,
+    edited_at: Option<DateTime<Utc>>,
+    thumbs_up_count: Option<i64>,
+    thumbs_up_mine: Option<bool>,
+    check_count: Option<i64>,
+    check_mine: Option<bool>,
+    question_count: Option<i64>,
+    question_mine: Option<bool>,
+}
 
 pub async fn list_handler(
     State(state): State<AppState>,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
     Path((checklist_id, rule_id)): Path<(String, String)>,
-) -> Result<Json<Vec<RuleCommentRow>>, (StatusCode, String)> {
-    let rows = sqlx::query_as::<_, RuleCommentRow>(
+) -> Result<Json<Vec<RuleCommentWithReactions>>, (StatusCode, String)> {
+    let rows = sqlx::query_as::<_, ListCommentRow>(
         r#"
         SELECT c.id, c.checklist_id, c.rule_id, c.user_id,
                u.display_name AS user_name,
-               c.body, c.created_at, c.edited_at
+               c.body, c.created_at, c.edited_at,
+               COUNT(r.*) FILTER (WHERE r.reaction = 'thumbs_up') AS thumbs_up_count,
+               COALESCE(BOOL_OR(r.reaction = 'thumbs_up' AND r.user_id = $3), false) AS thumbs_up_mine,
+               COUNT(r.*) FILTER (WHERE r.reaction = 'check') AS check_count,
+               COALESCE(BOOL_OR(r.reaction = 'check' AND r.user_id = $3), false) AS check_mine,
+               COUNT(r.*) FILTER (WHERE r.reaction = 'question') AS question_count,
+               COALESCE(BOOL_OR(r.reaction = 'question' AND r.user_id = $3), false) AS question_mine
         FROM rule_comments c
         JOIN users u ON u.id = c.user_id
+        LEFT JOIN comment_reactions r ON r.comment_id = c.id
         WHERE c.checklist_id = $1 AND c.rule_id = $2
+        GROUP BY c.id, u.display_name
         ORDER BY c.created_at DESC
         "#,
     )
     .bind(&checklist_id)
     .bind(&rule_id)
+    .bind(&user.id)
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(err_500)?;
-    Ok(Json(rows))
+
+    let out: Vec<RuleCommentWithReactions> = rows
+        .into_iter()
+        .map(|r| RuleCommentWithReactions {
+            id: r.id,
+            checklist_id: r.checklist_id,
+            rule_id: r.rule_id,
+            user_id: r.user_id,
+            user_name: r.user_name,
+            body: r.body,
+            created_at: r.created_at,
+            edited_at: r.edited_at,
+            reactions: ReactionsBlock {
+                thumbs_up: ReactionSummary {
+                    count: r.thumbs_up_count.unwrap_or(0),
+                    mine: r.thumbs_up_mine.unwrap_or(false),
+                },
+                check: ReactionSummary {
+                    count: r.check_count.unwrap_or(0),
+                    mine: r.check_mine.unwrap_or(false),
+                },
+                question: ReactionSummary {
+                    count: r.question_count.unwrap_or(0),
+                    mine: r.question_mine.unwrap_or(false),
+                },
+            },
+        })
+        .collect();
+
+    Ok(Json(out))
 }
 
 // ── Create ─────────────────────────────────────────────────────────────────
@@ -310,6 +409,77 @@ pub async fn delete_handler(
         .execute(state.pool.as_ref())
         .await
         .map_err(err_500)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Reactions ──────────────────────────────────────────────────────────────
+
+/// POST /api/comments/:id/reactions — add the caller's reaction to a
+/// comment. Idempotent (`ON CONFLICT DO NOTHING`). 400 on unknown
+/// reaction type, 404 if the comment doesn't exist.
+pub async fn add_reaction_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(comment_id): Path<String>,
+    Json(body): Json<ReactionBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_allowed_reaction(&body.reaction) {
+        return Err(err_400("Unknown reaction type"));
+    }
+
+    // Confirm the comment exists so we return 404 cleanly instead of
+    // letting the FK insert fail with a 500.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM rule_comments WHERE id = $1")
+            .bind(&comment_id)
+            .fetch_optional(state.pool.as_ref())
+            .await
+            .map_err(err_500)?;
+    if exists.is_none() {
+        return Err(err_404());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO comment_reactions (comment_id, user_id, reaction)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(&comment_id)
+    .bind(&user.id)
+    .bind(&body.reaction)
+    .execute(state.pool.as_ref())
+    .await
+    .map_err(err_500)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/comments/:id/reactions/:reaction — remove the caller's
+/// reaction. Idempotent (returns 204 even if no row matched).
+pub async fn remove_reaction_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path((comment_id, reaction)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !is_allowed_reaction(&reaction) {
+        return Err(err_400("Unknown reaction type"));
+    }
+
+    sqlx::query(
+        r#"
+        DELETE FROM comment_reactions
+        WHERE comment_id = $1 AND user_id = $2 AND reaction = $3
+        "#,
+    )
+    .bind(&comment_id)
+    .bind(&user.id)
+    .bind(&reaction)
+    .execute(state.pool.as_ref())
+    .await
+    .map_err(err_500)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
