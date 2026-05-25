@@ -31,6 +31,12 @@ use api::{
         delete_handler as delete_asset_acl_handler,
         list_handler as list_asset_acl_handler,
     },
+    asset_email_cc::{
+        create_handler as create_asset_email_cc_handler,
+        delete_handler as delete_asset_email_cc_handler,
+        list_handler as list_asset_email_cc_handler,
+        send_handler as send_asset_email_report_handler,
+    },
     asset_groups::{
         add_member_handler as add_asset_group_member_handler,
         create_handler as create_asset_group_handler,
@@ -261,6 +267,18 @@ async fn main() -> Result<()> {
         .route(
             "/api/assets/:id/acl/:user_id",
             axum::routing::delete(delete_asset_acl_handler),
+        )
+        .route(
+            "/api/assets/:id/email-cc",
+            get(list_asset_email_cc_handler).post(create_asset_email_cc_handler),
+        )
+        .route(
+            "/api/assets/:id/email-cc/:email",
+            axum::routing::delete(delete_asset_email_cc_handler),
+        )
+        .route(
+            "/api/assets/:id/email-report",
+            post(send_asset_email_report_handler),
         )
         .route(
             "/api/asset-groups",

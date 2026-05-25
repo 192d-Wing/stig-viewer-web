@@ -6,13 +6,23 @@ use axum::{
 use chrono::Utc;
 use printpdf::{BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference};
 use serde_json::Value;
+use sqlx::PgPool;
 use std::collections::HashMap;
+use std::path::Path as StdPath;
 
+use crate::config::Config;
 use crate::db_assets;
 use crate::db_attachments;
 use crate::db_checklists;
 use crate::severity::weighted_score;
 use crate::AppState;
+
+/// Result of a successful per-asset PDF build — the rendered bytes plus
+/// the asset name (callers want it for filenames, email subjects, etc.).
+pub(crate) struct BuiltAssetReport {
+    pub asset_name: String,
+    pub pdf_bytes: Vec<u8>,
+}
 
 // ── Layout constants ────────────────────────────────────────────────────────
 const PAGE_W: f32 = 210.0; // A4 mm
@@ -50,29 +60,50 @@ pub async fn report_handler(
     State(state): State<AppState>,
     Path(asset_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let pool = state.pool.as_ref();
-
-    let asset = db_assets::get_asset(pool, &asset_id)
+    let built = build_asset_report(state.pool.as_ref(), &state.config.data_dir, &asset_id)
         .await
-        .map_err(map_db)?
+        .map_err(|e| {
+            tracing::error!("build_asset_report failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
+
+    let filename = sanitize_filename(&format!("{}-stig-report.pdf", built.asset_name));
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        headers.insert(header::CONTENT_DISPOSITION, v);
+    }
+    Ok((headers, built.pdf_bytes))
+}
+
+/// Build the per-asset compliance PDF without going through HTTP. Used by
+/// both the `GET /api/assets/:id/report.pdf` handler and the on-demand
+/// email-send path. Returns `Ok(None)` when the asset doesn't exist so
+/// callers can map that to a 404 cleanly.
+pub(crate) async fn build_asset_report(
+    pool: &PgPool,
+    data_dir: &StdPath,
+    asset_id: &str,
+) -> anyhow::Result<Option<BuiltAssetReport>> {
+    let asset = match db_assets::get_asset(pool, asset_id).await? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
 
     let owner_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
         .bind(&asset.owner_id)
         .fetch_optional(pool)
-        .await
-        .map_err(map_db_sqlx)?
+        .await?
         .unwrap_or_else(|| asset.owner_id.clone());
 
-    let checklists = db_checklists::list_checklists_for_asset(pool, &asset_id)
-        .await
-        .map_err(map_db)?;
+    let checklists = db_checklists::list_checklists_for_asset(pool, asset_id).await?;
 
     // For each checklist, read its STIG JSON + overrides, build summary +
     // rule rows.
     let mut sections: Vec<ChecklistSection> = Vec::new();
     for c in &checklists {
-        let stig = load_stig_json(&state, &c.stig_id).await;
+        let stig = load_stig_json_from_dir(data_dir, &c.stig_id).await;
         let rules = stig
             .as_ref()
             .and_then(|v| v.get("rules"))
@@ -86,9 +117,7 @@ pub async fn report_handler(
             .map(|s| s.to_string())
             .unwrap_or_else(|| c.stig_id.clone());
 
-        let overrides = db_checklists::list_rule_overrides(pool, &c.id)
-            .await
-            .map_err(map_db)?;
+        let overrides = db_checklists::list_rule_overrides(pool, &c.id).await?;
         let over_by_id: HashMap<String, db_checklists::ChecklistRuleRow> = overrides
             .into_iter()
             .map(|r| (r.rule_id.clone(), r))
@@ -96,9 +125,7 @@ pub async fn report_handler(
 
         // Attachment counts per rule. Findings with N>0 get an
         // "Attachments: N" line in the PDF body.
-        let attachment_counts = db_attachments::counts_for_checklist(pool, &c.id)
-            .await
-            .map_err(map_db)?;
+        let attachment_counts = db_attachments::counts_for_checklist(pool, &c.id).await?;
         let attachments_by_rule: HashMap<String, i64> = attachment_counts
             .into_iter()
             .map(|r| (r.rule_id, r.count))
@@ -164,18 +191,22 @@ pub async fn report_handler(
         });
     }
 
-    let pdf_bytes = render_pdf(&asset, &owner_name, &sections).map_err(|e| {
-        tracing::error!("PDF render failed: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let pdf_bytes = render_pdf(&asset, &owner_name, &sections)?;
+    Ok(Some(BuiltAssetReport {
+        asset_name: asset.name,
+        pdf_bytes,
+    }))
+}
 
-    let filename = sanitize_filename(&format!("{}-stig-report.pdf", asset.name));
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
-    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
-        headers.insert(header::CONTENT_DISPOSITION, v);
-    }
-    Ok((headers, pdf_bytes))
+/// Convenience that drops the `Config` borrow for callers that already
+/// have one — keeps the public surface narrow.
+#[allow(dead_code)]
+pub(crate) async fn build_asset_report_with_config(
+    pool: &PgPool,
+    config: &Config,
+    asset_id: &str,
+) -> anyhow::Result<Option<BuiltAssetReport>> {
+    build_asset_report(pool, &config.data_dir, asset_id).await
 }
 
 // ── Data shapes ─────────────────────────────────────────────────────────────
@@ -429,25 +460,15 @@ fn sanitize_filename(s: &str) -> String {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn load_stig_json(state: &AppState, stig_id: &str) -> Option<Value> {
+async fn load_stig_json_from_dir(data_dir: &StdPath, stig_id: &str) -> Option<Value> {
     if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return None;
     }
-    let path = state
-        .config
-        .data_dir
-        .join("stigs")
-        .join(format!("{stig_id}.json"));
+    let path = data_dir.join("stigs").join(format!("{stig_id}.json"));
     let contents = tokio::fs::read_to_string(&path).await.ok()?;
     serde_json::from_str(&contents).ok()
 }
 
-fn map_db(e: anyhow::Error) -> StatusCode {
-    tracing::error!("report db error: {e:#}");
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
-fn map_db_sqlx(e: sqlx::Error) -> StatusCode {
-    tracing::error!("report sqlx error: {e:#}");
-    StatusCode::INTERNAL_SERVER_ERROR
+pub(crate) fn sanitize_report_filename(s: &str) -> String {
+    sanitize_filename(s)
 }

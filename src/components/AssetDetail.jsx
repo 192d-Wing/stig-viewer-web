@@ -8,6 +8,7 @@ import Box from "@cloudscape-design/components/box";
 import Modal from "@cloudscape-design/components/modal";
 import FormField from "@cloudscape-design/components/form-field";
 import Select from "@cloudscape-design/components/select";
+import Input from "@cloudscape-design/components/input";
 import Alert from "@cloudscape-design/components/alert";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
@@ -46,6 +47,18 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
   });
   const [aclError, setAclError] = useState(null);
   const [aclBusy, setAclBusy] = useState(false);
+
+  // ── Email CC state ─────────────────────────────────────────────────
+  // The list endpoint 403s for anyone who can't manage the asset, so we
+  // probe it and only render the section if the response was 200 — same
+  // pattern as the Sharing section above. Owner / write-ACL / admin.
+  const [ccRows, setCcRows] = useState([]);
+  const [ccVisible, setCcVisible] = useState(false);
+  const [ccInput, setCcInput] = useState("");
+  const [ccError, setCcError] = useState(null);
+  const [ccBusy, setCcBusy] = useState(false);
+  const [emailSendStatus, setEmailSendStatus] = useState(null);
+  const [emailSending, setEmailSending] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -147,6 +160,91 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
     },
     [assetId, refreshAcl],
   );
+
+  // ── Email CC: probe + load ────────────────────────────────────────
+  // Mirrors `refreshAcl` — a 403 from the list endpoint is the signal
+  // that the current user can't manage this asset, so we hide the
+  // section silently instead of surfacing a scary error.
+  const refreshCc = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/assets/${assetId}/email-cc`);
+      if (!res.ok) {
+        setCcVisible(false);
+        return;
+      }
+      const rows = await res.json();
+      setCcRows(rows);
+      setCcVisible(true);
+    } catch {
+      setCcVisible(false);
+    }
+  }, [assetId]);
+
+  useEffect(() => {
+    refreshCc();
+  }, [refreshCc]);
+
+  const addCc = useCallback(async () => {
+    const email = ccInput.trim();
+    if (!email || !email.includes("@")) {
+      setCcError("Enter a valid email address (must contain @).");
+      return;
+    }
+    setCcBusy(true);
+    setCcError(null);
+    try {
+      const rows = await apiJson(`/api/assets/${assetId}/email-cc`, "POST", {
+        email,
+      });
+      setCcRows(rows);
+      setCcInput("");
+    } catch (err) {
+      setCcError(err.message || "Failed to add recipient.");
+    } finally {
+      setCcBusy(false);
+    }
+  }, [assetId, ccInput]);
+
+  const removeCc = useCallback(
+    async (email) => {
+      setCcError(null);
+      const res = await apiFetch(
+        `/api/assets/${assetId}/email-cc/${encodeURIComponent(email)}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok && res.status !== 204) {
+        setCcError(`Remove failed: ${res.status}`);
+        return;
+      }
+      await refreshCc();
+    },
+    [assetId, refreshCc],
+  );
+
+  const emailReportNow = useCallback(async () => {
+    setEmailSending(true);
+    setEmailSendStatus(null);
+    try {
+      const result = await apiJson(
+        `/api/assets/${assetId}/email-report`,
+        "POST",
+        {},
+      );
+      setEmailSendStatus({
+        type: "success",
+        recipients: result.recipients || [],
+        mode: result.mode,
+        error: result.error || null,
+      });
+    } catch (err) {
+      setEmailSendStatus({
+        type: "error",
+        message: err.message || "Failed to send report.",
+      });
+    } finally {
+      setEmailSending(false);
+    }
+  }, [assetId]);
 
   const isOwner = asset && currentUser?.id === asset.ownerId;
 
@@ -617,6 +715,127 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
                     disabled={!aclTarget}
                     onClick={grantAcl}
                     data-testid="sharing-add-button"
+                  >
+                    Add
+                  </Button>
+                </FormField>
+              </ColumnLayout>
+            </SpaceBetween>
+          </Container>
+        )}
+
+        {ccVisible && (
+          <Container
+            header={
+              <Header
+                variant="h2"
+                counter={`(${ccRows.length})`}
+                description="Additional addresses that receive the per-asset compliance PDF when you click ‘Email report now’. The asset owner's email is always included if set."
+                actions={
+                  <Button
+                    variant="primary"
+                    loading={emailSending}
+                    onClick={emailReportNow}
+                    data-testid="email-report-now-button"
+                  >
+                    Email report now
+                  </Button>
+                }
+              >
+                Email recipients
+              </Header>
+            }
+            data-testid="email-cc-section"
+          >
+            <SpaceBetween direction="vertical" size="m">
+              {ccError && (
+                <Alert
+                  type="error"
+                  dismissible
+                  onDismiss={() => setCcError(null)}
+                >
+                  {ccError}
+                </Alert>
+              )}
+              {emailSendStatus?.type === "success" && (
+                <Alert
+                  type={emailSendStatus.error ? "warning" : "success"}
+                  dismissible
+                  onDismiss={() => setEmailSendStatus(null)}
+                  data-testid="email-send-result"
+                  header={
+                    emailSendStatus.error
+                      ? `Email send reported an error (mode: ${emailSendStatus.mode})`
+                      : `Email ${emailSendStatus.mode === "dryrun" ? "queued (dry-run)" : "sent"} to ${emailSendStatus.recipients.length} recipient${emailSendStatus.recipients.length === 1 ? "" : "s"}`
+                  }
+                >
+                  {emailSendStatus.recipients.join(", ") || "(no recipients)"}
+                  {emailSendStatus.error ? ` — ${emailSendStatus.error}` : ""}
+                </Alert>
+              )}
+              {emailSendStatus?.type === "error" && (
+                <Alert
+                  type="error"
+                  dismissible
+                  onDismiss={() => setEmailSendStatus(null)}
+                  data-testid="email-send-result"
+                >
+                  {emailSendStatus.message}
+                </Alert>
+              )}
+              <Table
+                variant="embedded"
+                items={ccRows}
+                data-testid="email-cc-table"
+                columnDefinitions={[
+                  {
+                    id: "email",
+                    header: "Email",
+                    cell: (r) => r.email,
+                  },
+                  {
+                    id: "added",
+                    header: "Added",
+                    cell: (r) => new Date(r.addedAt).toLocaleString(),
+                  },
+                  {
+                    id: "actions",
+                    header: "",
+                    cell: (r) => (
+                      <Button
+                        variant="inline-link"
+                        onClick={() => removeCc(r.email)}
+                        data-testid={`email-cc-remove-${r.email}`}
+                      >
+                        Remove
+                      </Button>
+                    ),
+                  },
+                ]}
+                empty={
+                  <Box textAlign="center" padding="m">
+                    <Box variant="p" color="text-body-secondary">
+                      No additional recipients configured yet.
+                    </Box>
+                  </Box>
+                }
+              />
+              <ColumnLayout columns={2}>
+                <FormField label="Email address">
+                  <Input
+                    value={ccInput}
+                    onChange={({ detail }) => setCcInput(detail.value)}
+                    placeholder="ops@example.gov"
+                    data-testid="email-cc-input"
+                  />
+                </FormField>
+                <FormField label="&nbsp;">
+                  <Button
+                    variant="primary"
+                    loading={ccBusy}
+                    disabled={ccInput.trim().length === 0}
+                    onClick={addCc}
+                    data-testid="email-cc-add-button"
                   >
                     Add
                   </Button>
