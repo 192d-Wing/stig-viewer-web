@@ -10,6 +10,7 @@ import Box from "@cloudscape-design/components/box";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
+import Toggle from "@cloudscape-design/components/toggle";
 import { exportCKL } from "./utils/exportCKL.js";
 import DropZone from "./components/DropZone.jsx";
 import StigLibrary from "./components/StigLibrary.jsx";
@@ -23,7 +24,7 @@ import Dashboard from "./components/Dashboard.jsx";
 import MyFindings from "./components/MyFindings.jsx";
 import AdminConsole from "./components/AdminConsole.jsx";
 import { AuthContext } from "./components/AuthGate.jsx";
-import { apiFetch, apiGet } from "./utils/api.js";
+import { apiFetch, apiGet, apiJson } from "./utils/api.js";
 
 export default function App() {
   const currentUser = useContext(AuthContext);
@@ -179,6 +180,38 @@ export default function App() {
   });
   const [notifOpen, setNotifOpen] = useState(false);
 
+  // Preferences sub-modal: six per-event-type toggles. Loaded lazily
+  // when the user opens the Preferences panel from inside the bell.
+  // The backend treats missing rows as "true" so first-open shows
+  // every toggle enabled.
+  const [notifPrefsOpen, setNotifPrefsOpen] = useState(false);
+  const [notifPrefs, setNotifPrefs] = useState({
+    assigned: true,
+    overdue: true,
+    mentions: true,
+    approvals: true,
+    decisions: true,
+    assignedDrafts: true,
+  });
+  const [notifPrefsSaving, setNotifPrefsSaving] = useState(false);
+
+  const openNotifPrefs = useCallback(async () => {
+    setNotifPrefsOpen(true);
+    try {
+      const p = await apiGet("/api/notifications/prefs");
+      setNotifPrefs({
+        assigned: p.assigned ?? true,
+        overdue: p.overdue ?? true,
+        mentions: p.mentions ?? true,
+        approvals: p.approvals ?? true,
+        decisions: p.decisions ?? true,
+        assignedDrafts: p.assignedDrafts ?? true,
+      });
+    } catch {
+      // Non-fatal — leave defaults in place so the toggles still render.
+    }
+  }, []);
+
   const refreshNotifications = useCallback(async () => {
     try {
       const d = await apiGet("/api/notifications");
@@ -203,6 +236,23 @@ export default function App() {
     const t = setInterval(refreshNotifications, 30_000);
     return () => clearInterval(t);
   }, [currentUser, refreshNotifications]);
+
+  const saveNotifPrefs = useCallback(async () => {
+    setNotifPrefsSaving(true);
+    try {
+      await apiJson("/api/notifications/prefs", "PUT", notifPrefs);
+      setNotifPrefsOpen(false);
+      // Refresh the bell so disabled buckets clear immediately and the
+      // unread badge reflects the new filter without waiting for the
+      // 30s poll.
+      await refreshNotifications();
+    } catch {
+      // Surface nothing for now — toggles stay where the user left
+      // them and the modal stays open so they can retry.
+    } finally {
+      setNotifPrefsSaving(false);
+    }
+  }, [notifPrefs, refreshNotifications]);
 
   const openNotifications = useCallback(async () => {
     setNotifOpen(true);
@@ -560,7 +610,20 @@ export default function App() {
       <Modal
         visible={notifOpen}
         onDismiss={() => setNotifOpen(false)}
-        header="Notifications"
+        header={
+          <SpaceBetween direction="horizontal" size="s">
+            <Box variant="h2" padding="n">
+              Notifications
+            </Box>
+            <Button
+              variant="link"
+              data-testid="notif-prefs-open"
+              onClick={openNotifPrefs}
+            >
+              Preferences
+            </Button>
+          </SpaceBetween>
+        }
         size="medium"
       >
         <SpaceBetween direction="vertical" size="l">
@@ -684,6 +747,95 @@ export default function App() {
               </ul>
             )}
           </Box>
+        </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={notifPrefsOpen}
+        onDismiss={() => setNotifPrefsOpen(false)}
+        header="Notification preferences"
+        size="small"
+        data-testid="notif-prefs-modal"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button
+                variant="link"
+                onClick={() => setNotifPrefsOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={notifPrefsSaving}
+                data-testid="notif-prefs-save"
+                onClick={saveNotifPrefs}
+              >
+                Save
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="s">
+          <Box color="text-status-inactive">
+            Disable an event type to hide its bucket and exclude it
+            from the bell badge.
+          </Box>
+          <Toggle
+            checked={notifPrefs.assigned}
+            data-testid="notif-pref-assigned"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, assigned: detail.checked }))
+            }
+          >
+            Newly assigned
+          </Toggle>
+          <Toggle
+            checked={notifPrefs.overdue}
+            data-testid="notif-pref-overdue"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, overdue: detail.checked }))
+            }
+          >
+            Overdue
+          </Toggle>
+          <Toggle
+            checked={notifPrefs.mentions}
+            data-testid="notif-pref-mentions"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, mentions: detail.checked }))
+            }
+          >
+            Mentions
+          </Toggle>
+          <Toggle
+            checked={notifPrefs.approvals}
+            data-testid="notif-pref-approvals"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, approvals: detail.checked }))
+            }
+          >
+            Approvals (pending)
+          </Toggle>
+          <Toggle
+            checked={notifPrefs.decisions}
+            data-testid="notif-pref-decisions"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, decisions: detail.checked }))
+            }
+          >
+            Decisions
+          </Toggle>
+          <Toggle
+            checked={notifPrefs.assignedDrafts}
+            data-testid="notif-pref-assigned_drafts"
+            onChange={({ detail }) =>
+              setNotifPrefs((p) => ({ ...p, assignedDrafts: detail.checked }))
+            }
+          >
+            Drafts waiting on you
+          </Toggle>
         </SpaceBetween>
       </Modal>
     </>
