@@ -1,16 +1,72 @@
+//! Outbound webhook delivery + admin CRUD.
+//!
+//! ## Payload signing (HMAC-SHA256)
+//!
+//! Every delivery whose `webhooks.secret` is non-empty carries an
+//! `X-Webhook-Signature` header of the form `sha256=<hex>` where `<hex>`
+//! is the lower-case hexadecimal HMAC-SHA256 of the raw request body
+//! keyed by the configured secret. The scheme matches GitHub's webhook
+//! convention, so any receiver that already validates GitHub webhooks
+//! can reuse the same code path verbatim.
+//!
+//! Webhooks with an empty secret are sent **unsigned** — no header at
+//! all — preserving the original opt-in behaviour for users who do not
+//! care about replay protection (e.g. internal-only Slack incoming
+//! webhooks behind a VPN). The pre-HMAC `X-Webhook-Secret` literal-value
+//! header was removed; secrets are never transmitted on the wire.
+//!
+//! ### Verification recipe — Python
+//! ```python
+//! import hmac, hashlib
+//! sig = "sha256=" + hmac.new(
+//!     secret.encode(), body_bytes, hashlib.sha256
+//! ).hexdigest()
+//! # constant-time compare against request.headers["X-Webhook-Signature"]
+//! hmac.compare_digest(sig, received_header)
+//! ```
+//!
+//! ### Verification recipe — Node.js
+//! ```js
+//! const crypto = require("crypto");
+//! const sig = "sha256=" + crypto
+//!   .createHmac("sha256", secret)
+//!   .update(rawBody)
+//!   .digest("hex");
+//! crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(receivedHeader));
+//! ```
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
 
 use crate::api::auth::AuthUser;
 use crate::AppState;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Compute the `sha256=<hex>` signature for `body` keyed by `secret`.
+/// Returns `None` when `secret` is empty so callers can branch on
+/// "unsigned webhook" without inspecting the string twice.
+fn sign_body(secret: &str, body: &[u8]) -> Option<String> {
+    if secret.is_empty() {
+        return None;
+    }
+    // Hmac::new_from_slice is infallible for HMAC-SHA256 — any byte
+    // length is valid as a key — so the unwrap can never fire.
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(body);
+    Some(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+}
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_SNIPPET_LIMIT: usize = 500;
@@ -457,8 +513,11 @@ async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, kind: &str, payload: &
         .post(&webhook.url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body.clone());
-    if !webhook.secret.is_empty() {
-        req = req.header("X-Webhook-Secret", webhook.secret.as_str());
+    // HMAC-SHA256(body, secret) → `X-Webhook-Signature: sha256=<hex>`.
+    // Webhooks with an empty secret remain unsigned (no header) so the
+    // "I don't care about replay protection" path keeps working.
+    if let Some(sig) = sign_body(&webhook.secret, body.as_bytes()) {
+        req = req.header("X-Webhook-Signature", sig);
     }
 
     match req.send().await {
