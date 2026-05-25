@@ -28,10 +28,13 @@ async function startCaptureServer() {
       res.end("ok");
     });
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // Bind 0.0.0.0 (not 127.0.0.1) so the backend container can reach us.
+  // The backend uses host.docker.internal — the special DNS name that
+  // docker-compose maps to the host gateway via extra_hosts.
+  await new Promise((resolve) => server.listen(0, "0.0.0.0", resolve));
   const { port } = server.address();
   return {
-    url: `http://127.0.0.1:${port}/hook`,
+    url: `http://host.docker.internal:${port}/hook`,
     captures,
     close: () =>
       new Promise((resolve) => {
