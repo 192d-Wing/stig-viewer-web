@@ -1,8 +1,13 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::api::auth::{client_ip, user_agent};
 use crate::api::compliance_report;
 use crate::api::dashboard::take_snapshot;
 use crate::api::rate_limit;
@@ -274,6 +279,7 @@ pub struct SamlLoginRequest {
 /// helpers.
 pub async fn saml_login_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(req): Json<SamlLoginRequest>,
 ) -> Result<(CookieJar, Json<serde_json::Value>), StatusCode> {
@@ -290,11 +296,15 @@ pub async fn saml_login_handler(
         req.display_name.clone()
     };
 
+    let ip = client_ip(&headers);
+    let ua = user_agent(&headers);
     let (user_id, session_id) = saml_login_user(
         state.pool.as_ref(),
         &req.name_id,
         &req.email,
         &display,
+        &ip,
+        &ua,
     )
     .await
     .map_err(|e| {
