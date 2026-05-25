@@ -39,6 +39,11 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile.dev
+    # host.docker.internal lets the backend container reach a server
+    # bound on the host's loopback — needed for E2E specs that spin up
+    # an HTTP capture server (e.g. the webhook HMAC spec).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: postgres://stig:stig_local@postgres:5432/stig_viewer
       PORT: "8080"
