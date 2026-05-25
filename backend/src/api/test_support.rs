@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::api::compliance_report;
 use crate::api::dashboard::take_snapshot;
+use crate::api::rate_limit;
 use crate::api::saml::saml_login_user;
 use crate::api::webhooks::run_overdue_digest;
 use crate::audit_retention;
@@ -428,4 +429,14 @@ pub async fn run_scheduler_handler(
             Ok(Json(json!({ "ok": false, "error": format!("{e:#}") })))
         }
     }
+}
+
+/// POST /api/test/reset-ratelimit — flush the in-memory token-bucket map
+/// used by the rate-limit middleware. The rate-limit E2E spec calls this
+/// in `beforeEach` so prior runs (and earlier mutation-heavy specs in the
+/// same process) don't contaminate alice's bucket. Gated by
+/// `STIG_ENV != "production"` at registration time.
+pub async fn reset_ratelimit_handler() -> StatusCode {
+    rate_limit::reset();
+    StatusCode::NO_CONTENT
 }

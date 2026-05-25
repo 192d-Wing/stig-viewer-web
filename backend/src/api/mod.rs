@@ -19,6 +19,7 @@ pub mod email;
 pub mod finding_approvals;
 pub mod findings;
 pub mod notifications;
+pub mod rate_limit;
 pub mod report;
 pub mod rule_bulk_import;
 pub mod rule_comments;
