@@ -35,6 +35,16 @@ pub struct AssetRow {
     /// `run_asset_email_schedules` in `asset_email_cc.rs`.
     #[sqlx(default)]
     pub email_last_sent_at: Option<DateTime<Utc>>,
+    /// Free-form markdown runbook for the asset (operational notes,
+    /// escalation contacts, known issues, etc). Stored as plain TEXT
+    /// in the DB; rendered client-side by `src/utils/markdown.js`.
+    /// Defaults to "" — the frontend treats empty as "no runbook yet".
+    ///
+    /// On read, anything past `MAX_RUNBOOK_BYTES` is defensively
+    /// truncated by `get_asset` / `list_assets` so a pathological
+    /// runbook can't blow the API response. Writes are not capped.
+    #[sqlx(default)]
+    pub runbook: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -49,13 +59,41 @@ pub struct AssetSummary {
     pub updated_at: DateTime<Utc>,
     #[sqlx(default)]
     pub tags: Vec<String>,
+    /// Runbook content is also exposed on the list-summary for parity
+    /// with the row endpoint. The list view doesn't render it today,
+    /// but external API consumers may want a one-shot fetch and the
+    /// truncation cap keeps the payload bounded.
+    #[sqlx(default)]
+    pub runbook: String,
+}
+
+/// Defensive read-side cap on `runbook`. The column is unconstrained
+/// TEXT, but a 100 KB body is already 10x the largest plausible
+/// operational runbook and well beyond the "useful to render" point.
+/// Anything past the cap is sliced on a UTF-8 boundary and the
+/// remainder discarded for the API response.
+pub const MAX_RUNBOOK_BYTES: usize = 100 * 1024;
+
+/// Slice `s` to at most `MAX_RUNBOOK_BYTES` bytes, respecting UTF-8
+/// boundaries. Returns the input unchanged if it already fits.
+fn truncate_runbook(s: &str) -> String {
+    if s.len() <= MAX_RUNBOOK_BYTES {
+        return s.to_string();
+    }
+    // Find the largest valid UTF-8 prefix that fits in the cap.
+    let mut end = MAX_RUNBOOK_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
     let mut rows = sqlx::query_as::<_, AssetSummary>(
         r#"
         SELECT a.id, a.name, a.hostname, a.classification,
-               a.owner_id, u.display_name AS owner_name, a.updated_at
+               a.owner_id, u.display_name AS owner_name, a.updated_at,
+               a.runbook
           FROM assets a
           JOIN users u ON u.id = a.owner_id
          ORDER BY a.updated_at DESC
@@ -63,6 +101,15 @@ pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
     )
     .fetch_all(pool)
     .await?;
+
+    // Defensive read-side truncation — see `MAX_RUNBOOK_BYTES`. Done
+    // here so callers (list, get, compare) never have to worry about
+    // an unbounded payload.
+    for r in &mut rows {
+        if r.runbook.len() > MAX_RUNBOOK_BYTES {
+            r.runbook = truncate_runbook(&r.runbook);
+        }
+    }
 
     // Attach tags in a single grouped query.
     let tag_rows: Vec<(String, String)> = sqlx::query_as(
@@ -98,6 +145,10 @@ pub async fn get_asset(pool: &PgPool, id: &str) -> Result<Option<AssetRow>> {
             .fetch_all(pool)
             .await?;
     row.tags = tags;
+    // Defensive read-side truncation — see `MAX_RUNBOOK_BYTES`.
+    if row.runbook.len() > MAX_RUNBOOK_BYTES {
+        row.runbook = truncate_runbook(&row.runbook);
+    }
     Ok(Some(row))
 }
 
@@ -158,6 +209,23 @@ pub async fn update_asset(
     .bind(hostname)
     .bind(description)
     .bind(classification)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replace the asset's runbook content. No write-side size cap — the
+/// read path in `get_asset` / `list_assets` defensively truncates to
+/// `MAX_RUNBOOK_BYTES`, so an oversize write simply gets clipped on
+/// the next read. Stamps `updated_at` so the list view re-sorts.
+pub async fn set_runbook(pool: &PgPool, id: &str, runbook: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE assets \
+         SET runbook = $1, updated_at = NOW() \
+         WHERE id = $2",
+    )
+    .bind(runbook)
     .bind(id)
     .execute(pool)
     .await?;
