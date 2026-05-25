@@ -129,8 +129,9 @@ use api::{
     stig_validator::lint_handler as stig_lint_handler,
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
-        reset_handler, run_digest_handler, run_report_handler, run_retention_handler,
-        run_scheduler_handler, saml_login_handler as test_saml_login_handler, set_role_handler,
+        reset_handler, reset_ratelimit_handler, run_digest_handler, run_report_handler,
+        run_retention_handler, run_scheduler_handler,
+        saml_login_handler as test_saml_login_handler, set_role_handler,
     },
     upload::{upload_library, upload_stig},
     webhooks::{
@@ -434,6 +435,14 @@ async fn main() -> Result<()> {
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
         .route_layer(middleware::from_fn(api::viewer_guard::viewer_guard))
+        // Per-user token-bucket rate limiter. Also needs `AuthUser` in
+        // extensions, so it sits inside the auth layer too. Added AFTER
+        // `viewer_guard` so the layer ordering is:
+        //   auth_middleware -> rate_limit -> viewer_guard -> handler
+        // i.e. we throttle before we let a request reach the read-only
+        // gate (or any business logic), but only after we know who's
+        // calling so we can key the bucket on `user.id`.
+        .route_layer(middleware::from_fn(api::rate_limit::rate_limit))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -466,6 +475,7 @@ async fn main() -> Result<()> {
             .route("/api/test/run-scheduler", post(run_scheduler_handler))
             .route("/api/test/saml-login", post(test_saml_login_handler))
             .route("/api/test/seed-archive", post(seed_catalog_archive_handler))
+            .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }
