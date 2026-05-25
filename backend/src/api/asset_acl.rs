@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::api::abac::{self, Decision};
 use crate::api::auth::AuthUser;
 use crate::db_assets;
 use crate::AppState;
@@ -100,7 +101,30 @@ pub async fn user_can(
         }
     };
 
-    matches!(granted.as_deref().map(rank), Some(g) if g >= needed)
+    if matches!(granted.as_deref().map(rank), Some(g) if g >= needed) {
+        return true;
+    }
+
+    // All three legacy paths (admin role, owner, ACL row) declined.
+    // Fall through to attribute-based access control: load the full
+    // asset row (with tags) once and evaluate the policy set.
+    //
+    // With zero rows in `abac_policies`, `evaluate` returns
+    // `NoOpinion` and we keep today's `false` — preserving the
+    // contract that default behaviour is unchanged.
+    let asset = match db_assets::get_asset(pool, asset_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::error!("user_can asset lookup for ABAC failed: {e:#}");
+            return false;
+        }
+    };
+    match abac::evaluate(pool, user, &asset, level).await {
+        Decision::Allow => true,
+        Decision::Deny => false,
+        Decision::NoOpinion => false,
+    }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────

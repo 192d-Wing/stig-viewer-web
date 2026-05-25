@@ -21,6 +21,12 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
+    abac::{
+        create_handler as create_abac_policy_handler,
+        delete_handler as delete_abac_policy_handler,
+        list_handler as list_abac_policies_handler,
+        update_handler as update_abac_policy_handler,
+    },
     admin::{
         list_users_handler as admin_list_users_handler,
         update_asset_owner_handler as admin_update_asset_owner_handler,
@@ -444,6 +450,15 @@ async fn main() -> Result<()> {
         )
         .route("/api/admin/backup", get(admin_backup_download_handler))
         .route("/api/admin/restore", post(admin_restore_handler))
+        .route(
+            "/api/admin/policies",
+            get(list_abac_policies_handler).post(create_abac_policy_handler),
+        )
+        .route(
+            "/api/admin/policies/:id",
+            axum::routing::patch(update_abac_policy_handler)
+                .delete(delete_abac_policy_handler),
+        )
         .route("/api/admin/sessions", get(list_active_sessions_handler))
         .route(
             "/api/admin/sessions/:id",
