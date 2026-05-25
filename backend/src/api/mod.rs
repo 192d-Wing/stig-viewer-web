@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod asset_acl;
+pub mod asset_email_cc;
 pub mod asset_groups;
 pub mod asset_import;
 pub mod assets;
