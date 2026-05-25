@@ -354,17 +354,21 @@ export default function ChecklistView({ checklistId, onBack }) {
       if (!editing) return;
       setCommentError(null);
       try {
-        if (mine) {
-          const res = await apiFetch(
-            `/api/comments/${commentId}/reactions/${reaction}`,
-            { method: "DELETE" },
-          );
-          if (!res.ok) throw new Error(`${res.status}`);
-        } else {
-          await apiJson(`/api/comments/${commentId}/reactions`, "POST", {
-            reaction,
-          });
-        }
+        // Both endpoints return 204 No Content, so we use apiFetch
+        // directly — apiJson assumes a JSON body and would swallow the
+        // success path through its "Unexpected end of JSON input" catch.
+        const path = mine
+          ? `/api/comments/${commentId}/reactions/${reaction}`
+          : `/api/comments/${commentId}/reactions`;
+        const opts = mine
+          ? { method: "DELETE" }
+          : {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ reaction }),
+            };
+        const res = await apiFetch(path, opts);
+        if (!res.ok) throw new Error(`${res.status}`);
         await refreshComments(editing.id);
       } catch (err) {
         setCommentError(parseSaveError(err.message));
