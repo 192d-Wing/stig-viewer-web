@@ -134,6 +134,49 @@ test.describe("Background job dashboard", () => {
     }
   });
 
+  test("API: forcing an error via injection records status='error' in latest+history", async ({
+    request,
+  }) => {
+    // The injection flag is one-shot: arm it for `snapshot`, run the
+    // scheduler once and assert the row was stamped 'error' with the
+    // canned message. A second run-scheduler tick should clear back
+    // to 'ok' because the flag was consumed by the first call.
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+
+    const inject = await request.post(
+      `${BACKEND}/api/test/inject-scheduler-error`,
+      {
+        headers: { "Content-Type": "application/json" },
+        data: { name: "snapshot" },
+      },
+    );
+    expect(inject.status()).toBe(204);
+
+    const trigger = await runScheduler(request, "snapshot");
+    expect(trigger.ok).toBe(false);
+    expect(typeof trigger.error).toBe("string");
+    expect(trigger.error).toContain("injected");
+
+    const body = await fetchRuns(request);
+    expect(body.latest.snapshot).toBeTruthy();
+    expect(body.latest.snapshot.status).toBe("error");
+    expect(body.latest.snapshot.message).toContain("injected");
+
+    const matchedErr = body.history.find(
+      (r) => r.name === "snapshot" && r.status === "error",
+    );
+    expect(matchedErr).toBeTruthy();
+    expect(matchedErr.message).toContain("injected");
+
+    // Flag is one-shot — the next tick should land as 'ok'.
+    const followup = await runScheduler(request, "snapshot");
+    expect(followup.ok).toBe(true);
+
+    const after = await fetchRuns(request);
+    expect(after.latest.snapshot.status).toBe("ok");
+  });
+
   test("UI: admin console renders the Background jobs section with the snapshot row", async ({
     page,
     request,

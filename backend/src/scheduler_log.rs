@@ -10,12 +10,52 @@
 //!
 //! The closure's `Result` is returned unchanged so existing tracing
 //! and metrics in the call site keep working.
+//!
+//! # Test-only failure injection
+//!
+//! `inject_failure(name)` arms a one-shot flag for a specific scheduler
+//! name. The next `record()` call for that name short-circuits before
+//! invoking the closure: it stamps `status='error'`,
+//! `message='injected test failure'` on the row and returns an
+//! `Err`. The flag is consumed atomically, so a subsequent tick for
+//! the same name behaves normally. This exists so the admin job
+//! dashboard's error path can be exercised by E2E — nothing in the
+//! real system errors on demand. The endpoint that arms the flag is
+//! gated by `STIG_ENV != "production"` at registration time in
+//! `main.rs`.
 
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::{LazyLock, Mutex};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sqlx::PgPool;
+
+/// Names of schedulers with a pending one-shot failure injection.
+/// Populated by `inject_failure`, drained by `consume_failure`.
+static INJECTED_FAILURES: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Arm a one-shot failure for `name`. The next `record()` call with
+/// the same name will short-circuit with an error before invoking the
+/// closure. Idempotent — calling twice is the same as calling once.
+pub fn inject_failure(name: &str) {
+    let mut guard = INJECTED_FAILURES
+        .lock()
+        .expect("INJECTED_FAILURES mutex poisoned");
+    guard.insert(name.to_string());
+}
+
+/// Atomically check + remove `name` from the pending-failure set.
+/// Returns `true` if a failure was armed for this name (and is now
+/// consumed).
+pub fn consume_failure(name: &str) -> bool {
+    let mut guard = INJECTED_FAILURES
+        .lock()
+        .expect("INJECTED_FAILURES mutex poisoned");
+    guard.remove(name)
+}
 
 /// Wrap an async closure with start/finish bookkeeping in
 /// `scheduler_runs`. The returned `Result` is the closure's, unchanged.
@@ -28,6 +68,10 @@ use sqlx::PgPool;
 /// If we can't insert the initial row (DB hiccup), we still run the
 /// closure — the scheduler is more important than its bookkeeping. The
 /// failure is logged at WARN.
+///
+/// If a test-only failure has been armed for this scheduler name via
+/// `inject_failure`, the closure is NOT invoked: the row is stamped
+/// `error`/`injected test failure` and an `Err` is returned.
 pub async fn record<F, Fut, T>(pool: &PgPool, name: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
@@ -50,6 +94,27 @@ where
             None
         }
     };
+
+    // Test-only short-circuit. Drains the flag before invoking the
+    // closure so a re-run for the same name behaves normally.
+    if consume_failure(name) {
+        let message = "injected test failure";
+        if let Some(id) = row_id {
+            let update = sqlx::query(
+                "UPDATE scheduler_runs SET status = 'error', message = $1, finished_at = NOW() WHERE id = $2",
+            )
+            .bind(message)
+            .bind(id)
+            .execute(pool)
+            .await;
+            if let Err(e) = update {
+                tracing::warn!(
+                    "scheduler_log: failed to update row {id} for {name} (injected): {e:#}"
+                );
+            }
+        }
+        return Err(anyhow!(message));
+    }
 
     let result = f().await;
 
