@@ -226,12 +226,13 @@ test.describe("Backup + restore — API", () => {
       })
       .then((r) => r.json());
 
-    const assetsAfter = await request
-      .get(`${BACKEND}/api/assets`, {
-        headers: { "X-User-Id": aliceMe.displayName },
-      })
-      .then((r) => r.json());
+    const assetsRes = await request.get(`${BACKEND}/api/assets`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    expect(assetsRes.status()).toBe(200);
+    const assetsAfter = await assetsRes.json();
     expect(assetsAfter.map((a) => a.id)).toContain(asset.id);
+    void aliceMe;
 
     // Attachment blob is back on disk: download returns the original bytes.
     const dl = await request.get(`${BACKEND}/api/attachments/${attRow.id}`, {
