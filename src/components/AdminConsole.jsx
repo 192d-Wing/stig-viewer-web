@@ -19,6 +19,7 @@ import DatePicker from "@cloudscape-design/components/date-picker";
 import Pagination from "@cloudscape-design/components/pagination";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
+import Tabs from "@cloudscape-design/components/tabs";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
@@ -93,6 +94,60 @@ function truncateUrl(url, max = 50) {
   return url.length > max ? `${url.slice(0, max - 1)}…` : url;
 }
 
+/**
+ * Render one verify-recipe snippet in a monospace block with a "Copy"
+ * button that pushes the raw text to the system clipboard. Each block
+ * tags its Copy button with a stable `data-testid` so e2e can confirm
+ * the wiring exists without depending on clipboard internals (which
+ * don't work in headless Chromium without explicit permissions).
+ */
+function SnippetBlock({ language, text }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = useCallback(async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      }
+      setCopied(true);
+      // Brief flash — the user just wants visible confirmation they
+      // clicked the right thing, not a permanent badge.
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard permission denied or unavailable. Silently swallow —
+      // the button is just a convenience; the text is selectable too.
+    }
+  }, [text]);
+  return (
+    <SpaceBetween direction="vertical" size="xs">
+      <Box float="right">
+        <Button
+          iconName="copy"
+          data-testid={`verify-snippet-copy-${language}`}
+          onClick={onCopy}
+        >
+          {copied ? "Copied" : "Copy"}
+        </Button>
+      </Box>
+      <pre
+        data-testid={`verify-snippet-body-${language}`}
+        style={{
+          background: "#1f2329",
+          color: "#e6edf3",
+          padding: "12px",
+          borderRadius: "4px",
+          overflowX: "auto",
+          fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+          fontSize: "13px",
+          whiteSpace: "pre",
+          margin: 0,
+        }}
+      >
+        {text}
+      </pre>
+    </SpaceBetween>
+  );
+}
+
 export default function AdminConsole() {
   const [users, setUsers] = useState([]);
   const [assets, setAssets] = useState([]);
@@ -127,6 +182,13 @@ export default function AdminConsole() {
   // Deliveries panel state: { webhook, rows, loading } | null
   const [deliveriesPanel, setDeliveriesPanel] = useState(null);
   const [testFlash, setTestFlash] = useState(null);
+
+  // Verify-recipe modal state: holds the JSON returned by
+  // GET /api/webhooks/:id/verify-recipe so the modal can render the
+  // curl / Python / Node snippets in a Tabs component. Shape matches
+  // the backend's `VerifyRecipe` struct.
+  const [verifyRecipe, setVerifyRecipe] = useState(null);
+  const [verifyError, setVerifyError] = useState(null);
 
   // Compliance reports
   const [reports, setReports] = useState([]);
@@ -659,6 +721,21 @@ export default function AdminConsole() {
     }
   }, []);
 
+  // Fetch and open the verify-recipe modal. The backend pre-fills the
+  // secret + sample HMAC so an operator can paste a snippet and have it
+  // validate end-to-end without further substitution.
+  const openVerifyRecipe = useCallback(async (hook) => {
+    setVerifyError(null);
+    setVerifyRecipe({ loading: true, webhook: hook });
+    try {
+      const recipe = await apiGet(`/api/webhooks/${hook.id}/verify-recipe`);
+      setVerifyRecipe(recipe);
+    } catch (err) {
+      setVerifyRecipe(null);
+      setVerifyError(err.message);
+    }
+  }, []);
+
   const columns = useMemo(
     () => [
       {
@@ -818,6 +895,13 @@ export default function AdminConsole() {
             </Button>
             <Button
               variant="inline-link"
+              data-testid={`verify-recipe-${w.id}`}
+              onClick={() => openVerifyRecipe(w)}
+            >
+              Verify recipe
+            </Button>
+            <Button
+              variant="inline-link"
               onClick={() =>
                 setHookModal({
                   mode: "edit",
@@ -839,7 +923,7 @@ export default function AdminConsole() {
         ),
       },
     ],
-    [toggleHookEnabled, testHook, openDeliveries, deleteHook],
+    [toggleHookEnabled, testHook, openDeliveries, openVerifyRecipe, deleteHook],
   );
 
   const assetOptions = useMemo(
@@ -1950,6 +2034,70 @@ export default function AdminConsole() {
             ]}
           />
         )}
+      </Modal>
+
+      <Modal
+        visible={verifyRecipe !== null}
+        onDismiss={() => setVerifyRecipe(null)}
+        header={`Verify recipe: ${verifyRecipe?.name ?? verifyRecipe?.webhook?.name ?? ""}`}
+        size="large"
+        footer={
+          <Box float="right">
+            <Button variant="link" onClick={() => setVerifyRecipe(null)}>
+              Close
+            </Button>
+          </Box>
+        }
+      >
+        {verifyRecipe?.loading ? (
+          <Box textAlign="center" padding="l">
+            Loading…
+          </Box>
+        ) : verifyRecipe?.snippets ? (
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="p">
+              Drop the matching snippet into your receiver to verify
+              incoming webhook signatures. The secret is pre-filled, so
+              you can paste and run without further substitution.
+            </Box>
+            <Tabs
+              tabs={[
+                {
+                  id: "curl",
+                  label: "curl",
+                  content: (
+                    <SnippetBlock
+                      language="curl"
+                      text={verifyRecipe.snippets.curl}
+                    />
+                  ),
+                },
+                {
+                  id: "python",
+                  label: "Python",
+                  content: (
+                    <SnippetBlock
+                      language="python"
+                      text={verifyRecipe.snippets.python}
+                    />
+                  ),
+                },
+                {
+                  id: "node",
+                  label: "Node",
+                  content: (
+                    <SnippetBlock
+                      language="node"
+                      text={verifyRecipe.snippets.node}
+                    />
+                  ),
+                },
+              ]}
+            />
+          </SpaceBetween>
+        ) : verifyError ? (
+          <Alert type="error">{verifyError}</Alert>
+        ) : null}
       </Modal>
 
       <Modal
