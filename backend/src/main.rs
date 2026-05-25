@@ -53,6 +53,7 @@ use api::{
         upload_handler as upload_attachment_handler,
     },
     audit::{activity_handler, rule_history_handler, search_handler as audit_search_handler},
+    backup::{download_handler as admin_backup_download_handler, restore_handler as admin_restore_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
@@ -411,6 +412,8 @@ async fn main() -> Result<()> {
             "/api/admin/scheduler-runs",
             get(list_scheduler_runs_handler),
         )
+        .route("/api/admin/backup", get(admin_backup_download_handler))
+        .route("/api/admin/restore", post(admin_restore_handler))
         .route("/api/admin/sessions", get(list_active_sessions_handler))
         .route(
             "/api/admin/sessions/:id",
