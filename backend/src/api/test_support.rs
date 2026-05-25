@@ -44,7 +44,8 @@ pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
     // reach it from `users`. List it explicitly so per-test archive seeds
     // don't leak between specs.
     let result = sqlx::query(
-        "TRUNCATE draft_comments, stig_drafts, users, catalog_archive CASCADE",
+        "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
+                  email_deliveries CASCADE",
     )
         .execute(state.pool.as_ref())
         .await;
