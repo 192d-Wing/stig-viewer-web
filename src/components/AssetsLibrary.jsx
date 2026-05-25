@@ -40,6 +40,7 @@ const EMPTY_FORM = {
   description: "",
   classification: "unclassified",
   tags: [],
+  runbook: "",
 };
 
 function classificationLabel(value) {
@@ -51,6 +52,10 @@ export default function AssetsLibrary() {
 
   // view = "list" | {type: "asset", id} | {type: "checklist", id, assetId}
   const [view, setView] = useState("list");
+  // Bumped after the edit modal saves successfully so a mounted
+  // `AssetDetail` re-fetches the asset (and any new runbook content).
+  // Used as React `key` on `AssetDetail` below.
+  const [detailRefreshKey, setDetailRefreshKey] = useState(0);
 
   const [assets, setAssets] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -270,6 +275,7 @@ export default function AssetsLibrary() {
       description: asset.description ?? "",
       classification: asset.classification,
       tags: asset.tags ?? [],
+      runbook: asset.runbook ?? "",
     });
     setTagDraft("");
     setSubmitError(null);
@@ -320,6 +326,11 @@ export default function AssetsLibrary() {
       setModal(null);
       setTagDraft("");
       await refresh();
+      // If an AssetDetail page is open, force it to re-fetch so any
+      // edits made via this modal (runbook content, classification,
+      // tags, …) are immediately visible without bouncing back to
+      // the list.
+      setDetailRefreshKey((k) => k + 1);
     } catch (err) {
       setSubmitError(err.message);
     } finally {
@@ -427,15 +438,129 @@ export default function AssetsLibrary() {
     [currentUser, openEdit],
   );
 
+  // The shared edit modal markup. Rendered both on the list view and
+  // the asset-detail view (the Edit button on AssetDetail opens it
+  // without bouncing the user back to the list). Defined inline as a
+  // local variable so the JSX is identical in both branches; the
+  // duplicate render is unconditional under <Modal visible=…> so
+  // Cloudscape only mounts the dialog when it's actually open.
+  const editModal = (
+    <Modal
+      visible={modal !== null}
+      onDismiss={closeModal}
+      header={modal?.mode === "edit" ? "Edit system" : "Add system"}
+      footer={
+        <Box float="right">
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button variant="link" onClick={closeModal}>
+              Cancel
+            </Button>
+            <Button variant="primary" loading={submitting} onClick={submit}>
+              {modal?.mode === "edit" ? "Save" : "Create"}
+            </Button>
+          </SpaceBetween>
+        </Box>
+      }
+    >
+      <SpaceBetween direction="vertical" size="m">
+        <FormField label="Name" description="Friendly identifier, e.g. web-prod-01">
+          <Input
+            value={form.name}
+            onChange={({ detail }) =>
+              setForm((f) => ({ ...f, name: detail.value }))
+            }
+            autoFocus
+          />
+        </FormField>
+        <FormField label="Hostname" description="DNS name or IP">
+          <Input
+            value={form.hostname}
+            onChange={({ detail }) =>
+              setForm((f) => ({ ...f, hostname: detail.value }))
+            }
+          />
+        </FormField>
+        <FormField label="Description">
+          <Textarea
+            value={form.description}
+            onChange={({ detail }) =>
+              setForm((f) => ({ ...f, description: detail.value }))
+            }
+            rows={3}
+          />
+        </FormField>
+        <FormField
+          label="Runbook"
+          description="Free-form markdown — operational notes, escalation contacts, known issues."
+        >
+          <div data-testid="runbook-textarea">
+            <Textarea
+              value={form.runbook}
+              onChange={({ detail }) =>
+                setForm((f) => ({ ...f, runbook: detail.value }))
+              }
+              rows={8}
+            />
+          </div>
+        </FormField>
+        <FormField label="Classification">
+          <Select
+            selectedOption={
+              CLASSIFICATIONS.find((c) => c.value === form.classification) ??
+              CLASSIFICATIONS[0]
+            }
+            onChange={({ detail }) =>
+              setForm((f) => ({
+                ...f,
+                classification: detail.selectedOption.value,
+              }))
+            }
+            options={CLASSIFICATIONS}
+          />
+        </FormField>
+        <FormField
+          label="Tags"
+          description="Press Enter to add. Use tags to group systems (e.g. production, pii)."
+        >
+          <SpaceBetween direction="vertical" size="xs">
+            <Input
+              value={tagDraft}
+              onChange={({ detail }) => setTagDraft(detail.value)}
+              onKeyDown={(e) => {
+                if (e.detail.key === "Enter") {
+                  e.preventDefault();
+                  commitTagDraft();
+                }
+              }}
+              placeholder="Add tag…"
+            />
+            {form.tags.length > 0 && (
+              <TokenGroup
+                items={form.tags.map((t) => ({ label: t, value: t }))}
+                onDismiss={({ detail }) => removeTag(detail.itemIndex)}
+              />
+            )}
+          </SpaceBetween>
+        </FormField>
+        {submitError && <Alert type="error">{submitError}</Alert>}
+      </SpaceBetween>
+    </Modal>
+  );
+
   if (view?.type === "asset") {
     return (
-      <AssetDetail
-        assetId={view.id}
-        onBack={() => setView("list")}
-        onOpenChecklist={(cid) =>
-          setView({ type: "checklist", id: cid, assetId: view.id })
-        }
-      />
+      <>
+        <AssetDetail
+          key={`${view.id}-${detailRefreshKey}`}
+          assetId={view.id}
+          onBack={() => setView("list")}
+          onOpenChecklist={(cid) =>
+            setView({ type: "checklist", id: cid, assetId: view.id })
+          }
+          onEdit={openEdit}
+        />
+        {editModal}
+      </>
     );
   }
 
@@ -572,92 +697,7 @@ export default function AssetsLibrary() {
         </Box>
       )}
 
-      <Modal
-        visible={modal !== null}
-        onDismiss={closeModal}
-        header={modal?.mode === "edit" ? "Edit system" : "Add system"}
-        footer={
-          <Box float="right">
-            <SpaceBetween direction="horizontal" size="xs">
-              <Button variant="link" onClick={closeModal}>
-                Cancel
-              </Button>
-              <Button variant="primary" loading={submitting} onClick={submit}>
-                {modal?.mode === "edit" ? "Save" : "Create"}
-              </Button>
-            </SpaceBetween>
-          </Box>
-        }
-      >
-        <SpaceBetween direction="vertical" size="m">
-          <FormField label="Name" description="Friendly identifier, e.g. web-prod-01">
-            <Input
-              value={form.name}
-              onChange={({ detail }) =>
-                setForm((f) => ({ ...f, name: detail.value }))
-              }
-              autoFocus
-            />
-          </FormField>
-          <FormField label="Hostname" description="DNS name or IP">
-            <Input
-              value={form.hostname}
-              onChange={({ detail }) =>
-                setForm((f) => ({ ...f, hostname: detail.value }))
-              }
-            />
-          </FormField>
-          <FormField label="Description">
-            <Textarea
-              value={form.description}
-              onChange={({ detail }) =>
-                setForm((f) => ({ ...f, description: detail.value }))
-              }
-              rows={3}
-            />
-          </FormField>
-          <FormField label="Classification">
-            <Select
-              selectedOption={
-                CLASSIFICATIONS.find((c) => c.value === form.classification) ??
-                CLASSIFICATIONS[0]
-              }
-              onChange={({ detail }) =>
-                setForm((f) => ({
-                  ...f,
-                  classification: detail.selectedOption.value,
-                }))
-              }
-              options={CLASSIFICATIONS}
-            />
-          </FormField>
-          <FormField
-            label="Tags"
-            description="Press Enter to add. Use tags to group systems (e.g. production, pii)."
-          >
-            <SpaceBetween direction="vertical" size="xs">
-              <Input
-                value={tagDraft}
-                onChange={({ detail }) => setTagDraft(detail.value)}
-                onKeyDown={(e) => {
-                  if (e.detail.key === "Enter") {
-                    e.preventDefault();
-                    commitTagDraft();
-                  }
-                }}
-                placeholder="Add tag…"
-              />
-              {form.tags.length > 0 && (
-                <TokenGroup
-                  items={form.tags.map((t) => ({ label: t, value: t }))}
-                  onDismiss={({ detail }) => removeTag(detail.itemIndex)}
-                />
-              )}
-            </SpaceBetween>
-          </FormField>
-          {submitError && <Alert type="error">{submitError}</Alert>}
-        </SpaceBetween>
-      </Modal>
+      {editModal}
 
       <Modal
         visible={importOpen}

@@ -40,6 +40,11 @@ pub struct UpdateAssetRequest {
     pub classification: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional free-form markdown runbook. Omitted ⇒ leave existing
+    /// content untouched. Sending an empty string explicitly clears
+    /// it. See `db_assets::set_runbook` / migration 033.
+    #[serde(default)]
+    pub runbook: Option<String>,
 }
 
 pub const MAX_TAG_LEN: usize = 50;
@@ -98,6 +103,7 @@ pub async fn create_asset_handler(
         requires_approval: false,
         email_cadence: "off".into(),
         email_last_sent_at: None,
+        runbook: String::new(),
     };
     db_assets::insert_asset(state.pool.as_ref(), &asset)
         .await
@@ -158,6 +164,13 @@ pub async fn update_asset_handler(
     db_assets::replace_tags(state.pool.as_ref(), &id, &tags)
         .await
         .map_err(map_db)?;
+    // Runbook is opt-in on PUT — omitting the field preserves what's
+    // already on the row. Sending "" explicitly clears it.
+    if let Some(runbook) = req.runbook.as_deref() {
+        db_assets::set_runbook(state.pool.as_ref(), &id, runbook)
+            .await
+            .map_err(map_db)?;
+    }
 
     db_assets::get_asset(state.pool.as_ref(), &id)
         .await
@@ -180,6 +193,11 @@ pub struct PatchAssetRequest {
     /// be one of `VALID_EMAIL_CADENCES`. Anything else → 400.
     #[serde(default)]
     pub email_cadence: Option<String>,
+    /// When set, replaces the asset's runbook content. Empty string is
+    /// the explicit "clear" signal. No write-side cap — the read path
+    /// applies `MAX_RUNBOOK_BYTES` truncation defensively.
+    #[serde(default)]
+    pub runbook: Option<String>,
 }
 
 /// PATCH /api/assets/:id — partial update. Today the only field is
@@ -209,6 +227,12 @@ pub async fn patch_asset_handler(
             return Err(StatusCode::BAD_REQUEST);
         }
         db_assets::set_email_cadence(pool, &id, cad)
+            .await
+            .map_err(map_db)?;
+    }
+
+    if let Some(runbook) = req.runbook.as_deref() {
+        db_assets::set_runbook(pool, &id, runbook)
             .await
             .map_err(map_db)?;
     }
