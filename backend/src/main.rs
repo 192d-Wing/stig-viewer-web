@@ -84,6 +84,7 @@ use api::{
         list_archive_handler as list_catalog_archive_handler,
         seed_archive_handler as seed_catalog_archive_handler,
     },
+    catalog_search::search_handler as catalog_search_handler,
     compliance_report::{
         download_handler as download_compliance_report_handler,
         list_handler as list_compliance_reports_handler,
@@ -498,6 +499,7 @@ async fn main() -> Result<()> {
         .route("/api/stigs/lint", post(stig_lint_handler))
         .route("/api/stigs/:id/diff", get(catalog_diff_handler))
         .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
+        .route("/api/catalog/search", get(catalog_search_handler))
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
