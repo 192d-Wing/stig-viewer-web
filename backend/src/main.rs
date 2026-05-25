@@ -125,6 +125,10 @@ use api::{
         list_handler as list_saved_searches_handler,
     },
     scheduler_status::list_handler as list_scheduler_runs_handler,
+    sessions::{
+        list_handler as list_active_sessions_handler,
+        revoke_handler as revoke_session_handler,
+    },
     stig::get_stig,
     stig_validator::lint_handler as stig_lint_handler,
     test_support::{
@@ -405,6 +409,11 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/scheduler-runs",
             get(list_scheduler_runs_handler),
+        )
+        .route("/api/admin/sessions", get(list_active_sessions_handler))
+        .route(
+            "/api/admin/sessions/:id",
+            axum::routing::delete(revoke_session_handler),
         )
         .route(
             "/api/saved-searches",
