@@ -17,6 +17,8 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Textarea from "@cloudscape-design/components/textarea";
 import DatePicker from "@cloudscape-design/components/date-picker";
 import Pagination from "@cloudscape-design/components/pagination";
+import FileUpload from "@cloudscape-design/components/file-upload";
+import ColumnLayout from "@cloudscape-design/components/column-layout";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
@@ -204,6 +206,78 @@ export default function AdminConsole() {
     const handle = setInterval(tick, 10_000);
     return () => clearInterval(handle);
   }, []);
+
+  // Backup / restore admin tools — full DB + attachments dump and a
+  // multipart upload to restore from such a dump. State here is local;
+  // there's no list view, just one-shot actions.
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupError, setBackupError] = useState(null);
+  const [restoreFiles, setRestoreFiles] = useState([]);
+  const [restoreForce, setRestoreForce] = useState(false);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreResult, setRestoreResult] = useState(null);
+  const [restoreError, setRestoreError] = useState(null);
+
+  const downloadBackup = useCallback(async () => {
+    setBackupBusy(true);
+    setBackupError(null);
+    try {
+      // apiFetch wires up X-User-Id + credentials so the admin gate
+      // applies. A raw <a href> would skip the header and 403 in test
+      // mode, so we go through the helper and dump to a blob URL.
+      const res = await apiFetch("/api/admin/backup");
+      if (!res.ok) {
+        throw new Error(`backup failed: ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const date = new Date().toISOString().slice(0, 10);
+      a.download = `stig-backup-${date}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Give the browser a tick to actually start the download before
+      // revoking the object URL.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setBackupError(err.message);
+    } finally {
+      setBackupBusy(false);
+    }
+  }, []);
+
+  const submitRestore = useCallback(async () => {
+    if (!restoreFiles.length) {
+      setRestoreError("Pick a backup .zip first.");
+      return;
+    }
+    setRestoreBusy(true);
+    setRestoreError(null);
+    setRestoreResult(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", restoreFiles[0], restoreFiles[0].name);
+      const qs = restoreForce ? "?force=true" : "?force=false";
+      const res = await apiFetch(`/api/admin/restore${qs}`, {
+        method: "POST",
+        body: fd,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body.error || `restore failed: ${res.status}`);
+      }
+      setRestoreResult(body);
+      // Refresh the rest of the console so any newly-restored users /
+      // assets / webhooks show up immediately.
+      await refresh();
+    } catch (err) {
+      setRestoreError(err.message);
+    } finally {
+      setRestoreBusy(false);
+    }
+  }, [restoreFiles, restoreForce, refresh]);
 
   const revokeSession = useCallback(
     async (row) => {
@@ -1270,6 +1344,107 @@ export default function AdminConsole() {
           </Header>
         }
       />
+
+      <Container
+        header={
+          <Header
+            variant="h2"
+            description="Dump every user-generated table + attachment blob to a single ZIP, or restore from a previously-taken backup. The STIG catalog itself is sourced externally and is not included."
+          >
+            Backup &amp; restore
+          </Header>
+        }
+        data-testid="backup-restore-section"
+      >
+        <ColumnLayout columns={2}>
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="h3">Backup</Box>
+            <Box variant="p" color="text-body-secondary">
+              Streams a ZIP containing one JSONL per table plus the raw
+              attachment blobs. Safe to take at any time.
+            </Box>
+            {backupError && <Alert type="error">{backupError}</Alert>}
+            <Box>
+              <Button
+                variant="primary"
+                iconName="download"
+                loading={backupBusy}
+                onClick={downloadBackup}
+                data-testid="backup-download-btn"
+              >
+                Download backup
+              </Button>
+            </Box>
+          </SpaceBetween>
+
+          <SpaceBetween direction="vertical" size="m">
+            <Box variant="h3">Restore</Box>
+            <Box variant="p" color="text-body-secondary">
+              Upload a backup .zip. Without <strong>Force overwrite</strong>
+              {" "}the target must be empty (no assets, no checklists). With
+              force, every backed-up table is truncated first —
+              destructive.
+            </Box>
+            <FormField label="Backup file">
+              <FileUpload
+                value={restoreFiles}
+                onChange={({ detail }) => {
+                  setRestoreFiles(detail.value);
+                  setRestoreResult(null);
+                  setRestoreError(null);
+                }}
+                accept=".zip"
+                showFileSize
+                i18nStrings={{
+                  uploadButtonText: () => "Choose backup .zip",
+                  dropzoneText: () => "Drop backup .zip here",
+                  removeFileAriaLabel: (i) => `Remove file ${i + 1}`,
+                  limitShowFewer: "Show fewer files",
+                  limitShowMore: "Show more files",
+                  errorIconAriaLabel: "Error",
+                }}
+                data-testid="restore-file-input"
+              />
+            </FormField>
+            <div data-testid="restore-force-toggle">
+              <Toggle
+                checked={restoreForce}
+                onChange={({ detail }) => setRestoreForce(detail.checked)}
+              >
+                Force overwrite (truncates existing data)
+              </Toggle>
+            </div>
+            <Box>
+              <Button
+                variant="primary"
+                loading={restoreBusy}
+                disabled={!restoreFiles.length}
+                onClick={submitRestore}
+                data-testid="restore-submit-btn"
+              >
+                Restore
+              </Button>
+            </Box>
+            {restoreError && (
+              <Alert type="error" data-testid="restore-error">
+                {restoreError}
+              </Alert>
+            )}
+            {restoreResult && (
+              <Alert type="success" data-testid="restore-success">
+                Restored {Object.values(restoreResult.restored ?? {}).reduce(
+                  (a, b) => a + b,
+                  0,
+                )}{" "}
+                rows across {Object.keys(restoreResult.restored ?? {}).length}{" "}
+                tables and {restoreResult.attachmentsWritten ?? 0}{" "}
+                attachment blob(s)
+                {restoreResult.forced ? " (force overwrite)" : ""}.
+              </Alert>
+            )}
+          </SpaceBetween>
+        </ColumnLayout>
+      </Container>
 
       <Modal
         visible={roleModal !== null}
