@@ -155,8 +155,11 @@ pub struct ReactionSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReactionsBlock {
+    // Snake-case wire keys match the request body's reaction value, the
+    // ALLOWED_REACTIONS allowlist, and the frontend REACTION_TYPES keys.
+    // Override the parent rename_all = camelCase explicitly on each.
+    #[serde(rename = "thumbs_up")]
     pub thumbs_up: ReactionSummary,
     pub check: ReactionSummary,
     pub question: ReactionSummary,
