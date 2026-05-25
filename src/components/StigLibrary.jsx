@@ -21,7 +21,29 @@ import Link from "@cloudscape-design/components/link";
 import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Modal from "@cloudscape-design/components/modal";
-import { BACKEND, apiJson, apiFetch } from "../utils/api.js";
+import ExpandableSection from "@cloudscape-design/components/expandable-section";
+import { BACKEND, apiJson, apiFetch, apiGet } from "../utils/api.js";
+
+/**
+ * Strip everything except `<mark>` and `</mark>` tags from a server-
+ * generated snippet. The snippet is built server-side from STIG
+ * content (no user input flows in), but we still defang any stray
+ * tags before handing the string to `dangerouslySetInnerHTML`.
+ */
+function sanitizeSnippet(raw) {
+  if (!raw) return "";
+  // Temporarily mark the allowed tags, escape everything else, restore.
+  const TOKEN_OPEN = "MARK_OPEN";
+  const TOKEN_CLOSE = "MARK_CLOSE";
+  const swapped = String(raw)
+    .replaceAll("<mark>", TOKEN_OPEN)
+    .replaceAll("</mark>", TOKEN_CLOSE);
+  // Drop any remaining tag-looking content.
+  const stripped = swapped.replace(/<[^>]*>/g, "");
+  return stripped
+    .replaceAll(TOKEN_OPEN, "<mark>")
+    .replaceAll(TOKEN_CLOSE, "</mark>");
+}
 const CATEGORIES = ["Windows", "Linux", "Browser", "Network"];
 
 /** Trim long body fields for the diff table cells so a 4 KB
@@ -181,6 +203,47 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [diffStatus, setDiffStatus] = useState("idle");
   const [diffData, setDiffData] = useState(null);
   const [diffError, setDiffError] = useState(null);
+
+  // Cross-rule search — separate from the existing title-only `q`
+  // URL filter. Hits a server endpoint that scans rule ids + titles
+  // across the whole catalog. Debounced so each keystroke doesn't
+  // fire a request.
+  const [crossSearch, setCrossSearch] = useState("");
+  const [crossResults, setCrossResults] = useState([]);
+  const [crossStatus, setCrossStatus] = useState("idle"); // idle | loading | done | error
+  const [crossError, setCrossError] = useState(null);
+
+  useEffect(() => {
+    const term = crossSearch.trim();
+    if (term.length < 2) {
+      setCrossResults([]);
+      setCrossStatus("idle");
+      setCrossError(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setCrossStatus("loading");
+    const handle = setTimeout(async () => {
+      try {
+        const data = await apiGet(
+          `/api/catalog/search?q=${encodeURIComponent(term)}&limit=50`,
+        );
+        if (cancelled) return;
+        setCrossResults(data.results || []);
+        setCrossStatus("done");
+        setCrossError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setCrossResults([]);
+        setCrossStatus("error");
+        setCrossError(err.message);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [crossSearch]);
 
   const openDiff = useCallback(async (stigId) => {
     setDiffStigId(stigId);
@@ -724,29 +787,115 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
           </Header>
         }
         filter={
-          <SpaceBetween direction="horizontal" size="m" alignItems="center">
-            <TextFilter
-              filteringText={searchText}
-              onChange={({ detail }) => {
-                setSearchText(detail.filteringText);
-                setCurrentPage(1);
-              }}
-              filteringPlaceholder="Search by title"
-              countText={`${displayList.length} matches`}
-            />
-            <SegmentedControl
-              selectedId={categoryFilter || "all"}
-              onChange={({ detail }) => {
-                setCategoryFilter(
-                  detail.selectedId === "all" ? null : detail.selectedId,
-                );
-                setCurrentPage(1);
-              }}
-              options={[
-                { text: "All", id: "all" },
-                ...CATEGORIES.map((c) => ({ text: c, id: c })),
-              ]}
-            />
+          <SpaceBetween size="s">
+            <SpaceBetween direction="horizontal" size="m" alignItems="center">
+              <TextFilter
+                filteringText={searchText}
+                onChange={({ detail }) => {
+                  setSearchText(detail.filteringText);
+                  setCurrentPage(1);
+                }}
+                filteringPlaceholder="Search by title"
+                countText={`${displayList.length} matches`}
+              />
+              <SegmentedControl
+                selectedId={categoryFilter || "all"}
+                onChange={({ detail }) => {
+                  setCategoryFilter(
+                    detail.selectedId === "all" ? null : detail.selectedId,
+                  );
+                  setCurrentPage(1);
+                }}
+                options={[
+                  { text: "All", id: "all" },
+                  ...CATEGORIES.map((c) => ({ text: c, id: c })),
+                ]}
+              />
+              <FormField label="Search across rules">
+                <Input
+                  type="search"
+                  value={crossSearch}
+                  onChange={({ detail }) => setCrossSearch(detail.value)}
+                  placeholder="Search rule titles, ids…"
+                  data-testid="catalog-cross-search-input"
+                />
+              </FormField>
+            </SpaceBetween>
+            {crossSearch.trim().length >= 2 && (
+              <ExpandableSection
+                variant="container"
+                defaultExpanded
+                headerText={
+                  crossStatus === "loading"
+                    ? "Cross-rule matches (searching…)"
+                    : `Cross-rule matches (${crossResults.length})`
+                }
+                data-testid="catalog-cross-search-panel"
+              >
+                {crossStatus === "error" && (
+                  <Alert type="error">{crossError}</Alert>
+                )}
+                {crossStatus === "done" && crossResults.length === 0 && (
+                  <Box data-testid="catalog-cross-search-empty">
+                    No matches.
+                  </Box>
+                )}
+                {crossResults.length > 0 && (
+                  <Table
+                    variant="embedded"
+                    items={crossResults}
+                    data-testid="catalog-cross-search-results"
+                    ariaLabels={{ tableLabel: "Cross-rule matches" }}
+                    columnDefinitions={[
+                      {
+                        id: "stig",
+                        header: "STIG",
+                        cell: (r) => (
+                          <Link
+                            onFollow={(e) => {
+                              e.preventDefault();
+                              handleLoad(r.stigId);
+                            }}
+                          >
+                            {r.stigTitle}
+                          </Link>
+                        ),
+                      },
+                      {
+                        id: "ruleId",
+                        header: "Rule ID",
+                        cell: (r) => r.ruleId || "—",
+                        width: 220,
+                      },
+                      {
+                        id: "field",
+                        header: "Field",
+                        cell: (r) => r.field,
+                        width: 110,
+                      },
+                      {
+                        id: "snippet",
+                        header: "Snippet",
+                        cell: (r) => (
+                          <span
+                            data-testid={`catalog-cross-search-snippet-${r.stigId}-${r.ruleId ?? "stig"}-${r.field}`}
+                            dangerouslySetInnerHTML={{
+                              __html: sanitizeSnippet(r.snippet),
+                            }}
+                          />
+                        ),
+                      },
+                      {
+                        id: "score",
+                        header: "Score",
+                        cell: (r) => r.score,
+                        width: 80,
+                      },
+                    ]}
+                  />
+                )}
+              </ExpandableSection>
+            )}
           </SpaceBetween>
         }
         empty={
