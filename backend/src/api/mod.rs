@@ -13,6 +13,7 @@ pub mod baselines;
 pub mod bundle;
 pub mod catalog;
 pub mod catalog_diff;
+pub mod catalog_search;
 pub mod checklists;
 pub mod compliance_report;
 pub mod dashboard;
