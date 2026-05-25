@@ -207,8 +207,11 @@ pub struct CallbackParams {
 pub async fn callback_handler(
     State(state): State<AppAuthState>,
     Query(params): Query<CallbackParams>,
+    headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
+    let ip = client_ip(&headers);
+    let ua = user_agent(&headers);
     let oidc = &state.oidc;
 
     // Pull AuthState from the state cookie and clear it.
@@ -293,7 +296,7 @@ pub async fn callback_handler(
         })?;
 
     // Create server-side session, set cookie.
-    let session_id = create_session(&state.pool, &user.id)
+    let session_id = create_session(&state.pool, &user.id, &ip, &ua)
         .await
         .map_err(|e| {
             tracing::error!("create_session failed: {e:#}");
@@ -458,13 +461,23 @@ pub(crate) async fn upsert_user(
     })
 }
 
-pub(crate) async fn create_session(pool: &PgPool, user_id: &str) -> Result<String> {
+pub(crate) async fn create_session(
+    pool: &PgPool,
+    user_id: &str,
+    ip: &str,
+    user_agent: &str,
+) -> Result<String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let expires_at: DateTime<Utc> = Utc::now() + Duration::hours(SESSION_LIFETIME_HOURS);
-    sqlx::query("INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, $3)")
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, expires_at, ip, user_agent) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
         .bind(&session_id)
         .bind(user_id)
         .bind(expires_at)
+        .bind(ip)
+        .bind(user_agent)
         .execute(pool)
         .await?;
     // Track activity for the admin console. Updating on every newly minted
@@ -478,6 +491,39 @@ pub(crate) async fn create_session(pool: &PgPool, user_id: &str) -> Result<Strin
     Ok(session_id)
 }
 
+/// Pull the client IP from `X-Forwarded-For` (first hop) or
+/// `X-Real-IP`, falling back to an empty string. We don't wire
+/// `axum::serve` with `ConnectInfo` today, so a header-derived value is
+/// the most reliable signal we have — typical deployments are behind a
+/// proxy that sets one of these anyway.
+pub(crate) fn client_ip(headers: &HeaderMap) -> String {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = xff.split(',').next() {
+            let trimmed = first.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let trimmed = real.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Pull the `User-Agent` request header, defaulting to an empty
+/// string. Used at session-creation time for the admin audit view.
+pub(crate) fn user_agent(headers: &HeaderMap) -> String {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
 async fn resolve_session_user(pool: &PgPool, headers: &HeaderMap) -> Result<Option<AuthUser>> {
     let session_id = match cookie_value(headers, SESSION_COOKIE) {
         Some(v) => v,
@@ -489,7 +535,9 @@ async fn resolve_session_user(pool: &PgPool, headers: &HeaderMap) -> Result<Opti
         SELECT u.id, u.display_name, u.email, u.role
           FROM sessions s
           JOIN users u ON u.id = s.user_id
-         WHERE s.id = $1 AND s.expires_at > NOW()
+         WHERE s.id = $1
+           AND s.expires_at > NOW()
+           AND s.revoked_at IS NULL
         "#,
     )
     .bind(&session_id)
@@ -514,12 +562,31 @@ async fn test_header_user(pool: &PgPool, headers: &HeaderMap) -> Result<Option<A
         _ => return Ok(None),
     };
     let user = upsert_user(pool, "test", &raw, &raw, "").await?;
-    // X-User-Id auth doesn't go through create_session, so stamp the
-    // last_login here so E2E + admin-console scenarios still see activity.
-    let _ = sqlx::query("UPDATE users SET last_login = NOW() WHERE id = $1")
-        .bind(&user.id)
-        .execute(pool)
-        .await;
+    // X-User-Id auth doesn't go through create_session organically, but
+    // the admin "active sessions" panel + session-audit spec want a real
+    // session row to look at. Mint a fresh one whenever the user has no
+    // active (non-revoked, non-expired) session — that way after an
+    // admin revoke the next request gets a brand-new session and the
+    // user stays logged in (the bypass is test-only).
+    let ip = client_ip(headers);
+    let ua = user_agent(headers);
+    let has_active: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM sessions \
+         WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW() \
+         LIMIT 1",
+    )
+    .bind(&user.id)
+    .fetch_optional(pool)
+    .await?;
+    if has_active.is_none() {
+        let _ = create_session(pool, &user.id, &ip, &ua).await?;
+    } else {
+        // Bypass already has a live session — just keep last_login fresh.
+        let _ = sqlx::query("UPDATE users SET last_login = NOW() WHERE id = $1")
+            .bind(&user.id)
+            .execute(pool)
+            .await;
+    }
     Ok(Some(user))
 }
 
