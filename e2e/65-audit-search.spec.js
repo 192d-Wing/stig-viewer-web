@@ -23,7 +23,7 @@ async function ensureUser(request, name) {
  * mutated. The asset name is the caller-supplied `assetName` so the UI
  * test can assert on a stable label.
  */
-async function seedActivity(request, userName, assetName, patches) {
+async function seedActivity(request, userName, assetName, patches, ruleIndex = 0) {
   const asset = await request
     .post(`${BACKEND}/api/assets`, {
       headers: {
@@ -49,7 +49,7 @@ async function seedActivity(request, userName, assetName, patches) {
       headers: { "X-User-Id": userName },
     })
     .then((r) => r.json());
-  const ruleId = detail.rules[0].id;
+  const ruleId = detail.rules[ruleIndex].id;
 
   for (const body of patches) {
     const res = await request.patch(
@@ -186,12 +186,23 @@ test.describe("Audit log search", () => {
     // Seed two distinct rules so we can backdate one independently of
     // the other. After the backdate, the "old" rule's rows live 60
     // days in the past — outside a from=yesterday window.
-    const old = await seedActivity(request, "alice", "old-host", [
-      { status: "open", findingDetails: "long ago" },
-    ]);
-    await seedActivity(request, "alice", "new-host", [
-      { status: "open", findingDetails: "just now" },
-    ]);
+    // IMPORTANT: use different rule indices because backdate_audit shifts
+    // ALL rows matching rule_id, and both checklists use the edge STIG —
+    // so if both pick rules[0] the backdate hits both.
+    const old = await seedActivity(
+      request,
+      "alice",
+      "old-host",
+      [{ status: "open", findingDetails: "long ago" }],
+      0,
+    );
+    await seedActivity(
+      request,
+      "alice",
+      "new-host",
+      [{ status: "open", findingDetails: "just now" }],
+      1,
+    );
     await backdateRule(request, old.ruleId, 60);
 
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
