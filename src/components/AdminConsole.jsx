@@ -44,6 +44,28 @@ const KIND_OPTIONS = [
   { label: "Compliance report", value: "compliance_report" },
 ];
 
+// ABAC effect/level enumerations. Mirror the validation in
+// backend/src/api/abac.rs — anything outside these sets is rejected
+// with 400 by the create/update handlers.
+const POLICY_EFFECT_OPTIONS = [
+  { label: "Allow", value: "allow" },
+  { label: "Deny", value: "deny" },
+];
+const POLICY_LEVEL_OPTIONS = [
+  { label: "Read", value: "read" },
+  { label: "Write", value: "write" },
+  { label: "Admin", value: "admin" },
+];
+// Role options for the policy modal — the wildcard "Any role" row
+// maps to an empty string, which the backend stores as NULL.
+const POLICY_ROLE_OPTIONS = [
+  { label: "Any role", value: "" },
+  { label: "Author", value: "author" },
+  { label: "Reviewer", value: "reviewer" },
+  { label: "Admin", value: "admin" },
+  { label: "Viewer", value: "viewer" },
+];
+
 function roleLabel(value) {
   return ROLE_OPTIONS.find((o) => o.value === value)?.label ?? value;
 }
@@ -89,6 +111,13 @@ export default function AdminConsole() {
   const [ownerSubmitting, setOwnerSubmitting] = useState(false);
   const [ownerError, setOwnerError] = useState(null);
   const [ownerSuccess, setOwnerSuccess] = useState(null);
+
+  // ABAC policy state. `policyModal` holds in-flight form values when
+  // the create modal is open; null otherwise.
+  const [policies, setPolicies] = useState([]);
+  const [policyModal, setPolicyModal] = useState(null);
+  const [policySubmitting, setPolicySubmitting] = useState(false);
+  const [policyError, setPolicyError] = useState(null);
 
   // Webhook modal state. `mode` is 'create' or 'edit'.
   const [hookModal, setHookModal] = useState(null);
@@ -159,7 +188,7 @@ export default function AdminConsole() {
     setLoading(true);
     setError(null);
     try {
-      const [u, a, w, r, e, ap, sr, sess] = await Promise.all([
+      const [u, a, w, r, e, ap, sr, sess, pol] = await Promise.all([
         apiGet("/api/admin/users"),
         apiGet("/api/assets"),
         apiGet("/api/webhooks").catch(() => []),
@@ -171,6 +200,7 @@ export default function AdminConsole() {
           history: [],
         })),
         apiGet("/api/admin/sessions").catch(() => []),
+        apiGet("/api/admin/policies").catch(() => []),
       ]);
       setUsers(u);
       setAssets(a);
@@ -180,6 +210,7 @@ export default function AdminConsole() {
       setApprovals(ap);
       setSchedulerRuns(sr);
       setSessions(sess);
+      setPolicies(pol);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -441,6 +472,80 @@ export default function AdminConsole() {
     }
   }, [rejectModal, rejectReason, refresh]);
 
+  // ── ABAC policy helpers ────────────────────────────────────────────────
+
+  const openCreatePolicy = useCallback(() => {
+    setPolicyModal({
+      name: "",
+      effect: "allow",
+      level: "read",
+      roleMatch: "",
+      classificationMatch: "",
+      tagMatch: "",
+    });
+    setPolicyError(null);
+  }, []);
+
+  const submitPolicy = useCallback(async () => {
+    if (!policyModal) return;
+    setPolicySubmitting(true);
+    setPolicyError(null);
+    try {
+      await apiJson("/api/admin/policies", "POST", {
+        name: policyModal.name,
+        effect: policyModal.effect,
+        level: policyModal.level,
+        roleMatch: policyModal.roleMatch,
+        classificationMatch: policyModal.classificationMatch,
+        tagMatch: policyModal.tagMatch,
+      });
+      setPolicyModal(null);
+      await refresh();
+    } catch (err) {
+      setPolicyError(err.message);
+    } finally {
+      setPolicySubmitting(false);
+    }
+  }, [policyModal, refresh]);
+
+  const togglePolicyEnabled = useCallback(
+    async (policy, next) => {
+      try {
+        await apiJson(`/api/admin/policies/${policy.id}`, "PATCH", {
+          enabled: next,
+        });
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      }
+    },
+    [refresh],
+  );
+
+  const deletePolicy = useCallback(
+    async (policy) => {
+      if (
+        !window.confirm(
+          `Delete policy "${policy.name}"? This can't be undone.`,
+        )
+      ) {
+        return;
+      }
+      try {
+        const res = await apiFetch(`/api/admin/policies/${policy.id}`, {
+          method: "DELETE",
+        });
+        if (!res.ok && res.status !== 204) {
+          throw new Error(`Delete failed: ${res.status}`);
+        }
+        await refresh();
+      } catch (err) {
+        setError(err.message);
+      }
+    },
+    [refresh],
+  );
+
   // ── Webhook helpers ────────────────────────────────────────────────────
 
   const openCreateHook = useCallback(() => {
@@ -598,6 +703,71 @@ export default function AdminConsole() {
       },
     ],
     [openRoleModal],
+  );
+
+  const policyColumns = useMemo(
+    () => [
+      {
+        id: "name",
+        header: "Name",
+        cell: (p) => p.name,
+      },
+      {
+        id: "effect",
+        header: "Effect",
+        cell: (p) => (
+          <Badge color={p.effect === "deny" ? "red" : "green"}>
+            {p.effect}
+          </Badge>
+        ),
+      },
+      {
+        id: "level",
+        header: "Level",
+        cell: (p) => p.level,
+      },
+      {
+        id: "role_match",
+        header: "Role match",
+        cell: (p) => p.roleMatch ?? "any",
+      },
+      {
+        id: "classification_match",
+        header: "Classification match",
+        cell: (p) => p.classificationMatch ?? "any",
+      },
+      {
+        id: "tag_match",
+        header: "Tag match",
+        cell: (p) => p.tagMatch ?? "any",
+      },
+      {
+        id: "enabled",
+        header: "Enabled",
+        cell: (p) => (
+          <div data-testid={`policy-enabled-${p.id}`}>
+            <Toggle
+              checked={p.enabled}
+              onChange={({ detail }) => togglePolicyEnabled(p, detail.checked)}
+            />
+          </div>
+        ),
+      },
+      {
+        id: "actions",
+        header: "",
+        cell: (p) => (
+          <Button
+            variant="inline-link"
+            onClick={() => deletePolicy(p)}
+            data-testid={`policy-delete-${p.id}`}
+          >
+            Delete
+          </Button>
+        ),
+      },
+    ],
+    [togglePolicyEnabled, deletePolicy],
   );
 
   const webhookColumns = useMemo(
@@ -1190,6 +1360,39 @@ export default function AdminConsole() {
       </Container>
 
       <Table
+        items={policies}
+        columnDefinitions={policyColumns}
+        loading={loading}
+        loadingText="Loading policies"
+        empty={
+          <Box textAlign="center" padding="l">
+            <Box variant="p" color="text-body-secondary">
+              No ABAC policies configured. Add one to layer attribute-based
+              rules on top of the owner / ACL / admin-role checks.
+            </Box>
+          </Box>
+        }
+        header={
+          <Header
+            counter={`(${policies.length})`}
+            description="Attribute-based access control. Each policy targets a level (read/write/admin) and matches by role, classification, and tag. Deny wins over Allow when both match."
+            actions={
+              <Button
+                variant="primary"
+                onClick={openCreatePolicy}
+                data-testid="add-policy-btn"
+              >
+                Add policy
+              </Button>
+            }
+          >
+            Policies
+          </Header>
+        }
+        data-testid="policies-table"
+      />
+
+      <Table
         items={webhooks}
         columnDefinitions={webhookColumns}
         loading={loading}
@@ -1483,6 +1686,125 @@ export default function AdminConsole() {
             />
           </FormField>
           {roleError && <Alert type="error">{roleError}</Alert>}
+        </SpaceBetween>
+      </Modal>
+
+      <Modal
+        visible={policyModal !== null}
+        onDismiss={() => setPolicyModal(null)}
+        header="Add policy"
+        data-testid="policy-modal"
+        footer={
+          <Box float="right">
+            <SpaceBetween direction="horizontal" size="xs">
+              <Button variant="link" onClick={() => setPolicyModal(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={policySubmitting}
+                onClick={submitPolicy}
+                data-testid="policy-submit-btn"
+              >
+                Save
+              </Button>
+            </SpaceBetween>
+          </Box>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          <FormField label="Name">
+            <Input
+              value={policyModal?.name ?? ""}
+              onChange={({ detail }) =>
+                setPolicyModal((m) => (m ? { ...m, name: detail.value } : m))
+              }
+              placeholder="e.g. Reviewers can write unclassified"
+              data-testid="policy-name-input"
+            />
+          </FormField>
+          <FormField label="Effect">
+            <Select
+              selectedOption={
+                POLICY_EFFECT_OPTIONS.find(
+                  (o) => o.value === policyModal?.effect,
+                ) ?? POLICY_EFFECT_OPTIONS[0]
+              }
+              onChange={({ detail }) =>
+                setPolicyModal((m) =>
+                  m ? { ...m, effect: detail.selectedOption.value } : m,
+                )
+              }
+              options={POLICY_EFFECT_OPTIONS}
+              data-testid="policy-effect-select"
+            />
+          </FormField>
+          <FormField label="Level">
+            <Select
+              selectedOption={
+                POLICY_LEVEL_OPTIONS.find(
+                  (o) => o.value === policyModal?.level,
+                ) ?? POLICY_LEVEL_OPTIONS[0]
+              }
+              onChange={({ detail }) =>
+                setPolicyModal((m) =>
+                  m ? { ...m, level: detail.selectedOption.value } : m,
+                )
+              }
+              options={POLICY_LEVEL_OPTIONS}
+              data-testid="policy-level-select"
+            />
+          </FormField>
+          <FormField
+            label="Role match"
+            description="Leave as 'Any role' to match every requester."
+          >
+            <Select
+              selectedOption={
+                POLICY_ROLE_OPTIONS.find(
+                  (o) => o.value === (policyModal?.roleMatch ?? ""),
+                ) ?? POLICY_ROLE_OPTIONS[0]
+              }
+              onChange={({ detail }) =>
+                setPolicyModal((m) =>
+                  m ? { ...m, roleMatch: detail.selectedOption.value } : m,
+                )
+              }
+              options={POLICY_ROLE_OPTIONS}
+              data-testid="policy-role-select"
+            />
+          </FormField>
+          <FormField
+            label="Classification match"
+            description="Empty matches any classification."
+          >
+            <Input
+              value={policyModal?.classificationMatch ?? ""}
+              onChange={({ detail }) =>
+                setPolicyModal((m) =>
+                  m ? { ...m, classificationMatch: detail.value } : m,
+                )
+              }
+              placeholder="unclassified"
+              data-testid="policy-classification-input"
+            />
+          </FormField>
+          <FormField
+            label="Tag match"
+            description="Asset must carry this exact tag. Empty matches any."
+          >
+            <Input
+              value={policyModal?.tagMatch ?? ""}
+              onChange={({ detail }) =>
+                setPolicyModal((m) =>
+                  m ? { ...m, tagMatch: detail.value } : m,
+                )
+              }
+              placeholder="prod"
+              data-testid="policy-tag-input"
+            />
+          </FormField>
+          {policyError && <Alert type="error">{policyError}</Alert>}
         </SpaceBetween>
       </Modal>
 
