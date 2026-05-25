@@ -13,6 +13,14 @@ fn map_severity(s: &str) -> &'static str {
 }
 
 /// A single STIG rule — matches the shape produced by the frontend's parseXCCDF.js.
+///
+/// Note on CCI fields: `cci_ids` (serialized as `cciIds`) is the long-standing
+/// field name used throughout the frontend and exporters. `cci` (serialized
+/// verbatim) is a parallel field that exposes the same data under the shorter
+/// name used by the per-rule CCI tag display. Both are populated together —
+/// always trimmed, filtered to `ident` children whose system attribute
+/// contains "cci" (case-insensitive), and deduplicated while preserving the
+/// first-seen order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -25,6 +33,10 @@ pub struct Rule {
     pub fix_text: String,
     pub check_text: String,
     pub cci_ids: Vec<String>,
+    /// Short-name mirror of `cci_ids` used by the per-rule CCI tag UI.
+    /// Always present (empty array when the rule has no CCIs).
+    #[serde(default, rename = "cci")]
+    pub cci: Vec<String>,
     pub status: String,
     pub finding_details: String,
     pub comments: String,
@@ -140,6 +152,11 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
     let mut current_group_id = String::new();
     let mut current_rule: Option<Rule> = None;
     let mut current_tag = String::new();
+    // The XCCDF `<ident system="...">` attribute on the element we're
+    // currently inside. Tracked separately so we can filter ident text
+    // children to CCI systems only (per spec, anything whose system URI
+    // contains the substring "cci", case-insensitive).
+    let mut current_ident_system = String::new();
     let mut depth: usize = 0;
     let mut rule_depth: usize = 0;
 
@@ -176,12 +193,19 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                             fix_text: String::new(),
                             check_text: String::new(),
                             cci_ids: Vec::new(),
+                            cci: Vec::new(),
                             status: "not_reviewed".to_string(),
                             finding_details: String::new(),
                             comments: String::new(),
                         });
                     }
                     _ => {}
+                }
+                // Capture the `system` attribute when entering an <ident>
+                // so the text-event handler can decide whether to keep it.
+                if local == "ident" {
+                    current_ident_system =
+                        attr_value(e.as_ref(), "system").unwrap_or_default();
                 }
                 current_tag = local;
             }
@@ -195,6 +219,9 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                 }
                 if local == "Group" {
                     in_group = false;
+                }
+                if local == "ident" {
+                    current_ident_system.clear();
                 }
                 depth = depth.saturating_sub(1);
                 current_tag.clear();
@@ -213,7 +240,27 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                             }
                             "fixtext" | "fix-text" => rule.fix_text = text,
                             "check-content" => rule.check_text = text,
-                            "ident" => rule.cci_ids.push(text),
+                            "ident" => {
+                                // Only retain idents whose `system` URI
+                                // names a CCI source — DISA, NIST, and
+                                // newer XCCDF bundles all spell this
+                                // differently but every variant contains
+                                // the substring "cci". Trim + dedupe so
+                                // the JSON shape is stable regardless of
+                                // upstream whitespace quirks.
+                                if current_ident_system
+                                    .to_lowercase()
+                                    .contains("cci")
+                                {
+                                    let value = text.trim().to_string();
+                                    if !value.is_empty()
+                                        && !rule.cci.iter().any(|c| c == &value)
+                                    {
+                                        rule.cci.push(value.clone());
+                                        rule.cci_ids.push(value);
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -446,4 +493,59 @@ pub fn extract_all_from_library(
     }
 
     (entries, errors)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XCCDF fragment with one rule carrying two CCI idents plus one
+    /// non-CCI ident. After parsing, `cci` must contain exactly the two
+    /// CCI values in document order; the non-CCI ident must be dropped.
+    /// Also verifies that the second rule (no idents at all) still gets
+    /// an empty `cci: []` array rather than a missing field.
+    #[test]
+    fn cci_idents_are_captured_filtered_and_deduped() {
+        let xml = r#"
+        <Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1">
+            <title>Test</title>
+            <Group id="V-1">
+                <Rule id="SV-1_rule" severity="medium">
+                    <title>Rule one</title>
+                    <ident system="http://iase.disa.mil/cci">CCI-000001</ident>
+                    <ident system="http://iase.disa.mil/cci">  CCI-000002  </ident>
+                    <ident system="http://iase.disa.mil/cci">CCI-000001</ident>
+                    <ident system="http://nvd.nist.gov/cve">CVE-2020-9999</ident>
+                </Rule>
+            </Group>
+            <Group id="V-2">
+                <Rule id="SV-2_rule" severity="low">
+                    <title>Rule two</title>
+                </Rule>
+            </Group>
+        </Benchmark>
+        "#;
+
+        let stig = parse_xccdf(xml).expect("parse");
+        assert_eq!(stig.rules.len(), 2);
+
+        let r1 = &stig.rules[0];
+        assert_eq!(
+            r1.cci,
+            vec!["CCI-000001".to_string(), "CCI-000002".to_string()],
+            "CCI idents kept in order, trimmed, deduped; non-CCI dropped",
+        );
+        // cci_ids mirrors cci so legacy consumers see the same set.
+        assert_eq!(r1.cci_ids, r1.cci);
+
+        let r2 = &stig.rules[1];
+        assert!(r2.cci.is_empty(), "rules with no idents must emit []");
+        // Serialization sanity check — `cci` must appear as a key even
+        // when empty so the API contract is "always present".
+        let json = serde_json::to_value(r2).expect("serialize");
+        assert!(json.get("cci").is_some(), "cci key must be present");
+        assert!(json.get("cci").unwrap().is_array());
+    }
 }
