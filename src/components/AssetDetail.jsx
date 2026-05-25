@@ -16,9 +16,10 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import LineChart from "@cloudscape-design/components/line-chart";
 import Toggle from "@cloudscape-design/components/toggle";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
+import { renderMarkdown } from "../utils/markdown.js";
 import { AuthContext } from "./AuthGate.jsx";
 
-export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
+export default function AssetDetail({ assetId, onBack, onOpenChecklist, onEdit }) {
   const currentUser = useContext(AuthContext);
 
   const [asset, setAsset] = useState(null);
@@ -946,6 +947,58 @@ export default function AssetDetail({ assetId, onBack, onOpenChecklist }) {
             </SpaceBetween>
           </Container>
         )}
+
+        <Container
+          header={
+            <Header
+              variant="h2"
+              description="Free-form markdown notes for this system — operational steps, escalation contacts, known issues."
+              actions={
+                // Edit is gated on write-or-better. `ccVisible` is a
+                // good proxy because the email-cc list endpoint 403s
+                // for users without the write ACL — reusing the
+                // signal avoids a separate ACL probe round-trip. The
+                // PUT endpoint server-side gates on `admin`, so non-
+                // owner write-ACL users will get a 403 if they try
+                // to save — handled by the existing error path in
+                // the modal.
+                (isOwner || ccVisible) && onEdit ? (
+                  <Button
+                    onClick={() => onEdit(asset)}
+                    data-testid="runbook-edit-button"
+                  >
+                    Edit
+                  </Button>
+                ) : null
+              }
+            >
+              Runbook
+            </Header>
+          }
+          data-testid="runbook-section"
+        >
+          {asset.runbook && asset.runbook.trim().length > 0 ? (
+            <div
+              className="runbook-rendered"
+              data-testid="runbook-rendered"
+              // The renderer in `utils/markdown.js` HTML-escapes
+              // every text token before assembling tags, so the
+              // only "raw" content here is the tag shell we
+              // constructed. Bare URLs are autolinked with
+              // rel="noopener noreferrer".
+              dangerouslySetInnerHTML={{
+                __html: renderMarkdown(asset.runbook),
+              }}
+            />
+          ) : (
+            <Box
+              color="text-body-secondary"
+              data-testid="runbook-placeholder"
+            >
+              No runbook yet — click Edit to add one.
+            </Box>
+          )}
+        </Container>
       </SpaceBetween>
 
       <Modal
