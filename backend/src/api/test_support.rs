@@ -7,6 +7,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::api::asset_email_cc::run_asset_email_schedules;
 use crate::api::auth::{client_ip, user_agent};
 use crate::api::compliance_report;
 use crate::api::dashboard::take_snapshot;
@@ -449,6 +450,23 @@ pub async fn run_scheduler_handler(
             // in the body but with a 200 so the dashboard fetch path
             // is the source of truth.
             Ok(Json(json!({ "ok": false, "error": format!("{e:#}") })))
+        }
+    }
+}
+
+/// POST /api/test/run-asset-email-schedules — synchronously run one
+/// tick of the per-asset scheduled-email loop and return the number of
+/// assets that were emailed. Used by E2E to drive the cadence path
+/// without waiting on the hourly scheduler. Gated by
+/// `STIG_ENV != "production"` at registration time.
+pub async fn run_asset_email_schedules_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match run_asset_email_schedules(state.pool.as_ref(), &state.config.data_dir).await {
+        Ok(count) => Ok(Json(json!({ "count": count }))),
+        Err(e) => {
+            tracing::error!("Test run-asset-email-schedules failed: {e:#}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

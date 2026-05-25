@@ -23,6 +23,18 @@ pub struct AssetRow {
     /// actually changes. Default FALSE preserves legacy behavior.
     #[sqlx(default)]
     pub requires_approval: bool,
+    /// Per-asset scheduled compliance-report email cadence.
+    /// One of `"off"` | `"daily"` | `"weekly"` | `"monthly"`. Default
+    /// `"off"` preserves legacy behavior — only the on-demand "Email
+    /// report now" path fires. See migration 032_asset_email_schedule.
+    #[sqlx(default)]
+    pub email_cadence: String,
+    /// Timestamp of the last scheduled (or attempted) per-asset email
+    /// send. NULL when no scheduled tick has ever fired for this asset.
+    /// Used by the scheduler to gate the cadence interval — see
+    /// `run_asset_email_schedules` in `asset_email_cc.rs`.
+    #[sqlx(default)]
+    pub email_last_sent_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -167,6 +179,34 @@ pub async fn set_requires_approval(
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Update the per-asset scheduled email cadence. Caller is responsible
+/// for validating the value against the allowlist (see
+/// `api::assets::VALID_EMAIL_CADENCES`).
+pub async fn set_email_cadence(pool: &PgPool, id: &str, cadence: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE assets \
+         SET email_cadence = $1, updated_at = NOW() \
+         WHERE id = $2",
+    )
+    .bind(cadence)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stamp `email_last_sent_at = NOW()` after a scheduled (or attempted)
+/// per-asset email send. Called from `run_asset_email_schedules` after
+/// each tick — whether the send fell into dryrun mode or actually
+/// reached SMTP — so the cadence-interval gate is monotonic.
+pub async fn stamp_email_last_sent_at(pool: &PgPool, id: &str) -> Result<()> {
+    sqlx::query("UPDATE assets SET email_last_sent_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
