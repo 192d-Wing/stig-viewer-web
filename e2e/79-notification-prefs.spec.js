@@ -195,12 +195,13 @@ test.describe("Notification preferences", () => {
     await page.getByTestId("notif-prefs-save").click();
     await expect(prefsDialog).toBeHidden();
 
-    // Re-open the bell and confirm the assignment is gone. The empty
-    // state copy from App.jsx surfaces in place of the assignment row.
-    await bell.click();
+    // The parent Notifications dialog stays open behind the sub-modal,
+    // and saveNotifPrefs triggers a bell refresh. Just wait for the
+    // empty-state copy to land in the still-visible dialog — don't
+    // re-click the bell (the modal backdrop blocks it anyway).
     await expect(dialog).toBeVisible();
     await expect(
       dialog.getByText("Nothing assigned to you recently."),
-    ).toBeVisible();
+    ).toBeVisible({ timeout: 10_000 });
   });
 });
