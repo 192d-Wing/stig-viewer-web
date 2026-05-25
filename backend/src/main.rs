@@ -78,7 +78,7 @@ use api::{
         list_handler as list_baselines_handler,
     },
     bundle::bundle_handler as asset_bundle_handler,
-    catalog::{get_catalog, get_health},
+    catalog::get_catalog,
     catalog_diff::{
         diff_handler as catalog_diff_handler,
         list_archive_handler as list_catalog_archive_handler,
@@ -115,6 +115,7 @@ use api::{
         update_policy_handler as update_asset_approval_policy_handler,
     },
     findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
+    health::get_health,
     notifications::{
         get_handler as get_notifications_handler,
         mark_read_handler as mark_notifications_read_handler,

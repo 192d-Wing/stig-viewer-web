@@ -51,14 +51,6 @@ pub async fn list_catalog(pool: &PgPool, category: Option<&str>) -> Result<Vec<C
     Ok(rows)
 }
 
-/// Count rows in the catalog (used by /api/health).
-pub async fn count_catalog(pool: &PgPool) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM stigs_catalog")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.0)
-}
-
 /// Upsert a catalog entry — inserts or updates on conflict.
 pub async fn upsert_catalog(pool: &PgPool, entry: &CatalogEntry) -> Result<()> {
     sqlx::query(
