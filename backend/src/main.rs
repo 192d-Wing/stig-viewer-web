@@ -112,6 +112,7 @@ use api::{
         get_handler as get_notifications_handler,
         mark_read_handler as mark_notifications_read_handler,
     },
+    oscal::export_handler as asset_oscal_handler,
     report::report_handler as asset_report_handler,
     rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
     rule_comments::{
@@ -299,6 +300,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/assets/:id/report.pdf", get(asset_report_handler))
         .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))
+        .route("/api/assets/:id/oscal.json", get(asset_oscal_handler))
         .route("/api/assets/:id/trend", get(asset_trend_handler))
         .route(
             "/api/assets/:left/diff/:right",
