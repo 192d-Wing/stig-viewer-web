@@ -119,7 +119,9 @@ use api::{
     health::get_health,
     notifications::{
         get_handler as get_notifications_handler,
+        get_prefs_handler as get_notification_prefs_handler,
         mark_read_handler as mark_notifications_read_handler,
+        put_prefs_handler as put_notification_prefs_handler,
     },
     oscal::export_handler as asset_oscal_handler,
     report::report_handler as asset_report_handler,
@@ -415,6 +417,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/notifications/mark-read",
             post(mark_notifications_read_handler),
+        )
+        .route(
+            "/api/notifications/prefs",
+            get(get_notification_prefs_handler).put(put_notification_prefs_handler),
         )
         .route("/api/users", get(list_users_handler))
         .route("/api/users/me", get(me_handler))
