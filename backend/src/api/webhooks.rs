@@ -76,6 +76,23 @@ const RESPONSE_SNIPPET_LIMIT: usize = 500;
 /// silently subscribed to a typo'd event name.
 const ALLOWED_KINDS: &[&str] = &["assigned", "overdue_digest", "compliance_report"];
 
+/// Allowed values for the `flavor` column — i.e. which wire schema the
+/// dispatcher serialises outbound events into. Same rejected-on-400
+/// pattern as `kinds`.
+///
+/// - `slack`: legacy `{ text, attachments: [{ title, text, color }] }`
+///   shape that incoming Slack webhooks consume directly. This is the
+///   default for backwards-compat with every existing webhook row.
+/// - `teams`: Microsoft Teams "MessageCard" legacy schema (the format
+///   Teams "Incoming Webhook" connectors accept). Rendered as a single
+///   card with `summary`, `title`, `themeColor`, and one section
+///   containing `text` + a `facts` list keyed off the event fields.
+/// - `generic`: flat `{ kind, title, body, color, fields }` shape with
+///   no platform-specific framing. Useful for custom integrations that
+///   want to re-render however they like (PagerDuty, in-house bots,
+///   webhook-to-DB sinks, etc.).
+const ALLOWED_FLAVORS: &[&str] = &["slack", "teams", "generic"];
+
 /// Maximum number of overdue findings included in a single digest
 /// payload. Slack incoming webhooks cap attachment size, and operators
 /// only care about the top of the list anyway.
@@ -90,6 +107,14 @@ fn validate_kinds(kinds: &[String]) -> Result<(), StatusCode> {
     Ok(())
 }
 
+fn validate_flavor(flavor: &str) -> Result<(), StatusCode> {
+    if ALLOWED_FLAVORS.contains(&flavor) {
+        Ok(())
+    } else {
+        Err(StatusCode::BAD_REQUEST)
+    }
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -101,6 +126,7 @@ pub struct WebhookRow {
     pub secret: String,
     pub kinds: Vec<String>,
     pub enabled: bool,
+    pub flavor: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
 }
@@ -127,6 +153,8 @@ pub struct CreateRequest {
     pub secret: Option<String>,
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
+    #[serde(default)]
+    pub flavor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +170,8 @@ pub struct UpdateRequest {
     pub kinds: Option<Vec<String>>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub flavor: Option<String>,
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -173,7 +203,7 @@ pub async fn list_handler(
     ensure_admin(&user)?;
     let rows = sqlx::query_as::<_, WebhookRow>(
         r#"
-        SELECT id, name, url, secret, kinds, enabled, created_by, created_at
+        SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at
           FROM webhooks
          ORDER BY created_at DESC
         "#,
@@ -205,14 +235,18 @@ pub async fn create_handler(
         .filter(|k| !k.is_empty())
         .unwrap_or_else(|| vec!["assigned".to_string()]);
     validate_kinds(&kinds)?;
+    // Default to the legacy Slack shape so omitting `flavor` matches the
+    // pre-flavor behaviour every existing integration relies on.
+    let flavor = req.flavor.unwrap_or_else(|| "slack".to_string());
+    validate_flavor(&flavor)?;
 
     let id = uuid::Uuid::new_v4().to_string();
 
     let row = sqlx::query_as::<_, WebhookRow>(
         r#"
-        INSERT INTO webhooks (id, name, url, secret, kinds, enabled, created_by)
-        VALUES ($1, $2, $3, $4, $5, TRUE, $6)
-        RETURNING id, name, url, secret, kinds, enabled, created_by, created_at
+        INSERT INTO webhooks (id, name, url, secret, kinds, enabled, flavor, created_by)
+        VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)
+        RETURNING id, name, url, secret, kinds, enabled, flavor, created_by, created_at
         "#,
     )
     .bind(&id)
@@ -220,6 +254,7 @@ pub async fn create_handler(
     .bind(&url)
     .bind(&secret)
     .bind(&kinds)
+    .bind(&flavor)
     .bind(&user.id)
     .fetch_one(state.pool.as_ref())
     .await
@@ -239,7 +274,7 @@ pub async fn update_handler(
     ensure_admin(&user)?;
 
     let existing = sqlx::query_as::<_, WebhookRow>(
-        "SELECT id, name, url, secret, kinds, enabled, created_by, created_at \
+        "SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at \
          FROM webhooks WHERE id = $1",
     )
     .bind(&id)
@@ -272,14 +307,16 @@ pub async fn update_handler(
     let kinds = req.kinds.unwrap_or(existing.kinds);
     validate_kinds(&kinds)?;
     let enabled = req.enabled.unwrap_or(existing.enabled);
+    let flavor = req.flavor.unwrap_or(existing.flavor);
+    validate_flavor(&flavor)?;
 
     let row = sqlx::query_as::<_, WebhookRow>(
         r#"
         UPDATE webhooks
            SET name = $1, url = $2, secret = $3,
-               kinds = $4, enabled = $5
-         WHERE id = $6
-        RETURNING id, name, url, secret, kinds, enabled, created_by, created_at
+               kinds = $4, enabled = $5, flavor = $6
+         WHERE id = $7
+        RETURNING id, name, url, secret, kinds, enabled, flavor, created_by, created_at
         "#,
     )
     .bind(&name)
@@ -287,6 +324,7 @@ pub async fn update_handler(
     .bind(&secret)
     .bind(&kinds)
     .bind(enabled)
+    .bind(&flavor)
     .bind(&id)
     .fetch_one(state.pool.as_ref())
     .await
@@ -359,7 +397,7 @@ pub async fn test_handler(
     ensure_admin(&user)?;
 
     let webhook = sqlx::query_as::<_, WebhookRow>(
-        "SELECT id, name, url, secret, kinds, enabled, created_by, created_at \
+        "SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at \
          FROM webhooks WHERE id = $1",
     )
     .bind(&id)
@@ -368,7 +406,7 @@ pub async fn test_handler(
     .map_err(map_sqlx)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    let payload = build_assigned_payload(&AssignedEvent {
+    let event = assigned_event(&AssignedEvent {
         rule_id: "SV-TEST".to_string(),
         assignee_name: user.display_name.clone(),
         asset_name: "test-asset".to_string(),
@@ -379,7 +417,8 @@ pub async fn test_handler(
 
     let pool = state.pool.clone();
     tokio::spawn(async move {
-        deliver_one(pool.as_ref(), &webhook, "assigned", &payload).await;
+        // Per-webhook flavor formatting happens inside deliver_one.
+        deliver_one(pool.as_ref(), &webhook, &event).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
@@ -405,8 +444,8 @@ pub struct VerifyRecipe {
     /// every existing copy/paste recipe out in the wild.
     #[serde(rename = "headerName")]
     pub header_name: String,
-    /// Pretty-printed canonical sample body — matches what
-    /// `build_assigned_payload` produces for the synthetic /test event.
+    /// Pretty-printed canonical sample body — matches what the Slack
+    /// formatter produces for the synthetic /test (`assigned`) event.
     #[serde(rename = "samplePayload")]
     pub sample_payload: String,
     pub snippets: VerifyRecipeSnippets,
@@ -538,7 +577,7 @@ pub async fn verify_recipe_handler(
     ensure_admin(&user)?;
 
     let webhook = sqlx::query_as::<_, WebhookRow>(
-        "SELECT id, name, url, secret, kinds, enabled, created_by, created_at \
+        "SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at \
          FROM webhooks WHERE id = $1",
     )
     .bind(&id)
@@ -565,6 +604,44 @@ pub struct AssignedEvent {
     pub due_date: Option<String>,
 }
 
+/// Flavor-agnostic representation of one outbound webhook event. Each
+/// event-source helper (assigned, overdue_digest, compliance_report)
+/// builds a `WebhookEvent`; the dispatcher then asks
+/// `format_for_flavor` to translate it into the wire JSON for each
+/// subscribed webhook's configured `flavor`.
+///
+/// `fields` is an ordered `(name, value)` list rather than a `HashMap`
+/// because (a) Teams MessageCard "facts" are rendered in array order
+/// and operators want stable ordering, and (b) it keeps the
+/// Slack-attachment rendering deterministic for the round-trip
+/// backwards-compat snapshot tests.
+#[derive(Debug, Clone)]
+pub struct WebhookEvent {
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    /// `#RRGGBB` for the slack/teams shapes (Teams strips the `#`).
+    /// Passed through verbatim for the generic shape so receivers can
+    /// re-interpret. Slack also accepts the named tokens `good`,
+    /// `warning`, `danger` — we preserve any string the caller hands us.
+    pub color: String,
+    pub fields: Vec<(String, String)>,
+    /// Optional per-row "attachments" — used by the overdue digest to
+    /// render each overdue finding as its own Slack attachment / Teams
+    /// section. Empty when the event is a single-card style.
+    pub items: Vec<WebhookEventItem>,
+}
+
+/// One row inside `WebhookEvent::items`. Lets the digest payload carry
+/// per-finding cards without forcing every event shape to pre-render
+/// them into the `body` string.
+#[derive(Debug, Clone)]
+pub struct WebhookEventItem {
+    pub title: String,
+    pub text: String,
+    pub color: String,
+}
+
 fn severity_color(sev: &str) -> &'static str {
     // Slack-style attachment colors keyed to CAT level. Anything we
     // don't recognise gets neutral grey.
@@ -576,65 +653,266 @@ fn severity_color(sev: &str) -> &'static str {
     }
 }
 
-pub fn build_assigned_payload(ev: &AssignedEvent) -> Value {
+/// Build the flavor-agnostic event for a single rule assignment. The
+/// `body` matches the human-readable text the legacy Slack `attachments[0].text`
+/// field carried, and `fields` mirrors the same data in a structured
+/// form so Teams "facts" and the generic flat shape don't need a second
+/// rendering pass.
+pub fn assigned_event(ev: &AssignedEvent) -> WebhookEvent {
     let due_part = ev
         .due_date
         .as_ref()
         .map(|d| format!(" · Due: {}", d))
         .unwrap_or_default();
+    let mut fields = vec![
+        ("Rule".to_string(), ev.rule_id.clone()),
+        ("Assignee".to_string(), ev.assignee_name.clone()),
+        ("Asset".to_string(), ev.asset_name.clone()),
+        ("STIG".to_string(), ev.stig_title.clone()),
+        ("Severity".to_string(), ev.severity.clone()),
+    ];
+    if let Some(d) = &ev.due_date {
+        fields.push(("Due".to_string(), d.clone()));
+    }
+    WebhookEvent {
+        kind: "assigned".to_string(),
+        title: format!("Asset: {} · STIG: {}", ev.asset_name, ev.stig_title),
+        body: format!("Severity: {}{}", ev.severity, due_part),
+        color: severity_color(&ev.severity).to_string(),
+        fields,
+        items: vec![],
+    }
+}
+
+/// Flavor-agnostic compliance-report event. The summary text mirrors
+/// what the previous hard-coded Slack payload emitted bit-for-bit so
+/// `flavor='slack'` subscribers don't see a wording change.
+pub fn compliance_report_event(
+    row: &crate::api::compliance_report::ComplianceReportRow,
+) -> WebhookEvent {
+    let s = &row.summary;
+    // The legacy Slack payload used the named tokens here; keep them so
+    // backwards compat is exact for slack webhooks. For teams/generic
+    // these are passed through as-is (teams will render with its own
+    // theme color when it doesn't parse the value as hex).
+    let color = if s.compliance_score >= 80.0 {
+        "good"
+    } else if s.compliance_score >= 50.0 {
+        "warning"
+    } else {
+        "danger"
+    };
+    let top = s.top_asset_name.clone().unwrap_or_else(|| "(none)".to_string());
+    let download = format!("/api/reports/{}/report.pdf", row.id);
+    let body = format!(
+        "Top-risk system: {} — download at {}",
+        top, download,
+    );
+    let fields = vec![
+        ("Compliance score".to_string(), format!("{:.1}%", s.compliance_score)),
+        ("Assets".to_string(), s.assets.to_string()),
+        ("Open findings".to_string(), s.open_findings.to_string()),
+        ("Overdue findings".to_string(), s.overdue_findings.to_string()),
+        ("Top-risk system".to_string(), top),
+        ("Download".to_string(), download),
+    ];
+    WebhookEvent {
+        kind: "compliance_report".to_string(),
+        title: format!("Compliance report for {} assets", s.assets),
+        // The Slack `text` field (top-of-card summary) is rebuilt from
+        // these numbers inside the slack formatter below. We park the
+        // long-form details in `body` instead.
+        body,
+        color: color.to_string(),
+        fields,
+        items: vec![],
+    }
+}
+
+/// Render `event` into the wire JSON for a given `flavor`. Switching on
+/// the flavor here — and using the resulting bytes as both the request
+/// body AND the HMAC input — guarantees the signature matches whatever
+/// the receiver actually parses.
+pub fn format_for_flavor(event: &WebhookEvent, flavor: &str) -> Value {
+    match flavor {
+        "teams" => format_teams(event),
+        "generic" => format_generic(event),
+        // Default + explicit "slack" → legacy Slack incoming-webhook shape.
+        _ => format_slack(event),
+    }
+}
+
+/// Compose the Slack `text` summary line for a given event. Keeps the
+/// human-readable wording each `kind` produced before the refactor so
+/// the slack flavor stays byte-identical for existing subscribers.
+fn slack_summary(event: &WebhookEvent) -> String {
+    match event.kind.as_str() {
+        "assigned" => {
+            // Legacy: "Finding {rule_id} assigned to {assignee_name}".
+            let rule = field(event, "Rule").unwrap_or_default();
+            let who = field(event, "Assignee").unwrap_or_default();
+            format!("Finding {} assigned to {}", rule, who)
+        }
+        "overdue_digest" => {
+            // Legacy: "{N} overdue findings across the fleet". `items`
+            // length matches the row count the digest collector found.
+            format!("{} overdue findings across the fleet", event.items.len())
+        }
+        "compliance_report" => {
+            let score = field(event, "Compliance score").unwrap_or_default();
+            let open = field(event, "Open findings").unwrap_or_default();
+            let overdue = field(event, "Overdue findings").unwrap_or_default();
+            // Strip the trailing '%' from the score and reformat to one
+            // decimal so the legacy wording survives unchanged.
+            let score_num = score.trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+            format!(
+                "Fleet compliance report ready — {:.1}% compliant, {} open, {} overdue",
+                score_num, open, overdue,
+            )
+        }
+        _ => event.title.clone(),
+    }
+}
+
+fn field<'a>(event: &'a WebhookEvent, name: &str) -> Option<&'a str> {
+    event
+        .fields
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+fn format_slack(event: &WebhookEvent) -> Value {
+    // Multi-item events (overdue digest) render one attachment per item.
+    // Single-card events render a single attachment, mirroring the
+    // legacy shape `{ text, attachments: [{ title, text, color }] }`.
+    let attachments: Vec<Value> = if event.items.is_empty() {
+        vec![json!({
+            "title": event.title,
+            "text": event.body,
+            "color": event.color,
+        })]
+    } else {
+        event
+            .items
+            .iter()
+            .map(|i| json!({
+                "title": i.title,
+                "text": i.text,
+                "color": i.color,
+            }))
+            .collect()
+    };
     json!({
-        "text": format!("Finding {} assigned to {}", ev.rule_id, ev.assignee_name),
-        "attachments": [{
-            "title": format!("Asset: {} · STIG: {}", ev.asset_name, ev.stig_title),
-            "text": format!("Severity: {}{}", ev.severity, due_part),
-            "color": severity_color(&ev.severity),
-        }]
+        "text": slack_summary(event),
+        "attachments": attachments,
     })
 }
 
-/// Fire a "compliance_report" event with a Slack-shaped payload pointing
-/// at the freshly-generated report. Best-effort — errors are logged but
-/// do not block the surrounding generate call.
+fn format_teams(event: &WebhookEvent) -> Value {
+    // Microsoft Teams "MessageCard" legacy schema. Teams strips the
+    // leading '#' from theme colors and treats named tokens
+    // (good/warning/danger) as invalid → we map the legacy tokens onto
+    // 6-char hex equivalents.
+    let theme_color = teams_theme_color(&event.color);
+    let facts: Vec<Value> = event
+        .fields
+        .iter()
+        .map(|(k, v)| json!({ "name": k, "value": v }))
+        .collect();
+    // For multi-item events (overdue digest), emit one section per item
+    // — each with its own title + text — plus a leading summary section.
+    let mut sections: Vec<Value> = Vec::with_capacity(1 + event.items.len());
+    sections.push(json!({
+        "text": event.body,
+        "facts": facts,
+    }));
+    for i in &event.items {
+        sections.push(json!({
+            "title": i.title,
+            "text": i.text,
+        }));
+    }
+    let summary = slack_summary(event);
+    json!({
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": summary,
+        "themeColor": theme_color,
+        "title": event.title,
+        "sections": sections,
+    })
+}
+
+/// Map an event color into a 6-char hex without `#`, suitable for
+/// Teams' `themeColor`. Slack-style named tokens are translated to
+/// reasonable defaults; anything we don't recognise falls back to grey.
+fn teams_theme_color(color: &str) -> String {
+    let trimmed = color.trim_start_matches('#');
+    if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return trimmed.to_ascii_lowercase();
+    }
+    match color {
+        "good" => "2a9d8f".to_string(),
+        "warning" => "df8b08".to_string(),
+        "danger" => "d13212".to_string(),
+        _ => "878787".to_string(),
+    }
+}
+
+fn format_generic(event: &WebhookEvent) -> Value {
+    // Flat shape for custom integrations. No platform-specific framing
+    // — receivers re-render however they like.
+    let fields: Vec<Value> = event
+        .fields
+        .iter()
+        .map(|(k, v)| json!({ "name": k, "value": v }))
+        .collect();
+    let items: Vec<Value> = event
+        .items
+        .iter()
+        .map(|i| json!({
+            "title": i.title,
+            "text": i.text,
+            "color": i.color,
+        }))
+        .collect();
+    json!({
+        "kind": event.kind,
+        "title": event.title,
+        "body": event.body,
+        "color": event.color,
+        "fields": fields,
+        "items": items,
+    })
+}
+
+/// Fire a "compliance_report" event. Best-effort — errors are logged
+/// but do not block the surrounding generate call.
 pub async fn fire_compliance_report(
     pool: &PgPool,
     row: &crate::api::compliance_report::ComplianceReportRow,
 ) -> anyhow::Result<()> {
-    let s = &row.summary;
-    let payload = serde_json::json!({
-        "text": format!(
-            "Fleet compliance report ready — {:.1}% compliant, {} open, {} overdue",
-            s.compliance_score, s.open_findings, s.overdue_findings,
-        ),
-        "attachments": [{
-            "title": format!("Compliance report for {} assets", s.assets),
-            "text": format!(
-                "Top-risk system: {} — download at /api/reports/{}/report.pdf",
-                s.top_asset_name.as_deref().unwrap_or("(none)"),
-                row.id,
-            ),
-            "color": if s.compliance_score >= 80.0 { "good" }
-                     else if s.compliance_score >= 50.0 { "warning" }
-                     else { "danger" },
-        }],
-    });
-    dispatch_event(pool, "compliance_report", payload).await;
+    dispatch_event(pool, compliance_report_event(row)).await;
     Ok(())
 }
 
-/// Fan an event out to every enabled webhook subscribed to `kind`.
+/// Fan an event out to every enabled webhook subscribed to `event.kind`.
 /// Intended to be called from inside a `tokio::spawn` so the originating
-/// request can return immediately.
-pub async fn dispatch_event(pool: &PgPool, kind: &str, payload: Value) {
+/// request can return immediately. Each subscribed webhook gets the
+/// payload formatted into its own configured `flavor` BEFORE signing —
+/// so the HMAC always covers the exact bytes the receiver parses.
+pub async fn dispatch_event(pool: &PgPool, event: WebhookEvent) {
     // Postgres array containment: kinds @> ARRAY[$2]
     let webhooks = match sqlx::query_as::<_, WebhookRow>(
         r#"
-        SELECT id, name, url, secret, kinds, enabled, created_by, created_at
+        SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at
           FROM webhooks
          WHERE enabled = TRUE
            AND $1 = ANY(kinds)
         "#,
     )
-    .bind(kind)
+    .bind(&event.kind)
     .fetch_all(pool)
     .await
     {
@@ -646,15 +924,22 @@ pub async fn dispatch_event(pool: &PgPool, kind: &str, payload: Value) {
     };
 
     for w in webhooks {
-        deliver_one(pool, &w, kind, &payload).await;
+        deliver_one(pool, &w, &event).await;
     }
 }
 
-/// POST the payload to one webhook and log the outcome. Failures (bad
-/// DNS, connection refused, non-2xx) are still recorded so the operator
-/// can debug from the Admin UI.
-async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, kind: &str, payload: &Value) {
-    let body = match serde_json::to_string(payload) {
+/// POST the formatted payload to one webhook and log the outcome.
+/// Failures (bad DNS, connection refused, non-2xx) are still recorded
+/// so the operator can debug from the Admin UI.
+///
+/// The flavor switch happens here, on a per-webhook basis, BEFORE we
+/// serialise the body bytes and sign them — so the HMAC always matches
+/// the exact wire payload the receiver sees, regardless of which schema
+/// the operator picked.
+async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) {
+    let payload = format_for_flavor(event, &webhook.flavor);
+    let kind = event.kind.as_str();
+    let body = match serde_json::to_string(&payload) {
         Ok(b) => b,
         Err(e) => {
             tracing::error!("webhook payload serialisation failed: {e:#}");
@@ -735,11 +1020,14 @@ struct OverdueDigestRow {
     assignee_name: Option<String>,
 }
 
-/// Build the Slack-shaped payload for the digest. Public so the test
-/// support endpoint and the scheduler can share the exact same code path.
-fn build_digest_payload(rows: &[OverdueDigestRow]) -> Value {
+/// Build the flavor-agnostic event for the overdue digest. Public so
+/// the test support endpoint and the scheduler can share the exact same
+/// code path. The `slack` formatter renders each item as an attachment
+/// (byte-identical to the legacy payload); `teams` renders one
+/// MessageCard section per item; `generic` exposes the raw item list.
+fn build_digest_event(rows: &[OverdueDigestRow]) -> WebhookEvent {
     let total = rows.len();
-    let attachments: Vec<Value> = rows
+    let items: Vec<WebhookEventItem> = rows
         .iter()
         .map(|r| {
             let due_part = r
@@ -751,21 +1039,28 @@ fn build_digest_payload(rows: &[OverdueDigestRow]) -> Value {
                 .days_overdue
                 .map(|d| format!(" · {} day(s) overdue", d))
                 .unwrap_or_default();
-            let who = r.assignee_name.clone().unwrap_or_else(|| "unassigned".to_string());
-            json!({
-                "title": format!("{} · {}", r.rule_id, r.asset_name),
-                "text": format!(
+            let who = r
+                .assignee_name
+                .clone()
+                .unwrap_or_else(|| "unassigned".to_string());
+            WebhookEventItem {
+                title: format!("{} · {}", r.rule_id, r.asset_name),
+                text: format!(
                     "STIG: {} · Assignee: {}{}{}",
                     r.stig_title, who, due_part, overdue_part
                 ),
-                "color": "#d13212",
-            })
+                color: "#d13212".to_string(),
+            }
         })
         .collect();
-    json!({
-        "text": format!("{} overdue findings across the fleet", total),
-        "attachments": attachments,
-    })
+    WebhookEvent {
+        kind: "overdue_digest".to_string(),
+        title: format!("{} overdue findings across the fleet", total),
+        body: format!("{} overdue findings across the fleet", total),
+        color: "#d13212".to_string(),
+        fields: vec![("Total overdue".to_string(), total.to_string())],
+        items,
+    }
 }
 
 /// Sweep enabled `overdue_digest` webhooks that haven't fired in the
@@ -781,7 +1076,7 @@ pub async fn run_overdue_digest(pool: &PgPool) -> anyhow::Result<usize> {
     // cadence honest while still preventing same-tick spam.
     let webhooks = sqlx::query_as::<_, WebhookRow>(
         r#"
-        SELECT id, name, url, secret, kinds, enabled, created_by, created_at
+        SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at
           FROM webhooks
          WHERE enabled = TRUE
            AND 'overdue_digest' = ANY(kinds)
@@ -823,7 +1118,7 @@ pub async fn run_overdue_digest(pool: &PgPool) -> anyhow::Result<usize> {
     .fetch_all(pool)
     .await?;
 
-    let payload = build_digest_payload(&rows);
+    let event = build_digest_event(&rows);
     let attempted = webhooks.len();
 
     for w in webhooks {
@@ -831,7 +1126,7 @@ pub async fn run_overdue_digest(pool: &PgPool) -> anyhow::Result<usize> {
         // still stamp `last_digest_at` — the cron semantics are "we
         // checked, nothing to do" rather than "we never ran."
         if !rows.is_empty() {
-            deliver_one(pool, &w, "overdue_digest", &payload).await;
+            deliver_one(pool, &w, &event).await;
         }
         let stamp = sqlx::query("UPDATE webhooks SET last_digest_at = NOW() WHERE id = $1")
             .bind(&w.id)
