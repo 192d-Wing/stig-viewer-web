@@ -96,6 +96,8 @@ pub async fn create_asset_handler(
         updated_at: now,
         tags: tags.clone(),
         requires_approval: false,
+        email_cadence: "off".into(),
+        email_last_sent_at: None,
     };
     db_assets::insert_asset(state.pool.as_ref(), &asset)
         .await
@@ -158,6 +160,60 @@ pub async fn update_asset_handler(
         .map_err(map_db)?;
 
     db_assets::get_asset(state.pool.as_ref(), &id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)
+        .map(Json)
+}
+
+// ── Partial update (PATCH) ─────────────────────────────────────────────────
+
+/// Legal `emailCadence` values. Kept in sync with the CHECK-style
+/// validation in migration 032 — the column itself is a free-form
+/// TEXT, but the handler is the only writer.
+pub const VALID_EMAIL_CADENCES: &[&str] = &["off", "daily", "weekly", "monthly"];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchAssetRequest {
+    /// When set, switches the per-asset scheduled email cadence. Must
+    /// be one of `VALID_EMAIL_CADENCES`. Anything else → 400.
+    #[serde(default)]
+    pub email_cadence: Option<String>,
+}
+
+/// PATCH /api/assets/:id — partial update. Today the only field is
+/// `emailCadence`. Owner or anyone with `write` ACL (or global admin)
+/// can call this. The wider PUT handler still owns name/classification
+/// /tags and gates on `admin` ACL.
+pub async fn patch_asset_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchAssetRequest>,
+) -> Result<Json<db_assets::AssetRow>, StatusCode> {
+    let pool = state.pool.as_ref();
+    let _existing = db_assets::get_asset(pool, &id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Owner / write-ACL / global-admin. Scheduling is operational, not
+    // structural — write is enough.
+    if !asset_acl::user_can(pool, &id, &user, "write").await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if let Some(cad) = req.email_cadence.as_deref() {
+        if !VALID_EMAIL_CADENCES.contains(&cad) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        db_assets::set_email_cadence(pool, &id, cad)
+            .await
+            .map_err(map_db)?;
+    }
+
+    db_assets::get_asset(pool, &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)

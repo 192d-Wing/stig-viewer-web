@@ -93,11 +93,6 @@ fn map_sqlx(e: sqlx::Error) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 
-fn map_anyhow(e: anyhow::Error) -> StatusCode {
-    tracing::error!("asset_email_cc db error: {e:#}");
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
 /// Owner / write-ACL / global-admin gate. Returns 404 when the asset
 /// doesn't exist so the caller can distinguish from 403, matching the
 /// rest of the codebase (see `checklists::delete_handler`).
@@ -132,15 +127,6 @@ async fn fetch_cc_rows(pool: &PgPool, asset_id: &str) -> Result<Vec<EmailCcRow>,
     .fetch_all(pool)
     .await
     .map_err(map_sqlx)
-}
-
-async fn fetch_owner_email(pool: &PgPool, owner_id: &str) -> Result<String, StatusCode> {
-    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
-        .bind(owner_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx)?;
-    Ok(email.unwrap_or_default())
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -208,24 +194,76 @@ pub async fn delete_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /api/assets/:id/email-report — generate the per-asset PDF and
-/// mail it to the owner + every CC. Synchronous; returns the resolved
-/// recipient list + send mode.
-pub async fn send_handler(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Path(asset_id): Path<String>,
-) -> Result<Json<EmailReportResult>, StatusCode> {
-    require_asset_write(state.pool.as_ref(), &asset_id, &user).await?;
+/// Outcome of a per-asset email send. Mirrors `EmailReportResult` but
+/// is the value object the scheduler consumes — the HTTP handler wraps
+/// it in `Json<EmailReportResult>` after mapping.
+#[derive(Debug, Clone)]
+pub struct AssetEmailOutcome {
+    pub recipients: Vec<String>,
+    pub mode: String,
+    pub error: Option<String>,
+}
 
-    let pool = state.pool.as_ref();
-    let asset = db_assets::get_asset(pool, &asset_id)
+/// Whether we found no recipients at all. The HTTP handler maps this
+/// to 400; the scheduler treats it as "skip this asset, leave
+/// `email_last_sent_at` untouched".
+#[derive(Debug)]
+pub enum AssetEmailError {
+    NoRecipients,
+    NotFound,
+    Internal(anyhow::Error),
+}
+
+impl From<AssetEmailError> for StatusCode {
+    fn from(e: AssetEmailError) -> Self {
+        match e {
+            AssetEmailError::NoRecipients => StatusCode::BAD_REQUEST,
+            AssetEmailError::NotFound => StatusCode::NOT_FOUND,
+            AssetEmailError::Internal(err) => {
+                tracing::error!("asset email send: {err:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
+/// Send (or dry-run) the per-asset compliance PDF for a single asset.
+/// This is the shared core used by both the HTTP `send_handler` and the
+/// background `run_asset_email_schedules` loop. It does NOT touch
+/// `email_last_sent_at` — the scheduler stamps that itself so the HTTP
+/// path stays cadence-agnostic.
+pub async fn send_asset_report(
+    pool: &PgPool,
+    data_dir: &std::path::Path,
+    asset_id: &str,
+) -> Result<AssetEmailOutcome, AssetEmailError> {
+    let asset = db_assets::get_asset(pool, asset_id)
         .await
-        .map_err(map_anyhow)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(AssetEmailError::Internal)?
+        .ok_or(AssetEmailError::NotFound)?;
 
-    let owner_email = fetch_owner_email(pool, &asset.owner_id).await?;
-    let cc_rows = fetch_cc_rows(pool, &asset_id).await?;
+    let owner_email: String = match sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(&asset.owner_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => return Err(AssetEmailError::Internal(e.into())),
+    };
+
+    let cc_rows: Vec<EmailCcRow> = match sqlx::query_as::<_, EmailCcRow>(
+        "SELECT email, added_at, added_by \
+           FROM asset_email_cc \
+          WHERE asset_id = $1 \
+          ORDER BY email",
+    )
+    .bind(asset_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return Err(AssetEmailError::Internal(e.into())),
+    };
 
     // Dedup while preserving insertion order so the audit row + response
     // stay deterministic for the e2e tests.
@@ -245,15 +283,15 @@ pub async fn send_handler(
     }
 
     if recipients.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AssetEmailError::NoRecipients);
     }
 
     // Build the PDF directly — no HTTP loopback. Reuses the exact code
     // path that backs `GET /api/assets/:id/report.pdf`.
-    let built = build_asset_report(pool, &state.config.data_dir, &asset_id)
+    let built = build_asset_report(pool, data_dir, asset_id)
         .await
-        .map_err(map_anyhow)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(AssetEmailError::Internal)?
+        .ok_or(AssetEmailError::NotFound)?;
 
     let subject = format!("Compliance report — {}", built.asset_name);
     let body = format!(
@@ -286,11 +324,11 @@ pub async fn send_handler(
             None,
         )
         .await;
-        return Ok(Json(EmailReportResult {
+        return Ok(AssetEmailOutcome {
             recipients,
             mode: "dryrun".into(),
             error: None,
-        }));
+        });
     }
 
     // ── Real SMTP path ──────────────────────────────────────────────────────
@@ -323,7 +361,10 @@ pub async fn send_handler(
                     "{}-stig-report.pdf",
                     crate::api::report::sanitize_report_filename(&built.asset_name)
                 ))
-                .body(built.pdf_bytes.clone(), ContentType::parse("application/pdf").unwrap()),
+                .body(
+                    built.pdf_bytes.clone(),
+                    ContentType::parse("application/pdf").unwrap(),
+                ),
             );
         let message = builder
             .multipart(multipart)
@@ -357,11 +398,11 @@ pub async fn send_handler(
                 None,
             )
             .await;
-            Ok(Json(EmailReportResult {
+            Ok(AssetEmailOutcome {
                 recipients,
                 mode: "sent".into(),
                 error: None,
-            }))
+            })
         }
         Err(e) => {
             let err_msg = format!("{e:#}");
@@ -377,13 +418,129 @@ pub async fn send_handler(
                 Some(&err_msg),
             )
             .await;
-            Ok(Json(EmailReportResult {
+            Ok(AssetEmailOutcome {
                 recipients,
                 mode: "sent".into(),
                 error: Some(err_msg),
-            }))
+            })
         }
     }
+}
+
+/// POST /api/assets/:id/email-report — generate the per-asset PDF and
+/// mail it to the owner + every CC. Synchronous; returns the resolved
+/// recipient list + send mode.
+pub async fn send_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(asset_id): Path<String>,
+) -> Result<Json<EmailReportResult>, StatusCode> {
+    require_asset_write(state.pool.as_ref(), &asset_id, &user).await?;
+
+    let outcome = send_asset_report(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        &asset_id,
+    )
+    .await
+    .map_err(StatusCode::from)?;
+
+    Ok(Json(EmailReportResult {
+        recipients: outcome.recipients,
+        mode: outcome.mode,
+        error: outcome.error,
+    }))
+}
+
+/// Run a single tick of the per-asset scheduled email loop. Selects all
+/// assets whose `email_cadence` is non-`off` AND whose
+/// `email_last_sent_at` is either NULL or far enough in the past for
+/// the cadence interval to have elapsed (>=1 day for daily, >=7 days
+/// for weekly, >=28 days for monthly).
+///
+/// For each match, invokes [`send_asset_report`] (which writes an
+/// `email_deliveries` audit row in dryrun or sent mode) and then stamps
+/// `email_last_sent_at = NOW()` so the same asset is skipped until the
+/// cadence elapses again. Returns the number of assets emailed.
+///
+/// Sends are best-effort: an internal error on one asset is logged and
+/// the loop continues. The cadence stamp still moves forward to avoid
+/// a hot retry loop hammering a permanently broken recipient.
+pub async fn run_asset_email_schedules(
+    pool: &PgPool,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<usize> {
+    // Pull just the (id, cadence) pairs first; the per-asset send path
+    // re-fetches the full row anyway via `db_assets::get_asset`. Doing
+    // the eligibility check entirely in SQL keeps the per-tick cost
+    // proportional to the number of assets that are actually due.
+    let due: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM assets
+         WHERE email_cadence <> 'off'
+           AND (
+                email_last_sent_at IS NULL
+             OR (email_cadence = 'daily'   AND email_last_sent_at < NOW() - INTERVAL '1 day')
+             OR (email_cadence = 'weekly'  AND email_last_sent_at < NOW() - INTERVAL '7 days')
+             OR (email_cadence = 'monthly' AND email_last_sent_at < NOW() - INTERVAL '28 days')
+           )
+         ORDER BY email_last_sent_at NULLS FIRST, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut sent = 0usize;
+    for asset_id in due {
+        match send_asset_report(pool, data_dir, &asset_id).await {
+            Ok(outcome) => {
+                if let Err(e) = db_assets::stamp_email_last_sent_at(pool, &asset_id).await {
+                    tracing::error!(
+                        "asset email schedule: stamp_last_sent failed for {asset_id}: {e:#}"
+                    );
+                }
+                tracing::info!(
+                    "asset email schedule: {asset_id} mode={} recipients={}",
+                    outcome.mode,
+                    outcome.recipients.len(),
+                );
+                sent += 1;
+            }
+            Err(AssetEmailError::NoRecipients) => {
+                // Owner has no email + no CCs configured. Stamp anyway
+                // so we don't re-check this asset on every tick — the
+                // operator can fix it by adding a CC, which will reset
+                // eligibility once the interval elapses again.
+                if let Err(e) = db_assets::stamp_email_last_sent_at(pool, &asset_id).await {
+                    tracing::error!(
+                        "asset email schedule: stamp_last_sent failed for {asset_id}: {e:#}"
+                    );
+                }
+                tracing::warn!(
+                    "asset email schedule: {asset_id} skipped — no recipients configured"
+                );
+            }
+            Err(AssetEmailError::NotFound) => {
+                // Race: the asset was deleted between the SELECT and
+                // the send. Nothing to stamp; loop on.
+                tracing::warn!("asset email schedule: {asset_id} vanished mid-tick");
+            }
+            Err(AssetEmailError::Internal(e)) => {
+                tracing::error!("asset email schedule: {asset_id} internal error: {e:#}");
+                // Stamp so a permanently-broken asset doesn't pin the
+                // loop in a hot retry.
+                if let Err(stamp_err) =
+                    db_assets::stamp_email_last_sent_at(pool, &asset_id).await
+                {
+                    tracing::error!(
+                        "asset email schedule: stamp_last_sent (post-error) failed for \
+                         {asset_id}: {stamp_err:#}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(sent)
 }
 
 /// Same audit-row insert helper that `email.rs` uses; duplicated rather
