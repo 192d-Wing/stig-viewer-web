@@ -45,6 +45,21 @@ const KIND_OPTIONS = [
   { label: "Compliance report", value: "compliance_report" },
 ];
 
+// Wire-payload flavor a webhook is configured to receive. Keep in sync
+// with ALLOWED_FLAVORS in backend/src/api/webhooks.rs.
+const FLAVOR_OPTIONS = [
+  { label: "Slack", value: "slack" },
+  { label: "Microsoft Teams", value: "teams" },
+  { label: "Generic", value: "generic" },
+];
+
+// Per-flavor Badge color for the webhooks table.
+const FLAVOR_BADGE_COLOR = {
+  slack: "blue",
+  teams: "red", // Cloudscape Badge has no "purple" — red is its closest accent.
+  generic: "grey",
+};
+
 // ABAC effect/level enumerations. Mirror the validation in
 // backend/src/api/abac.rs — anything outside these sets is rejected
 // with 400 by the create/update handlers.
@@ -618,6 +633,7 @@ export default function AdminConsole() {
       url: "",
       secret: "",
       kinds: ["assigned"],
+      flavor: "slack",
       enabled: true,
     });
     setHookError(null);
@@ -633,6 +649,7 @@ export default function AdminConsole() {
         url: hookModal.url,
         secret: hookModal.secret,
         kinds: hookModal.kinds,
+        flavor: hookModal.flavor ?? "slack",
       };
       if (hookModal.mode === "create") {
         await apiJson("/api/webhooks", "POST", body);
@@ -873,6 +890,21 @@ export default function AdminConsole() {
         ),
       },
       {
+        id: "flavor",
+        header: "Flavor",
+        cell: (w) => {
+          const flavor = w.flavor ?? "slack";
+          return (
+            <Badge
+              color={FLAVOR_BADGE_COLOR[flavor] ?? "grey"}
+              data-testid={`webhook-flavor-${w.id}`}
+            >
+              {flavor}
+            </Badge>
+          );
+        },
+      },
+      {
         id: "enabled",
         header: "Enabled",
         cell: (w) => (
@@ -910,6 +942,7 @@ export default function AdminConsole() {
                   url: w.url,
                   secret: w.secret ?? "",
                   kinds: w.kinds ?? ["assigned"],
+                  flavor: w.flavor ?? "slack",
                   enabled: w.enabled,
                 })
               }
@@ -1962,6 +1995,25 @@ export default function AdminConsole() {
               }
               options={KIND_OPTIONS}
               placeholder="Select event kinds"
+            />
+          </FormField>
+          <FormField
+            label="Flavor"
+            description="Wire payload schema. Slack = legacy {text, attachments}; Teams = MessageCard; Generic = flat {kind, title, body, color, fields}."
+          >
+            <Select
+              data-testid="webhook-flavor-select"
+              selectedOption={
+                FLAVOR_OPTIONS.find(
+                  (o) => o.value === (hookModal?.flavor ?? "slack"),
+                ) ?? FLAVOR_OPTIONS[0]
+              }
+              onChange={({ detail }) =>
+                setHookModal((m) =>
+                  m ? { ...m, flavor: detail.selectedOption.value } : m,
+                )
+              }
+              options={FLAVOR_OPTIONS}
             />
           </FormField>
           {hookError && <Alert type="error">{hookError}</Alert>}

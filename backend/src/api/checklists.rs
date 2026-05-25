@@ -639,7 +639,7 @@ async fn fire_assigned_event(
         Err(_) => "unknown".to_string(),
     };
 
-    let event = webhooks::AssignedEvent {
+    let assigned = webhooks::AssignedEvent {
         rule_id: rule_id.to_string(),
         assignee_name,
         asset_name,
@@ -647,8 +647,10 @@ async fn fire_assigned_event(
         severity,
         due_date: due_date.map(|d| d.to_string()),
     };
-    let payload = webhooks::build_assigned_payload(&event);
-    webhooks::dispatch_event(pool, "assigned", payload).await;
+    // Flavor-agnostic event — per-webhook wire schema is selected
+    // inside `dispatch_event` based on each subscriber's `flavor`.
+    let event = webhooks::assigned_event(&assigned);
+    webhooks::dispatch_event(pool, event).await;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
