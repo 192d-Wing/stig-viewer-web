@@ -651,6 +651,33 @@ export default function ChecklistView({ checklistId, onBack }) {
               cell: (r) => r.title || "—",
             },
             {
+              id: "cci",
+              header: "CCI",
+              cell: (r) => {
+                // Backend emits `cci` as the canonical short-name field;
+                // legacy `cciIds` is the fallback so this column keeps
+                // working against older STIG JSONs that haven't been
+                // re-parsed yet.
+                const ids = Array.isArray(r.cci)
+                  ? r.cci
+                  : Array.isArray(r.cciIds)
+                    ? r.cciIds
+                    : [];
+                if (ids.length === 0) return "—";
+                return (
+                  <span data-testid="rule-cci-cell">
+                    <SpaceBetween direction="horizontal" size="xxs">
+                      {ids.map((id) => (
+                        <Badge key={id} color="blue">
+                          {id}
+                        </Badge>
+                      ))}
+                    </SpaceBetween>
+                  </span>
+                );
+              },
+            },
+            {
               id: "status",
               header: "Status",
               cell: (r) => {
