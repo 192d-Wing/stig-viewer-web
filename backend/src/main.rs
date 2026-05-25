@@ -52,7 +52,7 @@ use api::{
         list_for_rule_handler as list_attachments_for_rule_handler,
         upload_handler as upload_attachment_handler,
     },
-    audit::{activity_handler, rule_history_handler},
+    audit::{activity_handler, rule_history_handler, search_handler as audit_search_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
@@ -335,6 +335,7 @@ async fn main() -> Result<()> {
                 .delete(delete_attachment_handler),
         )
         .route("/api/activity", get(activity_handler))
+        .route("/api/audit/search", get(audit_search_handler))
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/pending-for-me", get(pending_for_me_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))

@@ -15,6 +15,8 @@ import Alert from "@cloudscape-design/components/alert";
 import Container from "@cloudscape-design/components/container";
 import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Textarea from "@cloudscape-design/components/textarea";
+import DatePicker from "@cloudscape-design/components/date-picker";
+import Pagination from "@cloudscape-design/components/pagination";
 import { apiGet, apiJson, apiFetch, BACKEND } from "../utils/api.js";
 
 const ROLE_OPTIONS = [
@@ -124,6 +126,33 @@ export default function AdminConsole() {
   const [rejectError, setRejectError] = useState(null);
   const [approveBusyId, setApproveBusyId] = useState(null);
 
+  // Audit log search state. Filters are applied on Search-button click
+  // rather than on every keystroke so we don't spam the backend while
+  // an admin is still choosing dates / users.
+  const [auditUser, setAuditUser] = useState(null);
+  const [auditAsset, setAuditAsset] = useState(null);
+  const [auditFrom, setAuditFrom] = useState("");
+  const [auditTo, setAuditTo] = useState("");
+  const [auditPage, setAuditPage] = useState(1);
+  const AUDIT_PAGE_SIZE = 50;
+  const [auditRows, setAuditRows] = useState([]);
+  const [auditTotal, setAuditTotal] = useState(0);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState(null);
+  // Bumped on every Search click. The fetch effect watches it so a
+  // pagination change reuses the most-recently-submitted filters
+  // without snapshotting them via refs.
+  const [auditSearchTick, setAuditSearchTick] = useState(0);
+  // Snapshot of filters at the moment Search was clicked. Pagination
+  // changes re-run with these values, ignoring any unsubmitted edits
+  // the admin made to the filter row.
+  const [auditSubmitted, setAuditSubmitted] = useState({
+    userId: "",
+    assetId: "",
+    from: "",
+    to: "",
+  });
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -195,6 +224,51 @@ export default function AdminConsole() {
     },
     [refresh],
   );
+
+  // Re-fetch the audit page whenever the submitted filter set or page
+  // changes. The Search button bumps `auditSearchTick` (with page reset
+  // to 1) so a click always lands on page 1 even if the previous run
+  // was on a later page.
+  useEffect(() => {
+    if (auditSearchTick === 0) return;
+    let cancelled = false;
+    const run = async () => {
+      setAuditLoading(true);
+      setAuditError(null);
+      try {
+        const qs = new URLSearchParams();
+        if (auditSubmitted.userId) qs.set("userId", auditSubmitted.userId);
+        if (auditSubmitted.assetId) qs.set("assetId", auditSubmitted.assetId);
+        if (auditSubmitted.from) qs.set("from", auditSubmitted.from);
+        if (auditSubmitted.to) qs.set("to", auditSubmitted.to);
+        qs.set("page", String(auditPage));
+        qs.set("pageSize", String(AUDIT_PAGE_SIZE));
+        const res = await apiGet(`/api/audit/search?${qs.toString()}`);
+        if (cancelled) return;
+        setAuditRows(res.rows ?? []);
+        setAuditTotal(res.totalCount ?? 0);
+      } catch (err) {
+        if (!cancelled) setAuditError(err.message);
+      } finally {
+        if (!cancelled) setAuditLoading(false);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [auditSearchTick, auditPage, auditSubmitted]);
+
+  const runAuditSearch = useCallback(() => {
+    setAuditSubmitted({
+      userId: auditUser?.value ?? "",
+      assetId: auditAsset?.value ?? "",
+      from: auditFrom,
+      to: auditTo,
+    });
+    setAuditPage(1);
+    setAuditSearchTick((t) => t + 1);
+  }, [auditUser, auditAsset, auditFrom, auditTo]);
 
   const openRoleModal = useCallback((user) => {
     setRoleModal({ user, role: user.role });
@@ -866,6 +940,178 @@ export default function AdminConsole() {
               Re-assign owner
             </Button>
           </Box>
+        </SpaceBetween>
+      </Container>
+
+      <Container
+        header={
+          <Header
+            description="Cross-cutting search over rule_audit. Filter by user, asset, and date range; results are paginated server-side."
+          >
+            Audit log
+          </Header>
+        }
+      >
+        <SpaceBetween direction="vertical" size="m">
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+              gap: "var(--space-scaled-m, 12px)",
+            }}
+          >
+            <FormField label="User">
+              <Select
+                placeholder="Any user"
+                selectedOption={auditUser}
+                onChange={({ detail }) =>
+                  setAuditUser(detail.selectedOption ?? null)
+                }
+                options={[
+                  { label: "Any user", value: "" },
+                  ...userOptions,
+                ]}
+                empty="No users available"
+                filteringType="auto"
+                data-testid="audit-user-select"
+              />
+            </FormField>
+            <FormField label="Asset">
+              <Select
+                placeholder="Any asset"
+                selectedOption={auditAsset}
+                onChange={({ detail }) =>
+                  setAuditAsset(detail.selectedOption ?? null)
+                }
+                options={[
+                  { label: "Any asset", value: "" },
+                  ...assetOptions,
+                ]}
+                empty="No assets available"
+                filteringType="auto"
+                data-testid="audit-asset-select"
+              />
+            </FormField>
+            <FormField label="From">
+              <DatePicker
+                value={auditFrom}
+                onChange={({ detail }) => setAuditFrom(detail.value || "")}
+                placeholder="YYYY/MM/DD"
+                data-testid="audit-from-picker"
+              />
+            </FormField>
+            <FormField label="To">
+              <DatePicker
+                value={auditTo}
+                onChange={({ detail }) => setAuditTo(detail.value || "")}
+                placeholder="YYYY/MM/DD"
+                data-testid="audit-to-picker"
+              />
+            </FormField>
+          </div>
+          <Box>
+            <Button
+              variant="primary"
+              loading={auditLoading}
+              onClick={runAuditSearch}
+              data-testid="audit-search-button"
+            >
+              Search
+            </Button>
+          </Box>
+          {auditError && <Alert type="error">{auditError}</Alert>}
+          <Table
+            variant="embedded"
+            items={auditRows}
+            loading={auditLoading}
+            loadingText="Searching audit log"
+            empty={
+              <Box textAlign="center" padding="l">
+                <Box variant="p" color="text-body-secondary">
+                  {auditSearchTick === 0
+                    ? "Click Search to query the audit log."
+                    : "No audit rows match the current filters."}
+                </Box>
+              </Box>
+            }
+            columnDefinitions={[
+              {
+                id: "when",
+                header: "When",
+                cell: (r) =>
+                  r.occurredAt
+                    ? new Date(r.occurredAt).toLocaleString()
+                    : "—",
+              },
+              {
+                id: "by",
+                header: "By",
+                cell: (r) => r.byName,
+              },
+              {
+                id: "asset",
+                header: "Asset",
+                cell: (r) => r.assetName ?? "—",
+              },
+              {
+                id: "stig",
+                header: "STIG",
+                cell: (r) => r.stigTitle ?? "—",
+              },
+              {
+                id: "rule",
+                header: "Rule",
+                cell: (r) => r.ruleId,
+              },
+              {
+                id: "field",
+                header: "Field",
+                cell: (r) => r.field,
+              },
+              {
+                id: "from",
+                header: "From",
+                cell: (r) => (
+                  <span title={r.fromValue ?? ""}>
+                    {truncateUrl(r.fromValue ?? "", 60)}
+                  </span>
+                ),
+              },
+              {
+                id: "to",
+                header: "To",
+                cell: (r) => (
+                  <span title={r.toValue ?? ""}>
+                    {truncateUrl(r.toValue ?? "", 60)}
+                  </span>
+                ),
+              },
+            ]}
+            pagination={
+              <Pagination
+                currentPageIndex={auditPage}
+                pagesCount={Math.max(
+                  1,
+                  Math.ceil(auditTotal / AUDIT_PAGE_SIZE),
+                )}
+                onChange={({ detail }) => {
+                  setAuditPage(detail.currentPageIndex);
+                  // Force a re-fetch on page change. Submitted filters
+                  // are reused; the tick bump is what wakes the effect.
+                  setAuditSearchTick((t) => (t === 0 ? 1 : t + 1));
+                }}
+              />
+            }
+            header={
+              <Header
+                counter={`(${auditTotal})`}
+                description="Newest first. Truncated values show the full text on hover."
+              >
+                Results
+              </Header>
+            }
+            data-testid="audit-search-table"
+          />
         </SpaceBetween>
       </Container>
 
