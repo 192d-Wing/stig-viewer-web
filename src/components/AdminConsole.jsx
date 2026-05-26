@@ -261,38 +261,73 @@ export default function AdminConsole() {
     to: "",
   });
 
+  // Per-section error map keyed by the same labels rendered in the UI.
+  // A single failed fetch only blanks its own table; the rest of the
+  // console keeps rendering normal data.
+  const [sectionErrors, setSectionErrors] = useState({});
+
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
-    try {
-      const [u, a, w, r, e, ap, sr, sess, pol] = await Promise.all([
-        apiGet("/api/admin/users"),
-        apiGet("/api/assets"),
-        apiGet("/api/webhooks").catch(() => []),
-        apiGet("/api/reports").catch(() => []),
-        apiGet("/api/admin/email-deliveries").catch(() => []),
-        apiGet("/api/approvals?status=pending").catch(() => []),
-        apiGet("/api/admin/scheduler-runs").catch(() => ({
-          latest: {},
-          history: [],
-        })),
-        apiGet("/api/admin/sessions").catch(() => []),
-        apiGet("/api/admin/policies").catch(() => []),
-      ]);
-      setUsers(u);
-      setAssets(a);
-      setWebhooks(w);
-      setReports(r);
-      setEmails(e);
-      setApprovals(ap);
-      setSchedulerRuns(sr);
-      setSessions(sess);
-      setPolicies(pol);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
+    setSectionErrors({});
+
+    // Promise.allSettled means one bad endpoint never blanks the whole
+    // tab. We thread the same default empty shape per section so the
+    // tables/lists below always have *something* to render, and we
+    // surface per-section error strings in `sectionErrors` so the UI can
+    // show a targeted chip instead of a single top-level message.
+    const sections = [
+      { key: "users", path: "/api/admin/users", set: setUsers, fallback: [] },
+      { key: "assets", path: "/api/assets", set: setAssets, fallback: [] },
+      { key: "webhooks", path: "/api/webhooks", set: setWebhooks, fallback: [] },
+      { key: "reports", path: "/api/reports", set: setReports, fallback: [] },
+      {
+        key: "emails",
+        path: "/api/admin/email-deliveries",
+        set: setEmails,
+        fallback: [],
+      },
+      {
+        key: "approvals",
+        path: "/api/approvals?status=pending",
+        set: setApprovals,
+        fallback: [],
+      },
+      {
+        key: "schedulerRuns",
+        path: "/api/admin/scheduler-runs",
+        set: setSchedulerRuns,
+        fallback: { latest: {}, history: [] },
+      },
+      {
+        key: "sessions",
+        path: "/api/admin/sessions",
+        set: setSessions,
+        fallback: [],
+      },
+      {
+        key: "policies",
+        path: "/api/admin/policies",
+        set: setPolicies,
+        fallback: [],
+      },
+    ];
+
+    const results = await Promise.allSettled(
+      sections.map((s) => apiGet(s.path)),
+    );
+    const errors = {};
+    results.forEach((res, idx) => {
+      const s = sections[idx];
+      if (res.status === "fulfilled") {
+        s.set(res.value);
+      } else {
+        s.set(s.fallback);
+        errors[s.key] = res.reason?.message ?? String(res.reason);
+      }
+    });
+    setSectionErrors(errors);
+    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -647,13 +682,22 @@ export default function AdminConsole() {
       const body = {
         name: hookModal.name,
         url: hookModal.url,
-        secret: hookModal.secret,
         kinds: hookModal.kinds,
         flavor: hookModal.flavor ?? "slack",
       };
       if (hookModal.mode === "create") {
+        // On create the secret IS the source of truth — pass it through,
+        // empty string included (an empty secret means "unsigned").
+        body.secret = hookModal.secret ?? "";
         await apiJson("/api/webhooks", "POST", body);
       } else {
+        // On edit, the modal's secret field starts blank because the
+        // server never echoes the plaintext back. Only include the
+        // field when the admin actually typed a replacement, so a
+        // no-op save doesn't accidentally clear the existing secret.
+        if (hookModal.secret && hookModal.secret.length > 0) {
+          body.secret = hookModal.secret;
+        }
         await apiJson(`/api/webhooks/${hookModal.id}`, "PATCH", {
           ...body,
           enabled: hookModal.enabled,
@@ -940,7 +984,11 @@ export default function AdminConsole() {
                   id: w.id,
                   name: w.name,
                   url: w.url,
-                  secret: w.secret ?? "",
+                  // Server never returns the plaintext secret. The field
+                  // starts blank; submitHook only sends `secret` when
+                  // the admin types a replacement.
+                  secret: "",
+                  secretSet: !!w.secretSet,
                   kinds: w.kinds ?? ["assigned"],
                   flavor: w.flavor ?? "slack",
                   enabled: w.enabled,
@@ -1037,9 +1085,30 @@ export default function AdminConsole() {
     },
   ];
 
+  const sectionErrorEntries = Object.entries(sectionErrors);
+
   return (
     <SpaceBetween direction="vertical" size="l">
       {error && <Alert type="error">{error}</Alert>}
+      {sectionErrorEntries.length > 0 && (
+        <Alert
+          type="warning"
+          header={`${sectionErrorEntries.length} admin section${
+            sectionErrorEntries.length === 1 ? "" : "s"
+          } failed to load`}
+          data-testid="admin-section-errors"
+        >
+          The remaining sections rendered normally. Try Refresh once the
+          underlying failure clears.
+          <ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+            {sectionErrorEntries.map(([key, msg]) => (
+              <li key={key}>
+                <strong>{key}</strong>: {msg}
+              </li>
+            ))}
+          </ul>
+        </Alert>
+      )}
       {testFlash && (
         <Alert type="success" dismissible onDismiss={() => setTestFlash(null)}>
           {testFlash}
@@ -1166,7 +1235,10 @@ export default function AdminConsole() {
         loadingText="Loading users"
         empty={
           <Box textAlign="center" padding="l">
-            No users yet.
+            <Box variant="p" color="text-body-secondary">
+              No users yet. Users are created on first login through the
+              configured OIDC or SAML provider.
+            </Box>
           </Box>
         }
         header={
@@ -1181,6 +1253,7 @@ export default function AdminConsole() {
             Users
           </Header>
         }
+        data-testid="users-table"
       />
 
       <Table
@@ -1516,7 +1589,10 @@ export default function AdminConsole() {
         loadingText="Loading webhooks"
         empty={
           <Box textAlign="center" padding="l">
-            No webhooks configured.
+            <Box variant="p" color="text-body-secondary">
+              No webhooks configured. Use <strong>Add webhook</strong> above
+              to wire up Slack, Teams, or any HTTPS endpoint.
+            </Box>
           </Box>
         }
         header={
@@ -1532,6 +1608,7 @@ export default function AdminConsole() {
             Webhooks
           </Header>
         }
+        data-testid="webhooks-table"
       />
 
       <Table
@@ -1593,6 +1670,7 @@ export default function AdminConsole() {
             Compliance reports
           </Header>
         }
+        data-testid="compliance-reports-table"
       />
 
       <Table
@@ -1663,6 +1741,7 @@ export default function AdminConsole() {
             Email deliveries
           </Header>
         }
+        data-testid="email-deliveries-table"
       />
 
       <Container
@@ -1970,11 +2049,22 @@ export default function AdminConsole() {
           </FormField>
           <FormField
             label="Secret"
-            description="Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned."
+            description={
+              hookModal?.mode === "edit"
+                ? hookModal?.secretSet
+                  ? "A secret is already configured (not shown). Leave blank to keep it; type a new value to rotate."
+                  : "No secret configured. Type one to start signing, or leave blank for unsigned."
+                : "Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned."
+            }
           >
             <Input
               value={hookModal?.secret ?? ""}
               type="password"
+              placeholder={
+                hookModal?.mode === "edit" && hookModal?.secretSet
+                  ? "(leave blank to keep current)"
+                  : ""
+              }
               onChange={({ detail }) =>
                 setHookModal((m) => (m ? { ...m, secret: detail.value } : m))
               }

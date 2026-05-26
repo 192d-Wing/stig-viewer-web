@@ -25,7 +25,11 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
   }, [rule.id])
 
   return (
-    <div ref={panelRef} style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+    <div
+      ref={panelRef}
+      data-testid="rule-detail"
+      style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', minWidth: 0 }}
+    >
       {/* Header */}
       <div style={{
         padding: '16px 20px',
@@ -40,7 +44,13 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
         <Header
           variant="h2"
           actions={
-            <Button variant="icon" iconName="close" onClick={onClose} ariaLabel="Close detail panel" />
+            <Button
+              variant="icon"
+              iconName="close"
+              onClick={onClose}
+              ariaLabel="Close detail panel"
+              data-testid="rule-detail-close"
+            />
           }
           description={
             <SpaceBetween direction="horizontal" size="xs">
@@ -67,14 +77,16 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
         <Box margin={{ bottom: 'xs' }} fontSize="body-s" fontWeight="bold" color="text-label">
           Compliance Status
         </Box>
-        <SegmentedControl
-          selectedId={rule.status}
-          onChange={({ detail }) => onUpdateRule({ status: detail.selectedId })}
-          options={STATUS_OPTIONS.map((opt) => ({
-            id: opt.value,
-            text: opt.label,
-          }))}
-        />
+        <div data-testid="rule-detail-status">
+          <SegmentedControl
+            selectedId={rule.status}
+            onChange={({ detail }) => onUpdateRule({ status: detail.selectedId })}
+            options={STATUS_OPTIONS.map((opt) => ({
+              id: opt.value,
+              text: opt.label,
+            }))}
+          />
+        </div>
       </div>
 
       {/* Content sections */}
@@ -110,6 +122,7 @@ export default function RuleDetail({ rule, onUpdateRule, onClose }) {
                 onChange={({ detail }) => onUpdateRule({ [key]: detail.value })}
                 placeholder={`Enter ${label.toLowerCase()}…`}
                 rows={4}
+                data-testid={`rule-detail-${key}`}
               />
             </FormField>
           ))}

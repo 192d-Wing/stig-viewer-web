@@ -22,7 +22,7 @@ import Container from "@cloudscape-design/components/container";
 import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Modal from "@cloudscape-design/components/modal";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
-import { BACKEND, apiJson, apiFetch, apiGet } from "../utils/api.js";
+import { apiJson, apiFetch, apiGet } from "../utils/api.js";
 
 /**
  * Strip everything except `<mark>` and `</mark>` tags from a server-
@@ -281,11 +281,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
     setCatalogLoading(true);
     setCatalogError(null);
     let cancelled = false;
-    fetch(`${BACKEND}/api/catalog`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`Backend returned ${r.status}`);
-        return r.json();
-      })
+    apiGet(`/api/catalog`)
       .then((data) => {
         if (!cancelled) setCatalog(data);
       })
@@ -361,9 +357,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
     async (id) => {
       setLoadingId(id);
       try {
-        const r = await fetch(`${BACKEND}/api/stigs/${encodeURIComponent(id)}`);
-        if (!r.ok) throw new Error(`Backend returned ${r.status}`);
-        const stig = await r.json();
+        const stig = await apiGet(`/api/stigs/${encodeURIComponent(id)}`);
         onLoad(stig);
       } catch (err) {
         setCatalogError(`Failed to load STIG: ${err.message}`);
@@ -416,10 +410,9 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
     try {
       const body = new FormData();
       body.append("file", file);
-      const r = await fetch(`${BACKEND}/api/stigs/lint`, {
+      const r = await apiFetch(`/api/stigs/lint`, {
         method: "POST",
         body,
-        credentials: "include",
       });
       if (!r.ok) throw new Error(`Lint failed: ${r.status}`);
       const report = await r.json();
@@ -446,7 +439,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
         body.append("file", addFiles[0]);
         body.append("id", addId.trim());
         body.append("category", addCategory);
-        const r = await fetch(`${BACKEND}/api/upload`, {
+        const r = await apiFetch(`/api/upload`, {
           method: "POST",
           body,
         });
@@ -478,7 +471,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
       try {
         const body = new FormData();
         body.append("file", libFiles[0]);
-        const r = await fetch(`${BACKEND}/api/upload/library`, {
+        const r = await apiFetch(`/api/upload/library`, {
           method: "POST",
           body,
         });
@@ -697,6 +690,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
         loading={catalogLoading}
         loadingText="Connecting to backend"
         resizableColumns
+        data-testid="stig-library-table"
         items={paginatedItems}
         columnDefinitions={visibleColumns}
         sortingColumn={sortingColumn}
