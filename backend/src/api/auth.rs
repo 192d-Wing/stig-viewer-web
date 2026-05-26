@@ -72,6 +72,18 @@ pub struct OidcEnv {
 
 impl OidcEnv {
     pub fn from_env() -> Result<Self> {
+        // OIDC client secret: in production we refuse to fall back to the
+        // dev placeholder — the deployment must supply a real one.
+        let client_secret = match std::env::var("OIDC_CLIENT_SECRET") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ if crate::config::is_production() => {
+                return Err(anyhow::anyhow!(
+                    "OIDC_CLIENT_SECRET is required when STIG_ENV=production"
+                ));
+            }
+            _ => "dev-only-not-a-real-secret".into(),
+        };
+
         Ok(Self {
             internal_issuer_url: std::env::var("OIDC_INTERNAL_URL")
                 .unwrap_or_else(|_| "http://keycloak:8081/realms/stig-viewer".into()),
@@ -79,8 +91,7 @@ impl OidcEnv {
                 .unwrap_or_else(|_| "http://localhost:8081".into()),
             client_id: std::env::var("OIDC_CLIENT_ID")
                 .unwrap_or_else(|_| "stig-viewer-app".into()),
-            client_secret: std::env::var("OIDC_CLIENT_SECRET")
-                .unwrap_or_else(|_| "dev-only-not-a-real-secret".into()),
+            client_secret,
             redirect_uri: std::env::var("OIDC_REDIRECT_URI")
                 .unwrap_or_else(|_| "http://localhost:8080/auth/callback".into()),
             frontend_url: std::env::var("FRONTEND_URL")

@@ -1,6 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
+
+/// True when the deployment is flagged for production (STIG_ENV=production).
+/// In production we refuse to silently fall back to dev defaults for
+/// secrets / DB URLs — the boot fails loudly instead.
+pub fn is_production() -> bool {
+    std::env::var("STIG_ENV")
+        .map(|v| v == "production")
+        .unwrap_or(false)
+}
 
 /// One entry from stig-sources.toml — the curated DISA download manifest.
 #[derive(Debug, Clone, Deserialize)]
@@ -32,14 +41,25 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        // Database URL: in production we refuse to fall back to a dev
+        // Postgres on localhost — that's the kind of misconfig that
+        // silently boots the wrong stack in CI.
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ if is_production() => {
+                return Err(anyhow!(
+                    "DATABASE_URL is required when STIG_ENV=production"
+                ));
+            }
+            _ => "postgres://stig:stig_local@localhost:5432/stig_viewer".into(),
+        };
+
         Ok(Self {
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".into())
                 .parse()
                 .context("PORT must be a valid port number")?,
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://stig:stig_local@localhost:5432/stig_viewer".into()
-            }),
+            database_url,
             data_dir: PathBuf::from(
                 std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into()),
             ),
