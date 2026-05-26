@@ -817,7 +817,15 @@ export default function AssetsLibrary() {
                     cell: (r) => r.error || "",
                   },
                 ]}
-                empty={<Box>No rows.</Box>}
+                empty={
+                  <Box textAlign="center" padding="s">
+                    <Box variant="p" color="text-body-secondary">
+                      The CSV parsed cleanly but produced no preview rows —
+                      check that it has at least one data line below the
+                      header.
+                    </Box>
+                  </Box>
+                }
               />
             </>
           )}
