@@ -131,6 +131,43 @@ pub struct WebhookRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Public-facing view of a webhook row. Drops the `secret` column entirely
+/// — even an admin reading the list shouldn't carry the plaintext secret
+/// back through the wire (logs, browser caches, etc.). The Verify-recipe
+/// endpoint still embeds the secret server-side because that's its whole
+/// purpose; the secret never crosses this view.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookView {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// True when a non-empty secret is configured. The UI uses this to
+    /// know whether the webhook is signed without ever seeing the value.
+    pub secret_set: bool,
+    pub kinds: Vec<String>,
+    pub enabled: bool,
+    pub flavor: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<WebhookRow> for WebhookView {
+    fn from(r: WebhookRow) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            url: r.url,
+            secret_set: !r.secret.is_empty(),
+            kinds: r.kinds,
+            enabled: r.enabled,
+            flavor: r.flavor,
+            created_by: r.created_by,
+            created_at: r.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryRow {
@@ -199,7 +236,7 @@ fn valid_url(url: &str) -> bool {
 pub async fn list_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-) -> Result<Json<Vec<WebhookRow>>, StatusCode> {
+) -> Result<Json<Vec<WebhookView>>, StatusCode> {
     ensure_admin(&user)?;
     let rows = sqlx::query_as::<_, WebhookRow>(
         r#"
@@ -211,7 +248,7 @@ pub async fn list_handler(
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(map_sqlx)?;
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(WebhookView::from).collect()))
 }
 
 /// POST /api/webhooks — admin-only create. 400 on empty name/url or a
@@ -220,7 +257,7 @@ pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Json(req): Json<CreateRequest>,
-) -> Result<(StatusCode, Json<WebhookRow>), StatusCode> {
+) -> Result<(StatusCode, Json<WebhookView>), StatusCode> {
     ensure_admin(&user)?;
 
     let name = req.name.trim().to_string();
@@ -260,7 +297,7 @@ pub async fn create_handler(
     .await
     .map_err(map_sqlx)?;
 
-    Ok((StatusCode::CREATED, Json(row)))
+    Ok((StatusCode::CREATED, Json(WebhookView::from(row))))
 }
 
 /// PATCH /api/webhooks/:id — admin-only partial update. Any field left
@@ -270,7 +307,7 @@ pub async fn update_handler(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
     Json(req): Json<UpdateRequest>,
-) -> Result<Json<WebhookRow>, StatusCode> {
+) -> Result<Json<WebhookView>, StatusCode> {
     ensure_admin(&user)?;
 
     let existing = sqlx::query_as::<_, WebhookRow>(
@@ -303,7 +340,13 @@ pub async fn update_handler(
         }
         None => existing.url,
     };
-    let secret = req.secret.unwrap_or(existing.secret);
+    // Treat a None *or* explicit empty-string secret as "keep current".
+    // The masked list endpoint returns no secret, so the edit-modal field
+    // is empty by default; we must not let that wipe the configured value.
+    let secret = match req.secret {
+        Some(s) if !s.is_empty() => s,
+        _ => existing.secret,
+    };
     let kinds = req.kinds.unwrap_or(existing.kinds);
     validate_kinds(&kinds)?;
     let enabled = req.enabled.unwrap_or(existing.enabled);
@@ -330,7 +373,7 @@ pub async fn update_handler(
     .await
     .map_err(map_sqlx)?;
 
-    Ok(Json(row))
+    Ok(Json(WebhookView::from(row)))
 }
 
 /// DELETE /api/webhooks/:id — admin-only. Deliveries cascade away.

@@ -15,6 +15,7 @@ use anyhow::Result;
 use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
+use tokio::sync::Notify;
 use tower_http::cors::CorsLayer;
 use axum::http::{header, HeaderValue, Method};
 use tracing::info;
@@ -506,6 +507,11 @@ async fn main() -> Result<()> {
         .route("/api/stigs/:id/diff", get(catalog_diff_handler))
         .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
         .route("/api/catalog/search", get(catalog_search_handler))
+        // Catalog mutations — admin-only via ensure_admin in the handlers.
+        // Sit inside the auth layer so AuthUser is populated before the
+        // role check, and so the rate limiter throttles bulk-import abuse.
+        .route("/api/upload", post(upload_stig))
+        .route("/api/upload/library", post(upload_library))
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
@@ -528,8 +534,6 @@ async fn main() -> Result<()> {
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
-        .route("/api/upload", post(upload_stig))
-        .route("/api/upload/library", post(upload_library))
         .with_state(state.clone())
         .merge(auth_routes)
         .merge(saml_routes)
@@ -567,15 +571,27 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
         .layer(cors);
 
+    // Shared "stop" signal. Every scheduler loop selects on this so a
+    // SIGTERM during a long interval doesn't leave background tasks
+    // mid-write when the HTTP server shuts down.
+    let shutdown_notify = Arc::new(Notify::new());
+
     {
         let cfg = config.clone();
         let src = sources.clone();
         let db = pool.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("sync scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "sync", || async {
                     sync::run_sync(&cfg, &src, &db).await?;
                     Ok::<String, anyhow::Error>(format!("synced {} source(s)", src.len()))
@@ -597,11 +613,18 @@ async fn main() -> Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(24);
         let db = pool.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(snap_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("dashboard snapshot scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "snapshot", || async {
                     let n = take_snapshot(&db)
                         .await
@@ -627,11 +650,18 @@ async fn main() -> Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(24);
         let db = pool.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(digest_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("overdue digest scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "overdue_digest", || async {
                     let n = run_overdue_digest(&db).await?;
                     Ok::<String, anyhow::Error>(format!("attempted {n} webhook(s)"))
@@ -664,11 +694,18 @@ async fn main() -> Result<()> {
             .unwrap_or(true);
         let db = pool.clone();
         let cfg = config.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(retention_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("audit retention scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "audit_retention", || async {
                     let n = audit_retention::run_prune(
                         &db,
@@ -705,11 +742,18 @@ async fn main() -> Result<()> {
             .unwrap_or(30);
         let db = pool.clone();
         let cfg = config.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(report_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("compliance report scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "compliance_report", || async {
                     let row = run_compliance_report(&db, &cfg.data_dir, range_days).await?;
                     Ok::<String, anyhow::Error>(format!(
@@ -739,11 +783,18 @@ async fn main() -> Result<()> {
             .unwrap_or(1);
         let db = pool.clone();
         let cfg = config.clone();
+        let stop = shutdown_notify.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(interval_hours * 3600));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = stop.notified() => {
+                        tracing::info!("asset email schedule scheduler shutting down");
+                        return;
+                    }
+                }
                 let result = scheduler_log::record(&db, "asset_email_schedule", || async {
                     let n = run_asset_email_schedules(&db, &cfg.data_dir).await?;
                     Ok::<String, anyhow::Error>(format!("emailed {n} asset(s)"))
@@ -761,16 +812,44 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");
 
+    let shutdown_for_serve = shutdown_notify.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown_for_serve))
         .await?;
+
+    // HTTP server has finished draining. Let the schedulers wind down too.
+    // The schedulers each select on `notified()`, so a single broadcast
+    // wakes every loop. We give them a brief budget to log their exit so
+    // a container restart doesn't truncate the final tick's tracing line.
+    shutdown_notify.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
     Ok(())
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
-    info!("Shutting down…");
+/// Waits for SIGINT (Ctrl+C) or SIGTERM (container stop) and fires
+/// `notify` so the schedulers can cancel before the process exits.
+async fn shutdown_signal(notify: Arc<Notify>) {
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+
+    let int = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl+C handler");
+    };
+
+    tokio::select! {
+        _ = int => info!("SIGINT received, shutting down…"),
+        _ = term => info!("SIGTERM received, shutting down…"),
+    }
+    notify.notify_waiters();
 }

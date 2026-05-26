@@ -1,16 +1,24 @@
 use axum::{
     extract::{Multipart, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::Utc;
 
 use crate::{
-    api::stig_validator::lint_stig,
+    api::{auth::AuthUser, stig_validator::lint_stig},
     db::{upsert_catalog, CatalogEntry},
     parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf},
     AppState,
 };
+
+fn ensure_admin(user: &AuthUser) -> Result<(), (StatusCode, String)> {
+    if user.role == "admin" {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin role required".into()))
+    }
+}
 
 /// POST /api/upload
 ///
@@ -26,8 +34,10 @@ use crate::{
 ///        -F "category=Windows"
 pub async fn upload_stig(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ensure_admin(&user)?;
     let mut zip_bytes: Option<Vec<u8>> = None;
     let mut id: Option<String> = None;
     let mut category: Option<String> = None;
@@ -148,8 +158,10 @@ pub async fn upload_stig(
 ///        -F "file=@U_SRG-STIG_Library_January_2026.zip"
 pub async fn upload_library(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ensure_admin(&user)?;
     // Read the single 'file' field
     let mut zip_bytes: Option<Vec<u8>> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
