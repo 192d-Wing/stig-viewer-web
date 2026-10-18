@@ -2849,6 +2849,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "csv",
+ "ed25519-dalek",
  "flate2",
  "hex",
  "hmac",

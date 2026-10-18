@@ -178,6 +178,9 @@ use db::init_pool;
 pub struct AppState {
     pub pool: Arc<PgPool>,
     pub config: Arc<Config>,
+    /// `Some` when `SIGNING_KEY_HEX` is configured. Both `/api/sign` and
+    /// `/api/signing/pubkey` return 503 when this is `None`.
+    pub signing: Option<api::signing::SigningState>,
 }
 
 #[tokio::main]
@@ -202,6 +205,13 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
+
+    // ── Signing (optional) ──────────────────────────────────────────────────
+    let signing = api::signing::SigningState::from_env()?;
+    match &signing {
+        Some(s) => info!("Signing enabled (key_id={})", s.key_id),
+        None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
+    }
 
     // ── OIDC setup ──────────────────────────────────────────────────────────
     let oidc_env = OidcEnv::from_env()?;
@@ -234,6 +244,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
+        signing,
     };
 
     // Auth flow routes — public, do not require an existing session.
@@ -506,6 +517,9 @@ async fn main() -> Result<()> {
         .route("/api/stigs/:id/diff", get(catalog_diff_handler))
         .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
         .route("/api/catalog/search", get(catalog_search_handler))
+        // Ed25519 detached signing for exported artifacts (.ckl bundles).
+        // Returns 503 when SIGNING_KEY_HEX isn't set.
+        .route("/api/sign", post(api::signing::sign_handler))
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
@@ -530,6 +544,9 @@ async fn main() -> Result<()> {
         .route("/api/stigs/:id", get(get_stig))
         .route("/api/upload", post(upload_stig))
         .route("/api/upload/library", post(upload_library))
+        // Public verifier key for offline signature verification. Returns
+        // 503 when SIGNING_KEY_HEX isn't set.
+        .route("/api/signing/pubkey", get(api::signing::pubkey_handler))
         .with_state(state.clone())
         .merge(auth_routes)
         .merge(saml_routes)
