@@ -23,6 +23,12 @@ import ColumnLayout from "@cloudscape-design/components/column-layout";
 import Modal from "@cloudscape-design/components/modal";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import { BACKEND, apiJson, apiFetch, apiGet } from "../utils/api.js";
+import {
+  cacheCatalog,
+  cacheStig,
+  readCachedCatalog,
+  readCachedStig,
+} from "../utils/offlineCache.js";
 
 /**
  * Strip everything except `<mark>` and `</mark>` tags from a server-
@@ -125,6 +131,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const [catalog, setCatalog] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState(null);
+  const [catalogWarning, setCatalogWarning] = useState(null);
   const [loadingId, setLoadingId] = useState(null);
   const [draftingId, setDraftingId] = useState(null);
   // Filter + sort + columns + pagination all live in the URL so a library
@@ -280,6 +287,7 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
   const fetchCatalog = useCallback(() => {
     setCatalogLoading(true);
     setCatalogError(null);
+    setCatalogWarning(null);
     let cancelled = false;
     fetch(`${BACKEND}/api/catalog`)
       .then((r) => {
@@ -287,9 +295,20 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
         return r.json();
       })
       .then((data) => {
-        if (!cancelled) setCatalog(data);
+        if (cancelled) return;
+        setCatalog(data);
+        cacheCatalog(data).catch(() => {});
       })
-      .catch((err) => {
+      .catch(async (err) => {
+        if (cancelled) return;
+        const cached = await readCachedCatalog();
+        if (cached && !cancelled) {
+          setCatalog(cached.list);
+          setCatalogWarning(
+            `Backend unreachable — showing cached catalog from ${new Date(cached.cachedAt).toLocaleString()}.`,
+          );
+          return;
+        }
         if (!cancelled) setCatalogError(err.message);
       })
       .finally(() => {
@@ -365,7 +384,16 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
         if (!r.ok) throw new Error(`Backend returned ${r.status}`);
         const stig = await r.json();
         onLoad(stig);
+        cacheStig(id, stig).catch(() => {});
       } catch (err) {
+        const cached = await readCachedStig(id);
+        if (cached) {
+          onLoad(cached.stig);
+          setCatalogWarning(
+            `Loaded "${cached.stig.title || id}" from cache (${new Date(cached.cachedAt).toLocaleString()}).`,
+          );
+          return;
+        }
         setCatalogError(`Failed to load STIG: ${err.message}`);
       } finally {
         setLoadingId(null);
@@ -941,6 +969,16 @@ export default function StigLibrary({ onLoad, onUploadTab, onStartDraft }) {
             onDismiss={() => setCatalogError(null)}
           >
             {catalogError}
+          </Alert>
+        )}
+
+        {catalogWarning && (
+          <Alert
+            type="warning"
+            dismissible
+            onDismiss={() => setCatalogWarning(null)}
+          >
+            {catalogWarning}
           </Alert>
         )}
 
