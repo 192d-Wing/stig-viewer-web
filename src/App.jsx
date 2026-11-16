@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo, useRef, useCallback, useContext } from "react";
 import { useStigTabs } from "./hooks/useStigTabs.js";
+import { useOnline } from "./hooks/useOnline.js";
 import TopNavigation from "@cloudscape-design/components/top-navigation";
 import AppLayout from "@cloudscape-design/components/app-layout";
+import Flashbar from "@cloudscape-design/components/flashbar";
 import SideNavigation from "@cloudscape-design/components/side-navigation";
 import SplitPanel from "@cloudscape-design/components/split-panel";
 import Button from "@cloudscape-design/components/button";
@@ -28,6 +30,7 @@ import { apiFetch, apiGet, apiJson } from "./utils/api.js";
 
 export default function App() {
   const currentUser = useContext(AuthContext);
+  const online = useOnline();
 
   const handleSignOut = useCallback(async () => {
     try {
@@ -501,6 +504,22 @@ export default function App() {
       <AppLayout
         headerSelector="#h"
         contentType={isWriter || !hasTabs || showLibrary ? "table" : "default"}
+        notifications={
+          online ? undefined : (
+            <Flashbar
+              items={[
+                {
+                  type: "warning",
+                  header: "Offline",
+                  content:
+                    "No network connection. Cached STIGs remain viewable; uploads and saves will resume when the connection returns.",
+                  id: "offline",
+                  dismissible: false,
+                },
+              ]}
+            />
+          )
+        }
         navigationHide={isWriter || !hasTabs || isDiffMode}
         navigationOpen={!isWriter && navOpen && hasTabs && !isDiffMode}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}
