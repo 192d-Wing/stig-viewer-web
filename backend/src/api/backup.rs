@@ -582,6 +582,21 @@ mod tests {
         let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
         let smaller = (data.len() as u32 - 5).to_le_bytes();
         bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
+        assert!(err.contains("size") || err.contains("crc") || err.contains("checksum"), "{err}");
+    }
+
+    #[test]
+    fn restore_rejects_an_unsupported_compression_method() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        for pos in 0..bytes.len() - 12 {
+            if &bytes[pos..pos + 4] == b"PK\x03\x04" {
+                bytes[pos + 8..pos + 10].copy_from_slice(&12u16.to_le_bytes());
+            } else if &bytes[pos..pos + 4] == b"PK\x01\x02" {
+                bytes[pos + 10..pos + 12].copy_from_slice(&12u16.to_le_bytes());
+            }
+        }
         assert!(parse_backup_zip(&bytes).is_err());
     }
 
@@ -594,8 +609,15 @@ mod tests {
         bytes[cd + 24..cd + 28].copy_from_slice(&huge);
         let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
         bytes[lh + 22..lh + 26].copy_from_slice(&huge);
-        // The point is no huge allocation and no panic. The real data is
-        // read to its true end, so the result may be Ok or Err.
-        let _ = parse_backup_zip(&bytes);
+        // The buffer is no longer sized from the declared size, so this parses
+        // the real data. (A with_capacity(u32::MAX) regression is not cheaply
+        // observable: allocation of ~4 GiB usually succeeds lazily here.)
+        let (m, tables, atts) = parse_backup_zip(&bytes).unwrap();
+        assert_eq!(m.version, BACKUP_VERSION);
+        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m.schema_migration, 7);
+        assert_eq!(m.counts.get("users"), Some(&1));
+        assert!(tables.is_empty());
+        assert!(atts.is_empty());
     }
 }

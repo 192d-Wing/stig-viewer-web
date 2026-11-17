@@ -138,13 +138,13 @@ tasks:
     desc: Clippy for frontend and backend
     cmds:
       - cd frontend && cargo clippy --target wasm32-unknown-unknown -- -D warnings
-      - cd backend && cargo clippy -- -D warnings
+      - cd backend && cargo clippy --locked -- -D warnings
 
   test:
     desc: Unit tests for frontend and backend
     cmds:
       - cd frontend && cargo test
-      - cd backend && cargo test
+      - cd backend && cargo test --locked
 
   test:db:
     desc: Backend tests including the database-backed ones, against a throwaway Postgres on 127.0.0.1:55432

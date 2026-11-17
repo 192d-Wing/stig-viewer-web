@@ -307,11 +307,15 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
 
 /// Find and return the text content of the XCCDF file within a ZIP archive.
 pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String> {
+    extract_xccdf_nested(zip_bytes, MAX_ZIP_DEPTH)
+}
+
+fn extract_xccdf_nested(zip_bytes: &[u8], depth_left: u8) -> Result<String> {
     use std::io::Read;
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
 
-    // STIGs may be double-zipped; handle one level of nesting
+    // STIGs may be double-zipped; follow nested ZIPs up to MAX_ZIP_DEPTH levels.
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
         let name = file.name()?.to_lowercase();
@@ -325,9 +329,12 @@ pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String> {
 
         // Inner ZIP — extract it and recurse one level
         if name.ends_with(".zip") {
+            if depth_left == 0 {
+                bail!("ZIP nesting exceeds {MAX_ZIP_DEPTH} levels");
+            }
             let mut inner_bytes = Vec::new();
             file.read_to_end(&mut inner_bytes)?;
-            if let Ok(xccdf) = extract_xccdf_from_zip(&inner_bytes) {
+            if let Ok(xccdf) = extract_xccdf_nested(&inner_bytes, depth_left - 1) {
                 return Ok(xccdf);
             }
         }
@@ -707,6 +714,32 @@ mod tests {
         let (entries, errors) = extract_all_from_library(&lib);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "a-b");
+    }
+
+    #[test]
+    fn unsupported_compression_method_fails_a_single_upload() {
+        let mut z = zip_of(&[("U_X-xccdf.xml", &benchmark("X"))]);
+        for (_, method_off) in header_offsets(&z, "U_X-xccdf.xml") {
+            z[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
+        }
+        assert!(extract_xccdf_from_zip(&z).is_err());
+    }
+
+    #[test]
+    fn self_nesting_zip_is_bounded_not_a_stack_overflow() {
+        let mut z = zip_of(&[("readme.txt", b"x")]);
+        for _ in 0..(MAX_ZIP_DEPTH as usize + 5) {
+            z = zip_of(&[("inner.zip", &z)]);
+        }
+        let err = extract_xccdf_from_zip(&z).unwrap_err().to_string();
+        assert!(err.contains("No *_xccdf.xml found"), "{err}");
+        // An XCCDF within the limit is still found.
+        let mut ok = zip_of(&[("a-xccdf.xml", &benchmark("Deep"))]);
+        for _ in 0..MAX_ZIP_DEPTH {
+            ok = zip_of(&[("inner.zip", &ok)]);
+        }
+        assert!(extract_xccdf_from_zip(&ok).is_ok());
     }
 
     #[test]
@@ -722,9 +755,12 @@ mod tests {
         for (_, method_off) in hits {
             lib[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
         }
-        let (entries, _errors) = extract_all_from_library(&lib);
+        let (entries, errors) = extract_all_from_library(&lib);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["good"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "bad");
+        assert!(errors[0].1.contains("failed to read"), "{errors:?}");
     }
 
     /// XCCDF fragment with one rule carrying two CCI idents plus one
