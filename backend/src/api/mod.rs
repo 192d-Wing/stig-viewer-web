@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod catalog_diff;
 pub mod catalog_search;
 pub mod checklist_save;
+pub mod checklist_sets;
 pub mod checklists;
 pub mod compliance_report;
 pub mod dashboard;

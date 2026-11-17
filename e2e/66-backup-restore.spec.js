@@ -227,6 +227,51 @@ test.describe("Backup + restore — API", () => {
     expect(Math.max(...later.map((e) => e.id))).toBeGreaterThan(Math.max(...before.map((e) => e.id)));
   });
 
+  test("checklist sets survive a backup round trip", async ({ request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const headers = { "X-User-Id": "alice", "Content-Type": "application/json" };
+    const set = await request
+      .post(`${BACKEND}/api/checklist-sets`, { headers, data: { name: "Backed up", stigIds: ["edge"] } })
+      .then((r) => r.json());
+    const stig = await request.get(`${BACKEND}/api/stigs/edge`).then((r) => r.json());
+    const ruleId = stig.rules[0].id;
+    const saved = await request.patch(`${BACKEND}/api/checklist-sets/${set.id}/rules`, {
+      headers,
+      data: {
+        revision: 0,
+        changes: [{ stigId: "edge", ruleId, status: "open", findingDetails: "", comments: "kept" }],
+      },
+    });
+    expect(saved.status()).toBe(200);
+
+    const backupBytes = await request
+      .get(`${BACKEND}/api/admin/backup`, { headers: { "X-User-Id": "alice" } })
+      .then((r) => r.body());
+    const names = listZipEntries(backupBytes).map((e) => e.name);
+    for (const t of ["checklist_sets", "checklist_set_stigs", "checklist_set_rules"]) {
+      expect(names).toContain(`tables/${t}.jsonl`);
+    }
+
+    await resetDb();
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const restore = await request.post(`${BACKEND}/api/admin/restore?force=true`, {
+      headers: { "X-User-Id": "alice" },
+      multipart: { file: { name: "backup.zip", mimeType: "application/zip", buffer: backupBytes } },
+    });
+    expect(restore.status()).toBe(200);
+    const counts = (await restore.json()).restored;
+    expect([counts.checklist_sets, counts.checklist_set_stigs, counts.checklist_set_rules]).toEqual([1, 1, 1]);
+
+    const back = await request
+      .get(`${BACKEND}/api/checklist-sets/${set.id}`, { headers: { "X-User-Id": "alice" } })
+      .then((r) => r.json());
+    expect(back.name).toBe("Backed up");
+    expect(back.revision).toBe(1);
+    expect(back.stigs[0].rules).toEqual([{ ruleId, status: "open", findingDetails: "", comments: "kept" }]);
+  });
+
   test("round-trip: backup → reset → force-restore brings data back", async ({
     request,
   }) => {

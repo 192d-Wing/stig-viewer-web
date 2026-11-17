@@ -80,6 +80,48 @@ pub async fn api_fetch_json<B: Serialize + ?Sized>(
         .map_err(js_err)
 }
 
+/// Why a request made with `api_fetch_with_timeout` did not complete.
+#[derive(Debug, PartialEq)]
+pub enum FetchFailure {
+    /// No usable response: offline, DNS, CORS, connection reset.
+    Network(String),
+    /// The request was aborted after the timeout.
+    Timeout,
+    /// The request could not be built (never worth retrying).
+    Build(String),
+}
+
+/// Raw request with an optional pre-serialized JSON body that is aborted
+/// after `timeout_ms`, so a hung connection cannot block callers forever.
+/// The timeout covers the wait for response headers.
+pub async fn api_fetch_with_timeout(
+    method: &str,
+    path: &str,
+    json_body: Option<&str>,
+    timeout_ms: u32,
+) -> Result<Response, FetchFailure> {
+    use std::{cell::Cell, rc::Rc};
+    let ctl = web_sys::AbortController::new().map_err(|e| FetchFailure::Build(format!("{e:?}")))?;
+    let timed_out = Rc::new(Cell::new(false));
+    let _timer = {
+        let (ctl, timed_out) = (ctl.clone(), timed_out.clone());
+        gloo_timers::callback::Timeout::new(timeout_ms, move || {
+            timed_out.set(true);
+            ctl.abort();
+        })
+    };
+    let b = builder(method, path).abort_signal(Some(&ctl.signal()));
+    let req = match json_body {
+        Some(body) => b.header("Content-Type", "application/json").body(body).map_err(|e| FetchFailure::Build(js_err(e)))?,
+        None => b.build().map_err(|e| FetchFailure::Build(js_err(e)))?,
+    };
+    match req.send().await {
+        Ok(res) => Ok(res),
+        Err(_) if timed_out.get() => Err(FetchFailure::Timeout),
+        Err(e) => Err(FetchFailure::Network(js_err(e))),
+    }
+}
+
 /// GET + parse JSON. Errors as `"<status> <statusText>"` on non-2xx.
 pub async fn api_get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     let res = api_fetch("GET", path).await?;

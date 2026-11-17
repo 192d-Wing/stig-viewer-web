@@ -1,6 +1,7 @@
 //! Application shell: top navigation, viewer tabs, side navigation, split
 //! panel, and the notification bell.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gloo_events::EventListener;
@@ -10,12 +11,14 @@ use yew::prelude::*;
 
 use crate::api::{api_fetch, api_get, api_send};
 use crate::auth::use_current_user;
+use crate::autosave::{use_autosave, SetEvent};
 use crate::components::admin_console::AdminConsole;
 use crate::components::asset_groups_page::AssetGroupsPage;
 use crate::components::assets_library::AssetsLibrary;
 use crate::components::dashboard::Dashboard;
 use crate::components::diff_view::DiffView;
 use crate::components::drop_zone::DropZone;
+use crate::components::my_checklists::{MyChecklists, OpenedSet};
 use crate::components::my_findings::MyFindings;
 use crate::components::rule_detail::RuleDetail;
 use crate::components::stig_library::StigLibrary;
@@ -23,7 +26,7 @@ use crate::components::stig_view::StigView;
 use crate::components::stig_writer::StigWriter;
 use crate::data::sample_stig::generate_sample_stig;
 use crate::hooks::{use_interval, use_online};
-use crate::model::{AssetInfo, RuleUpdate, Stig, StigTab};
+use crate::model::{AssetInfo, ChecklistSet, RuleUpdate, ServerRule, Stig, StigTab};
 use crate::ui::*;
 use crate::util::{
     console_error, download_text, file_list_to_vec, file_text, now_ms, spawn_local, to_locale_string,
@@ -42,6 +45,8 @@ struct TabsState {
     tabs: Vec<StigTab>,
     active_tab_id: Option<String>,
     diff_pair: Option<DiffPair>,
+    /// Checklist sets the open tabs belong to.
+    sets: Vec<ChecklistSet>,
 }
 
 enum TabsAction {
@@ -57,6 +62,21 @@ enum TabsAction {
     /// (tab id, rule ids, status)
     SetStatusFor(String, Vec<String>, String),
     SetDiffPair(Option<DiffPair>),
+    /// The first edit of a catalog tab created its set.
+    SetCreated { tab_id: String, set: ChecklistSet },
+    SetSaved { set_id: String, revision: i64 },
+    /// Open a set's STIGs as tabs (a tab already open for a STIG is only focused).
+    OpenSet { set: ChecklistSet, stigs: Vec<(String, Stig)> },
+    SetRenamed { set_id: String, name: String },
+    SetLinked { set_id: String, asset: Option<(String, String)> },
+    SetDeleted(String),
+    /// Server state for a set; rules in `keep` (tab id, rule id) stay as the user has them.
+    ReplaceFromServer {
+        set_id: String,
+        revision: i64,
+        stigs: Vec<(String, Vec<ServerRule>)>,
+        keep: HashSet<(String, String)>,
+    },
 }
 
 fn generate_tab_id() -> String {
@@ -80,6 +100,7 @@ impl Reducible for TabsState {
                         stig: Rc::new(stig),
                         asset_info: AssetInfo::default(),
                         selected_rule_id: None,
+                        set_id: None,
                     })
                     .collect();
                 if let Some(first) = new_tabs.first() {
@@ -134,6 +155,82 @@ impl Reducible for TabsState {
                 }
             }
             TabsAction::SetDiffPair(pair) => s.diff_pair = pair,
+            TabsAction::SetCreated { tab_id, set } => {
+                if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    t.set_id = Some(set.id.clone());
+                }
+                if !s.sets.iter().any(|x| x.id == set.id) {
+                    s.sets.push(set);
+                }
+            }
+            TabsAction::SetSaved { set_id, revision } => {
+                if let Some(x) = s.sets.iter_mut().find(|x| x.id == set_id) {
+                    x.revision = revision;
+                }
+            }
+            TabsAction::OpenSet { set, stigs } => {
+                let mut first = None;
+                for (catalog_id, stig) in stigs {
+                    let open = s.tabs.iter().find(|t| t.set_id.as_deref() == Some(set.id.as_str()) && t.catalog_id.as_deref() == Some(catalog_id.as_str()));
+                    if let Some(t) = open {
+                        first.get_or_insert_with(|| t.id.clone());
+                        continue;
+                    }
+                    let tab = StigTab {
+                        id: generate_tab_id(),
+                        stig: Rc::new(stig),
+                        asset_info: AssetInfo::default(),
+                        selected_rule_id: None,
+                        catalog_id: Some(catalog_id),
+                        set_id: Some(set.id.clone()),
+                    };
+                    first.get_or_insert_with(|| tab.id.clone());
+                    s.tabs.push(tab);
+                }
+                match s.sets.iter_mut().find(|x| x.id == set.id) {
+                    Some(x) => {
+                        x.name = set.name;
+                        x.asset = set.asset;
+                    }
+                    None => s.sets.push(set),
+                }
+                if first.is_some() {
+                    s.active_tab_id = first;
+                }
+            }
+            TabsAction::SetRenamed { set_id, name } => {
+                if let Some(x) = s.sets.iter_mut().find(|x| x.id == set_id) {
+                    x.name = name;
+                }
+            }
+            TabsAction::SetLinked { set_id, asset } => {
+                if let Some(x) = s.sets.iter_mut().find(|x| x.id == set_id) {
+                    x.asset = asset;
+                }
+            }
+            TabsAction::SetDeleted(set_id) => {
+                let gone: Vec<String> =
+                    s.tabs.iter().filter(|t| t.set_id.as_deref() == Some(set_id.as_str())).map(|t| t.id.clone()).collect();
+                s.tabs.retain(|t| !gone.contains(&t.id));
+                s.sets.retain(|x| x.id != set_id);
+                if s.active_tab_id.as_ref().is_some_and(|a| gone.contains(a)) {
+                    s.active_tab_id = s.tabs.last().map(|t| t.id.clone());
+                }
+                if s.diff_pair.as_ref().is_some_and(|(a, b)| [a, b].iter().any(|x| x.as_ref().is_some_and(|x| gone.contains(x)))) {
+                    s.diff_pair = None;
+                }
+            }
+            TabsAction::ReplaceFromServer { set_id, revision, stigs, keep } => {
+                for t in s.tabs.iter_mut().filter(|t| t.set_id.as_deref() == Some(set_id.as_str())) {
+                    let Some((_, rules)) = stigs.iter().find(|(id, _)| Some(id) == t.catalog_id.as_ref()) else { continue };
+                    let keep_ids: HashSet<String> =
+                        keep.iter().filter(|(tab, _)| *tab == t.id).map(|(_, rule)| rule.clone()).collect();
+                    Rc::make_mut(&mut t.stig).overlay_server_state(rules, &keep_ids);
+                }
+                if let Some(x) = s.sets.iter_mut().find(|x| x.id == set_id) {
+                    x.revision = revision;
+                }
+            }
         }
         Rc::new(s)
     }
@@ -342,6 +439,19 @@ pub fn App() -> Html {
     let online = use_online();
     let tabs_state = use_reducer(TabsState::default);
     let dispatch = tabs_state.dispatcher();
+    let autosave_enabled = current_user.as_ref().is_some_and(|u| u.role != "viewer");
+    let autosave = use_autosave({
+        let dispatch = dispatch.clone();
+        Callback::from(move |e: SetEvent| match e {
+            SetEvent::Created { tab_id, set } => dispatch.dispatch(TabsAction::SetCreated { tab_id, set }),
+            SetEvent::Saved { set_id, revision } => dispatch.dispatch(TabsAction::SetSaved { set_id, revision }),
+            SetEvent::Replace { set_id, revision, stigs, keep } => {
+                dispatch.dispatch(TabsAction::ReplaceFromServer { set_id, revision, stigs, keep })
+            }
+        })
+    });
+    let show_my_checklists = use_state(|| false);
+    let open_note = use_state(|| None::<String>);
 
     // Top-level "view" is encoded in `?view=` so the URL is shareable. On
     // initial load we honour the param; `navigate_to` pushes a new history
@@ -383,6 +493,12 @@ pub fn App() -> Html {
     let diff_pair = tabs_state.diff_pair.clone();
     let is_diff_mode = diff_pair.is_some();
     let has_tabs = !tabs.is_empty();
+    autosave.sync(tabs, &tabs_state.sets, autosave_enabled);
+    let active_set = active_tab
+        .as_ref()
+        .and_then(|t| t.set_id.as_ref())
+        .and_then(|id| tabs_state.sets.iter().find(|s| &s.id == id))
+        .cloned();
 
     let selected_rule = active_tab.as_ref().and_then(|t| {
         t.stig.rules.iter().find(|r| Some(&r.id) == t.selected_rule_id.as_ref()).cloned()
@@ -522,12 +638,19 @@ pub fn App() -> Html {
         })
     };
 
-    let handle_sign_out = Callback::from(|_: ()| {
-        spawn_local(async {
-            let _ = api_fetch("POST", "/auth/logout").await;
-            let _ = window().location().reload();
-        });
-    });
+    let handle_sign_out = {
+        let autosave = autosave.clone();
+        Callback::from(move |_: ()| {
+            let autosave = autosave.clone();
+            spawn_local(async move {
+                // Save pending edits first; if that fails the reload below
+                // still asks before discarding them.
+                let _ = autosave.flush().await;
+                let _ = api_fetch("POST", "/auth/logout").await;
+                let _ = window().location().reload();
+            });
+        })
+    };
 
     let handle_load_from_library = {
         let dispatch = dispatch.clone();
@@ -578,13 +701,56 @@ pub fn App() -> Html {
                 let id = tab.id.clone();
                 let (d1, d2, d3, d4, d5) = (dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone());
                 let (i1, i2, i3, i4, i5) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+                let (a1, a4, a5) = (autosave.clone(), autosave.clone(), autosave.clone());
+                let all_stig = tab.stig.clone();
+                let set_tabs: Vec<StigTab> = match &tab.set_id {
+                    Some(sid) => tabs.iter().filter(|t| t.set_id.as_ref() == Some(sid)).cloned().collect(),
+                    None => Vec::new(),
+                };
+                let (rename_dispatch, link_dispatch, add_dispatch) = (dispatch.clone(), dispatch.clone(), dispatch.clone());
+                let (rename_id, link_id, add_set) =
+                    (active_set.as_ref().map(|s| s.id.clone()), active_set.as_ref().map(|s| s.id.clone()), active_set.clone());
                 html! {
                     <StigView tab={tab.clone()}
-                        on_update_rule={Callback::from(move |(rule_id, update)| d1.dispatch(TabsAction::UpdateRule { tab_id: i1.clone(), rule_id, update }))}
+                        set={active_set.clone()}
+                        {set_tabs}
+                        autosave={autosave_enabled.then(|| autosave.clone())}
+                        on_rename_set={Callback::from(move |name: String| {
+                            if let Some(set_id) = rename_id.clone() {
+                                rename_dispatch.dispatch(TabsAction::SetRenamed { set_id, name });
+                            }
+                        })}
+                        on_set_linked={Callback::from(move |asset: Option<(String, String)>| {
+                            if let Some(set_id) = link_id.clone() {
+                                link_dispatch.dispatch(TabsAction::SetLinked { set_id, asset });
+                            }
+                        })}
+                        on_add_stig={Callback::from(move |stig_id: String| {
+                            let (dispatch, set) = (add_dispatch.clone(), add_set.clone());
+                            spawn_local(async move {
+                                let Some(set) = set else { return };
+                                let path = format!("/api/stigs/{}", crate::util::encode_uri_component(&stig_id));
+                                match api_get::<Stig>(&path).await {
+                                    Ok(stig) => dispatch.dispatch(TabsAction::OpenSet { set, stigs: vec![(stig_id, stig)] }),
+                                    Err(e) => console_error(&format!("Failed to load {stig_id}: {e}")),
+                                }
+                            });
+                        })}
+                        on_update_rule={Callback::from(move |(rule_id, update): (String, RuleUpdate)| {
+                            a1.mark(&i1, std::slice::from_ref(&rule_id));
+                            d1.dispatch(TabsAction::UpdateRule { tab_id: i1.clone(), rule_id, update })
+                        })}
                         on_set_asset_info={Callback::from(move |info| d2.dispatch(TabsAction::SetAssetInfo(i2.clone(), info)))}
                         on_set_selected_rule={Callback::from(move |rule_id| d3.dispatch(TabsAction::SetSelectedRule(i3.clone(), rule_id)))}
-                        on_set_all_status={Callback::from(move |status| d4.dispatch(TabsAction::SetAllStatus(i4.clone(), status)))}
-                        on_set_status_for={Callback::from(move |(rule_ids, status)| d5.dispatch(TabsAction::SetStatusFor(i5.clone(), rule_ids, status)))}
+                        on_set_all_status={Callback::from(move |status| {
+                            let all_ids: Vec<String> = all_stig.rules.iter().map(|r| r.id.clone()).collect();
+                            a4.mark(&i4, &all_ids);
+                            d4.dispatch(TabsAction::SetAllStatus(i4.clone(), status))
+                        })}
+                        on_set_status_for={Callback::from(move |(rule_ids, status): (Vec<String>, String)| {
+                            a5.mark(&i5, &rule_ids);
+                            d5.dispatch(TabsAction::SetStatusFor(i5.clone(), rule_ids, status))
+                        })}
                         on_add_files={on_add_files.clone()} />
                 }
             }
@@ -700,6 +866,9 @@ pub fn App() -> Html {
                         if is_admin_user { {nav_btn("Admin", "admin")} }
                     </nav>
                     <div class="ui-topnav-utilities">
+                        if is_library_mode && autosave_enabled {
+                            <NavButton text="My checklists" onclick={{ let m = show_my_checklists.clone(); Callback::from(move |_| m.set(true)) }} />
+                        }
                         if is_library_mode && has_tabs {
                             <NavButton text="Open File" icon_name="upload" onclick={open_file} />
                             if tabs.len() >= 2 {
@@ -754,17 +923,38 @@ pub fn App() -> Html {
                                     };
                                     let close = {
                                         let (closing_tab_id, id) = (closing_tab_id.clone(), tab.id.clone());
+                                        let (autosave, dispatch) = (autosave.clone(), dispatch.clone());
+                                        // Set-backed tabs (or tabs with edits not yet saved) are
+                                        // flushed to the server and closed without the prompt.
+                                        let autosaved = autosave_enabled && tab.catalog_id.is_some() && (tab.set_id.is_some() || autosave.tab_is_dirty(&tab.id));
                                         Callback::from(move |e: MouseEvent| {
                                             e.prevent_default();
                                             e.stop_propagation();
-                                            closing_tab_id.set(Some(id.clone()));
+                                            if !autosaved {
+                                                closing_tab_id.set(Some(id.clone()));
+                                                return;
+                                            }
+                                            let (closing_tab_id, id, autosave, dispatch) =
+                                                (closing_tab_id.clone(), id.clone(), autosave.clone(), dispatch.clone());
+                                            spawn_local(async move {
+                                                match autosave.flush().await {
+                                                    Ok(()) => dispatch.dispatch(TabsAction::Remove(id)),
+                                                    // Could not save: keep the tab and ask.
+                                                    Err(_) => closing_tab_id.set(Some(id)),
+                                                }
+                                            });
                                         })
+                                    };
+                                    let set_name = tab.set_id.as_ref().and_then(|sid| tabs_state.sets.iter().find(|s| &s.id == sid)).map(|s| s.name.clone());
+                                    let label = match &set_name {
+                                        Some(n) => format!("{n} · {}", tab.stig.title),
+                                        None => tab.stig.title.clone(),
                                     };
                                     html! {
                                         <li key={tab.id.clone()} class="ui-sidenav-item">
                                             <a href={format!("#{}", tab.id)} class={classes!("ui-sidenav-link", is_active.then_some("ui-sidenav-active"))}
                                                aria-current={is_active.then_some("page")} onclick={follow}>
-                                                {tab.stig.title.clone()}
+                                                {label}
                                             </a>
                                             <Button variant="icon" icon_name="close" aria_label={format!("Close {}", tab.stig.title)} onclick={close} />
                                         </li>
@@ -782,6 +972,9 @@ pub fn App() -> Html {
                     }
                 }
                 <div class="ui-app-main">
+                    if let Some(n) = &*open_note {
+                        <Alert kind="warning" dismissible=true on_dismiss={{ let note = open_note.clone(); move |_| note.set(None) }}>{n.clone()}</Alert>
+                    }
                     if !online {
                         <Flash kind="warning" header="Offline">
                             {"No network connection. Cached STIGs remain viewable; uploads and saves will resume when the connection returns."}
@@ -805,11 +998,14 @@ pub fn App() -> Html {
                                 {icon("close")}
                             </button>
                         </div>
-                        <div class="ui-split-panel-body">
+                        <div class="ui-split-panel-body" onfocusout={{ let a = autosave.clone(); move |_: FocusEvent| a.flush_soon() }}>
                             <RuleDetail rule={rule.clone()}
                                 on_update_rule={{
-                                    let (dispatch, tab_id, rule_id) = (dispatch.clone(), tab_id.clone(), rule.id.clone());
-                                    Callback::from(move |update| dispatch.dispatch(TabsAction::UpdateRule { tab_id: tab_id.clone(), rule_id: rule_id.clone(), update }))
+                                    let (dispatch, tab_id, rule_id, autosave) = (dispatch.clone(), tab_id.clone(), rule.id.clone(), autosave.clone());
+                                    Callback::from(move |update| {
+                                        autosave.mark(&tab_id, std::slice::from_ref(&rule_id));
+                                        dispatch.dispatch(TabsAction::UpdateRule { tab_id: tab_id.clone(), rule_id: rule_id.clone(), update })
+                                    })
                                 }}
                                 on_close={{
                                     let (dispatch, tab_id) = (dispatch.clone(), tab_id.clone());
@@ -820,6 +1016,41 @@ pub fn App() -> Html {
                 }
             </div>
 
+            if autosave_enabled {
+                <MyChecklists show={*show_my_checklists}
+                    on_close={{ let m = show_my_checklists.clone(); Callback::from(move |_| m.set(false)) }}
+                    on_open={{
+                        let (dispatch, autosave, m, note) = (dispatch.clone(), autosave.clone(), show_my_checklists.clone(), open_note.clone());
+                        let already_open: HashSet<String> = tabs.iter().filter_map(|t| t.set_id.clone()).collect();
+                        let navigate_to = navigate_to.clone();
+                        let show_library = show_library.clone();
+                        Callback::from(move |(set, stigs, unknown): OpenedSet| {
+                            // An open set keeps its own revision: its unsaved edits are saved against it.
+                            if !already_open.contains(&set.id) {
+                                autosave.register_set(&set);
+                            }
+                            note.set((unknown > 0).then(|| format!(
+                                "{unknown} saved rule{} no longer match this STIG version and will not be saved to a system.",
+                                if unknown == 1 { "" } else { "s" }
+                            )));
+                            dispatch.dispatch(TabsAction::OpenSet { set, stigs });
+                            show_library.set(false);
+                            navigate_to.emit("viewer");
+                            m.set(false);
+                        })
+                    }}
+                    on_renamed={{
+                        let dispatch = dispatch.clone();
+                        Callback::from(move |(set_id, name): (String, String)| dispatch.dispatch(TabsAction::SetRenamed { set_id, name }))
+                    }}
+                    on_deleted={{
+                        let (dispatch, autosave) = (dispatch.clone(), autosave.clone());
+                        Callback::from(move |set_id: String| {
+                            autosave.forget_set(&set_id);
+                            dispatch.dispatch(TabsAction::SetDeleted(set_id));
+                        })
+                    }} />
+            }
             <Modal visible={closing_tab_id.is_some()} on_dismiss={dismiss_close.clone()} header="Close checklist"
                 footer={html! {
                     <UiBox float="right">

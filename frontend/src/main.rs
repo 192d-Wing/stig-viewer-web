@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod auth;
+mod autosave;
 mod components;
 mod constants;
 mod data;
