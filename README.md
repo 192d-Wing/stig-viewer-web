@@ -187,20 +187,72 @@ routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),
 
 ### Signing envelope (v2)
 
-`POST /api/sign` returns `{document, signature, keyId, version: 2,
-signatures: [{algorithm, keyId, signature}]}`. The legacy `signature` and
-`keyId` are unchanged and equal `signatures[0]`. `GET /api/signing/pubkey`
-returns `{algorithm, keyId, publicKey, keys: [{algorithm, keyId, publicKey}]}`.
+`POST /api/sign` returns:
 
-Signed bytes: the compact UTF-8 JSON of `document` with fields in this order:
-`version`, `algorithm`, `keyId`, `sha256`, `signedAt`, `signedBy`,
-`signedByName`, and `resource` only when present. To verify, pin the public
-key, take `document` exactly as received (preserve field order, no
-whitespace), and check the Ed25519 signature over those bytes. A verifier
-that rebuilds the document from a fixed field list must now include `keyId`
-and `version`, or verification fails. ML-DSA is not yet supported; unknown
-`algorithm` entries in `signatures` should be skipped. Export bundles do not
-use this envelope.
+```json
+{
+  "document": { "...": "convenience copy, NOT authenticated" },
+  "payload": "<base64url, no padding, of the exact signed bytes>",
+  "signature": "<base64 Ed25519, legacy = signatures[0].signature>",
+  "keyId": "<legacy = signatures[0].keyId>",
+  "version": 2,
+  "signatures": [{ "algorithm": "ed25519", "keyId": "...", "signature": "<base64>" }]
+}
+```
+
+`GET /api/signing/pubkey` returns `{algorithm, keyId, publicKey, keys:
+[{algorithm, keyId, publicKey}]}`; pin the key from it out of band.
+
+**Only `payload` is authenticated.** It is the compact UTF-8 JSON of the
+signing document: `version`, `algorithm`, `keyId`, `signers`
+(`[{algorithm, keyId}]`), `sha256`, `signedAt`, `signedBy`, `signedByName`,
+and `resource` only when present. `algorithm` and `keyId` equal `signers[0]`.
+The top-level `document`, `signature`, `keyId` and `version` are ignored by
+verifiers. Verifiers never rebuild JSON: they decode `payload` and parse those
+same bytes.
+
+Domain separation: the signature input is
+`b"stig-viewer/sign/v2\0" || payload_bytes` (`SIGN_DOMAIN` in
+`backend/src/api/signing.rs`).
+
+Verification steps (implemented by `verify_bundle` in `signing.rs`):
+
+1. Base64url-decode `payload` and parse it as the signing document.
+2. Require the signed `version` to be exactly 2.
+3. Require `signers` to be non-empty and free of duplicates, with
+   `signers[0]` equal to the signed `algorithm`/`keyId`.
+4. If any signer uses an algorithm you do not support, reject (never skip).
+5. Require the envelope's `signatures[]` to match `signers` one to one (same
+   algorithm and keyId; no extras, none missing).
+6. Require every signer's `keyId` to be the fingerprint of the key you pinned
+   (first 8 bytes of SHA-256 of the raw public key, hex).
+7. Verify every signature over `SIGN_DOMAIN || payload`.
+8. If you hold the artifact, require its SHA-256 to equal `sha256`.
+
+v1 is detected by the absence of `version` (and of `payload`); v1 verifiers,
+which checked a signature over a rebuilt document, break against v2 and must
+be updated. ML-DSA is not supported yet. Adding it means a new entry in both
+`signers` (inside the signed bytes) and `signatures`, and every signer must
+verify, so stripping a post-quantum signature is detected. Export bundles do
+not use this envelope.
+
+Worked example (Python, `cryptography` package):
+
+```python
+import base64, json
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+b = json.load(open("bundle.json"))
+payload = base64.urlsafe_b64decode(b["payload"] + "=" * (-len(b["payload"]) % 4))
+doc = json.loads(payload)
+assert doc["version"] == 2
+assert [(s["algorithm"], s["keyId"]) for s in doc["signers"]] == \
+       [(s["algorithm"], s["keyId"]) for s in b["signatures"]] == [("ed25519", PINNED_KEY_ID)]
+pub = Ed25519PublicKey.from_public_bytes(PINNED_PUBLIC_KEY_BYTES)
+pub.verify(base64.b64decode(b["signatures"][0]["signature"]),
+           b"stig-viewer/sign/v2\0" + payload)   # raises on failure
+assert doc["sha256"] == sha256_of_artifact_hex
+```
 
 ### Database
 

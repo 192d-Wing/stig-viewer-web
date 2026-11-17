@@ -20,7 +20,10 @@
 //! log aggregator you use for forensic review.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -80,6 +83,10 @@ fn compute_key_id(vk: &VerifyingKey) -> String {
 const ALGORITHM: &str = "ed25519";
 /// Envelope / document format version.
 pub const ENVELOPE_VERSION: u32 = 2;
+/// Domain-separation prefix. The Ed25519 signature input is
+/// `SIGN_DOMAIN || payload_bytes`, so a signature made here can never be
+/// replayed as a signature over some other protocol's message.
+pub const SIGN_DOMAIN: &[u8] = b"stig-viewer/sign/v2\0";
 
 // ── GET /api/signing/pubkey ─────────────────────────────────────────────────
 
@@ -143,23 +150,31 @@ pub struct SignRequest {
     pub resource: Option<String>,
 }
 
-/// Signing document. Serde preserves struct field order on serialisation,
-/// so two servers running the same code produce byte-identical JSON for
-/// the same inputs.
+/// One entry of the signed signer list.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SignerId {
+    pub algorithm: String,
+    pub key_id: String,
+}
+
+/// Signing document. Serde preserves struct field order on serialisation.
 ///
-/// Signed bytes: `serde_json::to_vec(&document)`, i.e. compact JSON (no
-/// whitespace), fields in declaration order (`version`, `algorithm`,
-/// `keyId`, `sha256`, `signedAt`, `signedBy`, `signedByName`, then
-/// `resource` only when present), UTF-8. Verifiers should verify against
-/// the document exactly as received (preserving field order), not rebuild
-/// it from a fixed field list; if they must rebuild, `version` and `keyId`
-/// are part of the document since envelope v2.
+/// The signed bytes (the envelope's `payload`) are `serde_json::to_vec` of
+/// this struct: compact JSON, fields in declaration order (`version`,
+/// `algorithm`, `keyId`, `signers`, `sha256`, `signedAt`, `signedBy`,
+/// `signedByName`, then `resource` only when present), UTF-8. Verifiers never
+/// rebuild these bytes: they decode `payload`, verify, then parse it.
+///
+/// `algorithm` and `keyId` are kept for compatibility and equal `signers[0]`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SigningDocument {
     pub version: u32,
     pub algorithm: &'static str,
     pub key_id: String,
+    /// Every signer that must have signed these bytes.
+    pub signers: Vec<SignerId>,
     pub sha256: String,
     pub signed_at: String,
     pub signed_by: String,
@@ -171,7 +186,12 @@ pub struct SigningDocument {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedBundle {
+    /// Convenience copy of the signed document. NOT authenticated: only
+    /// `payload` is. Verifiers must read fields from the verified payload.
     pub document: SigningDocument,
+    /// base64url (no padding) of the exact bytes that were signed
+    /// (before the domain prefix).
+    pub payload: String,
     /// Base64-standard encoded 64-byte Ed25519 signature.
     /// Legacy field; equals `signatures[0].signature`.
     pub signature: String,
@@ -179,7 +199,7 @@ pub struct SignedBundle {
     pub key_id: String,
     /// Envelope version (2).
     pub version: u32,
-    /// Algorithm-tagged signatures over the same document bytes.
+    /// Algorithm-tagged signatures over `SIGN_DOMAIN || payload`.
     pub signatures: Vec<BundleSignature>,
 }
 
@@ -196,14 +216,22 @@ fn document_bytes(document: &SigningDocument) -> Result<Vec<u8>, serde_json::Err
     serde_json::to_vec(document)
 }
 
+fn signing_input(payload: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + payload.len());
+    input.extend_from_slice(SIGN_DOMAIN);
+    input.extend_from_slice(payload);
+    input
+}
+
 fn build_bundle(
     sk: &SigningState,
     document: SigningDocument,
 ) -> Result<SignedBundle, serde_json::Error> {
-    let doc_bytes = document_bytes(&document)?;
-    let signature = BASE64.encode(sk.signing_key.sign(&doc_bytes).to_bytes());
+    let payload = document_bytes(&document)?;
+    let signature = BASE64.encode(sk.signing_key.sign(&signing_input(&payload)).to_bytes());
     Ok(SignedBundle {
         document,
+        payload: URL_SAFE_NO_PAD.encode(&payload),
         signature: signature.clone(),
         key_id: sk.key_id.clone(),
         version: ENVELOPE_VERSION,
@@ -215,20 +243,167 @@ fn build_bundle(
     })
 }
 
+// ── Reference verifier ──────────────────────────────────────────────────────
+
+/// Fields of the signed document, parsed from the verified payload.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+pub struct VerifiedDocument {
+    pub version: Option<u32>,
+    pub algorithm: String,
+    pub key_id: String,
+    pub signers: Vec<SignerId>,
+    pub sha256: String,
+    pub signed_at: String,
+    pub signed_by: String,
+    pub signed_by_name: String,
+    #[serde(default)]
+    pub resource: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+pub enum VerifyError {
+    /// Envelope is not JSON of the expected shape, or has no `payload`/`signatures` (e.g. v1).
+    MalformedEnvelope,
+    BadPayloadEncoding,
+    /// Payload is not a signing document.
+    MalformedDocument,
+    /// Signed document has no `version`, or it is not 2 (v1 documents).
+    UnsupportedVersion,
+    /// A signer uses an algorithm this verifier cannot check.
+    UnsupportedAlgorithm(String),
+    /// `signers` is empty or contains duplicates, or `algorithm`/`keyId` disagree with `signers[0]`.
+    BadSignerSet,
+    /// A signer has no matching entry in `signatures`.
+    MissingSignature,
+    /// `signatures` has an entry that is not in the signed `signers`, or a duplicate.
+    UnexpectedSignature,
+    BadSignatureEncoding,
+    SignatureInvalid,
+    /// A signer's keyId is not the pinned key's fingerprint.
+    KeyIdMismatch,
+    ArtifactHashMismatch,
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bundle verification failed: {self:?}")
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+#[derive(Deserialize)]
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+struct EnvelopeIn {
+    payload: String,
+    signatures: Vec<SignatureIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+struct SignatureIn {
+    algorithm: String,
+    key_id: String,
+    signature: String,
+}
+
+/// Reference verifier for the v2 envelope. Only `payload` and `signatures`
+/// are read from the envelope; `document`, `signature`, `keyId` and `version`
+/// at the top level are unauthenticated and ignored.
+///
+/// Steps: decode `payload`; parse it; require signed `version == 2`; require a
+/// non-empty duplicate-free `signers` list whose first entry equals the signed
+/// `algorithm`/`keyId`; reject any unsupported signer algorithm; require the
+/// `signatures` set to equal the `signers` set; require every signer's keyId
+/// to be the pinned key's fingerprint; verify every signature over
+/// `SIGN_DOMAIN || payload`; and, if given, require `sha256` to equal the hash
+/// of the artifact.
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+pub fn verify_bundle(
+    bundle_json: &[u8],
+    pinned: &VerifyingKey,
+    artifact_sha256: Option<&str>,
+) -> Result<VerifiedDocument, VerifyError> {
+    let env: EnvelopeIn =
+        serde_json::from_slice(bundle_json).map_err(|_| VerifyError::MalformedEnvelope)?;
+    let payload = URL_SAFE_NO_PAD
+        .decode(env.payload.as_bytes())
+        .map_err(|_| VerifyError::BadPayloadEncoding)?;
+    let doc: VerifiedDocument =
+        serde_json::from_slice(&payload).map_err(|_| VerifyError::MalformedDocument)?;
+
+    if doc.version != Some(ENVELOPE_VERSION) {
+        return Err(VerifyError::UnsupportedVersion);
+    }
+    let first = doc.signers.first().ok_or(VerifyError::BadSignerSet)?;
+    if first.algorithm != doc.algorithm || first.key_id != doc.key_id {
+        return Err(VerifyError::BadSignerSet);
+    }
+    for (i, s) in doc.signers.iter().enumerate() {
+        if s.algorithm != ALGORITHM {
+            return Err(VerifyError::UnsupportedAlgorithm(s.algorithm.clone()));
+        }
+        if doc.signers[..i].contains(s) {
+            return Err(VerifyError::BadSignerSet);
+        }
+    }
+    let pinned_id = compute_key_id(pinned);
+    if doc.signers.iter().any(|s| s.key_id != pinned_id) {
+        return Err(VerifyError::KeyIdMismatch);
+    }
+
+    for (i, sig) in env.signatures.iter().enumerate() {
+        let known = doc
+            .signers
+            .iter()
+            .any(|s| s.algorithm == sig.algorithm && s.key_id == sig.key_id);
+        let duplicate = env.signatures[..i]
+            .iter()
+            .any(|o| o.algorithm == sig.algorithm && o.key_id == sig.key_id);
+        if !known || duplicate {
+            return Err(VerifyError::UnexpectedSignature);
+        }
+    }
+    let input = signing_input(&payload);
+    for signer in &doc.signers {
+        let sig = env
+            .signatures
+            .iter()
+            .find(|s| s.algorithm == signer.algorithm && s.key_id == signer.key_id)
+            .ok_or(VerifyError::MissingSignature)?;
+        let raw = BASE64
+            .decode(sig.signature.as_bytes())
+            .map_err(|_| VerifyError::BadSignatureEncoding)?;
+        let parsed = ed25519_dalek::Signature::from_slice(&raw)
+            .map_err(|_| VerifyError::BadSignatureEncoding)?;
+        pinned
+            .verify_strict(&input, &parsed)
+            .map_err(|_| VerifyError::SignatureInvalid)?;
+    }
+
+    if let Some(expected) = artifact_sha256 {
+        if !expected.eq_ignore_ascii_case(&doc.sha256) {
+            return Err(VerifyError::ArtifactHashMismatch);
+        }
+    }
+    Ok(doc)
+}
+
 /// Cap signed payloads at 100 MiB. Larger inputs should be hashed
 /// client-side; the server only cares about the sha in the document.
 const MAX_SIGN_BYTES: usize = 100 * 1024 * 1024;
 
-pub async fn sign_handler(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthUser>,
-    Json(body): Json<SignRequest>,
-) -> Result<Json<SignedBundle>, (StatusCode, String)> {
-    let sk = state.signing.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "signing is not configured".into(),
-    ))?;
-
+/// Validates the request and builds the signed bundle. Returns the bundle and
+/// the content length.
+fn sign_request(
+    sk: &SigningState,
+    user: &AuthUser,
+    body: &SignRequest,
+) -> Result<(SignedBundle, usize), (StatusCode, String)> {
     let content = BASE64.decode(body.content.trim()).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -250,6 +425,10 @@ pub async fn sign_handler(
         version: ENVELOPE_VERSION,
         algorithm: ALGORITHM,
         key_id: sk.key_id.clone(),
+        signers: vec![SignerId {
+            algorithm: ALGORITHM.into(),
+            key_id: sk.key_id.clone(),
+        }],
         sha256: hex::encode(sha),
         signed_at: chrono::Utc::now().to_rfc3339(),
         signed_by: user.id.clone(),
@@ -264,12 +443,34 @@ pub async fn sign_handler(
             "signing failed".to_string(),
         )
     })?;
+    Ok((bundle, content.len()))
+}
 
+pub async fn sign_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(body): Json<SignRequest>,
+) -> Result<Json<SignedBundle>, (StatusCode, String)> {
+    let sk = state.signing.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "signing is not configured".into(),
+    ))?;
+
+    let (bundle, bytes) = sign_request(sk, &user, &body)?;
+
+    let algorithms = bundle
+        .signatures
+        .iter()
+        .map(|s| s.algorithm)
+        .collect::<Vec<_>>()
+        .join(",");
     tracing::info!(
         user = %user.id,
         sha256 = %bundle.document.sha256,
         key_id = %sk.key_id,
-        bytes = content.len(),
+        version = bundle.version,
+        algorithms = %algorithms,
+        bytes,
         resource = %bundle.document.resource.as_deref().unwrap_or(""),
         "signing.sign"
     );
@@ -282,9 +483,10 @@ pub async fn sign_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::Verifier;
+    use serde_json::{json, Value};
 
-    const TEST_SEED_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SEED_HEX: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn test_state() -> SigningState {
         let bytes = hex::decode(TEST_SEED_HEX).unwrap();
@@ -298,11 +500,19 @@ mod tests {
         }
     }
 
+    fn other_key() -> VerifyingKey {
+        Ed25519SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    }
+
     fn sample_doc(st: &SigningState, sha256: String) -> SigningDocument {
         SigningDocument {
             version: ENVELOPE_VERSION,
             algorithm: ALGORITHM,
             key_id: st.key_id.clone(),
+            signers: vec![SignerId {
+                algorithm: ALGORITHM.into(),
+                key_id: st.key_id.clone(),
+            }],
             sha256,
             signed_at: "2026-01-01T00:00:00Z".into(),
             signed_by: "u1".into(),
@@ -315,6 +525,39 @@ mod tests {
         build_bundle(st, sample_doc(st, "ab".repeat(32))).unwrap()
     }
 
+    fn wire(st: &SigningState) -> Value {
+        serde_json::to_value(sample_bundle(st)).unwrap()
+    }
+
+    fn verify(
+        v: &Value,
+        st: &SigningState,
+        hash: Option<&str>,
+    ) -> Result<VerifiedDocument, VerifyError> {
+        verify_bundle(
+            &serde_json::to_vec(v).unwrap(),
+            &st.signing_key.verifying_key(),
+            hash,
+        )
+    }
+
+    /// Re-signs an arbitrary payload value with the test key, returning a wire envelope.
+    fn resign(st: &SigningState, payload: &Value) -> Value {
+        let bytes = serde_json::to_vec(payload).unwrap();
+        let sig = BASE64.encode(st.signing_key.sign(&signing_input(&bytes)).to_bytes());
+        json!({
+            "payload": URL_SAFE_NO_PAD.encode(&bytes),
+            "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": sig}]
+        })
+    }
+
+    fn payload_value(v: &Value) -> Value {
+        let b = URL_SAFE_NO_PAD
+            .decode(v["payload"].as_str().unwrap())
+            .unwrap();
+        serde_json::from_slice(&b).unwrap()
+    }
+
     #[test]
     fn legacy_fields_equal_first_signature() {
         let b = sample_bundle(&test_state());
@@ -323,68 +566,194 @@ mod tests {
         assert_eq!(b.signature, b.signatures[0].signature);
         assert_eq!(b.key_id, b.signatures[0].key_id);
         assert_eq!(b.signatures[0].algorithm, "ed25519");
+        assert_eq!(b.document.signers[0].key_id, b.document.key_id);
     }
 
     #[test]
-    fn existing_signature_round_trips_from_json() {
-        let st = test_state();
-        let wire = serde_json::to_string(&sample_bundle(&st)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
-        let sig_b = BASE64.decode(v["signature"].as_str().unwrap()).unwrap();
-        let sig = ed25519_dalek::Signature::from_slice(&sig_b).unwrap();
-        // Verifier takes the document bytes exactly as received on the wire.
-        let start = wire.find(r#"{"document":"#).unwrap() + r#"{"document":"#.len();
-        let end = wire.find(r#","signature":"#).unwrap();
-        let doc_bytes = &wire.as_bytes()[start..end];
-        st.signing_key
-            .verifying_key()
-            .verify(doc_bytes, &sig)
-            .expect("must verify");
-    }
-
-    #[test]
-    fn tampering_key_id_or_version_breaks_verification() {
+    fn payload_is_exactly_the_signed_document_bytes() {
         let st = test_state();
         let b = sample_bundle(&st);
-        let sig =
-            ed25519_dalek::Signature::from_slice(&BASE64.decode(&b.signature).unwrap()).unwrap();
-        let vk = st.signing_key.verifying_key();
-        assert!(serde_json::to_string(&b.document)
+        let bytes = URL_SAFE_NO_PAD.decode(&b.payload).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&b.document).unwrap());
+        assert!(!b.payload.contains('=') && !b.payload.contains('+') && !b.payload.contains('/'));
+        assert!(bytes.starts_with(br#"{"version":2,"algorithm":"ed25519","keyId":""#));
+    }
+
+    #[test]
+    fn happy_path_verifies_via_payload() {
+        let st = test_state();
+        let doc = verify(&wire(&st), &st, Some(&"AB".repeat(32))).unwrap();
+        assert_eq!(doc.version, Some(2));
+        assert_eq!(doc.sha256, "ab".repeat(32));
+        assert_eq!(doc.signed_by, "u1");
+        assert_eq!(doc.resource.as_deref(), Some("windows-11"));
+        assert!(verify(&wire(&st), &st, None).is_ok());
+    }
+
+    #[test]
+    fn tampered_payload_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        let mut b = URL_SAFE_NO_PAD
+            .decode(v["payload"].as_str().unwrap())
+            .unwrap();
+        let n = b.len() - 3;
+        b[n] ^= 1;
+        v["payload"] = URL_SAFE_NO_PAD.encode(&b).into();
+        assert!(verify(&v, &st, None).is_err());
+        v["payload"] = "!!!not base64".into();
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadPayloadEncoding));
+    }
+
+    #[test]
+    fn unsigned_envelope_document_and_legacy_fields_are_ignored() {
+        let st = test_state();
+        let mut v = wire(&st);
+        v["document"]["sha256"] = "00".repeat(32).into();
+        v["document"]["signedBy"] = "attacker".into();
+        v["signature"] = "garbage".into();
+        v["keyId"] = "ffffffffffffffff".into();
+        v["version"] = 1.into();
+        let doc = verify(&v, &st, None).unwrap();
+        assert_eq!(doc.sha256, "ab".repeat(32));
+        assert_eq!(doc.signed_by, "u1");
+    }
+
+    #[test]
+    fn stripped_signature_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        v["signatures"] = json!([]);
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::MissingSignature));
+    }
+
+    #[test]
+    fn extra_unsigned_signature_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        let first = v["signatures"][0].clone();
+        v["signatures"].as_array_mut().unwrap().push(json!({
+            "algorithm": "ml-dsa-65", "keyId": st.key_id, "signature": first["signature"]
+        }));
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::UnexpectedSignature));
+        let mut v = wire(&st);
+        v["signatures"].as_array_mut().unwrap().push(first);
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::UnexpectedSignature));
+    }
+
+    #[test]
+    fn unknown_algorithm_in_signers_rejected_not_skipped() {
+        let st = test_state();
+        let mut p = payload_value(&wire(&st));
+        p["signers"]
+            .as_array_mut()
             .unwrap()
-            .contains(&format!("\"keyId\":\"{}\"", st.key_id)));
-        let mut d = sample_doc(&st, "ab".repeat(32));
-        d.key_id = "0000000000000000".into();
-        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_err());
-        let mut d = sample_doc(&st, "ab".repeat(32));
-        d.version = 1;
-        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_err());
-        // Untampered still verifies.
-        let d = sample_doc(&st, "ab".repeat(32));
-        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_ok());
+            .push(json!({"algorithm": "ml-dsa-65", "keyId": "0011223344556677"}));
+        let mut v = resign(&st, &p);
+        assert_eq!(
+            verify(&v, &st, None),
+            Err(VerifyError::UnsupportedAlgorithm("ml-dsa-65".into()))
+        );
+        v["signatures"].as_array_mut().unwrap().push(json!({
+            "algorithm": "ml-dsa-65", "keyId": "0011223344556677", "signature": "AAAA"
+        }));
+        assert!(matches!(
+            verify(&v, &st, None),
+            Err(VerifyError::UnsupportedAlgorithm(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_pinned_key_rejected() {
+        let st = test_state();
+        let r = verify_bundle(&serde_json::to_vec(&wire(&st)).unwrap(), &other_key(), None);
+        assert_eq!(r, Err(VerifyError::KeyIdMismatch));
+    }
+
+    #[test]
+    fn wrong_artifact_hash_rejected() {
+        let st = test_state();
+        let r = verify(&wire(&st), &st, Some(&"cd".repeat(32)));
+        assert_eq!(r, Err(VerifyError::ArtifactHashMismatch));
+    }
+
+    #[test]
+    fn missing_version_v1_rejected() {
+        let st = test_state();
+        // v1 envelope: no payload at all.
+        let v1 =
+            json!({"document": {"algorithm": "ed25519"}, "signature": "x", "keyId": st.key_id});
+        assert_eq!(verify(&v1, &st, None), Err(VerifyError::MalformedEnvelope));
+        // Signed payload without `version`.
+        let mut p = payload_value(&wire(&st));
+        p.as_object_mut().unwrap().remove("version");
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::UnsupportedVersion)
+        );
+        p["version"] = 1.into();
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn signature_without_domain_prefix_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        let bytes = URL_SAFE_NO_PAD
+            .decode(v["payload"].as_str().unwrap())
+            .unwrap();
+        let bare = BASE64.encode(st.signing_key.sign(&bytes).to_bytes());
+        v["signatures"][0]["signature"] = bare.into();
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::SignatureInvalid));
+    }
+
+    #[test]
+    fn signer_list_must_match_signed_algorithm_and_key_id() {
+        let st = test_state();
+        let mut p = payload_value(&wire(&st));
+        p["signers"][0]["keyId"] = "0000000000000000".into();
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::BadSignerSet)
+        );
+        p["signers"] = json!([]);
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::BadSignerSet)
+        );
     }
 
     #[test]
     fn envelope_json_shape_snapshot() {
         let st = test_state();
-        let mut v = serde_json::to_value(sample_bundle(&st)).unwrap();
+        let mut v = wire(&st);
         let sig = v["signature"].as_str().unwrap().to_string();
         assert_eq!(v["signatures"][0]["signature"], sig.as_str());
+        let payload = v["payload"].as_str().unwrap().to_string();
         v["signature"] = "SIG".into();
         v["signatures"][0]["signature"] = "SIG".into();
-        let expected = serde_json::json!({
+        v["payload"] = "PAYLOAD".into();
+        let signer = json!({"algorithm": "ed25519", "keyId": st.key_id});
+        let expected = json!({
             "document": {
                 "version": 2, "algorithm": "ed25519", "keyId": st.key_id,
+                "signers": [signer],
                 "sha256": "ab".repeat(32), "signedAt": "2026-01-01T00:00:00Z",
                 "signedBy": "u1", "signedByName": "User One", "resource": "windows-11"
             },
+            "payload": "PAYLOAD",
             "signature": "SIG", "keyId": st.key_id, "version": 2,
             "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": "SIG"}]
         });
         assert_eq!(v, expected);
-        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys.len(), 5);
-        let doc = serde_json::to_string(&sample_bundle(&st).document).unwrap();
-        assert!(doc.starts_with(r#"{"version":2,"algorithm":"ed25519","keyId":""#));
+        assert_eq!(v.as_object().unwrap().len(), 6);
+        assert_eq!(
+            payload_value(&json!({"payload": payload}))["signers"][0],
+            signer
+        );
     }
 
     #[test]
@@ -394,11 +763,63 @@ mod tests {
         let pk = BASE64.encode(st.signing_key.verifying_key().as_bytes());
         assert_eq!(
             v,
-            serde_json::json!({
+            json!({
                 "algorithm": "ed25519", "keyId": st.key_id, "publicKey": pk,
                 "keys": [{"algorithm": "ed25519", "keyId": st.key_id, "publicKey": pk}]
             })
         );
+    }
+
+    fn user() -> AuthUser {
+        AuthUser {
+            id: "u1".into(),
+            display_name: "User One".into(),
+            email: "u1@example.test".into(),
+            role: "user".into(),
+        }
+    }
+
+    fn request(content: &str, resource: Option<&str>) -> SignRequest {
+        SignRequest {
+            content: content.into(),
+            resource: resource.map(String::from),
+        }
+    }
+
+    #[test]
+    fn resource_none_is_absent_and_empty_becomes_none() {
+        let st = test_state();
+        let content = BASE64.encode(b"hello");
+        for res in [None, Some("")] {
+            let (b, n) = sign_request(&st, &user(), &request(&content, res)).unwrap();
+            assert_eq!(n, 5);
+            assert!(b.document.resource.is_none());
+            let bytes = URL_SAFE_NO_PAD.decode(&b.payload).unwrap();
+            assert!(!String::from_utf8(bytes).unwrap().contains("resource"));
+        }
+        let (b, _) = sign_request(&st, &user(), &request(&content, Some("r1"))).unwrap();
+        assert_eq!(b.document.resource.as_deref(), Some("r1"));
+        let wire = serde_json::to_vec(&b).unwrap();
+        let doc = verify_bundle(
+            &wire,
+            &st.signing_key.verifying_key(),
+            Some(&hex::encode(Sha256::digest(b"hello"))),
+        )
+        .unwrap();
+        assert_eq!(doc.signed_by, "u1");
+    }
+
+    #[test]
+    fn sign_request_rejects_bad_input() {
+        let st = test_state();
+        let bad = sign_request(&st, &user(), &request("***", None))
+            .err()
+            .unwrap();
+        assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+        let empty = sign_request(&st, &user(), &request("", None))
+            .err()
+            .unwrap();
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -412,9 +833,7 @@ mod tests {
         let err = SigningState::from_hex(Some("deadbeef")).unwrap_err();
         assert!(err.to_string().contains("32 bytes"));
         assert!(SigningState::from_hex(Some("zz")).is_err());
-        assert!(SigningState::from_hex(Some(&"ab".repeat(32)))
-            .unwrap()
-            .is_some());
+        assert!(SigningState::from_hex(Some(&"ab".repeat(32))).unwrap().is_some());
     }
 
     #[test]
@@ -424,25 +843,5 @@ mod tests {
         assert_eq!(a.key_id, b.key_id);
         // 8 bytes → 16 hex chars.
         assert_eq!(a.key_id.len(), 16);
-    }
-
-    #[test]
-    fn sign_and_verify_round_trip() {
-        let st = test_state();
-        let content = b"<CHECKLIST>pretend this is a .ckl</CHECKLIST>";
-
-        let sha = Sha256::digest(content);
-        let document = sample_doc(&st, hex::encode(sha));
-        let doc_bytes = serde_json::to_vec(&document).unwrap();
-        let signature = st.signing_key.sign(&doc_bytes);
-
-        // Verifying against the matching verifying key succeeds.
-        let vk = st.signing_key.verifying_key();
-        vk.verify(&doc_bytes, &signature).expect("must verify");
-
-        // Flipping a single bit of the document breaks the signature.
-        let mut tampered = doc_bytes.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(vk.verify(&tampered, &signature).is_err());
     }
 }
