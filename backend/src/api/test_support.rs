@@ -381,6 +381,7 @@ pub async fn bump_stig_handler(
     .await;
 
     match result {
+        Ok(r) if r.rows_affected() == 0 => StatusCode::NOT_FOUND,
         Ok(_) => StatusCode::NO_CONTENT,
         Err(e) => {
             tracing::error!("Test bump-stig failed: {e:#}");

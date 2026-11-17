@@ -165,6 +165,21 @@ created under the old `DATA_DIR` (inside the checkout, `backend/data`) are not
 migrated to the new volume; recreate them. `task data:restore` is gone
 because nothing rewrites the tracked files any more.
 
+`STIG_SEED_DIR` is dev-only: the backend refuses to start if it is set while
+`STIG_ENV=production`.
+
+Renamed sync ids. The DISA sync manifest now uses the ids library import
+derives: `windows-11` is `ms-windows-11`, `windows-server-2019` and
+`windows-server-2022` are `ms-windows-server-2019` / `-2022`, `ubuntu-2004` is
+`can-ubuntu-20-04-lts`, `ubuntu-2204` is `can-ubuntu-22-04-lts`,
+`chrome-windows` is `google-chrome`, `firefox` is `moz-firefox`,
+`active-directory` is `active-directory-domain` and `dns` is `bind-9-x`;
+`cisco-ios-xe` was dropped (no current download). Nothing is migrated.
+Checklists on an old id keep working against the old STIG file but are no
+longer refreshed by sync, and the backend logs a warning at start naming such
+ids. To move one forward, re-apply the STIG under the new id (or delete the
+old catalog entry once its checklists are gone).
+
 Catalog uploads (`POST /api/upload`, `POST /api/upload/library`) require a
 signed-in user with the `admin` role and accept bodies up to 500 MB. Other
 routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),

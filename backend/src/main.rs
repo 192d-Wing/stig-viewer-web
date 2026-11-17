@@ -240,6 +240,10 @@ async fn main() -> Result<()> {
     }
 
     let config = Arc::new(Config::from_env()?);
+    config::validate_seed_dir(
+        std::env::var("STIG_ENV").ok().as_deref(),
+        config.seed_dir.as_deref(),
+    )?;
     let sources = Arc::new(load_sources()?);
 
     info!(
@@ -257,6 +261,7 @@ async fn main() -> Result<()> {
     if let Some(seed_dir) = &config.seed_dir {
         seed::seed(seed_dir, &config.data_dir.join("stigs"), &pool, &sources).await;
     }
+    seed::warn_orphaned_ids(&pool, &sources, config.seed_dir.as_deref()).await;
 
     // ── Signing (optional) ──────────────────────────────────────────────────
     let signing = api::signing::SigningState::from_env()?;

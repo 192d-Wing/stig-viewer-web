@@ -55,17 +55,9 @@ fn is_stale_status(status: u16) -> bool {
     matches!(status, 404 | 410)
 }
 
-/// Write `bytes` to `path` unless the file already holds exactly them.
-/// Returns whether the file was written.
-async fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
-    match tokio::fs::read(path).await {
-        Ok(existing) if existing == bytes => return Ok(false),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    tokio::fs::write(path, bytes).await?;
-    Ok(true)
+/// True when the file on disk already holds exactly the new bytes.
+fn is_unchanged(existing: Option<&[u8]>, new: &[u8]) -> bool {
+    existing == Some(new)
 }
 
 /// Download, parse, and index one STIG from DISA.
@@ -115,17 +107,15 @@ async fn sync_one(
 
     // 4a. Identical bytes: nothing to write and nothing to archive. (The
     //     catalog row is still upserted below so a reset database re-indexes.)
-    let unchanged = matches!(
-        tokio::fs::read(&json_path).await,
-        Ok(existing) if existing == json_str.as_bytes()
-    );
+    let existing = tokio::fs::read(&json_path).await.ok();
+    let unchanged = is_unchanged(existing.as_deref(), json_str.as_bytes());
 
     // 4b. If a previous JSON already exists for this STIG, archive it
     //     under stigs/archive/ keyed by the OLD version + release so the
     //     diff endpoint can compare current vs prior. We look up the
     //     pre-sync catalog row to capture the about-to-be-replaced
     //     metadata.
-    if !unchanged && tokio::fs::try_exists(&json_path).await.unwrap_or(false) {
+    if !unchanged && existing.is_some() {
         if let Err(e) =
             archive_previous_catalog(pool, data_dir, &source.id, &json_path).await
         {
@@ -136,10 +126,11 @@ async fn sync_one(
         }
     }
 
-    if write_if_changed(&json_path, json_str.as_bytes()).await? {
-        info!("Wrote '{}'", json_path.display());
-    } else {
+    if unchanged {
         info!("'{}' unchanged; not rewritten", source.id);
+    } else {
+        tokio::fs::write(&json_path, json_str.as_bytes()).await?;
+        info!("Wrote '{}'", json_path.display());
     }
 
     // 5. Upsert catalog row in Postgres
@@ -353,19 +344,12 @@ mod id_tests {
         assert_eq!(s.describe(), "synced 5, 2 stale URL(s), 1 error(s)");
     }
 
-    #[tokio::test]
-    async fn write_if_changed_skips_identical_bytes() {
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("x.json");
-        assert!(write_if_changed(&p, b"one").await.unwrap(), "new file is written");
-        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        assert!(!write_if_changed(&p, b"one").await.unwrap(), "same bytes skipped");
-        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
-        assert!(write_if_changed(&p, b"two").await.unwrap(), "changed bytes written");
-        assert_eq!(std::fs::read(&p).unwrap(), b"two");
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn unchanged_only_when_bytes_equal() {
+        assert!(is_unchanged(Some(b"one"), b"one"));
+        assert!(!is_unchanged(Some(b"one"), b"two"));
+        assert!(!is_unchanged(None, b"one"), "a missing file is a change");
+        assert!(!is_unchanged(None, b""));
     }
 
     #[test]

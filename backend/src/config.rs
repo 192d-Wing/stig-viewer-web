@@ -57,10 +57,7 @@ impl Config {
             sync_on_start: parse_flag_default_true(
                 std::env::var("STIG_SYNC_ON_START").ok().as_deref(),
             ),
-            seed_dir: std::env::var("STIG_SEED_DIR")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .map(PathBuf::from),
+            seed_dir: parse_seed_dir(std::env::var("STIG_SEED_DIR").ok().as_deref()),
         })
     }
 }
@@ -82,6 +79,23 @@ pub fn parse_flag_default_true(raw: Option<&str>) -> bool {
         raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("false") | Some("0")
     )
+}
+
+/// `STIG_SEED_DIR` value: unset, empty or whitespace-only means no seeding.
+pub fn parse_seed_dir(raw: Option<&str>) -> Option<PathBuf> {
+    raw.filter(|v| !v.trim().is_empty()).map(PathBuf::from)
+}
+
+/// Startup guard: `STIG_SEED_DIR` is a dev-only convenience, so a production
+/// deployment that sets it refuses to start (like [`TestHooks::validate`]).
+pub fn validate_seed_dir(stig_env: Option<&str>, seed_dir: Option<&std::path::Path>) -> Result<()> {
+    if is_production(stig_env) && seed_dir.is_some() {
+        anyhow::bail!(
+            "refusing to start: STIG_SEED_DIR must not be set when STIG_ENV=production \
+             (it is a dev-only seeding hook)"
+        );
+    }
+    Ok(())
 }
 
 /// True when `STIG_ENV` names production (trimmed, case-insensitive).
@@ -177,6 +191,23 @@ mod tests {
         }
         // The e2e suite reads these two from the seed.
         assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    #[test]
+    fn seed_dir_empty_or_blank_is_none() {
+        assert_eq!(parse_seed_dir(None), None);
+        assert_eq!(parse_seed_dir(Some("")), None);
+        assert_eq!(parse_seed_dir(Some("  \t")), None);
+        assert_eq!(parse_seed_dir(Some("/app/data")), Some(PathBuf::from("/app/data")));
+    }
+
+    #[test]
+    fn production_refuses_seed_dir() {
+        let dir = std::path::Path::new("/seed");
+        assert!(validate_seed_dir(Some(" Production "), Some(dir)).is_err());
+        assert!(validate_seed_dir(Some("production"), None).is_ok());
+        assert!(validate_seed_dir(Some("development"), Some(dir)).is_ok());
+        assert!(validate_seed_dir(None, Some(dir)).is_ok());
     }
 
     #[test]
