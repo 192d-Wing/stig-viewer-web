@@ -46,7 +46,7 @@ struct TabsState {
 
 enum TabsAction {
     /// Add tabs and focus the first new one.
-    Add(Vec<Stig>),
+    Add(Vec<(Option<String>, Stig)>),
     /// Close a tab and move focus to the nearest remaining tab.
     Remove(String),
     SetActive(String),
@@ -54,6 +54,8 @@ enum TabsAction {
     SetAssetInfo(String, AssetInfo),
     SetSelectedRule(String, Option<String>),
     SetAllStatus(String, String),
+    /// (tab id, rule ids, status)
+    SetStatusFor(String, Vec<String>, String),
     SetDiffPair(Option<DiffPair>),
 }
 
@@ -72,7 +74,8 @@ impl Reducible for TabsState {
             TabsAction::Add(stigs) => {
                 let new_tabs: Vec<StigTab> = stigs
                     .into_iter()
-                    .map(|stig| StigTab {
+                    .map(|(catalog_id, stig)| StigTab {
+                        catalog_id,
                         id: generate_tab_id(),
                         stig: Rc::new(stig),
                         asset_info: AssetInfo::default(),
@@ -125,6 +128,11 @@ impl Reducible for TabsState {
                     }
                 }
             }
+            TabsAction::SetStatusFor(tab_id, rule_ids, status) => {
+                if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    Rc::make_mut(&mut t.stig).set_status_for(&rule_ids, &status);
+                }
+            }
             TabsAction::SetDiffPair(pair) => s.diff_pair = pair,
         }
         Rc::new(s)
@@ -143,7 +151,7 @@ fn add_files(tabs: UseReducerDispatcher<TabsState>, files: Vec<web_sys::File>) {
                 Err(e) => Err(e),
             };
             match parsed {
-                Ok(stig) => stigs.push(stig),
+                Ok(stig) => stigs.push((None, stig)),
                 // Surface parsing errors without crashing.
                 Err(e) => console_error(&format!("Failed to parse {name}: {e}")),
             }
@@ -386,7 +394,7 @@ pub fn App() -> Html {
     };
     let on_load_sample = {
         let dispatch = dispatch.clone();
-        Callback::from(move |_| dispatch.dispatch(TabsAction::Add(vec![generate_sample_stig()])))
+        Callback::from(move |_| dispatch.dispatch(TabsAction::Add(vec![(None, generate_sample_stig())])))
     };
 
     let handle_diff_toggle = {
@@ -524,8 +532,8 @@ pub fn App() -> Html {
     let handle_load_from_library = {
         let dispatch = dispatch.clone();
         let show_library = show_library.clone();
-        Callback::from(move |stig: Stig| {
-            dispatch.dispatch(TabsAction::Add(vec![stig]));
+        Callback::from(move |(id, stig): (String, Stig)| {
+            dispatch.dispatch(TabsAction::Add(vec![(Some(id), stig)]));
             show_library.set(false);
         })
     };
@@ -568,14 +576,15 @@ pub fn App() -> Html {
         _ => match &active_tab {
             Some(tab) => {
                 let id = tab.id.clone();
-                let (d1, d2, d3, d4) = (dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone());
-                let (i1, i2, i3, i4) = (id.clone(), id.clone(), id.clone(), id.clone());
+                let (d1, d2, d3, d4, d5) = (dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone());
+                let (i1, i2, i3, i4, i5) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
                 html! {
                     <StigView tab={tab.clone()}
                         on_update_rule={Callback::from(move |(rule_id, update)| d1.dispatch(TabsAction::UpdateRule { tab_id: i1.clone(), rule_id, update }))}
                         on_set_asset_info={Callback::from(move |info| d2.dispatch(TabsAction::SetAssetInfo(i2.clone(), info)))}
                         on_set_selected_rule={Callback::from(move |rule_id| d3.dispatch(TabsAction::SetSelectedRule(i3.clone(), rule_id)))}
                         on_set_all_status={Callback::from(move |status| d4.dispatch(TabsAction::SetAllStatus(i4.clone(), status)))}
+                        on_set_status_for={Callback::from(move |(rule_ids, status)| d5.dispatch(TabsAction::SetStatusFor(i5.clone(), rule_ids, status)))}
                         on_add_files={on_add_files.clone()} />
                 }
             }

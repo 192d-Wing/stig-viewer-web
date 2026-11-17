@@ -1,4 +1,7 @@
 use crate::components::asset_modal::{asset_field, with_asset_field, ASSET_FIELDS};
+use crate::auth::use_current_user;
+use std::collections::HashSet;
+use crate::components::save_to_system_modal::SaveToSystemModal;
 use crate::components::poam_export_modal::{export_base_name, PoamExportModal};
 use crate::components::rule_list::RuleList;
 use crate::constants::{severity_badge_color, status_indicator_kind, SEVERITY_ORDER, STATUS_OPTIONS};
@@ -72,6 +75,8 @@ pub struct StigViewProps {
     pub on_set_selected_rule: Callback<Option<String>>,
     /// New status for every rule in the tab.
     pub on_set_all_status: Callback<String>,
+    /// (rule ids, new status) for the rules ticked in the list.
+    pub on_set_status_for: Callback<(Vec<String>, String)>,
     pub on_add_files: Callback<Vec<web_sys::File>>,
 }
 
@@ -85,6 +90,15 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let severity_filter = use_state(String::new);
     let status_filter = use_state(String::new);
     let show_poam_modal = use_state(|| false);
+    let show_save_modal = use_state(|| false);
+    let can_save = use_current_user().is_some_and(|u| u.role != "viewer");
+    // Rule ids ticked for a multi-rule status change. Per tab: cleared when
+    // the viewer switches to another open STIG.
+    let checked = use_state(Vec::<String>::new);
+    {
+        let checked = checked.clone();
+        use_effect_with(p.tab.id.clone(), move |_| checked.set(Vec::new()));
+    }
     let file_input_ref = use_node_ref();
 
     let filtered_rules = use_memo(
@@ -176,6 +190,27 @@ pub fn StigView(p: &StigViewProps) -> Html {
         Callback::from(move |text: String| search_term.set(text))
     };
 
+    // Only ticked rules that pass the current filters are acted on, so a
+    // status change never touches rules the user cannot see.
+    let checked_set: HashSet<&str> = checked.iter().map(String::as_str).collect();
+    let checked_visible: Vec<String> =
+        filtered_rules.iter().filter(|r| checked_set.contains(r.id.as_str())).map(|r| r.id.clone()).collect();
+    let on_check = {
+        let checked = checked.clone();
+        Callback::from(move |(ids, on): (Vec<String>, bool)| {
+            let changed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let mut next: Vec<String> = checked.iter().filter(|id| !changed.contains(id.as_str())).cloned().collect();
+            if on {
+                next.extend(ids);
+            }
+            checked.set(next);
+        })
+    };
+    let on_set_checked_status = {
+        let (ids, on_set_status_for) = (checked_visible.clone(), p.on_set_status_for.clone());
+        Callback::from(move |status: String| on_set_status_for.emit((ids.clone(), status)))
+    };
+
     let rules_tab = html! {
         <SpaceBetween size="m">
             <SpaceBetween direction="horizontal" size="m" align_items="end">
@@ -203,6 +238,9 @@ pub fn StigView(p: &StigViewProps) -> Html {
                     {on_search_change}
                     on_select_rule={p.on_set_selected_rule.reform(|rule: Rule| Some(rule.id))}
                     on_set_all_status={p.on_set_all_status.clone()}
+                    checked_ids={checked_visible}
+                    {on_check}
+                    {on_set_checked_status}
                 />
             </div>
         </SpaceBetween>
@@ -274,6 +312,14 @@ pub fn StigView(p: &StigViewProps) -> Html {
                             tabindex="-1"
                             onchange={on_files_picked}
                         />
+                        if can_save {
+                            <Button
+                                onclick={{ let m = show_save_modal.clone(); move |_| m.set(true) }}
+                                disabled={p.tab.catalog_id.is_none()}
+                                title={p.tab.catalog_id.is_none().then_some("Only STIGs opened from the library can be saved to a system.")}
+                                testid="save-to-system"
+                            >{"Save to system"}</Button>
+                        }
                         <Button onclick={move |_| open_poam()}>{"Export POAM"}</Button>
                         <Button variant="primary" onclick={handle_export_ckl}>{"Export .ckl"}</Button>
                     </SpaceBetween>
@@ -327,6 +373,16 @@ pub fn StigView(p: &StigViewProps) -> Html {
                 TabItem::new("asset", "Asset", asset_tab),
             ]} />
 
+            if *show_save_modal {
+                if let Some(catalog_id) = p.tab.catalog_id.clone() {
+                    <SaveToSystemModal
+                        show=true
+                        on_close={{ let m = show_save_modal.clone(); move |_| m.set(false) }}
+                        stig={Rc::clone(stig)}
+                        {catalog_id}
+                    />
+                }
+            }
             <PoamExportModal
                 show={*show_poam_modal}
                 on_close={move |_| close_poam()}

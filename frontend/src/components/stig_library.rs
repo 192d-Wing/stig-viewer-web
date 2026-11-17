@@ -548,7 +548,7 @@ fn TablePreferences(p: &TablePreferencesProps) -> Html {
 #[derive(Properties, PartialEq)]
 pub struct StigLibraryProps {
     /// A STIG fetched from the catalog, to open as a viewer tab.
-    pub on_load: Callback<Stig>,
+    pub on_load: Callback<(String, Stig)>,
     /// Draft id to open in the writer.
     pub on_start_draft: Callback<String>,
     /// Content of the "Upload" tab (the DropZone).
@@ -829,7 +829,7 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                 let path = format!("/api/stigs/{}", encode_uri_component(&id));
                 match public_get::<Stig>(&path).await {
                     Ok(stig) => {
-                        on_load.emit(stig.clone());
+                        on_load.emit((id.clone(), stig.clone()));
                         loading_id.set(None);
                         cache_stig(&id, &stig).await;
                     }
@@ -838,7 +838,7 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                             Some(cached) => {
                                 let title = if cached.stig.title.is_empty() { id.clone() } else { cached.stig.title.clone() };
                                 let when = to_locale_string(&cached.cached_at);
-                                on_load.emit(cached.stig);
+                                on_load.emit((id.clone(), cached.stig));
                                 warning.set(Some(format!("Loaded \"{title}\" from cache ({when}).")));
                             }
                             None => error.set(Some(format!("Failed to load STIG: {err}"))),
