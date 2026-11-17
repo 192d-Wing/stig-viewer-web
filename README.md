@@ -185,6 +185,23 @@ signed-in user with the `admin` role and accept bodies up to 500 MB. Other
 routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),
 `/api/sign` and the admin restore.
 
+### Signing envelope (v2)
+
+`POST /api/sign` returns `{document, signature, keyId, version: 2,
+signatures: [{algorithm, keyId, signature}]}`. The legacy `signature` and
+`keyId` are unchanged and equal `signatures[0]`. `GET /api/signing/pubkey`
+returns `{algorithm, keyId, publicKey, keys: [{algorithm, keyId, publicKey}]}`.
+
+Signed bytes: the compact UTF-8 JSON of `document` with fields in this order:
+`version`, `algorithm`, `keyId`, `sha256`, `signedAt`, `signedBy`,
+`signedByName`, and `resource` only when present. To verify, pin the public
+key, take `document` exactly as received (preserve field order, no
+whitespace), and check the Ed25519 signature over those bytes. A verifier
+that rebuilds the document from a fixed field list must now include `keyId`
+and `version`, or verification fails. ML-DSA is not yet supported; unknown
+`algorithm` entries in `signatures` should be skipped. Export bundles do not
+use this envelope.
+
 ### Database
 
 Postgres data lives in a named volume (`postgres_data`). Migrations apply on

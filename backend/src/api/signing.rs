@@ -5,7 +5,7 @@
 //! `None` and both endpoints respond 503.
 //!
 //! - `GET  /api/signing/pubkey` — public; returns `{algorithm, keyId,
-//!   publicKey}` so verifiers can pin a trusted copy of the key offline.
+//!   publicKey, keys: [{algorithm, keyId, publicKey}]}` so verifiers can pin a trusted copy of the key offline.
 //! - `POST /api/sign` — authenticated; takes an opaque blob (base64) +
 //!   optional `resource` label, hashes the content, wraps the hash plus
 //!   the signer's identity and a timestamp in a canonical JSON "signing
@@ -77,6 +77,10 @@ fn compute_key_id(vk: &VerifyingKey) -> String {
     hex::encode(&digest[..8])
 }
 
+const ALGORITHM: &str = "ed25519";
+/// Envelope / document format version.
+pub const ENVELOPE_VERSION: u32 = 2;
+
 // ── GET /api/signing/pubkey ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -86,6 +90,31 @@ pub struct PubkeyResponse {
     pub key_id: String,
     /// Raw public key bytes, base64-standard (not URL-safe) encoded.
     pub public_key: String,
+    /// Algorithm-tagged key list (envelope v2). Today it holds one entry
+    /// identical to the top-level fields.
+    pub keys: Vec<PubkeyEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PubkeyEntry {
+    pub algorithm: &'static str,
+    pub key_id: String,
+    pub public_key: String,
+}
+
+fn pubkey_response(sk: &SigningState) -> PubkeyResponse {
+    let public_key = BASE64.encode(sk.signing_key.verifying_key().as_bytes());
+    PubkeyResponse {
+        algorithm: ALGORITHM,
+        key_id: sk.key_id.clone(),
+        public_key: public_key.clone(),
+        keys: vec![PubkeyEntry {
+            algorithm: ALGORITHM,
+            key_id: sk.key_id.clone(),
+            public_key,
+        }],
+    }
 }
 
 pub async fn pubkey_handler(
@@ -95,11 +124,7 @@ pub async fn pubkey_handler(
         .signing
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "signing is not configured"))?;
-    Ok(Json(PubkeyResponse {
-        algorithm: "ed25519",
-        key_id: sk.key_id.clone(),
-        public_key: BASE64.encode(sk.signing_key.verifying_key().as_bytes()),
-    }))
+    Ok(Json(pubkey_response(sk)))
 }
 
 // ── POST /api/sign ──────────────────────────────────────────────────────────
@@ -120,12 +145,21 @@ pub struct SignRequest {
 
 /// Signing document. Serde preserves struct field order on serialisation,
 /// so two servers running the same code produce byte-identical JSON for
-/// the same inputs. Verifiers reconstruct this struct from the response
-/// and verify `signature` against its bytes.
+/// the same inputs.
+///
+/// Signed bytes: `serde_json::to_vec(&document)`, i.e. compact JSON (no
+/// whitespace), fields in declaration order (`version`, `algorithm`,
+/// `keyId`, `sha256`, `signedAt`, `signedBy`, `signedByName`, then
+/// `resource` only when present), UTF-8. Verifiers should verify against
+/// the document exactly as received (preserving field order), not rebuild
+/// it from a fixed field list; if they must rebuild, `version` and `keyId`
+/// are part of the document since envelope v2.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SigningDocument {
+    pub version: u32,
     pub algorithm: &'static str,
+    pub key_id: String,
     pub sha256: String,
     pub signed_at: String,
     pub signed_by: String,
@@ -139,8 +173,46 @@ pub struct SigningDocument {
 pub struct SignedBundle {
     pub document: SigningDocument,
     /// Base64-standard encoded 64-byte Ed25519 signature.
+    /// Legacy field; equals `signatures[0].signature`.
     pub signature: String,
+    /// Legacy field; equals `signatures[0].key_id`.
     pub key_id: String,
+    /// Envelope version (2).
+    pub version: u32,
+    /// Algorithm-tagged signatures over the same document bytes.
+    pub signatures: Vec<BundleSignature>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleSignature {
+    pub algorithm: &'static str,
+    pub key_id: String,
+    pub signature: String,
+}
+
+/// Canonical signed bytes for a document.
+fn document_bytes(document: &SigningDocument) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(document)
+}
+
+fn build_bundle(
+    sk: &SigningState,
+    document: SigningDocument,
+) -> Result<SignedBundle, serde_json::Error> {
+    let doc_bytes = document_bytes(&document)?;
+    let signature = BASE64.encode(sk.signing_key.sign(&doc_bytes).to_bytes());
+    Ok(SignedBundle {
+        document,
+        signature: signature.clone(),
+        key_id: sk.key_id.clone(),
+        version: ENVELOPE_VERSION,
+        signatures: vec![BundleSignature {
+            algorithm: ALGORITHM,
+            key_id: sk.key_id.clone(),
+            signature,
+        }],
+    })
 }
 
 /// Cap signed payloads at 100 MiB. Larger inputs should be hashed
@@ -175,7 +247,9 @@ pub async fn sign_handler(
 
     let sha = Sha256::digest(&content);
     let document = SigningDocument {
-        algorithm: "ed25519",
+        version: ENVELOPE_VERSION,
+        algorithm: ALGORITHM,
+        key_id: sk.key_id.clone(),
         sha256: hex::encode(sha),
         signed_at: chrono::Utc::now().to_rfc3339(),
         signed_by: user.id.clone(),
@@ -183,29 +257,24 @@ pub async fn sign_handler(
         resource: body.resource.clone().filter(|s| !s.is_empty()),
     };
 
-    let doc_bytes = serde_json::to_vec(&document).map_err(|e| {
+    let bundle = build_bundle(sk, document).map_err(|e| {
         tracing::error!("canonicalise signing document: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "signing failed".to_string(),
         )
     })?;
-    let signature = sk.signing_key.sign(&doc_bytes);
 
     tracing::info!(
         user = %user.id,
-        sha256 = %document.sha256,
+        sha256 = %bundle.document.sha256,
         key_id = %sk.key_id,
         bytes = content.len(),
-        resource = %document.resource.as_deref().unwrap_or(""),
+        resource = %bundle.document.resource.as_deref().unwrap_or(""),
         "signing.sign"
     );
 
-    Ok(Json(SignedBundle {
-        document,
-        signature: BASE64.encode(signature.to_bytes()),
-        key_id: sk.key_id.clone(),
-    }))
+    Ok(Json(bundle))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -215,8 +284,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
 
-    const TEST_SEED_HEX: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SEED_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn test_state() -> SigningState {
         let bytes = hex::decode(TEST_SEED_HEX).unwrap();
@@ -230,6 +298,109 @@ mod tests {
         }
     }
 
+    fn sample_doc(st: &SigningState, sha256: String) -> SigningDocument {
+        SigningDocument {
+            version: ENVELOPE_VERSION,
+            algorithm: ALGORITHM,
+            key_id: st.key_id.clone(),
+            sha256,
+            signed_at: "2026-01-01T00:00:00Z".into(),
+            signed_by: "u1".into(),
+            signed_by_name: "User One".into(),
+            resource: Some("windows-11".into()),
+        }
+    }
+
+    fn sample_bundle(st: &SigningState) -> SignedBundle {
+        build_bundle(st, sample_doc(st, "ab".repeat(32))).unwrap()
+    }
+
+    #[test]
+    fn legacy_fields_equal_first_signature() {
+        let b = sample_bundle(&test_state());
+        assert_eq!(b.version, 2);
+        assert_eq!(b.signatures.len(), 1);
+        assert_eq!(b.signature, b.signatures[0].signature);
+        assert_eq!(b.key_id, b.signatures[0].key_id);
+        assert_eq!(b.signatures[0].algorithm, "ed25519");
+    }
+
+    #[test]
+    fn existing_signature_round_trips_from_json() {
+        let st = test_state();
+        let wire = serde_json::to_string(&sample_bundle(&st)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let sig_b = BASE64.decode(v["signature"].as_str().unwrap()).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_b).unwrap();
+        // Verifier takes the document bytes exactly as received on the wire.
+        let start = wire.find(r#"{"document":"#).unwrap() + r#"{"document":"#.len();
+        let end = wire.find(r#","signature":"#).unwrap();
+        let doc_bytes = &wire.as_bytes()[start..end];
+        st.signing_key
+            .verifying_key()
+            .verify(doc_bytes, &sig)
+            .expect("must verify");
+    }
+
+    #[test]
+    fn tampering_key_id_or_version_breaks_verification() {
+        let st = test_state();
+        let b = sample_bundle(&st);
+        let sig =
+            ed25519_dalek::Signature::from_slice(&BASE64.decode(&b.signature).unwrap()).unwrap();
+        let vk = st.signing_key.verifying_key();
+        assert!(serde_json::to_string(&b.document)
+            .unwrap()
+            .contains(&format!("\"keyId\":\"{}\"", st.key_id)));
+        let mut d = sample_doc(&st, "ab".repeat(32));
+        d.key_id = "0000000000000000".into();
+        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_err());
+        let mut d = sample_doc(&st, "ab".repeat(32));
+        d.version = 1;
+        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_err());
+        // Untampered still verifies.
+        let d = sample_doc(&st, "ab".repeat(32));
+        assert!(vk.verify(&serde_json::to_vec(&d).unwrap(), &sig).is_ok());
+    }
+
+    #[test]
+    fn envelope_json_shape_snapshot() {
+        let st = test_state();
+        let mut v = serde_json::to_value(sample_bundle(&st)).unwrap();
+        let sig = v["signature"].as_str().unwrap().to_string();
+        assert_eq!(v["signatures"][0]["signature"], sig.as_str());
+        v["signature"] = "SIG".into();
+        v["signatures"][0]["signature"] = "SIG".into();
+        let expected = serde_json::json!({
+            "document": {
+                "version": 2, "algorithm": "ed25519", "keyId": st.key_id,
+                "sha256": "ab".repeat(32), "signedAt": "2026-01-01T00:00:00Z",
+                "signedBy": "u1", "signedByName": "User One", "resource": "windows-11"
+            },
+            "signature": "SIG", "keyId": st.key_id, "version": 2,
+            "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": "SIG"}]
+        });
+        assert_eq!(v, expected);
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys.len(), 5);
+        let doc = serde_json::to_string(&sample_bundle(&st).document).unwrap();
+        assert!(doc.starts_with(r#"{"version":2,"algorithm":"ed25519","keyId":""#));
+    }
+
+    #[test]
+    fn pubkey_json_shape_snapshot() {
+        let st = test_state();
+        let v = serde_json::to_value(pubkey_response(&st)).unwrap();
+        let pk = BASE64.encode(st.signing_key.verifying_key().as_bytes());
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "algorithm": "ed25519", "keyId": st.key_id, "publicKey": pk,
+                "keys": [{"algorithm": "ed25519", "keyId": st.key_id, "publicKey": pk}]
+            })
+        );
+    }
+
     #[test]
     fn from_hex_returns_none_when_unset_or_blank() {
         assert!(SigningState::from_hex(None).unwrap().is_none());
@@ -241,7 +412,9 @@ mod tests {
         let err = SigningState::from_hex(Some("deadbeef")).unwrap_err();
         assert!(err.to_string().contains("32 bytes"));
         assert!(SigningState::from_hex(Some("zz")).is_err());
-        assert!(SigningState::from_hex(Some(&"ab".repeat(32))).unwrap().is_some());
+        assert!(SigningState::from_hex(Some(&"ab".repeat(32)))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -259,14 +432,7 @@ mod tests {
         let content = b"<CHECKLIST>pretend this is a .ckl</CHECKLIST>";
 
         let sha = Sha256::digest(content);
-        let document = SigningDocument {
-            algorithm: "ed25519",
-            sha256: hex::encode(sha),
-            signed_at: "2026-01-01T00:00:00Z".into(),
-            signed_by: "u1".into(),
-            signed_by_name: "User One".into(),
-            resource: Some("windows-11".into()),
-        };
+        let document = sample_doc(&st, hex::encode(sha));
         let doc_bytes = serde_json::to_vec(&document).unwrap();
         let signature = st.signing_key.sign(&doc_bytes);
 
