@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
-use crate::api::checklists::{create_checklist, is_valid_stig_id, load_stig_json, take_rules};
+use crate::api::checklists::{is_valid_stig_id, load_stig_json, take_rules};
 use crate::api::rule_bulk_status::{
     apply_plan, expected_status, plan_rule, short_id, Plan, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
@@ -143,29 +143,9 @@ pub async fn save_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut created = false;
-    let checklist = match db_checklists::find_checklist(pool, &asset.id, &req.stig_id)
+    let (checklist, created) = find_or_create(pool, &asset.id, &req.stig_id)
         .await
-        .map_err(map_db)?
-    {
-        Some(c) => c,
-        None => match create_checklist(pool, &asset.id, &req.stig_id).await {
-            Ok(c) => {
-                created = true;
-                c
-            }
-            Err(e) => {
-                // A concurrent save may have created it first.
-                match db_checklists::find_checklist(pool, &asset.id, &req.stig_id)
-                    .await
-                    .map_err(map_db)?
-                {
-                    Some(c) => c,
-                    None => return Err(map_db(e)),
-                }
-            }
-        },
-    };
+        .map_err(map_db)?;
 
     let existing: HashMap<String, ChecklistRuleRow> =
         db_checklists::list_rule_overrides(pool, &checklist.id)
@@ -230,6 +210,41 @@ pub async fn save_handler(
         error_count: count("error"),
         results,
     }))
+}
+
+/// Find the asset's checklist for a STIG, creating it when absent. A
+/// concurrent creator is handled by the insert-if-absent plus a re-read, so
+/// only a genuine failure surfaces as an error. The flag is true when this
+/// call created the checklist.
+async fn find_or_create(
+    pool: &sqlx::PgPool,
+    asset_id: &str,
+    stig_id: &str,
+) -> anyhow::Result<(db_checklists::ChecklistRow, bool)> {
+    if let Some(c) = db_checklists::find_checklist(pool, asset_id, stig_id).await? {
+        return Ok((c, false));
+    }
+    let (applied_version, applied_release) = db_checklists::catalog_version(pool, stig_id).await?;
+    let now = chrono::Utc::now();
+    let row = db_checklists::ChecklistRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        asset_id: asset_id.to_string(),
+        stig_id: stig_id.to_string(),
+        status: "in_progress".into(),
+        created_at: now,
+        updated_at: now,
+        applied_version,
+        applied_release,
+    };
+    let inserted = db_checklists::insert_checklist_if_absent(pool, &row).await?;
+    if inserted {
+        return Ok((row, true));
+    }
+    // Lost the race: the winner's row is the checklist.
+    db_checklists::find_checklist(pool, asset_id, stig_id)
+        .await?
+        .map(|c| (c, false))
+        .ok_or_else(|| anyhow::anyhow!("checklist vanished after concurrent create"))
 }
 
 /// Process one entry; returns the result status or a per-rule error message.
@@ -389,5 +404,247 @@ mod tests {
             plan_rule(true, None, &merged.status, &e.finding_details, false),
             Plan::Reject(_)
         ));
+    }
+
+    // ── Database-backed tests ──────────────────────────────────────────────
+
+    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_user, RULES, STIG_ID};
+    use sqlx::PgPool;
+
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    async fn call(
+        state: &AppState,
+        user: &str,
+        role: &str,
+        stig_id: &str,
+        rules: Vec<SaveRule>,
+    ) -> Result<Json<SaveResponse>, StatusCode> {
+        save_handler(
+            State(state.clone()),
+            Extension(auth(user, role)),
+            Path("a1".into()),
+            Json(SaveRequest { stig_id: stig_id.into(), rules }),
+        )
+        .await
+    }
+
+    fn rule(id: &str, status: &str, details: &str, comments: &str) -> SaveRule {
+        SaveRule {
+            rule_id: id.into(),
+            status: status.into(),
+            finding_details: details.into(),
+            comments: comments.into(),
+        }
+    }
+
+    async fn base(pool: &PgPool, requires_approval: bool) {
+        seed_user(pool, "owner").await;
+        seed_user(pool, "other").await;
+        seed_asset(pool, "a1", "owner", requires_approval).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_one_rejects_when_the_live_row_was_reopened(pool: PgPool) {
+        base(&pool, true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        db_checklists::upsert_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner", None, None)
+            .await
+            .unwrap();
+        // The caller read the rule as closed...
+        let prev = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        // ...then someone reopened it before the save wrote.
+        db_checklists::upsert_rule(&pool, "c1", RULES[0], "open", "d", "", "owner", None, None)
+            .await
+            .unwrap();
+        let audit_before = count(&pool, "SELECT COUNT(*) FROM rule_audit").await;
+
+        let out = save_one(
+            &pool,
+            "c1",
+            "owner",
+            true,
+            true,
+            Some(&prev),
+            &rule(RULES[0], "not_a_finding", "d", "new comment"),
+        )
+        .await;
+        assert_eq!(out, Err("rule changed while saving; try again".to_string()));
+
+        let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        assert_eq!((live.status.as_str(), live.comments.as_str()), ("open", ""));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, audit_before);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn pending_path_keeps_comments_with_a_single_audit_row(pool: PgPool) {
+        base(&pool, true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let out = save_one(
+            &pool,
+            "c1",
+            "owner",
+            true,
+            true,
+            None,
+            &rule(RULES[0], "not_a_finding", "because", "reviewer note"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0, "pending_approval");
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals WHERE status = 'pending'").await, 1);
+        let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        assert_eq!(live.status, "not_reviewed");
+        assert_eq!(live.comments, "reviewer note");
+        let fields: Vec<String> = sqlx::query_scalar("SELECT field FROM rule_audit")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(fields, ["comments"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn find_or_create_returns_the_existing_checklist(pool: PgPool) {
+        base(&pool, false).await;
+        seed_checklist(&pool, "orig", "a1", STIG_ID).await;
+        let (c, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        assert_eq!((c.id.as_str(), created), ("orig", false));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn find_or_create_creates_once_then_finds(pool: PgPool) {
+        base(&pool, false).await;
+        let (first, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        assert!(created);
+        let (again, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        assert_eq!((again.id, created), (first.id, false));
+    }
+
+    // Probabilistic: the race window is only hit when tasks interleave between the find and
+    // the insert. A regression to a plain INSERT would surface as a unique-violation error or
+    // two "created" results, not necessarily on every run.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_find_or_create_yields_one_checklist(pool: PgPool) {
+        base(&pool, false).await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            tasks.spawn(async move { find_or_create(&pool, "a1", STIG_ID).await });
+        }
+        let mut ids = HashSet::new();
+        let mut created = 0;
+        while let Some(res) = tasks.join_next().await {
+            let (c, was_created) = res.unwrap().unwrap();
+            ids.insert(c.id);
+            created += usize::from(was_created);
+        }
+        assert_eq!((ids.len(), created), (1, 1));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_handler_forbids_a_non_writer(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let err = call(&state, "other", "author", STIG_ID, vec![]).await.err();
+        assert_eq!(err, Some(StatusCode::FORBIDDEN));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_handler_rejects_bad_requests_without_creating_a_checklist(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let bad_id = call(&state, "owner", "author", "../etc", vec![]).await.err();
+        assert_eq!(bad_id, Some(StatusCode::BAD_REQUEST));
+        let too_many: Vec<SaveRule> = (0..=MAX_RULES).map(|i| rule(&format!("r{i}"), "open", "", "")).collect();
+        let err = call(&state, "owner", "author", STIG_ID, too_many).await.err();
+        assert_eq!(err, Some(StatusCode::BAD_REQUEST));
+        // More distinct ids than the STIG has rules.
+        let extra: Vec<SaveRule> = (0..=RULES.len()).map(|i| rule(&format!("x{i}"), "open", "", "")).collect();
+        let err = call(&state, "owner", "author", STIG_ID, extra).await.err();
+        assert_eq!(err, Some(StatusCode::BAD_REQUEST));
+        let err = call(&state, "owner", "author", "NO-SUCH-STIG", vec![]).await.err();
+        assert_eq!(err, Some(StatusCode::NOT_FOUND));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_handler_counts_match_the_rows(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let rules = vec![
+            rule(RULES[0], "open", "", ""),
+            rule(RULES[0], "not_applicable", "dup ignored", ""), // duplicate id: first wins
+            rule(RULES[1], "bogus", "", ""),                     // invalid status
+            rule(RULES[2], "not_reviewed", "", ""),              // untouched
+        ];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert!(out.created);
+        assert_eq!(out.results.len(), 3);
+        assert_eq!(
+            (out.applied_count, out.pending_count, out.unchanged_count, out.error_count),
+            (1, 0, 1, 1)
+        );
+        let stored = db_checklists::list_rule_overrides(&pool, &out.checklist_id).await.unwrap();
+        assert_eq!(stored.len(), out.applied_count);
+        assert_eq!(stored[0].status, "open");
+
+        // A second save reuses the checklist and finds nothing to change.
+        let again = vec![rule(RULES[0], "open", "", "")];
+        let Json(out2) = call(&state, "owner", "author", STIG_ID, again).await.unwrap();
+        assert_eq!((out2.created, out2.checklist_id.as_str()), (false, out.checklist_id.as_str()));
+        assert_eq!(out2.unchanged_count, 1);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_handler_routes_closing_through_approval_on_gated_assets(pool: PgPool) {
+        base(&pool, true).await;
+        let (state, _dir) = app_state(pool.clone());
+        let rules = vec![rule(RULES[0], "not_a_finding", "why", "note")];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert_eq!((out.applied_count, out.pending_count, out.error_count), (0, 1, 0));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_handler_reports_per_rule_errors_and_writes_nothing_for_them(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let long_id = "x".repeat(MAX_RULE_ID_BYTES + 1);
+        let long_text = "y".repeat(MAX_TEXT_BYTES + 1);
+        let rules = vec![
+            rule("SV-unknown", "open", "", ""),
+            rule(&long_id, "open", "", ""),
+            rule(RULES[0], "open", &long_text, ""),
+        ];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (0, 3));
+        let msgs: Vec<&str> = out.results.iter().map(|r| r.error.as_deref().unwrap()).collect();
+        assert_eq!(
+            msgs,
+            [
+                "rule is not part of this checklist's STIG",
+                "rule id too long",
+                "finding details or comments too long"
+            ]
+        );
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
     }
 }

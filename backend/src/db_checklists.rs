@@ -89,6 +89,27 @@ pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     Ok(())
 }
 
+/// Insert a checklist unless one already exists for `(asset_id, stig_id)`.
+/// Returns true when this call inserted the row, false when the pair was
+/// already present (for example a concurrent save created it first).
+pub async fn insert_checklist_if_absent(pool: &PgPool, row: &ChecklistRow) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO checklists \
+            (id, asset_id, stig_id, status, applied_version, applied_release) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (asset_id, stig_id) DO NOTHING",
+    )
+    .bind(&row.id)
+    .bind(&row.asset_id)
+    .bind(&row.stig_id)
+    .bind(&row.status)
+    .bind(&row.applied_version)
+    .bind(&row.applied_release)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Stamp a checklist with a new applied_version + applied_release.
 /// Used by re-apply to clear the drift flag once the user has acked
 /// that the catalog has moved forward.
@@ -500,5 +521,194 @@ mod tests {
         let reopened = row("open", "d");
         assert_eq!(resolve_patch(Some(&reopened), &patch), Err(PatchRejected::StatusChanged));
         assert_eq!(resolve_patch(None, &patch), Err(PatchRejected::StatusChanged));
+    }
+
+    // ── Database-backed tests ──────────────────────────────────────────────
+
+    use crate::test_fixtures::{seed_asset, seed_checklist, seed_user};
+
+    async fn setup(pool: &PgPool) {
+        seed_user(pool, "u1").await;
+        seed_asset(pool, "a1", "u1", false).await;
+        seed_checklist(pool, "c1", "a1", "S").await;
+    }
+
+    async fn audit_fields(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT field FROM rule_audit ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn checklist_updated_at(pool: &PgPool) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT updated_at FROM checklists WHERE id = 'c1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_keeps_untouched_columns(pool: PgPool) {
+        setup(&pool).await;
+        let due = NaiveDate::from_ymd_opt(2026, 12, 31);
+        upsert_rule(&pool, "c1", "r1", "open", "details", "notes", "u1", Some("u1"), due)
+            .await
+            .unwrap();
+        let out = patch_rule(
+            &pool,
+            "c1",
+            "r1",
+            RulePatch { status: Some("not_a_finding"), ..RulePatch::default() },
+            "u1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, "not_a_finding");
+        assert_eq!(out.finding_details, "details");
+        assert_eq!(out.comments, "notes");
+        assert_eq!(out.assignee_id.as_deref(), Some("u1"));
+        assert_eq!(out.due_date, due);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_writes_one_audit_row_per_changed_field(pool: PgPool) {
+        setup(&pool).await;
+        patch_rule(
+            &pool,
+            "c1",
+            "r1",
+            RulePatch {
+                status: Some("open"),
+                finding_details: Some("d"),
+                comments: Some("c"),
+                ..RulePatch::default()
+            },
+            "u1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(audit_fields(&pool).await, ["status", "finding_details", "comments"]);
+        // Re-applying the same values changes nothing, so adds no audit rows.
+        patch_rule(
+            &pool,
+            "c1",
+            "r1",
+            RulePatch { status: Some("open"), ..RulePatch::default() },
+            "u1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(audit_fields(&pool).await.len(), 3);
+    }
+
+    async fn assert_rejected_writes_nothing(pool: &PgPool, patch: RulePatch<'_>, want: PatchRejected) {
+        let before = checklist_updated_at(pool).await;
+        let err = patch_rule(pool, "c1", "r1", patch, "u1").await.unwrap_err();
+        assert_eq!(err.downcast_ref::<PatchRejected>(), Some(&want));
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(pool).await.unwrap();
+        assert_eq!(rules, 0);
+        assert!(audit_fields(pool).await.is_empty());
+        assert_eq!(checklist_updated_at(pool).await, before);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn details_required_rejection_leaves_no_trace(pool: PgPool) {
+        setup(&pool).await;
+        assert_rejected_writes_nothing(&pool, closing(), PatchRejected::DetailsRequired).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn status_changed_rejection_leaves_no_trace(pool: PgPool) {
+        setup(&pool).await;
+        // No row exists, so the live status is not_reviewed.
+        let patch = RulePatch { status: Some("open"), expect_status: Some("not_a_finding"), ..RulePatch::default() };
+        assert_rejected_writes_nothing(&pool, patch, PatchRejected::StatusChanged).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn expect_status_is_checked_against_the_live_row(pool: PgPool) {
+        setup(&pool).await;
+        upsert_rule(&pool, "c1", "r1", "not_a_finding", "d", "", "u1", None, None).await.unwrap();
+        let patch = RulePatch { comments: Some("x"), expect_status: Some("not_a_finding"), ..RulePatch::default() };
+        assert!(patch_rule(&pool, "c1", "r1", patch, "u1").await.is_ok());
+        // The row is reopened behind the caller's back.
+        upsert_rule(&pool, "c1", "r1", "open", "d", "x", "u1", None, None).await.unwrap();
+        let err = patch_rule(&pool, "c1", "r1", patch, "u1").await.unwrap_err();
+        assert_eq!(err.downcast_ref::<PatchRejected>(), Some(&PatchRejected::StatusChanged));
+    }
+
+    // Probabilistic: tasks interleave only at I/O awaits on the default runtime. A lost
+    // update (stale snapshot overwriting a sibling column) would show up as a flaky failure.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_patches_on_different_columns_both_survive(pool: PgPool) {
+        setup(&pool).await;
+        upsert_rule(&pool, "c1", "r1", "open", "", "", "u1", None, None).await.unwrap();
+        let (a, b) = tokio::join!(
+            patch_rule(&pool, "c1", "r1", RulePatch { comments: Some("c"), ..RulePatch::default() }, "u1"),
+            patch_rule(&pool, "c1", "r1", RulePatch { finding_details: Some("d"), ..RulePatch::default() }, "u1"),
+        );
+        a.unwrap();
+        b.unwrap();
+        let rows = list_rule_overrides(&pool, "c1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].comments.as_str(), rows[0].finding_details.as_str()), ("c", "d"));
+    }
+
+    // Probabilistic: interleaving is not forced. A lock-order regression (rule row
+    // locked before the checklist row) would surface as a deadlock error, but not on every run.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn twenty_concurrent_writers_do_not_deadlock(pool: PgPool) {
+        setup(&pool).await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..20 {
+            let pool = pool.clone();
+            tasks.spawn(async move {
+                let rule = format!("r{}", i % 4);
+                if i % 2 == 0 {
+                    patch_rule(
+                        &pool,
+                        "c1",
+                        &rule,
+                        RulePatch { comments: Some("p"), ..RulePatch::default() },
+                        "u1",
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    upsert_rule(&pool, "c1", &rule, "open", "d", "u", "u1", None, None).await.map(|_| ())
+                }
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap().unwrap();
+        }
+        assert_eq!(list_rule_overrides(&pool, "c1").await.unwrap().len(), 4);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn insert_if_absent_reports_whether_it_inserted(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        seed_asset(&pool, "a1", "u1", false).await;
+        let mk = |id: &str| ChecklistRow {
+            id: id.into(),
+            asset_id: "a1".into(),
+            stig_id: "S".into(),
+            status: "in_progress".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            applied_version: String::new(),
+            applied_release: String::new(),
+        };
+        assert!(insert_checklist_if_absent(&pool, &mk("first")).await.unwrap());
+        assert!(!insert_checklist_if_absent(&pool, &mk("second")).await.unwrap());
+        assert_eq!(find_checklist(&pool, "a1", "S").await.unwrap().unwrap().id, "first");
     }
 }

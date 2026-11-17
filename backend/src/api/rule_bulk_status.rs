@@ -450,4 +450,129 @@ mod tests {
             Plan::Apply { finding_details: "fixed".into() }
         );
     }
+
+    // ── Database-backed tests ──────────────────────────────────────────────
+
+    use crate::test_fixtures::{app_state, StigDir, seed_asset, seed_checklist, seed_user, RULES, STIG_ID};
+    use sqlx::PgPool;
+
+    async fn setup(pool: &PgPool) -> (AppState, StigDir) {
+        seed_user(pool, "owner").await;
+        seed_user(pool, "other").await;
+        seed_asset(pool, "a1", "owner", false).await;
+        seed_checklist(pool, "c1", "a1", STIG_ID).await;
+        app_state(pool.clone())
+    }
+
+    async fn call(
+        state: &AppState,
+        user: &str,
+        checklist: &str,
+        rule_ids: &[&str],
+        status: &str,
+        details: &str,
+    ) -> Result<Json<BulkStatusResponse>, StatusCode> {
+        bulk_status_handler(
+            State(state.clone()),
+            Extension(crate::test_fixtures::auth(user, "author")),
+            Path(checklist.into()),
+            Json(BulkStatusRequest {
+                rule_ids: rule_ids.iter().map(|s| s.to_string()).collect(),
+                status: status.into(),
+                finding_details: details.into(),
+            }),
+        )
+        .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_forbids_a_non_writer_and_404s_a_missing_checklist(pool: PgPool) {
+        let (state, _dir) = setup(&pool).await;
+        let err = call(&state, "other", "c1", &RULES, "open", "").await.err();
+        assert_eq!(err, Some(StatusCode::FORBIDDEN));
+        let err = call(&state, "owner", "nope", &RULES, "open", "").await.err();
+        assert_eq!(err, Some(StatusCode::NOT_FOUND));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_rejects_each_bad_request_shape(pool: PgPool) {
+        let (state, _dir) = setup(&pool).await;
+        let bad = |r: Result<Json<BulkStatusResponse>, StatusCode>| r.err();
+        assert_eq!(bad(call(&state, "owner", "c1", &RULES, "bogus", "").await), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(bad(call(&state, "owner", "c1", &[], "open", "").await), Some(StatusCode::BAD_REQUEST));
+        let many: Vec<String> = (0..=MAX_RULES).map(|i| format!("r{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(bad(call(&state, "owner", "c1", &many, "open", "").await), Some(StatusCode::BAD_REQUEST));
+        let long = "x".repeat(MAX_FINDING_DETAILS_BYTES + 1);
+        assert_eq!(bad(call(&state, "owner", "c1", &RULES, "open", &long).await), Some(StatusCode::BAD_REQUEST));
+        let extra = ["x1", "x2", "x3", "x4"];
+        assert_eq!(bad(call(&state, "owner", "c1", &extra, "open", "").await), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_counts_match_the_rows_and_duplicates_collapse(pool: PgPool) {
+        let (state, _dir) = setup(&pool).await;
+        let ids = [RULES[0], RULES[0], RULES[1], "SV-unknown"];
+        let Json(out) = call(&state, "owner", "c1", &ids, "open", "").await.unwrap();
+        assert_eq!(out.results.len(), 3);
+        assert_eq!((out.applied_count, out.pending_count, out.error_count), (2, 0, 1));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows as usize, out.applied_count);
+        // Closing without any finding details is a per-rule error and writes nothing new.
+        let Json(out) = call(&state, "owner", "c1", &[RULES[2]], "not_a_finding", "").await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (0, 1));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_queues_closing_on_gated_assets_once(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let (state, _dir) = app_state(pool.clone());
+        let Json(out) = call(&state, "owner", "c1", &[RULES[0]], "not_a_finding", "why").await.unwrap();
+        assert_eq!((out.applied_count, out.pending_count), (0, 1));
+        let Json(out) = call(&state, "owner", "c1", &[RULES[0]], "not_a_finding", "why").await.unwrap();
+        assert_eq!(out.results[0].note.as_deref(), Some(ALREADY_PENDING));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn apply_plan_rejects_a_stale_closed_snapshot(pool: PgPool) {
+        // The handler cannot be driven to this from one direct call (the row
+        // must change between its snapshot read and its write), so this is
+        // the equivalent check one level down with a stale `expect_status`.
+        let (_state, _dir) = setup(&pool).await;
+        db_checklists::upsert_rule(&pool, "c1", RULES[0], "open", "d", "", "owner", None, None)
+            .await
+            .unwrap();
+        let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        let out = apply_plan(
+            &pool,
+            "c1",
+            RULES[0],
+            "owner",
+            "not_a_finding",
+            true,
+            Some("not_a_finding"),
+            None,
+            None,
+            Plan::Apply { finding_details: "d".into() },
+        )
+        .await;
+        assert_eq!(out.err().as_deref(), Some("rule changed while saving; try again"));
+        let status: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "open");
+        let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        assert_eq!(audit_after, audit_before);
+    }
 }
