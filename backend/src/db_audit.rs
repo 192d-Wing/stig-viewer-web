@@ -92,7 +92,7 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
 pub const COLLAPSE_WINDOW_SECS: i64 = 300;
 
 /// Collapse a repeated denied/rejected event into the newest matching row
-/// (same user, action, outcome, the three id columns, the exact `detail`,
+/// (same user, action, outcome, the three id columns, the `detail` without its client-derived counters (`requested`, `distinct`),
 /// `source_ip` and `user_role`) whose first occurrence is within [`COLLAPSE_WINDOW_SECS`]. Only
 /// `repeat_count` and `last_occurred_at` change; the row keeps the first
 /// request's `request_id`, `source_ip` and `detail`. Returns whether a row was
@@ -109,7 +109,7 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
                         AND asset_id IS NOT DISTINCT FROM $4::text \
                         AND checklist_id IS NOT DISTINCT FROM $5::text \
                         AND stig_id IS NOT DISTINCT FROM $6::text \
-                        AND detail IS NOT DISTINCT FROM $7::jsonb \
+                        AND (detail - 'requested' - 'distinct') IS NOT DISTINCT FROM ($7::jsonb - 'requested' - 'distinct') \
                         AND source_ip IS NOT DISTINCT FROM $9::text \
                         AND user_role IS NOT DISTINCT FROM $10::text \
                         AND occurred_at > NOW() - make_interval(secs => $8) \
@@ -331,6 +331,22 @@ mod tests {
         assert_eq!(got.len(), 5);
         assert_eq!(got[0], ("denied".to_string(), 2, true, Some("req-1".to_string())));
         assert!(got[1..].iter().all(|r| r.1 == 1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn client_derived_counters_do_not_split_the_key_but_reason_and_dry_run_do(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for n in [1, 50, 9000] {
+            record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "requested": n }))).await;
+        }
+        assert_eq!(rows(&pool).await.len(), 1);
+        record_or_log(&pool, ev("rejected", json!({ "reason": "other", "requested": 1 }))).await;
+        record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "dryRun": true, "requested": 1 }))).await;
+        record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "dryRun": false, "requested": 1 }))).await;
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].1, 3);
     }
 
     #[sqlx::test]

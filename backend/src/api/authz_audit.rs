@@ -232,6 +232,7 @@ mod tests {
         assert_eq!(got, [("OTHER".to_string(), 4)]);
 
         // An author past the burst gets 429 from rate_limit, which is not recorded.
+        seed_user(&pool, "rl-author-pkg6").await;
         let author = serve(app(state, "rl-author-pkg6", "author")).await;
         let mut limited = 0;
         for _ in 0..60 {
@@ -240,7 +241,12 @@ mod tests {
             }
         }
         assert!(limited > 0, "never rate limited");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 1);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE user_id = 'rl-author-pkg6'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert_eq!(total, 1);
     }
 }

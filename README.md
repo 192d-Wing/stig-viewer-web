@@ -207,8 +207,9 @@ cd backend && cargo clippy -- -D warnings
   centrally as `authz.denied` with `detail = {method, route}`, where `route` is
   the route template, never the URL. 401 and 429 responses are not recorded.
 - Repeated `denied`/`rejected` events collapse. Only a true repeat does: the
-  same user, action, outcome, asset/checklist/STIG ids, exact `detail`
-  (for `authz.denied`, the method and route template), `source_ip` and
+  same user, action, outcome, asset/checklist/STIG ids, `detail`
+  (for `authz.denied`, the method and route template), ignoring only the
+  client-derived counters `requested` and `distinct`, `source_ip` and
   `user_role`. Such an event, arriving within 5 minutes of the row's first
   occurrence, increments `repeat_count` and sets `last_occurred_at` on that row
   instead of adding one, so a collapsed row covers
