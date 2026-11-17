@@ -472,7 +472,10 @@ async fn reapply_one(
 /// Returns the upserted rule on the direct-write path. When the asset
 /// has `requires_approval = TRUE` and the proposed status is a closing
 /// one, returns 202 Accepted with the new approval row's id (the rule
-/// row itself is NOT modified).
+/// row itself is NOT modified). When the rule was already at that closing
+/// status the write goes through directly, guarded by the status read
+/// under the checklist lock: a concurrent reopen yields 409 Conflict
+/// instead of silently re-closing the rule without review.
 #[allow(clippy::result_large_err)] // axum handler: Response is the error type
 pub async fn update_rule_handler(
     State(state): State<AppState>,
@@ -520,6 +523,7 @@ pub async fn update_rule_handler(
     // or admin approves. requires_approval defaults to FALSE so the
     // existing direct-close behavior the bulk of the E2E suite depends
     // on is unaffected.
+    let mut expect_status: Option<&str> = None;
     if asset.requires_approval && finding_approvals::is_closing_status(&req.status) {
         let current_status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM checklist_rules \
@@ -534,7 +538,9 @@ pub async fn update_rule_handler(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
         let already_closed = current_status.as_deref() == Some(req.status.as_str());
-        if !already_closed {
+        if already_closed {
+            expect_status = Some(req.status.as_str());
+        } else {
             // Idempotency: if a pending request already exists for this
             // rule, return 202 without filing a duplicate row. `request_many`
             // does the check and the insert under the checklist lock.
@@ -592,7 +598,7 @@ pub async fn update_rule_handler(
     })?
     .flatten();
 
-    let row = db_checklists::upsert_rule(
+    let row = match db_checklists::upsert_rule_expecting(
         state.pool.as_ref(),
         db_checklists::RuleWrite {
             checklist_id: &id,
@@ -604,10 +610,21 @@ pub async fn update_rule_handler(
             assignee_id: req.assignee_id.as_deref(),
             due_date: req.due_date,
         },
+        expect_status,
     )
     .await
     .map_err(map_db)
-    .map_err(|s| s.into_response())?;
+    .map_err(|s| s.into_response())?
+    {
+        Ok(row) => row,
+        Err(rejected) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": rejected.to_string() })),
+            )
+                .into_response());
+        }
+    };
 
     // Fire the webhook only when the assignee actually changed and the
     // new value is non-null — null means "unassigned", which we treat
@@ -1081,5 +1098,83 @@ mod tests {
         assert_eq!(body["error"], "finding_details required for status not_a_finding");
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Deterministic race: the rule is closed when the handler reads it, then
+    /// a concurrent transaction (holding the checklist lock) reopens it before
+    /// the handler's write gets the lock.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_already_closed_patch_conflicts_when_the_rule_is_reopened_before_the_write(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
+        let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        sqlx::query("UPDATE checklist_rules SET status = 'open' WHERE rule_id = $1")
+            .bind(RULES[0])
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let (state, _dir) = app_state(pool.clone());
+        let h = tokio::spawn(async move { patch(&state, RULES[0], "not_a_finding", "because").await });
+        let mut waiting = false;
+        for _ in 0..400 {
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE NOT granted")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if n > 0 {
+                waiting = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(waiting, "the handler never blocked on the checklist lock");
+        holder.commit().await.unwrap();
+
+        let (code, body) = h.await.unwrap();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "rule changed while saving; try again");
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(live, "open");
+        let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        assert_eq!(audit_after, audit_before);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_already_closed_patch_still_writes_directly(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
+        let (state, _dir) = app_state(pool.clone());
+        let (code, body) = patch(&state, RULES[0], "not_a_finding", "updated reason").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["findingDetails"], "updated reason");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn ungated_patch_is_unchanged(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
+        let (state, _dir) = app_state(pool.clone());
+        let (code, _) = patch(&state, RULES[0], "open", "").await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, body) = patch(&state, RULES[0], "not_applicable", "n/a here").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "not_applicable");
     }
 }

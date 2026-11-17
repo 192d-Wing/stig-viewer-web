@@ -210,6 +210,22 @@ pub struct RuleWrite<'a> {
 }
 
 pub async fn upsert_rule(pool: &PgPool, w: RuleWrite<'_>) -> Result<ChecklistRuleRow> {
+    // With no expectation the guarded write cannot be rejected.
+    match upsert_rule_expecting(pool, w, None).await? {
+        Ok(row) => Ok(row),
+        Err(rejected) => Err(rejected.into()),
+    }
+}
+
+/// `upsert_rule` with a write-time status guard: when `expect_status` is
+/// `Some(s)` and the row, read under the checklist lock, holds a different
+/// status (`not_reviewed` when there is no row), nothing is written and
+/// `PatchRejected::StatusChanged` comes back.
+pub async fn upsert_rule_expecting(
+    pool: &PgPool,
+    w: RuleWrite<'_>,
+    expect_status: Option<&str>,
+) -> Result<Result<ChecklistRuleRow, PatchRejected>> {
     let mut tx = pool.begin().await?;
     lock_checklist(&mut tx, w.checklist_id).await?;
 
@@ -222,10 +238,18 @@ pub async fn upsert_rule(pool: &PgPool, w: RuleWrite<'_>) -> Result<ChecklistRul
     .fetch_optional(&mut *tx)
     .await?;
 
+    if let Some(expected) = expect_status {
+        let cur = existing.as_ref().map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+        if cur != expected {
+            tx.rollback().await?;
+            return Ok(Err(PatchRejected::StatusChanged));
+        }
+    }
+
     let row = write_rule(&mut tx, existing.as_ref(), &w).await?;
     touch_checklist(&mut tx, w.checklist_id).await?;
     tx.commit().await?;
-    Ok(row)
+    Ok(Ok(row))
 }
 
 /// Columns a caller wants to change on one rule; `None` keeps whatever the
@@ -1186,5 +1210,55 @@ mod tests {
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
         let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
         assert!(out.iter().all(|o| *o == PatchOutcome::Written));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_rejects_a_changed_status_and_leaves_no_trace(pool: PgPool) {
+        setup(&pool).await;
+        let w = |status| RuleWrite {
+            checklist_id: "c1",
+            rule_id: "r1",
+            status,
+            finding_details: "why",
+            comments: "",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        upsert_rule(&pool, w("open")).await.unwrap();
+        let audit = count(&pool, "SELECT COUNT(*) FROM rule_audit").await;
+        let out = upsert_rule_expecting(&pool, w("not_a_finding"), Some("not_a_finding"))
+            .await
+            .unwrap();
+        assert_eq!(out.unwrap_err(), PatchRejected::StatusChanged);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, audit);
+        let st: String = sqlx::query_scalar("SELECT status FROM checklist_rules WHERE rule_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(st, "open");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_none_matches_upsert_rule(pool: PgPool) {
+        setup(&pool).await;
+        let w = |rule_id| RuleWrite {
+            checklist_id: "c1",
+            rule_id,
+            status: "open",
+            finding_details: "d",
+            comments: "c",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        let a = upsert_rule(&pool, w("r1")).await.unwrap();
+        let b = upsert_rule_expecting(&pool, w("r2"), None).await.unwrap().unwrap();
+        assert_eq!((a.status, a.finding_details, a.comments), (b.status, b.finding_details, b.comments));
+        // An expectation that holds writes through.
+        let c = upsert_rule_expecting(&pool, w("r2"), Some("open")).await.unwrap();
+        assert!(c.is_ok());
     }
 }
