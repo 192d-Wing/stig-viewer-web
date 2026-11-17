@@ -30,6 +30,20 @@ pub struct NewAuditEvent<'a> {
     pub ctx: Option<&'a RequestCtx>,
 }
 
+/// Declare an audit maintenance mode (`retention`, `restore`, `migration` or `test`) for the
+/// rest of this transaction; the guard triggers from migration 040 permit the
+/// matching mutation of `rule_audit` / `audit_events` only while it is set.
+pub(crate) async fn set_maintenance(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    mode: &str,
+) -> Result<()> {
+    sqlx::query("SELECT set_config('stig.audit_maintenance', $1, true)")
+        .bind(mode)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Upper bound on one audit write (both attempts of [`record_or_log`]), so a
 /// busy pool cannot hold the response for the pool's acquire timeout.
 pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -66,7 +80,7 @@ fn bounded(ev: &NewAuditEvent<'_>) -> BoundedIds {
     }
 }
 
-async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<()> {
+async fn insert<'e, E: sqlx::PgExecutor<'e>>(pool: E, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<()> {
     sqlx::query(
         "INSERT INTO audit_events (user_id, action, outcome, asset_id, checklist_id, stig_id, detail, \
                                   source_ip, request_id, user_role) \
@@ -87,6 +101,18 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
     Ok(())
 }
 
+/// Insert an event on an open transaction, so it commits or rolls back with
+/// the caller's work. Unlike [`record_or_log`] a failure is returned.
+pub(crate) async fn record_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ev: &NewAuditEvent<'_>,
+) -> Result<()> {
+    if let Some(ctx) = ev.ctx {
+        ctx.audited.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    insert(&mut **tx, ev, &bounded(ev), &ev.detail).await
+}
+
 /// Identical `denied`/`rejected` events from the same user within this many
 /// seconds of the first one are collapsed into it (see [`collapse`]).
 pub const COLLAPSE_WINDOW_SECS: i64 = 300;
@@ -103,7 +129,8 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
         return Ok(false);
     }
     let n = sqlx::query(
-        "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() \
+        "UPDATE audit_events SET repeat_count = repeat_count + 1, \
+             last_occurred_at = GREATEST(NOW(), COALESCE(last_occurred_at, occurred_at)) \
          WHERE id = (SELECT id FROM audit_events \
                       WHERE user_id = $1 AND action = $2 AND outcome = $3 \
                         AND asset_id IS NOT DISTINCT FROM $4::text \
@@ -202,6 +229,146 @@ mod tests {
     use super::*;
     use crate::test_fixtures::seed_user;
 
+    /// Run one statement in a transaction with the given audit maintenance mode.
+    async fn in_mode(pool: &PgPool, mode: &str, sql: &str) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        set_maintenance(&mut tx, mode).await?;
+        sqlx::query(sql).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn is_guard_error(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|d| d.code())
+            .is_some_and(|c| c == "42501")
+    }
+
+    async fn seed_both(pool: &PgPool) {
+        sqlx::query("INSERT INTO users (id, display_name, email, role, sub, provider) VALUES ('u1', 'u1', '', 'author', 'u1', 'test') ON CONFLICT DO NOTHING")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r','status')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
+            .execute(pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn guard_rejects_plain_mutation_of_both_tables(pool: PgPool) {
+        seed_both(&pool).await;
+        for t in ["rule_audit", "audit_events"] {
+            for sql in [
+                format!("UPDATE {t} SET user_id = user_id"),
+                format!("DELETE FROM {t}"),
+                format!("TRUNCATE {t}"),
+            ] {
+                let e = sqlx::query(&sql).execute(&pool).await.unwrap_err();
+                assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42501"), "{sql}");
+            }
+        }
+        let e = sqlx::query("TRUNCATE users CASCADE").execute(&pool).await.unwrap_err();
+        assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42501"));
+        let n: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn guard_modes_allow_only_their_operations(pool: PgPool) {
+        seed_both(&pool).await;
+        // retention: DELETE only.
+        assert!(is_guard_error(&in_mode(&pool, "retention", "UPDATE rule_audit SET field = 'x'").await.unwrap_err()));
+        assert!(is_guard_error(&in_mode(&pool, "retention", "TRUNCATE rule_audit").await.unwrap_err()));
+        // test: UPDATE and TRUNCATE, not DELETE.
+        in_mode(&pool, "test", "UPDATE rule_audit SET field = 'x'").await.unwrap();
+        assert!(is_guard_error(&in_mode(&pool, "test", "DELETE FROM rule_audit").await.unwrap_err()));
+        // An unknown mode permits nothing.
+        assert!(is_guard_error(&in_mode(&pool, "bogus", "DELETE FROM audit_events").await.unwrap_err()));
+        in_mode(&pool, "retention", "DELETE FROM rule_audit").await.unwrap();
+        in_mode(&pool, "retention", "DELETE FROM audit_events").await.unwrap();
+        // The mode is transaction-local: it does not leak to the next statement.
+        let e = sqlx::query("DELETE FROM audit_events").execute(&pool).await;
+        assert!(e.is_ok(), "no rows left, so nothing to guard");
+        seed_both(&pool).await;
+        let e = sqlx::query("DELETE FROM audit_events").execute(&pool).await.unwrap_err();
+        assert!(e.as_database_error().is_some());
+        // restore: TRUNCATE (cascading from users) only; DELETE is rejected.
+        seed_both(&pool).await;
+        assert!(is_guard_error(&in_mode(&pool, "restore", "DELETE FROM rule_audit").await.unwrap_err()));
+        in_mode(&pool, "restore", "TRUNCATE users CASCADE").await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+        seed_both(&pool).await;
+        in_mode(&pool, "test", "TRUNCATE users CASCADE").await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn guard_allows_only_the_collapse_update_without_a_mode(pool: PgPool) {
+        seed_both(&pool).await;
+        let code = |e: sqlx::Error| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string()));
+        // An `ok` row has no collapse shape.
+        let e = sqlx::query("UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()")
+            .execute(&pool).await.unwrap_err();
+        assert_eq!(code(e).as_deref(), Some("42501"));
+        in_mode(&pool, "test", "UPDATE audit_events SET outcome = 'denied'").await.unwrap();
+        // The collapse shape on a denied row passes without any mode.
+        sqlx::query("UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()")
+            .execute(&pool).await.unwrap();
+        // Rejected: another column too, an outcome change, a jump over 1, a
+        // decrease, no change, a past or future or infinite timestamp.
+        for sql in [
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW(), action = 'x'",
+            "UPDATE audit_events SET outcome = 'ok'",
+            "UPDATE audit_events SET repeat_count = repeat_count + 2, last_occurred_at = NOW()",
+            "UPDATE audit_events SET repeat_count = 1, last_occurred_at = NOW()",
+            "UPDATE audit_events SET repeat_count = repeat_count, last_occurred_at = NOW()",
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() - INTERVAL '1 day'",
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() + INTERVAL '1 day'",
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = 'infinity'",
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NULL",
+        ] {
+            let e = sqlx::query(sql).execute(&pool).await.unwrap_err();
+            assert_eq!(code(e).as_deref(), Some("42501"), "{sql}");
+        }
+        // rule_audit has no collapse shape.
+        let e = sqlx::query("UPDATE rule_audit SET field = 'x'").execute(&pool).await.unwrap_err();
+        assert_eq!(code(e).as_deref(), Some("42501"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn guard_triggers_are_always_enabled_and_migration_mode_allows_update_only(pool: PgPool) {
+        seed_both(&pool).await;
+        let enabled: Vec<(String, String)> = sqlx::query_as(
+            "SELECT tgname::text, tgenabled::text FROM pg_trigger WHERE tgname LIKE '%\\_guard\\_%' ORDER BY tgname",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(enabled.len(), 4);
+        assert!(enabled.iter().all(|(_, e)| e == "A"), "{enabled:?}");
+        in_mode(&pool, "migration", "UPDATE rule_audit SET field = 'y'").await.unwrap();
+        assert!(is_guard_error(&in_mode(&pool, "migration", "DELETE FROM rule_audit").await.unwrap_err()));
+        assert!(is_guard_error(&in_mode(&pool, "migration", "TRUNCATE rule_audit").await.unwrap_err()));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn collapse_onto_a_row_whose_last_occurrence_is_slightly_in_the_future_still_collapses(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        in_mode(&pool, "test", "UPDATE audit_events SET last_occurred_at = NOW() + INTERVAL '30 seconds'").await.unwrap();
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, 2);
+    }
+
     fn ev(outcome: &'static str, detail: Value) -> NewAuditEvent<'static> {
         NewAuditEvent {
             user_id: "u1",
@@ -290,8 +457,7 @@ mod tests {
         assert_eq!(rows(&pool).await.len(), 5);
 
         // Age the first row past the window: the next identical event inserts.
-        sqlx::query("UPDATE audit_events SET occurred_at = NOW() - INTERVAL '6 minutes' WHERE id = (SELECT MIN(id) FROM audit_events)")
-            .execute(&pool)
+        in_mode(&pool, "test", "UPDATE audit_events SET occurred_at = NOW() - INTERVAL '6 minutes' WHERE id = (SELECT MIN(id) FROM audit_events)")
             .await
             .unwrap();
         record_or_log(&pool, ev("rejected", json!({ "reason": "a" }))).await;
@@ -355,7 +521,10 @@ mod tests {
         seed_user(&pool, "u1").await;
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
         let age = |secs: i32| {
-            sqlx::query("UPDATE audit_events SET occurred_at = NOW() - make_interval(secs => $1)").bind(secs as f64).execute(&pool)
+            let pool = pool.clone();
+            async move {
+                in_mode(&pool, "test", &format!("UPDATE audit_events SET occurred_at = NOW() - make_interval(secs => {secs})")).await
+            }
         };
         age(299).await.unwrap(); // 4m59s: still inside
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;

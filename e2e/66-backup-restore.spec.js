@@ -178,7 +178,9 @@ test.describe("Backup + restore — API", () => {
           .get(`${BACKEND}/api/audit/events${query}`, { headers: { "X-User-Id": "alice" } })
           .then((r) => r.json())
       ).rows;
-    const listEvents = async () => (await fetchEvents()).filter((e) => e.action !== "audit.read");
+    // A forced restore also records a backup.restore event inside the restore transaction.
+    const listEvents = async () =>
+      (await fetchEvents()).filter((e) => e.action !== "audit.read" && e.action !== "backup.restore");
     const before = await listEvents();
     expect(before.map((e) => e.action)).toContain("checklist.create");
     // The backup holds the audit.read rows already written, plus the one this
@@ -203,6 +205,9 @@ test.describe("Backup + restore — API", () => {
     });
     expect(restoreRes.status()).toBe(200);
     expect((await restoreRes.json()).restored.audit_events).toBe(before.length + readsInBackup);
+
+    // The restore itself leaves a record in the replaced audit trail.
+    expect((await fetchEvents("?action=backup.restore")).length).toBe(1);
 
     // The audit.read rows survive the round trip like any other event.
     const restoredReads = await fetchEvents("?action=audit.read");

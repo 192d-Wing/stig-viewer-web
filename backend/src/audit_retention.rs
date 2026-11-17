@@ -83,12 +83,15 @@ pub async fn run_prune(
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let mut tx = pool.begin().await.context("begin rule_audit prune tx")?;
+    crate::db_audit::set_maintenance(&mut tx, "retention").await.context("set audit maintenance mode")?;
     let deleted = sqlx::query("DELETE FROM rule_audit WHERE id = ANY($1::bigint[])")
         .bind(&ids)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("delete pruned rule_audit rows")?
         .rows_affected();
+    tx.commit().await.context("commit rule_audit prune")?;
 
     Ok(deleted as usize)
 }
@@ -168,12 +171,15 @@ async fn run_prune_events_batched(
         }
 
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        let mut tx = pool.begin().await.context("begin audit_events prune tx")?;
+        crate::db_audit::set_maintenance(&mut tx, "retention").await.context("set audit maintenance mode")?;
         let deleted = sqlx::query("DELETE FROM audit_events WHERE id = ANY($1::bigint[])")
             .bind(&ids)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .context("delete pruned audit_events rows")?
             .rows_affected() as usize;
+        tx.commit().await.context("commit audit_events prune")?;
         total += deleted;
         if deleted == 0 || (rows.len() as i64) < batch {
             return Ok(total);
@@ -302,6 +308,27 @@ async fn write_archive(data_dir: &Path, rows: &[AuditRow]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_fixtures::seed_user;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_rule_audit_deletes_and_archives_under_the_guard(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for (rule, age) in [("old", "10 days"), ("new", "0 days")] {
+            sqlx::query(&format!(
+                "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+                 VALUES ('u1', 'c', $1, 'status', NOW() - INTERVAL '{age}')"
+            ))
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(run_prune(&pool, &dir, 5, true).await.unwrap(), 1);
+        let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit").fetch_all(&pool).await.unwrap();
+        assert_eq!(left, ["new"]);
+        assert!(dir.join("audit_archive").exists());
+    }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]

@@ -223,6 +223,48 @@ cd backend && cargo clippy -- -D warnings
 - IP addresses are retained with the audit rows, in the retention archive and
   in backups.
 
+
+### Database guard on the audit tables
+
+Migration `040_audit_guard.sql` makes `rule_audit` and `audit_events`
+append-only at the database level. Triggers on both tables (`BEFORE UPDATE OR
+DELETE` per row, `BEFORE TRUNCATE` per statement, one shared function) raise
+SQLSTATE `42501` unless the transaction declared a maintenance mode with
+`SELECT set_config('stig.audit_maintenance', '<mode>', true)`:
+
+- `retention`: DELETE (the audit retention sweep);
+- `restore`: TRUNCATE only (a forced backup restore);
+- `migration`: UPDATE only (a data migration that backfills audit rows);
+- `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
+  which exist only under `STIG_ENABLE_TEST_ROUTES`).
+
+The one update always allowed is the collapse of a repeated denial: on a
+`denied` or `rejected` `audit_events` row only `repeat_count` (exactly +1) and
+`last_occurred_at` (not before the row's last occurrence, not more than a
+minute in the future) may change. The triggers are `ENABLE ALWAYS`, so
+`session_replication_role = replica` does not skip them.
+
+A forced restore records `backup.restore` inside the restore transaction,
+re-inserting the acting admin's user row first if the backup lacks it. If the
+record cannot be written the whole restore rolls back. A structured `audit`
+log line is also written before the restore starts and after it commits
+(including how many attachment blobs were written).
+
+Migration authors: a migration that UPDATEs, backfills or DELETEs audit rows
+fails with 42501. A data migration must first run
+`SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
+transaction (UPDATE only). Never use `test` mode in production code.
+
+Limit: this is a guard, not a privilege boundary. Any code that can run SQL as
+the application role can set the mode, and a DBA or the table owner can
+disable the triggers. It stops accidents, stray queries and injected
+statements that do not know the mode; it does not stop a compromised
+application or database administrator. For production hardening, run
+migrations and the retention/restore jobs under a separate role that owns the
+tables, give the application role only `SELECT` and `INSERT` on the audit
+tables (plus `UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and
+ship audit rows to an external append-only store.
+
 ## Repository layout
 
 ```
