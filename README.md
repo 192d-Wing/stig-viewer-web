@@ -202,6 +202,24 @@ cd backend && cargo clippy -- -D warnings
   without that setting every row records the proxy's address; with it set, the
   proxy must append to `X-Forwarded-For` as described above, since a value the
   client supplied further left is never used.
+- A 403 from the authenticated API that its handler did not record itself
+  (the viewer read-only gate, role checks, `/api/audit/*`) is recorded
+  centrally as `authz.denied` with `detail = {method, route}`, where `route` is
+  the route template, never the URL. 401 and 429 responses are not recorded.
+- Repeated `denied`/`rejected` events collapse. Only a true repeat does: the
+  same user, action, outcome, asset/checklist/STIG ids, `detail`
+  (for `authz.denied`, the method and route template), ignoring only the
+  client-derived counters `requested` and `distinct`, `source_ip` and
+  `user_role`. Such an event, arriving within 5 minutes of the row's first
+  occurrence, increments `repeat_count` and sets `last_occurred_at` on that row
+  instead of adding one, so a collapsed row covers
+  [`occurred_at`, `occurred_at` + 5 minutes]. Requests with different request
+  ids still merge; the row keeps the first request's `request_id`, `source_ip`
+  and `detail`, and later requests are represented only by the counter. The
+  `method` of `authz.denied` is one of the standard methods or `OTHER`. `ok`
+  and `partial` events are never collapsed. Retention prunes a row only when
+  both `occurred_at` and `last_occurred_at` are past the cutoff, and the
+  archive line carries both fields.
 - IP addresses are retained with the audit rows, in the retention archive and
   in backups.
 

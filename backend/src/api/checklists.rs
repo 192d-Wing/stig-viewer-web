@@ -1139,7 +1139,12 @@ mod tests {
         let h = tokio::spawn(async move { patch(&state, RULES[0], "not_a_finding", "because").await });
         let mut waiting = false;
         for _ in 0..400 {
-            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pg_locks WHERE NOT granted")
+            let n: i64 = sqlx::query_scalar(
+                // Only waits in this test's own database: sqlx::test databases
+                // share one server, and other tests' lock waits must not count.
+                "SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+                 WHERE NOT l.granted AND a.datname = current_database()",
+            )
                 .fetch_one(&pool)
                 .await
                 .unwrap();
