@@ -51,6 +51,7 @@ const TABLES: &[&str] = &[
     "checklists",
     "checklist_rules",
     "rule_audit",
+    "audit_events",
     "rule_comments",
     "comment_mentions",
     "attachments",
@@ -67,6 +68,7 @@ const TABLES: &[&str] = &[
 /// restore so subsequent INSERTs don't collide with restored ids.
 const SERIAL_TABLES: &[(&str, &str)] = &[
     ("rule_audit", "id"),
+    ("audit_events", "id"),
     ("webhook_deliveries", "id"),
 ];
 

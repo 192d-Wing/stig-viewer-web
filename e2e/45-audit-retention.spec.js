@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { resetDb, BACKEND } from "./helpers.js";
+import { resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 /**
  * Seed an asset + checklist, then patch the first rule a couple of
@@ -142,5 +142,25 @@ test.describe("Audit retention", () => {
 
     const second = await runRetention(request, 30, false);
     expect(second.pruned).toBe(0);
+  });
+
+  test("API: request events are kept inside retain_days and pruned past it", async ({ request }) => {
+    await seedAuditRows(request, "alice"); // the checklist create leaves one event
+    const events = async () => {
+      await setUserRole("audit-admin", "admin");
+      return request
+        .get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "audit-admin" } })
+        .then((r) => r.json());
+    };
+    expect((await events()).totalCount).toBe(1);
+
+    const kept = await runRetention(request, 30, false);
+    expect(kept.prunedEvents).toBe(0);
+    expect((await events()).totalCount).toBe(1);
+
+    // retain_days = 0 puts the cutoff at "now": everything written so far is expired.
+    const swept = await runRetention(request, 0, false);
+    expect(swept.prunedEvents).toBe(1);
+    expect((await events()).totalCount).toBe(0);
   });
 });

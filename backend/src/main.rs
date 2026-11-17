@@ -2,6 +2,7 @@ mod api;
 mod audit_retention;
 mod config;
 mod db;
+mod db_audit;
 mod db_assets;
 mod db_attachments;
 mod db_checklists;
@@ -67,7 +68,10 @@ use api::{
         list_for_rule_handler as list_attachments_for_rule_handler,
         upload_handler as upload_attachment_handler,
     },
-    audit::{activity_handler, rule_history_handler, search_handler as audit_search_handler},
+    audit::{
+        activity_handler, events_handler as audit_events_handler, rule_history_handler,
+        search_handler as audit_search_handler,
+    },
     backup::{download_handler as admin_backup_download_handler, restore_handler as admin_restore_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
@@ -447,6 +451,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/activity", get(activity_handler))
         .route("/api/audit/search", get(audit_search_handler))
+        .route("/api/audit/events", get(audit_events_handler))
         .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
         .route("/api/drafts/pending-for-me", get(pending_for_me_handler))
         .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
@@ -762,16 +767,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "audit_retention", || async {
-                    let n = audit_retention::run_prune(
-                        &db,
-                        &cfg.data_dir,
-                        retain_days,
-                        archive_enabled,
-                    )
-                    .await?;
-                    Ok::<String, anyhow::Error>(format!(
-                        "pruned {n} rows (retain_days={retain_days}, archive={archive_enabled})"
-                    ))
+                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled).await
                 })
                 .await;
                 match result {

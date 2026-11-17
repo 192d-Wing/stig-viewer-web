@@ -20,6 +20,10 @@ pub struct ChecklistRow {
     pub applied_version: String,
     #[serde(default)]
     pub applied_release: String,
+    /// Who created the checklist. `None` = unknown (rows that predate the
+    /// column are not backfilled).
+    #[serde(default)]
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -75,8 +79,8 @@ pub async fn find_checklist(
 pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO checklists \
-            (id, asset_id, stig_id, status, applied_version, applied_release) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+            (id, asset_id, stig_id, status, applied_version, applied_release, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&row.id)
     .bind(&row.asset_id)
@@ -84,6 +88,7 @@ pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     .bind(&row.status)
     .bind(&row.applied_version)
     .bind(&row.applied_release)
+    .bind(&row.created_by)
     .execute(pool)
     .await?;
     Ok(())
@@ -95,8 +100,8 @@ pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
 pub async fn insert_checklist_if_absent(pool: &PgPool, row: &ChecklistRow) -> Result<bool> {
     let res = sqlx::query(
         "INSERT INTO checklists \
-            (id, asset_id, stig_id, status, applied_version, applied_release) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+            (id, asset_id, stig_id, status, applied_version, applied_release, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (asset_id, stig_id) DO NOTHING",
     )
     .bind(&row.id)
@@ -105,6 +110,7 @@ pub async fn insert_checklist_if_absent(pool: &PgPool, row: &ChecklistRow) -> Re
     .bind(&row.status)
     .bind(&row.applied_version)
     .bind(&row.applied_release)
+    .bind(&row.created_by)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() == 1)
@@ -706,9 +712,27 @@ mod tests {
             updated_at: Utc::now(),
             applied_version: String::new(),
             applied_release: String::new(),
+            created_by: Some("u1".into()),
         };
         assert!(insert_checklist_if_absent(&pool, &mk("first")).await.unwrap());
         assert!(!insert_checklist_if_absent(&pool, &mk("second")).await.unwrap());
-        assert_eq!(find_checklist(&pool, "a1", "S").await.unwrap().unwrap().id, "first");
+        let found = find_checklist(&pool, "a1", "S").await.unwrap().unwrap();
+        assert_eq!(found.id, "first");
+        assert_eq!(found.created_by.as_deref(), Some("u1"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_row_without_created_by_reads_back_as_none_and_serialises_null(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        seed_asset(&pool, "a1", "u1", false).await;
+        // Same shape as a row from before migration 036: the column is left unset.
+        crate::test_fixtures::seed_checklist(&pool, "c1", "a1", "S").await;
+        let by_id = get_checklist(&pool, "c1").await.unwrap().unwrap();
+        let by_pair = find_checklist(&pool, "a1", "S").await.unwrap().unwrap();
+        assert_eq!(by_id.created_by, None);
+        assert_eq!(by_pair.created_by, None);
+        let json = serde_json::to_value(&by_id).unwrap();
+        assert_eq!(json["createdBy"], serde_json::Value::Null);
     }
 }

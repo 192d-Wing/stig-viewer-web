@@ -394,3 +394,75 @@ test.describe("Checklist bulk status — UI", () => {
     expect(opened).toBe(visible);
   });
 });
+
+test.describe("Checklist bulk status — audit events", () => {
+  test.beforeEach(async () => {
+    await resetDb();
+  });
+
+  async function events(request, query = "") {
+    await setUserRole("audit-admin", "admin");
+    const res = await request.get(`${BACKEND}/api/audit/events${query}`, {
+      headers: { "X-User-Id": "audit-admin" },
+    });
+    expect(res.status()).toBe(200);
+    return (await res.json()).rows.filter((r) => r.action === "rules.bulk_status");
+  }
+
+  test("an admin sees one event with the right counts, and no request text", async ({ request }) => {
+    const { checklistId, ruleIds } = await seedChecklist(request);
+    const secret = "E2E-SECRET-FINDING-TEXT";
+    const res = await bulkStatus(request, checklistId, {
+      ruleIds: [...ruleIds.slice(0, 3), "SV-not-in-this-stig"],
+      status: "not_a_finding",
+      findingDetails: secret,
+    });
+    expect(res.status()).toBe(200);
+
+    const rows = await events(request);
+    expect(rows).toHaveLength(1);
+    const [ev] = rows;
+    expect(ev.outcome).toBe("partial");
+    expect(ev.assetName).toBe(ASSET_NAME);
+    expect(ev.detail.targetStatus).toBe("not_a_finding");
+    expect(ev.detail.requested).toBe(4);
+    expect(ev.detail.applied).toBe(3);
+    expect(ev.detail.errors).toBe(1);
+    expect(ev.detail.rejected).toEqual([
+      { ruleId: "SV-not-in-this-stig", reason: "rule is not part of this checklist's STIG" },
+    ]);
+    expect(JSON.stringify(ev)).not.toContain(secret);
+  });
+
+  test("a clean request is recorded as ok", async ({ request }) => {
+    const { checklistId, ruleIds } = await seedChecklist(request);
+    await bulkStatus(request, checklistId, { ruleIds: ruleIds.slice(0, 2), status: "open" });
+    const rows = await events(request, "?outcome=ok");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].detail.applied).toBe(2);
+  });
+
+  test("a 403 leaves a denied event and a 400 leaves a rejected event", async ({ request }) => {
+    const { checklistId, ruleIds } = await seedChecklist(request);
+    expect((await bulkStatus(request, checklistId, { ruleIds, status: "open" }, "mallory")).status()).toBe(403);
+    expect((await bulkStatus(request, checklistId, { ruleIds, status: "bogus" })).status()).toBe(400);
+    const rows = await events(request);
+    expect(rows.map((r) => [r.outcome, r.detail.reason]).sort()).toEqual([
+      ["denied", "forbidden"],
+      ["rejected", "invalid_status"],
+    ]);
+    const denied = rows.find((r) => r.outcome === "denied");
+    expect(denied.byName).toBe("mallory");
+    expect(denied.assetName).toBe(ASSET_NAME);
+  });
+
+  test("a NUL or quote in a rule id still leaves an event", async ({ request }) => {
+    const { checklistId, ruleIds } = await seedChecklist(request);
+    const res = await bulkStatus(request, checklistId, { ruleIds: [ruleIds[0], "\u0000", 'q"\\'], status: "open" });
+    expect(res.status()).toBe(200);
+    const rows = await events(request);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].outcome).toBe("partial");
+    expect(rows[0].detail.rejected.map((r) => r.ruleId)).toEqual(["?", "q??"]);
+  });
+});

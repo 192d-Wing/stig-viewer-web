@@ -183,7 +183,7 @@ pub async fn search_handler(
 
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(50).clamp(1, 200);
-    let offset = (page - 1) * page_size;
+    let offset = (page - 1).saturating_mul(page_size);
 
     let from_ts = match params.from.as_deref() {
         Some(s) if !s.is_empty() => Some(parse_date_param(s, false)?),
@@ -325,4 +325,225 @@ pub async fn search_handler(
         page_size,
         rows,
     }))
+}
+
+// ── GET /api/audit/events ───────────────────────────────────────────────────
+//
+// Request-level events from `audit_events` (bulk status, save to system,
+// checklist creation, including rejected and denied requests). Admin-only,
+// like `/api/audit/search`; all filters optional.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventsQuery {
+    pub user_id: Option<String>,
+    pub asset_id: Option<String>,
+    pub checklist_id: Option<String>,
+    pub action: Option<String>,
+    pub outcome: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AuditEventDbRow {
+    id: i64,
+    occurred_at: DateTime<Utc>,
+    by_name: String,
+    asset_name: Option<String>,
+    stig_title: Option<String>,
+    action: String,
+    outcome: String,
+    /// `detail::text`; sqlx's json feature is not enabled.
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventRow {
+    pub id: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub by_name: String,
+    pub asset_name: Option<String>,
+    pub stig_title: Option<String>,
+    pub action: String,
+    pub outcome: String,
+    pub detail: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEventsResponse {
+    pub total_count: i64,
+    pub page: i64,
+    pub page_size: i64,
+    pub rows: Vec<AuditEventRow>,
+}
+
+/// Push the optional filters as a WHERE clause (all values bound).
+fn push_event_filters<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+    p: &'a AuditEventsQuery,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) {
+    let mut sep = " WHERE ";
+    let texts: [(&str, &'a Option<String>); 5] = [
+        ("e.user_id", &p.user_id),
+        ("e.asset_id", &p.asset_id),
+        ("e.checklist_id", &p.checklist_id),
+        ("e.action", &p.action),
+        ("e.outcome", &p.outcome),
+    ];
+    for (col, v) in texts {
+        if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
+            qb.push(sep).push(col).push(" = ").push_bind(v);
+            sep = " AND ";
+        }
+    }
+    if let Some(ts) = from {
+        qb.push(sep).push("e.occurred_at >= ").push_bind(ts);
+        sep = " AND ";
+    }
+    if let Some(ts) = to {
+        qb.push(sep).push("e.occurred_at <= ").push_bind(ts);
+    }
+}
+
+pub async fn events_handler(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(params): Query<AuditEventsQuery>,
+) -> Result<Json<AuditEventsResponse>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params.page_size.unwrap_or(50).clamp(1, 200);
+    let offset = (page - 1).saturating_mul(page_size);
+
+    let from_ts = match params.from.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_date_param(s, false)?),
+        _ => None,
+    };
+    let to_ts = match params.to.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_date_param(s, true)?),
+        _ => None,
+    };
+
+    let mut count_qb = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM audit_events e");
+    push_event_filters(&mut count_qb, &params, from_ts, to_ts);
+    let total_count: i64 = count_qb
+        .build_query_scalar()
+        .fetch_one(state.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!("audit events count failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT e.id, e.occurred_at, \
+                COALESCE(u.display_name, e.user_id) AS by_name, \
+                ast.name AS asset_name, \
+                COALESCE(sc.title, e.stig_id) AS stig_title, \
+                e.action, e.outcome, e.detail::text AS detail \
+           FROM audit_events e \
+           LEFT JOIN users u ON u.id = e.user_id \
+           LEFT JOIN assets ast ON ast.id = e.asset_id \
+           LEFT JOIN stigs_catalog sc ON sc.id = e.stig_id",
+    );
+    push_event_filters(&mut qb, &params, from_ts, to_ts);
+    qb.push(" ORDER BY e.occurred_at DESC, e.id DESC LIMIT ")
+        .push_bind(page_size)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let db_rows: Vec<AuditEventDbRow> = qb
+        .build_query_as()
+        .fetch_all(state.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!("audit events query failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let rows = db_rows
+        .into_iter()
+        .map(|r| AuditEventRow {
+            id: r.id,
+            occurred_at: r.occurred_at,
+            by_name: r.by_name,
+            asset_name: r.asset_name,
+            stig_title: r.stig_title,
+            action: r.action,
+            outcome: r.outcome,
+            detail: serde_json::from_str(&r.detail).unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+
+    Ok(Json(AuditEventsResponse { total_count, page, page_size, rows }))
+}
+
+#[cfg(test)]
+mod events_tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, auth, seed_user};
+    use sqlx::PgPool;
+
+    fn query(action: Option<&str>) -> AuditEventsQuery {
+        AuditEventsQuery {
+            user_id: None,
+            asset_id: None,
+            checklist_id: None,
+            action: action.map(str::to_string),
+            outcome: None,
+            from: None,
+            to: None,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    async fn call(state: &AppState, role: &str, q: AuditEventsQuery) -> Result<Json<AuditEventsResponse>, StatusCode> {
+        events_handler(State(state.clone()), Extension(auth("u1", role)), Query(q)).await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn events_are_admin_only_left_joined_and_filterable(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        // The asset ids refer to nothing: the record outlives deletion.
+        for (action, outcome) in [("checklist.save", "ok"), ("checklist.create", "denied")] {
+            sqlx::query(
+                "INSERT INTO audit_events (user_id, action, outcome, asset_id, detail) \
+                 VALUES ('u1', $1, $2, 'deleted-asset', '{\"k\":1}')",
+            )
+            .bind(action)
+            .bind(outcome)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let (state, _dir) = app_state(pool.clone());
+        for role in ["author", "reviewer", "viewer"] {
+            assert_eq!(call(&state, role, query(None)).await.err(), Some(StatusCode::FORBIDDEN), "{role}");
+        }
+
+        let Json(all) = call(&state, "admin", query(None)).await.unwrap();
+        assert_eq!(all.total_count, 2);
+        assert!(all.rows.iter().all(|r| r.asset_name.is_none() && r.detail["k"] == 1));
+
+        let Json(some) = call(&state, "admin", query(Some("checklist.create"))).await.unwrap();
+        assert_eq!(some.total_count, 1);
+        assert_eq!(some.rows[0].outcome, "denied");
+
+        // A huge page does not overflow the offset.
+        let mut q = query(None);
+        q.page = Some(i64::MAX);
+        let Json(far) = call(&state, "admin", q).await.unwrap();
+        assert!(far.rows.is_empty());
+    }
 }

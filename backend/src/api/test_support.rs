@@ -229,17 +229,27 @@ pub async fn run_retention_handler(
     State(state): State<AppState>,
     Json(req): Json<RunRetentionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match audit_retention::run_prune(
+    // Independent prunes: an error in one must not skip the other.
+    let rules = audit_retention::run_prune(
         state.pool.as_ref(),
         &state.config.data_dir,
         req.retain_days,
         req.archive,
     )
-    .await
-    {
-        Ok(pruned) => Ok(Json(json!({ "pruned": pruned }))),
-        Err(e) => {
-            tracing::error!("Test run-retention failed: {e:#}");
+    .await;
+    let events = audit_retention::run_prune_events(
+        state.pool.as_ref(),
+        &state.config.data_dir,
+        req.retain_days,
+        req.archive,
+    )
+    .await;
+    match (rules, events) {
+        (Ok(pruned), Ok(pruned_events)) => {
+            Ok(Json(json!({ "pruned": pruned, "prunedEvents": pruned_events })))
+        }
+        (r, e) => {
+            tracing::error!("Test run-retention failed: rule_audit={r:?} audit_events={e:?}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -421,8 +431,7 @@ pub async fn run_scheduler_handler(
         }
         "audit_retention" => {
             scheduler_log::record(pool, "audit_retention", || async {
-                let n = audit_retention::run_prune(pool, &data_dir, 365, false).await?;
-                Ok::<String, anyhow::Error>(format!("pruned {n} rows"))
+                audit_retention::run_scheduled(pool, &data_dir, 365, false).await
             })
             .await
         }

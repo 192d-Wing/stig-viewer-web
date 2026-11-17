@@ -19,6 +19,7 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
@@ -27,6 +28,7 @@ use crate::api::rule_bulk_status::{
     apply_plan, expected_status, plan_rule, short_id, Plan, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets;
+use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow, RulePatch};
 use crate::AppState;
 
@@ -112,27 +114,76 @@ fn merge_entry(existing: Option<&ChecklistRuleRow>, e: &SaveRule) -> Option<Merg
 }
 
 /// POST /api/assets/:id/checklists/save
+///
+/// The work (access check through the final audit events) runs in a spawned
+/// task: each rule is committed on its own, so a client disconnect that drops
+/// this future must not leave committed writes without their audit events.
 pub async fn save_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Path(asset_id): Path<String>,
     Json(req): Json<SaveRequest>,
 ) -> Result<Json<SaveResponse>, StatusCode> {
+    tokio::spawn(save_work(state, user, asset_id, req))
+        .await
+        .map_err(|e| {
+            tracing::error!("save task failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+}
+
+async fn save_work(
+    state: AppState,
+    user: AuthUser,
+    asset_id: String,
+    req: SaveRequest,
+) -> Result<Json<SaveResponse>, StatusCode> {
     let pool = state.pool.as_ref();
     let asset = db_assets::get_asset(pool, &asset_id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    // The request's STIG id is recorded only once it has the expected shape.
+    let event_stig = is_valid_stig_id(&req.stig_id).then_some(req.stig_id.as_str());
+    let request_event = |outcome: &'static str, detail: serde_json::Value| {
+        db_audit::record_or_log(
+            pool,
+            NewAuditEvent {
+                user_id: &user.id,
+                action: "checklist.save",
+                outcome,
+                asset_id: Some(&asset.id),
+                checklist_id: None,
+                stig_id: event_stig,
+                detail,
+            },
+        )
+    };
     if !asset_acl::user_can(pool, &asset.id, &user, "write").await {
+        request_event("denied", json!({ "reason": "forbidden" })).await;
         return Err(StatusCode::FORBIDDEN);
     }
-    if !is_valid_stig_id(&req.stig_id) || req.rules.len() > MAX_RULES {
+    if !is_valid_stig_id(&req.stig_id) {
+        request_event("rejected", json!({ "reason": "invalid_stig_id", "requested": req.rules.len() })).await;
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.rules.len() > MAX_RULES {
+        request_event("rejected", json!({ "reason": "too_many_rules", "requested": req.rules.len() })).await;
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Load the catalog STIG before creating anything so a bad id never
     // leaves an empty checklist behind.
-    let mut stig = load_stig_json(&state, &req.stig_id).await?;
+    let mut stig = match load_stig_json(&state, &req.stig_id).await
+    {
+        Ok(v) => v,
+        Err(code) => {
+            if code == StatusCode::BAD_REQUEST || code == StatusCode::NOT_FOUND {
+                request_event("rejected", json!({ "reason": "stig_unavailable" })).await;
+            }
+            return Err(code);
+        }
+    };
     let known: HashSet<String> = take_rules(&mut stig)
         .iter()
         .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
@@ -140,12 +191,34 @@ pub async fn save_handler(
 
     let distinct: HashSet<&str> = req.rules.iter().map(|r| r.rule_id.as_str()).collect();
     if distinct.len() > known.len() {
+        request_event(
+            "rejected",
+            json!({ "reason": "more_rules_than_stig", "requested": req.rules.len(), "distinct": distinct.len() }),
+        )
+        .await;
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let (checklist, created) = find_or_create(pool, &asset.id, &req.stig_id)
+    let (checklist, created) = find_or_create(pool, &asset.id, &req.stig_id, &user.id)
         .await
         .map_err(map_db)?;
+    if created {
+        // Separate event so every checklist creation is searchable by action,
+        // whichever endpoint made it (also noted as `created` in the save event).
+        db_audit::record_or_log(
+            pool,
+            NewAuditEvent {
+                user_id: &user.id,
+                action: "checklist.create",
+                outcome: "ok",
+                asset_id: Some(&asset.id),
+                checklist_id: Some(&checklist.id),
+                stig_id: Some(&req.stig_id),
+                detail: json!({ "via": "save" }),
+            },
+        )
+        .await;
+    }
 
     let existing: HashMap<String, ChecklistRuleRow> =
         db_checklists::list_rule_overrides(pool, &checklist.id)
@@ -179,13 +252,14 @@ pub async fn save_handler(
     }
 
     let count = |s: &str| results.iter().filter(|r| r.status == s).count();
-    let rejected: Vec<String> = results
+    let all_rejected: Vec<(String, String)> = results
         .iter()
         .filter(|r| r.status == "error")
-        .take(100)
-        .map(|r| r.rule_id.clone())
+        .map(|r| (r.rule_id.clone(), r.error.clone().unwrap_or_default()))
         .collect();
-    // No general-purpose audit table exists; record the request as one line.
+    let rejected: Vec<&str> = all_rejected.iter().take(100).map(|(id, _)| id.as_str()).collect();
+    // The durable record is written below; this line stays as the fallback
+    // when that write fails.
     tracing::info!(
         target: "audit",
         user_id = %user.id,
@@ -201,6 +275,30 @@ pub async fn save_handler(
         rejected_rule_ids = ?rejected,
         "save to system"
     );
+    let (rejected_list, rejected_truncated) = db_audit::rejected_detail(&all_rejected);
+    db_audit::record_or_log(
+        pool,
+        NewAuditEvent {
+            user_id: &user.id,
+            action: "checklist.save",
+            outcome: if count("error") > 0 { "partial" } else { "ok" },
+            asset_id: Some(&asset.id),
+            checklist_id: Some(&checklist.id),
+            stig_id: Some(&req.stig_id),
+            detail: json!({
+                "created": created,
+                "requested": req.rules.len(),
+                "applied": count("applied"),
+                "pending": count("pending_approval"),
+                "unchanged": count("unchanged"),
+                "errors": count("error"),
+                "alreadyPending": results.iter().filter(|r| r.note.is_some()).count(),
+                "rejected": rejected_list,
+                "rejectedTruncated": rejected_truncated,
+            }),
+        },
+    )
+    .await;
     Ok(Json(SaveResponse {
         checklist_id: checklist.id,
         created,
@@ -220,6 +318,7 @@ async fn find_or_create(
     pool: &sqlx::PgPool,
     asset_id: &str,
     stig_id: &str,
+    created_by: &str,
 ) -> anyhow::Result<(db_checklists::ChecklistRow, bool)> {
     if let Some(c) = db_checklists::find_checklist(pool, asset_id, stig_id).await? {
         return Ok((c, false));
@@ -235,6 +334,7 @@ async fn find_or_create(
         updated_at: now,
         applied_version,
         applied_release,
+        created_by: Some(created_by.to_string()),
     };
     let inserted = db_checklists::insert_checklist_if_absent(pool, &row).await?;
     if inserted {
@@ -513,7 +613,7 @@ mod tests {
     async fn find_or_create_returns_the_existing_checklist(pool: PgPool) {
         base(&pool, false).await;
         seed_checklist(&pool, "orig", "a1", STIG_ID).await;
-        let (c, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        let (c, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
         assert_eq!((c.id.as_str(), created), ("orig", false));
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
     }
@@ -522,9 +622,9 @@ mod tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn find_or_create_creates_once_then_finds(pool: PgPool) {
         base(&pool, false).await;
-        let (first, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        let (first, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
         assert!(created);
-        let (again, created) = find_or_create(&pool, "a1", STIG_ID).await.unwrap();
+        let (again, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
         assert_eq!((again.id, created), (first.id, false));
     }
 
@@ -538,7 +638,7 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
             let pool = pool.clone();
-            tasks.spawn(async move { find_or_create(&pool, "a1", STIG_ID).await });
+            tasks.spawn(async move { find_or_create(&pool, "a1", STIG_ID, "owner").await });
         }
         let mut ids = HashSet::new();
         let mut created = 0;
@@ -646,5 +746,192 @@ mod tests {
         );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
+    }
+
+    async fn events(pool: &PgPool) -> Vec<(String, String, Option<String>, Option<String>, String)> {
+        sqlx::query_as(
+            "SELECT action, outcome, checklist_id, stig_id, detail::text FROM audit_events ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_records_create_and_save_events_and_the_creator(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let rules = vec![rule(RULES[0], "open", "", ""), rule("SV-unknown", "open", "", "")];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert!(out.created);
+        let by: Option<String> = sqlx::query_scalar("SELECT created_by FROM checklists WHERE id = $1")
+            .bind(&out.checklist_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(by.as_deref(), Some("owner"));
+
+        // A second save reuses the checklist: a save event, no second create event.
+        let _ = call(&state, "owner", "author", STIG_ID, vec![rule(RULES[1], "open", "", "")]).await.unwrap();
+
+        let ev = events(&pool).await;
+        let kinds: Vec<(&str, &str)> = ev.iter().map(|e| (e.0.as_str(), e.1.as_str())).collect();
+        assert_eq!(
+            kinds,
+            [("checklist.create", "ok"), ("checklist.save", "partial"), ("checklist.save", "ok")]
+        );
+        assert!(ev.iter().all(|e| e.2.as_deref() == Some(out.checklist_id.as_str())));
+        assert!(ev.iter().all(|e| e.3.as_deref() == Some(STIG_ID)));
+        let d = |i: usize| serde_json::from_str::<serde_json::Value>(&ev[i].4).unwrap();
+        assert_eq!(d(0)["via"], "save");
+        assert_eq!(d(1)["created"], true);
+        assert_eq!((d(1)["applied"].as_i64(), d(1)["errors"].as_i64()), (Some(1), Some(1)));
+        assert_eq!(d(1)["rejected"][0]["ruleId"], "SV-unknown");
+        assert_eq!(d(2)["created"], false);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_records_denied_and_rejected_requests(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        call(&state, "other", "author", STIG_ID, vec![]).await.err();
+        call(&state, "owner", "author", "../etc", vec![]).await.err();
+        let too_many: Vec<SaveRule> = (0..=MAX_RULES).map(|i| rule(&format!("r{i}"), "open", "", "")).collect();
+        call(&state, "owner", "author", STIG_ID, too_many).await.err();
+        let extra: Vec<SaveRule> = (0..=RULES.len()).map(|i| rule(&format!("x{i}"), "open", "", "")).collect();
+        call(&state, "owner", "author", STIG_ID, extra).await.err();
+        // An unknown STIG is a 404 to the client, recorded as stig_unavailable.
+        call(&state, "owner", "author", "NO-SUCH-STIG", vec![]).await.err();
+
+        let ev = events(&pool).await;
+        let got: Vec<(String, String)> = ev
+            .iter()
+            .map(|e| {
+                let d: serde_json::Value = serde_json::from_str(&e.4).unwrap();
+                (e.1.clone(), d["reason"].as_str().unwrap().to_string())
+            })
+            .collect();
+        let want: Vec<(String, String)> = [
+            ("denied", "forbidden"),
+            ("rejected", "invalid_stig_id"),
+            ("rejected", "too_many_rules"),
+            ("rejected", "more_rules_than_stig"),
+            ("rejected", "stig_unavailable"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        // The malformed STIG id is not stored; valid ones are.
+        assert_eq!(ev[1].3, None);
+        assert_eq!(ev[2].3.as_deref(), Some(STIG_ID));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_event_detail_never_holds_request_text(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let rules = vec![
+            rule(RULES[0], "not_a_finding", "ZZ-RECOGNISABLE-DETAILS", "ZZ-RECOGNISABLE-COMMENT"),
+            rule(RULES[1], "bogus", "ZZ-RECOGNISABLE-DETAILS", "ZZ-RECOGNISABLE-COMMENT"),
+        ];
+        let _ = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let ev = events(&pool).await;
+        assert!(!ev.is_empty());
+        for e in &ev {
+            assert!(!e.4.contains("ZZ-RECOGNISABLE"), "detail leaked request text: {}", e.4);
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_still_succeeds_when_the_audit_event_cannot_be_written(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        sqlx::query("DROP TABLE audit_events").execute(&pool).await.unwrap();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, vec![rule(RULES[0], "open", "", "")])
+            .await
+            .unwrap();
+        assert!(out.created);
+        assert_eq!(out.applied_count, 1);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
+        assert_eq!(call(&state, "other", "author", STIG_ID, vec![]).await.err(), Some(StatusCode::FORBIDDEN));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_hostile_rule_ids_still_leave_save_event(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let long = "x".repeat(300);
+        let rules = vec![
+            rule("\u{0}", "open", "", ""),
+            rule("q\"b\\\n\t\u{7f}", "open", "", ""),
+            rule(&long, "open", "", ""),
+        ];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert_eq!(out.error_count, 3);
+        let saves: Vec<_> = events(&pool).await.into_iter().filter(|e| e.0 == "checklist.save").collect();
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].1, "partial");
+        let d: serde_json::Value = serde_json::from_str(&saves[0].4).unwrap();
+        assert_ne!(d, serde_json::json!({ "detailDropped": true }));
+        let listed: Vec<&str> = d["rejected"].as_array().unwrap().iter().map(|r| r["ruleId"].as_str().unwrap()).collect();
+        assert_eq!(listed, ["?", "q?b????", "x".repeat(64).as_str()]);
+    }
+
+    /// Relies on the current-thread runtime `#[sqlx::test]` uses (one `yield_now`
+    /// lets the handler task reach its `tokio::spawn` before `abort()`).
+    /// See the bulk-status twin: the future is dropped after its first poll;
+    /// the checklist, the rule write, the create event and the save event must
+    /// all still land.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_work_and_events_survive_the_handler_future_being_dropped(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let st = state.clone();
+        let h = tokio::spawn(async move {
+            let _ = call(&st, "owner", "author", STIG_ID, vec![rule(RULES[0], "open", "", "")]).await;
+        });
+        tokio::task::yield_now().await;
+        h.abort();
+        let mut seen = 0i64;
+        for _ in 0..200 {
+            seen = count(&pool, "SELECT COUNT(*) FROM audit_events").await;
+            if seen >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(seen, 2);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_with_a_huge_stig_id_leaves_events_without_the_value(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let huge = "A".repeat(100_000);
+        assert_eq!(call(&state, "other", "author", &huge, vec![]).await.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(call(&state, "owner", "author", &huge, vec![]).await.err(), Some(StatusCode::BAD_REQUEST));
+        let ev: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT outcome, stig_id, detail->>'reason' FROM audit_events ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ev,
+            [
+                ("denied".to_string(), None, "forbidden".to_string()),
+                ("rejected".to_string(), None, "invalid_stig_id".to_string()),
+            ]
+        );
     }
 }
