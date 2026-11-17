@@ -18,6 +18,7 @@
 //! `email_deliveries` so the e2e tests + operators can confirm the
 //! handler fired without needing a real mail server.
 
+use super::email::insert_delivery;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -541,39 +542,6 @@ pub async fn run_asset_email_schedules(
         }
     }
     Ok(sent)
-}
-
-/// Same audit-row insert helper that `email.rs` uses; duplicated rather
-/// than re-exported to keep `email.rs` private to its module-level
-/// concerns (the fleet report).
-#[allow(clippy::too_many_arguments)]
-async fn insert_delivery(
-    pool: &PgPool,
-    kind: &str,
-    to_addresses: &str,
-    subject: &str,
-    body_snippet: &str,
-    attached: Option<&str>,
-    mode: &str,
-    error: Option<&str>,
-) {
-    let res = sqlx::query(
-        "INSERT INTO email_deliveries \
-            (kind, to_addresses, subject, body_snippet, attached, mode, error) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(kind)
-    .bind(to_addresses)
-    .bind(subject)
-    .bind(body_snippet)
-    .bind(attached)
-    .bind(mode)
-    .bind(error)
-    .execute(pool)
-    .await;
-    if let Err(e) = res {
-        tracing::error!("email_deliveries insert failed: {e:#}");
-    }
 }
 
 #[cfg(test)]
