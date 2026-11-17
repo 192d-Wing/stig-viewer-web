@@ -5,6 +5,31 @@ use crate::ui::*;
 use serde::Deserialize;
 use yew::prelude::*;
 
+/// Login emblem image: the operator-installed seal in `frontend/public/brand/`.
+/// Change this if the asset is replaced with a different file name or format.
+const LOGIN_EMBLEM_SRC: &str = "/brand/org-emblem.png";
+/// Alt text for the emblem; update it if the emblem is replaced.
+const LOGIN_EMBLEM_ALT: &str = "Department of War seal";
+/// Number of decorative binary columns in the login background.
+const LOGIN_BINARY_COLUMNS: usize = 36;
+/// Number of digits per column.
+const LOGIN_BINARY_ROWS: usize = 70;
+
+/// Deterministic 0/1 text for one background column, one digit per line.
+fn login_binary_column(col: usize) -> String {
+    (0..LOGIN_BINARY_ROWS)
+        .map(|row| {
+            if (col * 7 + row * 3 + col * row) % 5 < 2 {
+                '1'
+            } else {
+                '0'
+            }
+        })
+        .map(String::from)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct User {
@@ -81,22 +106,37 @@ pub fn AuthGate(props: &AuthGateProps) -> Html {
             </UiBox>
         },
         AuthState::Unauthed => html! {
-            <UiBox text_align="center" padding="xxl">
-                <SpaceBetween direction="vertical" size="l">
-                    <UiBox variant="h1">{"STIG Tools"}</UiBox>
-                    <UiBox variant="p" color="text-body-secondary">
-                        {"Sign in with your organization account."}
-                    </UiBox>
-                    <SpaceBetween direction="horizontal" size="s">
+            <main class="login-screen">
+                <div class="login-bg" aria-hidden="true">
+                    <div class="login-binary" aria-hidden="true">
+                        { for (0..LOGIN_BINARY_COLUMNS).map(|c| html! {
+                            <span key={c}>{login_binary_column(c)}</span>
+                        }) }
+                    </div>
+                </div>
+                <section class="login-card" aria-labelledby="login-title" data-testid="login-card">
+                    <h1 id="login-title" class="login-title">{"STIG Tools"}</h1>
+                    <p class="login-subtitle">{"Sign in with your organization account."}</p>
+                    <div class="login-actions">
                         <Button variant="primary" onclick={goto("/auth/login")}>
                             {"Sign in with Keycloak"}
                         </Button>
                         <Button variant="normal" onclick={goto("/auth/saml/login")}>
                             {"Sign in with SAML"}
                         </Button>
-                    </SpaceBetween>
-                </SpaceBetween>
-            </UiBox>
+                    </div>
+                </section>
+                <div class="login-emblem-panel">
+                    <img
+                        class="login-emblem"
+                        src={LOGIN_EMBLEM_SRC}
+                        alt={LOGIN_EMBLEM_ALT}
+                        width="360"
+                        height="360"
+                        data-testid="login-emblem"
+                    />
+                </div>
+            </main>
         },
         AuthState::Authed(user) => html! {
             <ContextProvider<AuthContext> context={Some(user.clone())}>

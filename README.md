@@ -200,3 +200,16 @@ cd backend && cargo clippy -- -D warnings
 ├── dev/keycloak/         Dev realm import
 └── docker-compose.yml    Local dev stack
 ```
+
+## Login emblem
+
+The sign-in screen shows an emblem from `frontend/public/brand/org-emblem.png`
+(served at `/brand/org-emblem.png`). This is the operator-installed seal, and
+the operator is responsible for being authorized to display it (for example
+under DoD seal and insignia policy). PNG is recommended because it has no
+script surface; use at least 512px. The installed file is about 1.5 MB, so
+consider losslessly compressing or downscaling it (it is shown at most 360px
+wide) to speed up the first paint. To swap it, replace the file and adjust
+`LOGIN_EMBLEM_SRC` and `LOGIN_EMBLEM_ALT` in `frontend/src/auth.rs`. The
+background accent colour is the `--login-accent` variable in
+`frontend/styles/app.css`.
