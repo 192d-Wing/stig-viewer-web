@@ -403,6 +403,51 @@ pub fn filename_to_id(zip_name: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
+/// Derive a slug ID from an XCCDF file name inside a multi-STIG bundle.
+///
+/// `U_Cisco_IOS-XE_Router_RTR_STIG_V3R5_Manual-xccdf.xml` → `cisco-ios-xe-router-rtr`
+pub fn xccdf_name_to_id(xccdf_name: &str) -> String {
+    let id = filename_to_id(xccdf_name);
+    id.strip_suffix("-stig").map(str::to_string).unwrap_or(id)
+}
+
+/// How deep `extract_all_xccdf_from_zip` follows ZIPs nested inside ZIPs.
+/// DISA bundles nest two levels (product bundle → per-STIG ZIP → XCCDF).
+const MAX_ZIP_DEPTH: u8 = 3;
+
+/// Return every XCCDF document in a ZIP archive as `(entry name, content)`,
+/// following nested ZIPs. Unlike `extract_xccdf_from_zip` this does not stop
+/// at the first hit: DISA product bundles (`U_Cisco_IOS-XE_Router_Y26M04_STIG.zip`)
+/// carry several STIGs (NDM, RTR, ...) as sibling inner ZIPs.
+pub fn extract_all_xccdf_from_zip(zip_bytes: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_xccdf(zip_bytes, MAX_ZIP_DEPTH, &mut out);
+    out
+}
+
+fn collect_xccdf(zip_bytes: &[u8], depth_left: u8, out: &mut Vec<(String, String)>) {
+    use std::io::Read;
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) else {
+        return;
+    };
+    for i in 0..archive.len() {
+        let Ok(mut file) = archive.by_index(i) else { continue };
+        let name = file.name().to_string();
+        let lower = name.to_lowercase();
+        if lower.ends_with("_xccdf.xml") || lower.ends_with("-xccdf.xml") {
+            let mut content = String::new();
+            if file.read_to_string(&mut content).is_ok() {
+                out.push((name, content));
+            }
+        } else if lower.ends_with(".zip") && depth_left > 0 {
+            let mut inner = Vec::new();
+            if file.read_to_end(&mut inner).is_ok() {
+                collect_xccdf(&inner, depth_left - 1, out);
+            }
+        }
+    }
+}
+
 /// Infer the catalog category from an XCCDF benchmark title.
 pub fn infer_category(title: &str) -> &'static str {
     let t = title.to_lowercase();
@@ -452,6 +497,7 @@ pub fn extract_all_from_library(
 
     let mut entries: Vec<LibraryEntry> = Vec::new();
     let mut errors: Vec<(String, String)> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
         // Read each ZIP entry name + bytes (separate scope to appease borrow checker)
@@ -475,26 +521,43 @@ pub fn extract_all_from_library(
             (raw_name, bytes)
         };
 
-        let id = filename_to_id(&raw_name);
+        let outer_id = filename_to_id(&raw_name);
 
-        let xccdf = match extract_xccdf_from_zip(&inner_bytes) {
-            Ok(x) => x,
-            Err(e) => {
-                errors.push((id, format!("ZIP extraction failed: {e}")));
-                continue;
+        let docs = extract_all_xccdf_from_zip(&inner_bytes);
+        if docs.is_empty() {
+            errors.push((outer_id, "ZIP extraction failed: No *_xccdf.xml found in ZIP archive".into()));
+            continue;
+        }
+
+        // A ZIP holding one STIG keeps the ID derived from the ZIP's own name.
+        // A product bundle holding several gets one ID per STIG, derived from
+        // each XCCDF file name, so they no longer overwrite each other.
+        let multi = docs.len() > 1;
+        for (xccdf_name, xccdf) in docs {
+            let mut id = if multi { xccdf_name_to_id(&xccdf_name) } else { outer_id.clone() };
+            if id.is_empty() {
+                id = outer_id.clone();
             }
-        };
-
-        let stig = match parse_xccdf(&xccdf) {
-            Ok(s) => s,
-            Err(e) => {
-                errors.push((id, format!("XCCDF parse failed: {e}")));
-                continue;
+            if !seen_ids.insert(id.clone()) {
+                let base = id.clone();
+                let mut n = 2;
+                while !seen_ids.insert(format!("{base}-{n}")) {
+                    n += 1;
+                }
+                id = format!("{base}-{n}");
             }
-        };
 
-        let category = infer_category(&stig.title).to_string();
-        entries.push(LibraryEntry { id, category, stig });
+            let stig = match parse_xccdf(&xccdf) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push((id, format!("XCCDF parse failed: {e}")));
+                    continue;
+                }
+            };
+
+            let category = infer_category(&stig.title).to_string();
+            entries.push(LibraryEntry { id, category, stig });
+        }
     }
 
     (entries, errors)
@@ -505,6 +568,64 @@ pub fn extract_all_from_library(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(bytes).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn benchmark(title: &str) -> Vec<u8> {
+        format!(
+            r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>{title}</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title></Rule></Group></Benchmark>"#
+        )
+        .into_bytes()
+    }
+
+    /// A product bundle with several inner STIG ZIPs must yield one catalog
+    /// entry per STIG; a single-STIG ZIP keeps its ZIP-name ID.
+    #[test]
+    fn library_import_keeps_every_stig_in_a_product_bundle() {
+        let ndm = zip_of(&[(
+            "U_Cisco_IOS-XE_Router_NDM_V3R7_Manual_STIG/U_Cisco_IOS-XE_Router_NDM_STIG_V3R7_Manual-xccdf.xml",
+            &benchmark("Cisco IOS XE Router NDM"),
+        )]);
+        let rtr = zip_of(&[(
+            "U_Cisco_IOS-XE_Router_RTR_V3R5_Manual_STIG/U_Cisco_IOS-XE_Router_RTR_STIG_V3R5_Manual-xccdf.xml",
+            &benchmark("Cisco IOS XE Router RTR"),
+        )]);
+        let bundle = zip_of(&[
+            ("U_Cisco_IOS-XE_Router_NDM_V3R7_Manual_STIG.zip", &ndm),
+            ("U_Cisco_IOS-XE_Router_RTR_V3R5_Manual_STIG.zip", &rtr),
+        ]);
+        let single = zip_of(&[(
+            "U_MS_Windows_11_V2R3_Manual_STIG/U_MS_Windows_11_STIG_V2R3_Manual-xccdf.xml",
+            &benchmark("Microsoft Windows 11"),
+        )]);
+        let library = zip_of(&[
+            ("U_Cisco_IOS-XE_Router_Y26M04_STIG.zip", &bundle),
+            ("U_MS_Windows_11_V2R3_STIG.zip", &single),
+        ]);
+
+        let (entries, errors) = extract_all_from_library(&library);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut got: Vec<(String, String)> =
+            entries.into_iter().map(|e| (e.id, e.stig.title)).collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("cisco-ios-xe-router-ndm".to_string(), "Cisco IOS XE Router NDM".to_string()),
+                ("cisco-ios-xe-router-rtr".to_string(), "Cisco IOS XE Router RTR".to_string()),
+                ("ms-windows-11".to_string(), "Microsoft Windows 11".to_string()),
+            ]
+        );
+    }
 
     /// XCCDF fragment with one rule carrying two CCI idents plus one
     /// non-CCI ident. After parsing, `cci` must contain exactly the two
