@@ -9,11 +9,15 @@
   (backend/src/parser/mod.rs) iterates all rules in a group. This fixture
   matches DISA's shape so both parsers agree.
 
+  Each Rule also carries the <reference> block DISA emits, whose <dc:title>
+  ("DPMS Target …") shares the local name "title" with the Rule's own
+  <title>. Parsers must keep the Rule title (regression: issue #10).
+
   Used by:
   - frontend/src/utils/parse_xccdf.rs (tests)   (frontend parse_xccdf)
   - backend/src/parser/mod.rs::parity_tests    (backend parse_xccdf)
 -->
-<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1" id="test-benchmark">
+<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1" xmlns:dc="http://purl.org/dc/elements/1.1/" id="test-benchmark">
   <title>Parity Fixture STIG</title>
   <description>Shared fixture for FE/BE parser parity tests.</description>
   <version>2</version>
@@ -23,6 +27,13 @@
     <Rule id="SV-1001r1_rule" severity="high">
       <title>Critical rule under test</title>
       <description>&lt;VulnDiscussion&gt;Why this critical finding matters.&lt;/VulnDiscussion&gt;&lt;FalsePositives&gt;None.&lt;/FalsePositives&gt;</description>
+      <reference>
+        <dc:title>DPMS Target Parity Fixture</dc:title>
+        <dc:publisher>DISA</dc:publisher>
+        <dc:type>DPMS Target</dc:type>
+        <dc:subject>Parity Fixture</dc:subject>
+        <dc:identifier>0000</dc:identifier>
+      </reference>
       <fixtext>Apply the configuration change.</fixtext>
       <check system="C-1001r1_chk">
         <check-content>Verify the setting with a runtime probe.</check-content>
@@ -36,6 +47,13 @@
     <Rule id="SV-1002r1_rule" severity="medium">
       <title>Medium-severity rule</title>
       <description>&lt;VulnDiscussion&gt;Medium impact finding.&lt;/VulnDiscussion&gt;</description>
+      <reference>
+        <dc:title>DPMS Target Parity Fixture</dc:title>
+        <dc:publisher>DISA</dc:publisher>
+        <dc:type>DPMS Target</dc:type>
+        <dc:subject>Parity Fixture</dc:subject>
+        <dc:identifier>0000</dc:identifier>
+      </reference>
       <fixtext>Document the justification.</fixtext>
       <check system="C-1002r1_chk">
         <check-content>Review audit logs.</check-content>
@@ -48,6 +66,13 @@
     <Rule id="SV-1003r1_rule" severity="low">
       <title>Informational finding</title>
       <description>&lt;VulnDiscussion&gt;Minor informational check.&lt;/VulnDiscussion&gt;</description>
+      <reference>
+        <dc:title>DPMS Target Parity Fixture</dc:title>
+        <dc:publisher>DISA</dc:publisher>
+        <dc:type>DPMS Target</dc:type>
+        <dc:subject>Parity Fixture</dc:subject>
+        <dc:identifier>0000</dc:identifier>
+      </reference>
       <fixtext>Note in documentation.</fixtext>
       <check system="C-1003r1_chk">
         <check-content>No runtime probe required.</check-content>

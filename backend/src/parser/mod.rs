@@ -234,7 +234,12 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                 if in_rule {
                     if let Some(ref mut rule) = current_rule {
                         match current_tag.as_str() {
-                            "title" => rule.title = text,
+                            // Only the Rule's own <title> (a direct child).
+                            // DISA rules also carry <reference><dc:title>,
+                            // whose local name is "title" too; matching it
+                            // here used to overwrite every rule title with
+                            // "DPMS Target …".
+                            "title" if depth == rule_depth + 1 => rule.title = text,
                             "description" => {
                                 rule.description = clean_description(&text)
                             }
@@ -549,6 +554,41 @@ mod tests {
         assert!(json.get("cci").unwrap().is_array());
     }
 
+    /// DISA rules carry a Dublin Core title inside `<reference>` after the
+    /// rule's own `<title>`. It must not replace the rule title, and it must
+    /// not leak into a rule that has no title of its own.
+    #[test]
+    fn reference_dc_title_does_not_override_rule_title() {
+        let xml = r#"
+        <Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"
+                   xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <title>Test</title>
+            <Group id="V-1">
+                <title>SRG-APP-000001</title>
+                <Rule id="SV-1_rule" severity="high">
+                    <title>The real rule title</title>
+                    <reference>
+                        <dc:title>DPMS Target Some Product</dc:title>
+                        <dc:publisher>DISA</dc:publisher>
+                    </reference>
+                </Rule>
+            </Group>
+            <Group id="V-2">
+                <Rule id="SV-2_rule" severity="low">
+                    <reference>
+                        <dc:title>DPMS Target Some Product</dc:title>
+                    </reference>
+                </Rule>
+            </Group>
+        </Benchmark>
+        "#;
+
+        let stig = parse_xccdf(xml).expect("parse");
+        assert_eq!(stig.title, "Test");
+        assert_eq!(stig.rules[0].title, "The real rule title");
+        assert_eq!(stig.rules[1].title, "", "dc:title must not stand in for a missing rule title");
+    }
+
     // ── Parity with the frontend parser ──────────────────────────────────────
     //
     // Shared fixture also exercised by
@@ -570,6 +610,12 @@ mod tests {
         assert_eq!(by_stig_id["V-1001"].id, "SV-1001r1_rule");
         assert_eq!(by_stig_id["V-1002"].severity, "CAT II");
         assert_eq!(by_stig_id["V-1003"].severity, "CAT III");
+
+        // Each rule in the fixture also has <reference><dc:title>DPMS Target …
+        // The rule's own <title> must win.
+        assert_eq!(by_stig_id["V-1001"].title, "Critical rule under test");
+        assert_eq!(by_stig_id["V-1002"].title, "Medium-severity rule");
+        assert_eq!(by_stig_id["V-1003"].title, "Informational finding");
     }
 
     #[test]

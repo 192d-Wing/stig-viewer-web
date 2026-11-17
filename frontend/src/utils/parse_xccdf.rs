@@ -297,6 +297,9 @@ mod tests {
         assert_eq!(by_stig_id(&stig, "V-1001").severity, "CAT I");
         assert_eq!(by_stig_id(&stig, "V-1001").id, "SV-1001r1_rule");
         assert_eq!(by_stig_id(&stig, "V-1001").title, "Critical rule under test");
+        // The fixture's <reference><dc:title> must not replace rule titles.
+        assert_eq!(by_stig_id(&stig, "V-1002").title, "Medium-severity rule");
+        assert_eq!(by_stig_id(&stig, "V-1003").title, "Informational finding");
 
         assert_eq!(by_stig_id(&stig, "V-1002").severity, "CAT II");
         assert_eq!(by_stig_id(&stig, "V-1002").id, "SV-1002r1_rule");
