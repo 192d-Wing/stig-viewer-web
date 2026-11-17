@@ -12,9 +12,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN rustup target add wasm32-unknown-unknown
 
 # Prebuilt (static) Trunk for the image's architecture; compiling it takes minutes.
+# HTTPS is enforced for the request and for any redirect it follows.
 RUN arch="$(uname -m)" \
-    && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${arch}-unknown-linux-musl.tar.gz" \
+    && curl --proto '=https' --tlsv1.2 -fsSL \
+       "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${arch}-unknown-linux-musl.tar.gz" \
        | tar -xz -C /usr/local/bin trunk
+
+# Run as an unprivileged user. Everything the build writes (cargo registry,
+# target dir, Trunk's dist) lives outside the bind-mounted source tree in
+# directories this user owns, so the container never needs write access to
+# the checkout.
+RUN useradd --create-home --uid 1000 dev \
+    && mkdir -p /cargo /target /dist \
+    && chown dev:dev /cargo /target /dist
+
+ENV CARGO_HOME=/cargo \
+    CARGO_TARGET_DIR=/target \
+    TRUNK_BUILD_DIST=/dist
+
+USER dev
 
 WORKDIR /app/frontend
 

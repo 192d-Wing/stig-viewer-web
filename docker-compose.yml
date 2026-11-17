@@ -95,19 +95,21 @@ services:
       #   API_URL=http://192.168.1.5:8080 docker compose up
       # (VITE_API_URL is still honoured for existing setups.)
       API_URL: ${API_URL:-${VITE_API_URL:-http://localhost:8080}}
-      CARGO_TARGET_DIR: /target
       # Bind mounts don't deliver inotify events on every host; poll instead.
       TRUNK_WATCH_POLL: "true"
     ports:
       - "5173:5173"
     volumes:
-      - ./frontend:/app/frontend
+      # Source is read-only: the image runs unprivileged and writes its build
+      # output to the /target, /dist and /cargo paths it owns.
+      - ./frontend:/app/frontend:ro
       - frontend_target:/target
-      - cargo_registry:/usr/local/cargo/registry
+      - frontend_cargo:/cargo
     command: trunk serve
 
 volumes:
   postgres_data:
   backend_target:
   frontend_target:
+  frontend_cargo:
   cargo_registry:
