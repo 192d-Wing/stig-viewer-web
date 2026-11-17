@@ -150,10 +150,10 @@ either is enabled while `STIG_ENV=production`, and with neither set
 
 ### STIG data directory
 
-The tracked `backend/data/stigs` is a read-only seed. It is never written by
+The tracked `backend/seed/stigs` is a read-only seed. It is never written by
 the running stack: compose sets `DATA_DIR=/data`, a named volume (`stig_data`)
 holding synced and uploaded STIGs, drafts, attachments and archives. A
-dev-only `STIG_SEED_DIR` (set to `/app/data/stigs` in compose) makes the
+dev-only `STIG_SEED_DIR` (set to `/app/seed/stigs` in compose) makes the
 backend copy seed files that are missing from `DATA_DIR/stigs` at start and
 add catalog rows for any STIG file that has none; it never overwrites an
 existing file. Production leaves `STIG_SEED_DIR` unset and points `DATA_DIR`

@@ -62,11 +62,11 @@ services:
       STIG_SYNC_ON_START: ${STIG_SYNC_ON_START:-true}
       # Mutable data (synced/uploaded STIGs, drafts, attachments, archives)
       # lives in the stig_data named volume, not in the git checkout. The
-      # tracked backend/data/stigs is a read-only seed: files missing from
+      # tracked backend/seed/stigs is a read-only seed: files missing from
       # the volume are copied in at start and existing ones are never
       # overwritten. Production leaves STIG_SEED_DIR unset.
       DATA_DIR: /data
-      STIG_SEED_DIR: /app/data/stigs
+      STIG_SEED_DIR: /app/seed/stigs
       # OIDC config. Two URLs because the IdP is reached on two networks:
       #   OIDC_INTERNAL_URL — backend-to-Keycloak via the docker network.
       #                       Used for discovery, token exchange, JWKS fetch.
