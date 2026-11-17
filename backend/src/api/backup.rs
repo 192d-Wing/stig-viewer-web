@@ -476,7 +476,10 @@ fn parse_backup_zip(bytes: &[u8]) -> anyhow::Result<ParsedBackup> {
         if name.ends_with('/') {
             continue;
         }
-        let mut buf = Vec::with_capacity(entry.size() as usize);
+        // Never size the buffer from the archive's declared entry size: it is
+        // attacker-controlled and would allow a huge allocation or a
+        // capacity-overflow panic.
+        let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
 
         if name == "manifest.json" {
@@ -580,5 +583,19 @@ mod tests {
         let smaller = (data.len() as u32 - 5).to_le_bytes();
         bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
         assert!(parse_backup_zip(&bytes).is_err());
+    }
+
+    #[test]
+    fn restore_does_not_allocate_from_an_enormous_declared_size() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        let huge = u32::MAX.to_le_bytes();
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 24..cd + 28].copy_from_slice(&huge);
+        let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        bytes[lh + 22..lh + 26].copy_from_slice(&huge);
+        // The point is no huge allocation and no panic. The real data is
+        // read to its true end, so the result may be Ok or Err.
+        let _ = parse_backup_zip(&bytes);
     }
 }
