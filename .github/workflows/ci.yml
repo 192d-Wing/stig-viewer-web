@@ -75,9 +75,14 @@ jobs:
           docker run -d --name ci-postgres \
             -e POSTGRES_USER=stig -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=stig_viewer \
             -p 127.0.0.1:5432:5432 "$DB_IMAGE"
+          # Probe over TCP with a real login. The image first runs a temporary
+          # server on the unix socket only while it initialises, then restarts;
+          # a socket-level pg_isready can succeed against that temporary server
+          # and let the tests start just before the restart drops them.
           ready=0
           for _ in $(seq 1 60); do
-            if docker exec ci-postgres pg_isready -U stig -d stig_viewer >/dev/null 2>&1; then ready=1; break; fi
+            if docker exec -e PGPASSWORD="$pw" ci-postgres \
+                 psql -h 127.0.0.1 -U stig -d stig_viewer -tAc 'select 1' >/dev/null 2>&1; then ready=1; break; fi
             sleep 1
           done
           [ "$ready" = 1 ] || { echo "Postgres did not become ready" >&2; docker logs ci-postgres; exit 1; }
