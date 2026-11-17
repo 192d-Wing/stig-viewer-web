@@ -16,4 +16,6 @@ blob-report/
 .DS_Store
 
 # Editor / tool state
-.claude/
+.claude/*
+!.claude/agents/
+!.claude/skills/

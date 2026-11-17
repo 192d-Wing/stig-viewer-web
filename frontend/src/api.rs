@@ -128,6 +128,17 @@ pub async fn api_send<B: Serialize + ?Sized>(
     Ok(())
 }
 
+/// Raw multipart POST of a prepared form. Carries credentials like every
+/// other call here. Does not treat non-2xx as an error.
+pub async fn api_post_form(path: &str, form: web_sys::FormData) -> Result<Response, String> {
+    builder("POST", path)
+        .body(form)
+        .map_err(js_err)?
+        .send()
+        .await
+        .map_err(js_err)
+}
+
 /// Raw multipart POST of one file under the field name `file`. Does not treat
 /// non-2xx as an error.
 pub async fn api_upload_raw(path: &str, file: &web_sys::File) -> Result<Response, String> {

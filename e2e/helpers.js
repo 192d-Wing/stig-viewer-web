@@ -13,9 +13,20 @@ export async function loginAs(page, name) {
 /**
  * Truncate all user-generated tables via the test-only reset endpoint.
  * Call in beforeEach/beforeAll to ensure a clean slate.
+ *
+ * `/api/test/*` only exists when the backend runs with
+ * STIG_ENABLE_TEST_ROUTES=true, and the X-User-Id header used throughout
+ * these helpers only works with ALLOW_TEST_AUTH_HEADER=true. The compose
+ * stack and CI set both.
  */
 export async function resetDb() {
   const res = await fetch(`${BACKEND}/api/test/reset`, { method: "POST" });
+  if (res.status === 404) {
+    throw new Error(
+      "resetDb failed: 404 — start the backend with STIG_ENABLE_TEST_ROUTES=true " +
+        "(and ALLOW_TEST_AUTH_HEADER=true) to run the E2E suite",
+    );
+  }
   if (!res.ok && res.status !== 204) {
     throw new Error(`resetDb failed: ${res.status}`);
   }
@@ -70,6 +81,23 @@ export async function transitionDraft(userName, draftId, action, body = {}) {
  * helper endpoint. As a workaround, we'll use the auto-create flow
  * and then directly PATCH the role.
  */
+/**
+ * POST a STIG ZIP to the catalog upload endpoint as `userName`. Uploads are
+ * admin-only, so pass a user that has been given the admin role (see
+ * `setUserRole`). Returns the raw fetch Response.
+ */
+export async function uploadStigAs(userName, { file, filename, id, category }) {
+  const form = new FormData();
+  form.append("file", new Blob([file]), filename);
+  form.append("id", id);
+  form.append("category", category);
+  return fetch(`${BACKEND}/api/upload`, {
+    method: "POST",
+    headers: { "X-User-Id": userName },
+    body: form,
+  });
+}
+
 export async function setUserRole(userName, role) {
   // First ensure the user exists by hitting /api/users/me
   await fetch(`${BACKEND}/api/users/me`, {

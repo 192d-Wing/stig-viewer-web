@@ -1,0 +1,146 @@
+# https://taskfile.dev
+#
+#   task          list the available tasks
+#   task dev      stand up local dev: backend stack in containers + frontend on the host
+#
+# Works with either Docker or Podman; whichever is installed is used.
+version: '3'
+
+vars:
+  ENGINE:
+    sh: if command -v docker >/dev/null 2>&1; then echo docker; else echo podman; fi
+  COMPOSE: '{{.ENGINE}} compose'
+  API_URL: '{{.API_URL | default "http://localhost:8080"}}'
+
+tasks:
+  default:
+    desc: List the available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  # ── Local dev ──────────────────────────────────────────────────────────────
+
+  dev:
+    desc: Stand up local dev (postgres, keycloak, backend in containers; frontend via trunk on :5173)
+    cmds:
+      - task: up
+      - task: frontend
+
+  dev:containers:
+    desc: Run everything in containers, frontend included (foreground, Ctrl-C to stop)
+    deps: [engine]
+    cmds:
+      - '{{.COMPOSE}} up'
+
+  up:
+    desc: Start postgres, keycloak and the backend in the background
+    deps: [engine]
+    cmds:
+      - '{{.COMPOSE}} up -d postgres keycloak backend'
+      - cmd: echo "Backend → http://localhost:8080 (first start compiles; follow with 'task logs -- backend')"
+        silent: true
+
+  frontend:
+    desc: Serve the frontend with trunk on http://localhost:5173 (rebuilds on change)
+    deps: [setup]
+    dir: frontend
+    env:
+      API_URL: '{{.API_URL}}'
+    cmds:
+      - trunk serve
+
+  down:
+    desc: Stop the containers (data is kept)
+    deps: [engine]
+    cmds:
+      - '{{.COMPOSE}} down'
+
+  reset:
+    desc: Stop the containers and drop the database volume
+    deps: [engine]
+    prompt: This deletes the local Postgres data. Continue?
+    cmds:
+      - '{{.COMPOSE}} down -v'
+
+  status:
+    desc: Show container status
+    deps: [engine]
+    cmds:
+      - '{{.COMPOSE}} ps'
+
+  logs:
+    desc: "Follow container logs (one service: task logs -- backend)"
+    deps: [engine]
+    cmds:
+      - '{{.COMPOSE}} logs -f {{.CLI_ARGS}}'
+
+  data:restore:
+    desc: Discard the tracked STIG data files the backend's DISA sync rewrites on start
+    cmds:
+      - git checkout -- backend/data
+
+  # ── Checks ─────────────────────────────────────────────────────────────────
+
+  lint:
+    desc: Clippy for frontend and backend
+    cmds:
+      - cd frontend && cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - cd backend && cargo clippy -- -D warnings
+
+  test:
+    desc: Unit tests for frontend and backend
+    cmds:
+      - cd frontend && cargo test
+      - cd backend && cargo test
+
+  e2e:
+    desc: "Playwright suite; needs 'task dev' running (extra args: task e2e -- e2e/02-library.spec.js)"
+    deps: [node-modules]
+    cmds:
+      - npx playwright test {{.CLI_ARGS}}
+
+  build:
+    desc: Release build of the frontend into frontend/dist
+    deps: [setup]
+    dir: frontend
+    env:
+      API_URL: '{{.API_URL}}'
+    cmds:
+      - trunk build --release
+
+  # ── Prerequisites ──────────────────────────────────────────────────────────
+
+  setup:
+    desc: Install the frontend toolchain (wasm target, trunk) if missing
+    status:
+      - rustup target list --installed | grep -q wasm32-unknown-unknown
+      - command -v trunk
+    cmds:
+      - rustup target add wasm32-unknown-unknown
+      - command -v trunk >/dev/null 2>&1 || cargo install trunk --locked
+
+  node-modules:
+    internal: true
+    sources: [package-lock.json]
+    generates: [node_modules/.package-lock.json]
+    cmds:
+      - npm ci
+
+  engine:
+    internal: true
+    silent: true
+    cmds:
+      # Podman on macOS/Windows needs its VM running before compose can talk to it.
+      - |
+        if [ "{{.ENGINE}}" = podman ] && ! podman info >/dev/null 2>&1; then
+          echo "Starting podman machine…"
+          podman machine start 2>/dev/null || true
+          # A machine can be listed as running while its socket is dead
+          # (e.g. after the host sleeps); restart it in that case.
+          if ! podman info >/dev/null 2>&1; then
+            echo "Podman machine is unresponsive; restarting it…"
+            podman machine stop
+            podman machine start
+          fi
+        fi

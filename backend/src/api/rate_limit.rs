@@ -56,8 +56,8 @@ fn is_read_method(method: &Method) -> bool {
 }
 
 /// True for paths that are exempt from rate limiting regardless of method.
-/// `/api/test/*` is gated by `STIG_ENV != "production"` at registration
-/// time, so this only matters in dev / CI — but it's important there: the
+/// `/api/test/*` is only registered when `STIG_ENABLE_TEST_ROUTES=true`,
+/// so this only matters in dev / CI — but it's important there: the
 /// reset-db + seed helpers fire from E2E setup and we don't want a noisy
 /// spec to eat into the next spec's budget.
 fn is_exempt_path(path: &str) -> bool {

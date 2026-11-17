@@ -211,8 +211,8 @@ pub async fn list_archive_handler(
 
 /// Body for `POST /api/test/seed-archive` — synchronously fabricates
 /// a "previous version" archive entry for E2E so we don't have to run
-/// a real DISA sync to populate `catalog_archive`. Gated by the
-/// STIG_ENV != "production" block, same as the rest of `test_support`.
+/// a real DISA sync to populate `catalog_archive`. Only registered when
+/// `STIG_ENABLE_TEST_ROUTES=true`, same as the rest of `test_support`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeedArchiveRequest {
