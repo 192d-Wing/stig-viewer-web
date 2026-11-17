@@ -286,7 +286,7 @@ mod tests {
     /// rcgen can't generate RSA itself (KeyGenerationUnavailable); we
     /// generate the keypair with the `rsa` crate and feed it in.
     fn gen_cert() -> (String, RsaPrivateKey) {
-        let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let rsa = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let pkcs8_pem = rsa
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
             .unwrap()

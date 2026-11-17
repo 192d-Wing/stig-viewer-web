@@ -2,6 +2,7 @@
 name    = "stig-viewer-backend"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 [[bin]]
 name = "stig-viewer-backend"
@@ -16,7 +17,7 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 toml               = "0.8"
 quick-xml          = "0.37"
-zip                = "2"
+zip                = { version = "9.6", default-features = false, features = ["deflate-flate2", "deflate64", "time"] }  # deflate-flate2 (not deflate) so the deflate engine stays miniz_oxide; it takes its backend from the flate2 = "1" below
 sqlx               = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate"] }
 chrono             = { version = "0.4", features = ["serde"] }
 tracing            = "0.1"
@@ -41,4 +42,5 @@ ed25519-dalek      = "2"
 
 [dev-dependencies]
 rcgen              = "0.13"
-rand               = "0.8"
+# Keep this rsa on the same version as the main [dependencies] rsa.
+rsa                = { version = "0.9", features = ["sha2", "getrandom"] }

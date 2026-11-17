@@ -307,14 +307,18 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
 
 /// Find and return the text content of the XCCDF file within a ZIP archive.
 pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String> {
+    extract_xccdf_nested(zip_bytes, MAX_ZIP_DEPTH)
+}
+
+fn extract_xccdf_nested(zip_bytes: &[u8], depth_left: u8) -> Result<String> {
     use std::io::Read;
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor)?;
 
-    // STIGs may be double-zipped; handle one level of nesting
+    // STIGs may be double-zipped; follow nested ZIPs up to MAX_ZIP_DEPTH levels.
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_lowercase();
+        let name = file.name()?.to_lowercase();
 
         // Direct XCCDF XML inside the outer ZIP
         if name.ends_with("_xccdf.xml") || name.ends_with("-xccdf.xml") {
@@ -325,9 +329,14 @@ pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String> {
 
         // Inner ZIP — extract it and recurse one level
         if name.ends_with(".zip") {
+            // This error is swallowed by the `if let Ok` below by design: a too-deep
+            // inner ZIP is skipped and the caller reports "No *_xccdf.xml found".
+            if depth_left == 0 {
+                bail!("ZIP nesting exceeds {MAX_ZIP_DEPTH} levels");
+            }
             let mut inner_bytes = Vec::new();
             file.read_to_end(&mut inner_bytes)?;
-            if let Ok(xccdf) = extract_xccdf_from_zip(&inner_bytes) {
+            if let Ok(xccdf) = extract_xccdf_nested(&inner_bytes, depth_left - 1) {
                 return Ok(xccdf);
             }
         }
@@ -432,7 +441,7 @@ fn collect_xccdf(zip_bytes: &[u8], depth_left: u8, out: &mut Vec<(String, String
     };
     for i in 0..archive.len() {
         let Ok(mut file) = archive.by_index(i) else { continue };
-        let name = file.name().to_string();
+        let Ok(name) = file.name().map(|n| n.into_owned()) else { continue };
         let lower = name.to_lowercase();
         if lower.ends_with("_xccdf.xml") || lower.ends_with("-xccdf.xml") {
             let mut content = String::new();
@@ -506,7 +515,7 @@ pub fn extract_all_from_library(
                 Ok(f) => f,
                 Err(_) => continue,
             };
-            let raw_name = file.name().to_string();
+            let Ok(raw_name) = file.name().map(|n| n.into_owned()) else { continue };
 
             // Only process STIG ZIPs; skip SRGs, READMEs, manifests, etc.
             if !raw_name.to_lowercase().ends_with("_stig.zip") {
@@ -647,6 +656,120 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].1.contains("exceeds"), "{errors:?}");
         assert!(errors[0].0.len() <= 64);
+    }
+
+    /// Offsets of every local (`PK\x03\x04`) and central (`PK\x01\x02`) header
+    /// whose entry name equals `name`, as `(name_offset, method_offset)`.
+    fn header_offsets(bytes: &[u8], name: &str) -> Vec<(usize, usize)> {
+        let n = name.as_bytes();
+        let mut out = Vec::new();
+        for pos in 0..bytes.len().saturating_sub(46) {
+            let (name_off, method_off) = match &bytes[pos..pos + 4] {
+                b"PK\x03\x04" => (30, 8),
+                b"PK\x01\x02" => (46, 10),
+                _ => continue,
+            };
+            if bytes.get(pos + name_off..pos + name_off + n.len()) == Some(n) {
+                out.push((pos + name_off, pos + method_off));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn extract_xccdf_finds_direct_nested_and_rejects_bad_input() {
+        let xml = benchmark("Direct");
+        let direct = zip_of(&[("dir/U_X-xccdf.xml", &xml)]);
+        assert_eq!(extract_xccdf_from_zip(&direct).unwrap().as_bytes(), &xml[..]);
+
+        let nested = zip_of(&[("inner.zip", &direct)]);
+        assert_eq!(extract_xccdf_from_zip(&nested).unwrap().as_bytes(), &xml[..]);
+
+        let none = zip_of(&[("readme.txt", b"hi")]);
+        let err = extract_xccdf_from_zip(&none).unwrap_err().to_string();
+        assert!(err.contains("No *_xccdf.xml found"), "{err}");
+
+        assert!(extract_xccdf_from_zip(b"definitely not a zip").is_err());
+    }
+
+    #[test]
+    fn extract_xccdf_reads_a_stored_entry() {
+        use std::io::Write;
+        let xml = benchmark("Stored");
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("U_X-xccdf.xml", opts).unwrap();
+        w.write_all(&xml).unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+        assert_eq!(extract_xccdf_from_zip(&bytes).unwrap().as_bytes(), &xml[..]);
+    }
+
+    #[test]
+    fn library_import_accepts_a_non_utf8_entry_name() {
+        let mut lib = zip_of(&[("U_AXB_V1R1_STIG.zip", &zip_of(&[("a-xccdf.xml", &benchmark("Patched"))]))]);
+        let hits = header_offsets(&lib, "U_AXB_V1R1_STIG.zip");
+        assert_eq!(hits.len(), 2);
+        for (name_off, _) in hits {
+            lib[name_off + 3] = 0xFF; // the 'X'
+        }
+        let (entries, errors) = extract_all_from_library(&lib);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "a-b");
+    }
+
+    #[test]
+    fn unsupported_compression_method_fails_a_single_upload() {
+        let mut z = zip_of(&[("U_X-xccdf.xml", &benchmark("X"))]);
+        for (_, method_off) in header_offsets(&z, "U_X-xccdf.xml") {
+            z[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
+        }
+        let e = extract_xccdf_from_zip(&z).unwrap_err().to_string();
+        assert!(e.contains("compression method not supported: 12"), "{e}");
+    }
+
+    #[test]
+    fn self_nesting_zip_is_bounded_not_a_stack_overflow() {
+        let mut z = zip_of(&[("readme.txt", b"x")]);
+        for _ in 0..(MAX_ZIP_DEPTH as usize + 5) {
+            z = zip_of(&[("inner.zip", &z)]);
+        }
+        let err = extract_xccdf_from_zip(&z).unwrap_err().to_string();
+        assert!(err.contains("No *_xccdf.xml found"), "{err}");
+        // Boundary: an XCCDF MAX_ZIP_DEPTH levels down is found, one more is not.
+        let mut over = zip_of(&[("a-xccdf.xml", &benchmark("Deep"))]);
+        for _ in 0..=MAX_ZIP_DEPTH {
+            over = zip_of(&[("inner.zip", &over)]);
+        }
+        assert!(extract_xccdf_from_zip(&over).is_err());
+        // An XCCDF within the limit is still found.
+        let mut ok = zip_of(&[("a-xccdf.xml", &benchmark("Deep"))]);
+        for _ in 0..MAX_ZIP_DEPTH {
+            ok = zip_of(&[("inner.zip", &ok)]);
+        }
+        assert!(extract_xccdf_from_zip(&ok).is_ok());
+    }
+
+    #[test]
+    fn library_import_skips_an_unsupported_compression_method() {
+        let good = zip_of(&[("a-xccdf.xml", &benchmark("Good"))]);
+        let bad = zip_of(&[("a-xccdf.xml", &benchmark("Bad"))]);
+        let mut lib = zip_of(&[
+            ("U_Bad_V1R1_STIG.zip", &bad),
+            ("U_Good_V1R1_STIG.zip", &good),
+        ]);
+        let hits = header_offsets(&lib, "U_Bad_V1R1_STIG.zip");
+        assert_eq!(hits.len(), 2);
+        for (_, method_off) in hits {
+            lib[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
+        }
+        let (entries, errors) = extract_all_from_library(&lib);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "bad");
+        assert!(errors[0].1.contains("failed to read"), "{errors:?}");
     }
 
     /// XCCDF fragment with one rule carrying two CCI idents plus one

@@ -472,11 +472,14 @@ fn parse_backup_zip(bytes: &[u8]) -> anyhow::Result<ParsedBackup> {
 
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.into_owned();
         if name.ends_with('/') {
             continue;
         }
-        let mut buf = Vec::with_capacity(entry.size() as usize);
+        // Never size the buffer from the archive's declared entry size: it is
+        // attacker-controlled and would allow a huge allocation or a
+        // capacity-overflow panic.
+        let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
 
         if name == "manifest.json" {
@@ -519,4 +522,103 @@ fn parse_backup_zip(bytes: &[u8]) -> anyhow::Result<ParsedBackup> {
 #[allow(dead_code)]
 fn _json_macro_sentinel() -> Value {
     json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            version: BACKUP_VERSION.to_string(),
+            taken_at: "2026-01-01T00:00:00Z".into(),
+            schema_migration: 7,
+            counts: HashMap::from([("users".to_string(), 1)]),
+        }
+    }
+
+    fn zip_with(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut w = ZipWriter::new(Cursor::new(Vec::new()));
+        w.start_file(name, SimpleFileOptions::default()).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn backup_round_trips_rows_and_attachment_blobs() {
+        let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(dir.join(&id), b"blob bytes \x00\x01\x02").unwrap();
+
+        let row = json!({"id": 1, "name": "alice"});
+        let built = build_backup_zip(
+            manifest(),
+            HashMap::from([("users".to_string(), vec![row.clone()])]),
+            vec![id.clone()],
+            dir.clone(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let (m, tables, atts) = parse_backup_zip(&built.unwrap()).unwrap();
+
+        assert_eq!(m.version, BACKUP_VERSION);
+        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m.schema_migration, 7);
+        assert_eq!(m.counts.get("users"), Some(&1));
+        assert_eq!(tables.get("users"), Some(&vec![row]));
+        assert_eq!(atts, vec![(id, b"blob bytes \x00\x01\x02".to_vec())]);
+    }
+
+    #[test]
+    fn restore_rejects_an_archive_without_a_manifest() {
+        assert!(parse_backup_zip(&zip_with("tables/users.jsonl", b"{}\n")).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_an_entry_whose_size_disagrees_with_its_data() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        // Central directory header: uncompressed size at offset 24.
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        let smaller = (data.len() as u32 - 5).to_le_bytes();
+        bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
+        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
+    }
+
+    #[test]
+    fn restore_rejects_an_unsupported_compression_method() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        for pos in 0..bytes.len() - 12 {
+            if &bytes[pos..pos + 4] == b"PK\x03\x04" {
+                bytes[pos + 8..pos + 10].copy_from_slice(&12u16.to_le_bytes());
+            } else if &bytes[pos..pos + 4] == b"PK\x01\x02" {
+                bytes[pos + 10..pos + 12].copy_from_slice(&12u16.to_le_bytes());
+            }
+        }
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string();
+        assert!(err.contains("compression method not supported: 12"), "{err}");
+    }
+
+    #[test]
+    fn restore_parses_an_entry_with_an_enormous_declared_size() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        let huge = u32::MAX.to_le_bytes();
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 24..cd + 28].copy_from_slice(&huge);
+        let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        bytes[lh + 22..lh + 26].copy_from_slice(&huge);
+        // The buffer is no longer sized from the declared size, so this parses
+        // the real data. (A with_capacity(u32::MAX) regression is not cheaply
+        // observable: allocation of ~4 GiB usually succeeds lazily here.)
+        let (m, tables, atts) = parse_backup_zip(&bytes).unwrap();
+        assert_eq!(m.version, BACKUP_VERSION);
+        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m.schema_migration, 7);
+        assert_eq!(m.counts.get("users"), Some(&1));
+        assert!(tables.is_empty());
+        assert!(atts.is_empty());
+    }
 }
