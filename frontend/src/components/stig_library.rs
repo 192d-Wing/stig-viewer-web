@@ -1533,6 +1533,22 @@ mod snippet_tests {
     }
 
     #[test]
+    fn exact_outputs_for_near_miss_tags() {
+        assert_eq!(sanitize_snippet("<mark x"), "&lt;mark x");
+        assert_eq!(
+            sanitize_snippet("<MARK>x</MARK>"),
+            "&lt;MARK&gt;x&lt;/MARK&gt;"
+        );
+    }
+
+    #[test]
+    fn existing_entities_pass_through_unchanged() {
+        for s in ["&lt;mark&gt;", "&#60;script&#62;"] {
+            assert_eq!(sanitize_snippet(s), s);
+        }
+    }
+
+    #[test]
     fn sentinel_text_stays_literal() {
         assert_eq!(sanitize_snippet("MARK_CLOSE"), "MARK_CLOSE");
         assert_eq!(sanitize_snippet("x <"), "x &lt;");
