@@ -34,6 +34,7 @@
   ],
   "users": [
     {
+      "id": "c00677de-7425-4030-a5f0-860c7cc1edab",
       "username": "alice",
       "enabled": true,
       "email": "alice@example.test",
@@ -45,6 +46,7 @@
       ]
     },
     {
+      "id": "b0b0b0b0-6f1d-4c2e-9a7b-2d5e8f3a1c40",
       "username": "bob",
       "enabled": true,
       "email": "bob@example.test",

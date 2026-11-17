@@ -34,12 +34,59 @@ tasks:
       - '{{.COMPOSE}} up'
 
   up:
-    desc: Start postgres, keycloak and the backend in the background
+    desc: Start postgres, keycloak and the backend in the background, and wait until the backend is ready
     deps: [engine]
     cmds:
       - '{{.COMPOSE}} up -d postgres keycloak backend'
-      - cmd: echo "Backend → http://localhost:8080 (first start compiles; follow with 'task logs -- backend')"
-        silent: true
+      - task: wait
+      - task: seed:admin
+
+  wait:
+    desc: Wait until the backend answers its health check (BACKEND_WAIT seconds, default 600)
+    silent: true
+    vars:
+      BACKEND_URL: '{{.BACKEND_URL | default "http://localhost:8080"}}'
+      BACKEND_WAIT: '{{.BACKEND_WAIT | default "600"}}'
+    cmds:
+      # The backend container compiles before it listens, so the containers
+      # being "up" does not mean the API is reachable yet.
+      - |
+        url='{{.BACKEND_URL}}/api/health'
+        limit={{.BACKEND_WAIT}}
+        start=$(date +%s)
+        printf 'Waiting for the backend at %s (first start compiles; this can take a few minutes) ' "$url"
+        while :; do
+          if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+            printf '\nBackend is ready after %ss → {{.BACKEND_URL}}\n' "$(( $(date +%s) - start ))"
+            exit 0
+          fi
+          if [ "$(( $(date +%s) - start ))" -ge "$limit" ]; then
+            printf '\nBackend did not answer within %ss. Last backend log lines:\n' "$limit" >&2
+            {{.COMPOSE}} logs --tail 30 backend >&2 || true
+            echo "Follow it with: task logs -- backend" >&2
+            exit 1
+          fi
+          printf '.'
+          sleep 2
+        done
+
+  seed:admin:
+    desc: Make the dev user alice an admin in the local database (runs as part of 'task up')
+    silent: true
+    vars:
+      # Fixed Keycloak user id for alice (dev/keycloak/stig-viewer-realm.json).
+      # The backend keys users on (provider, sub), so the row can exist before
+      # her first sign-in and survives a database reset.
+      ALICE_SUB: c00677de-7425-4030-a5f0-860c7cc1edab
+    cmds:
+      # Dev database only: this goes through the compose project's postgres
+      # container. Run after 'wait', so the migrations have created the table.
+      - |
+        {{.COMPOSE}} exec -T postgres psql -U stig -d stig_viewer -q -v ON_ERROR_STOP=1 -c "
+          INSERT INTO users (id, display_name, email, sub, provider, role)
+          VALUES ('{{.ALICE_SUB}}', 'Alice Author', 'alice@example.test', '{{.ALICE_SUB}}', 'oidc', 'admin')
+          ON CONFLICT (provider, sub) DO UPDATE SET role = 'admin';" >/dev/null
+        echo "Dev user alice (alice@example.test) has the admin role."
 
   frontend:
     desc: Serve the frontend with trunk on http://localhost:5173 (rebuilds on change)
@@ -48,6 +95,11 @@ tasks:
     env:
       API_URL: '{{.API_URL}}'
     cmds:
+      # The backend only accepts browser requests from this exact origin
+      # (FRONTEND_URL). Trunk also prints http://127.0.0.1:5173 and LAN
+      # addresses; opening the app on those fails with "Cannot connect to backend".
+      - cmd: echo "Open the app at http://localhost:5173 (not 127.0.0.1 or a LAN address)"
+        silent: true
       - trunk serve
 
   down:
