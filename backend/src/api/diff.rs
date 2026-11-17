@@ -106,6 +106,7 @@ pub async fn diff_handler(
         asset_name: String,
         stig_title: String,
         // field → (from_first, to_latest, by_latest, at_latest)
+        #[allow(clippy::type_complexity)]
         fields: BTreeMap<String, (Option<String>, Option<String>, String, DateTime<Utc>)>,
     }
 

@@ -384,7 +384,7 @@ impl<'a> PageState<'a> {
 
     fn kv(&mut self, key: &str, value: &str, fonts: &Fonts) {
         self.layer.use_text(
-            &format!("{key}: "),
+            format!("{key}: "),
             SIZE_BODY,
             Mm(MARGIN_L),
             Mm(self.y),
