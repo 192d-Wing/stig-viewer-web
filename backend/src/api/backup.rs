@@ -284,6 +284,7 @@ fn err_response(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json
 pub async fn restore_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<crate::api::request_ctx::RequestCtx>,
     Query(q): Query<RestoreQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<RestoreResponse>, (StatusCode, Json<RestoreError>)> {
@@ -379,6 +380,12 @@ pub async fn restore_handler(
     })?;
 
     if q.force {
+        // The truncate reaches the audit tables, whose guard triggers need the
+        // `restore` maintenance mode (transaction-local).
+        crate::db_audit::set_maintenance(&mut tx, "restore").await.map_err(|e| {
+            tracing::error!("restore maintenance mode: {e:#}");
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        })?;
         // CASCADE so children get cleared too. Quoted to keep the
         // identifier list safe even if a name ever collides with a
         // reserved word.
@@ -427,6 +434,24 @@ pub async fn restore_handler(
         tracing::error!("restore commit: {e:#}");
         err_response(StatusCode::INTERNAL_SERVER_ERROR, "commit failed")
     })?;
+
+    // A restore replaces the audit trail when forced, so record it after the
+    // commit (best effort: the acting user may not exist in the restored data).
+    let restored_rows: i64 = restored.values().sum();
+    crate::db_audit::record_or_log(
+        pool,
+        crate::db_audit::NewAuditEvent {
+            user_id: &user.id,
+            ctx: Some(&ctx),
+            action: "backup.restore",
+            outcome: "ok",
+            asset_id: None,
+            checklist_id: None,
+            stig_id: None,
+            detail: json!({ "forced": q.force, "restoredRows": restored_rows }),
+        },
+    )
+    .await;
 
     // ── Attachment blobs ────────────────────────────────────────────────
     let dest_dir = state.config.data_dir.join("attachments");

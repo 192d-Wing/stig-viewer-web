@@ -44,12 +44,21 @@ pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
     // catalog_archive has no FK linkage to user tables, so CASCADE doesn't
     // reach it from `users`. List it explicitly so per-test archive seeds
     // don't leak between specs.
-    let result = sqlx::query(
-        "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
-                  email_deliveries, login_notice_acks CASCADE",
-    )
-        .execute(state.pool.as_ref())
-        .await;
+    // CASCADE from `users` reaches the audit tables, whose guard triggers need
+    // the `test` maintenance mode.
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.pool.begin().await?;
+        crate::db_audit::set_maintenance(&mut tx, "test").await?;
+        sqlx::query(
+            "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
+                      email_deliveries, login_notice_acks CASCADE",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
 
     match result {
         Ok(_) => {
@@ -272,14 +281,21 @@ pub async fn backdate_audit_handler(
     State(state): State<AppState>,
     Json(req): Json<BackdateAuditRequest>,
 ) -> StatusCode {
-    let result = sqlx::query(
-        "UPDATE rule_audit \
-         SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
-         WHERE rule_id = $2",
-    )
-    .bind(req.days.to_string())
-    .bind(&req.rule_id)
-    .execute(state.pool.as_ref())
+    let result: anyhow::Result<()> = async {
+        let mut tx = state.pool.begin().await?;
+        crate::db_audit::set_maintenance(&mut tx, "test").await?;
+        sqlx::query(
+            "UPDATE rule_audit \
+             SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
+             WHERE rule_id = $2",
+        )
+        .bind(req.days.to_string())
+        .bind(&req.rule_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
     .await;
 
     match result {

@@ -223,6 +223,35 @@ cd backend && cargo clippy -- -D warnings
 - IP addresses are retained with the audit rows, in the retention archive and
   in backups.
 
+
+### Database guard on the audit tables
+
+Migration `040_audit_guard.sql` makes `rule_audit` and `audit_events`
+append-only at the database level. Triggers on both tables (`BEFORE UPDATE OR
+DELETE` per row, `BEFORE TRUNCATE` per statement, one shared function) raise
+SQLSTATE `42501` unless the transaction declared a maintenance mode with
+`SELECT set_config('stig.audit_maintenance', '<mode>', true)`:
+
+- `retention`: DELETE (the audit retention sweep);
+- `restore`: TRUNCATE and DELETE (a forced backup restore, which also records
+  a `backup.restore` event after it commits);
+- `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
+  which exist only under `STIG_ENABLE_TEST_ROUTES`).
+
+The one update always allowed is the collapse of a repeated denial: only
+`repeat_count` (strictly increasing) and `last_occurred_at` (not moving
+backwards) may change.
+
+Limit: this is a guard, not a privilege boundary. Any code that can run SQL as
+the application role can set the mode, and a DBA or the table owner can
+disable the triggers. It stops accidents, stray queries and injected
+statements that do not know the mode; it does not stop a compromised
+application or database administrator. For production hardening, run
+migrations and the retention/restore jobs under a separate role that owns the
+tables, give the application role only `SELECT` and `INSERT` on the audit
+tables (plus `UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and
+ship audit rows to an external append-only store.
+
 ## Repository layout
 
 ```
