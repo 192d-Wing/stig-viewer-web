@@ -9,17 +9,36 @@ on:
 jobs:
   lint-and-build:
     runs-on: ubuntu-latest
+    env:
+      TRUNK_VERSION: "0.22.1"
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
 
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run build
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            frontend/target
+          key: frontend-${{ runner.os }}-${{ hashFiles('frontend/Cargo.lock') }}
+
+      - name: Install Trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" trunk
+
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test
+      - run: trunk build --release
 
   e2e:
     needs: lint-and-build
@@ -60,12 +79,13 @@ jobs:
 
       - name: Wait for frontend
         run: |
-          for i in $(seq 1 20); do
+          # The first `trunk serve` compiles the wasm bundle from scratch.
+          for i in $(seq 1 180); do
             if curl -sf http://localhost:5173 >/dev/null; then
               echo "frontend healthy after ${i} attempts"
               exit 0
             fi
-            sleep 2
+            sleep 5
           done
           echo "Frontend did not become healthy"
           docker compose logs frontend

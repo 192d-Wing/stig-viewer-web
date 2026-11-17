@@ -3,6 +3,8 @@ dist
 
 # Rust
 backend/target
+frontend/target
+frontend/dist
 backend/data/
 
 # Playwright

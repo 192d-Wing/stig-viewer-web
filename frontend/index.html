@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <!-- The production Content-Security-Policy <meta> is injected here by
+       scripts/inject-csp.sh on release builds. `trunk serve` sends a relaxed
+       dev policy as an HTTP header instead (see Trunk.toml). -->
+  <!--CSP-->
+  <title>STIG Tools</title>
+  <link data-trunk rel="css" href="styles/app.css" />
+  <link data-trunk rel="copy-dir" href="public/fonts" />
+  <link data-trunk rel="copy-file" href="boot.js" />
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+</head>
+
+<body>
+  <div id="root"></div>
+</body>
+
+</html>

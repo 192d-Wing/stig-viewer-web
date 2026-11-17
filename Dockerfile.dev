@@ -1,10 +1,23 @@
-FROM node:22-alpine
+# trixie rather than bookworm: the wasm-bindgen and wasm-opt binaries Trunk
+# downloads need glibc >= 2.38.
+FROM rust:1-slim-trixie
 
-WORKDIR /app
+ARG TRUNK_VERSION=0.22.1
 
-COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+
+# Prebuilt (static) Trunk for the image's architecture; compiling it takes minutes.
+RUN arch="$(uname -m)" \
+    && curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${arch}-unknown-linux-musl.tar.gz" \
+       | tar -xz -C /usr/local/bin trunk
+
+WORKDIR /app/frontend
 
 EXPOSE 5173
 
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+CMD ["trunk", "serve"]
