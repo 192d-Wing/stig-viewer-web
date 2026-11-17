@@ -12,7 +12,7 @@ fn map_severity(s: &str) -> &'static str {
     }
 }
 
-/// A single STIG rule — matches the shape produced by the frontend's parseXCCDF.js.
+/// A single STIG rule — matches the shape produced by the frontend's parse_xccdf.rs.
 ///
 /// Note on CCI fields: `cci_ids` (serialized as `cciIds`) is the long-standing
 /// field name used throughout the frontend and exporters. `cci` (serialized
@@ -56,7 +56,7 @@ pub struct StigData {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Strip known XCCDF XML tags from description text (mirrors cleanDescription in parseXCCDF.js).
+/// Strip known XCCDF XML tags from description text (mirrors clean_description in the frontend's parse_xccdf.rs).
 fn clean_description(raw: &str) -> String {
     // Tags to strip completely (with their contents)
     const STRIP_TAGS: &[&str] = &[
@@ -552,7 +552,7 @@ mod tests {
     // ── Parity with the frontend parser ──────────────────────────────────────
     //
     // Shared fixture also exercised by
-    // src/utils/__tests__/parserParity.test.js on the JS side. Any assertion
+    // the tests in frontend/src/utils/parse_xccdf.rs on the frontend side. Any assertion
     // that drifts between these two tests indicates a real parser
     // divergence.
     const PARITY_FIXTURE: &str = include_str!("../../../testdata/fixtures/minimal.xccdf.xml");

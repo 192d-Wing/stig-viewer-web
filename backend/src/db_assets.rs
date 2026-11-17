@@ -37,7 +37,7 @@ pub struct AssetRow {
     pub email_last_sent_at: Option<DateTime<Utc>>,
     /// Free-form markdown runbook for the asset (operational notes,
     /// escalation contacts, known issues, etc). Stored as plain TEXT
-    /// in the DB; rendered client-side by `src/utils/markdown.js`.
+    /// in the DB; rendered client-side by `frontend/src/utils/markdown.rs`.
     /// Defaults to "" — the frontend treats empty as "no runbook yet".
     ///
     /// On read, anything past `MAX_RUNBOOK_BYTES` is defensively

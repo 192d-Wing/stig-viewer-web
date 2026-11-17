@@ -254,7 +254,7 @@ fn build_zip(
 
 // ── CKL rendering ──────────────────────────────────────────────────────────
 //
-// Ported from `src/utils/exportCKL.js`. Keep field order + casing
+// Mirrors `frontend/src/utils/export_ckl.rs`. Keep field order + casing
 // faithful so DISA STIG Viewer can ingest the output.
 
 fn render_ckl(hostname: &str, section: &ChecklistSection) -> String {

@@ -5,12 +5,12 @@
   VulnDiscussion-wrapped description text that the cleaner must strip.
 
   DISA STIGs use exactly one Rule per Group. The frontend parser
-  (src/utils/parseXCCDF.js) honors that invariant; the backend parser
+  (frontend/src/utils/parse_xccdf.rs) honors that invariant; the backend parser
   (backend/src/parser/mod.rs) iterates all rules in a group. This fixture
   matches DISA's shape so both parsers agree.
 
   Used by:
-  - src/utils/__tests__/parserParity.test.js   (frontend parseXCCDF)
+  - frontend/src/utils/parse_xccdf.rs (tests)   (frontend parse_xccdf)
   - backend/src/parser/mod.rs::parity_tests    (backend parse_xccdf)
 -->
 <Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1" id="test-benchmark">

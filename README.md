@@ -50,11 +50,11 @@ Not just a viewer — a full-stack compliance workflow platform.
 ```
           Browser
              │
-             │  (Vite dev / static build)
+             │  (Trunk dev / static build)
              ▼
     ┌─────────────────┐           ┌──────────────┐
-    │  React 19 +     │  HTTP     │  Keycloak /  │
-    │  Cloudscape UI  │◀─OIDC────▶│  SAML IdP    │
+    │  Rust / Yew     │  HTTP     │  Keycloak /  │
+    │  (WebAssembly)  │◀─OIDC────▶│  SAML IdP    │
     └────────┬────────┘           └──────────────┘
              │ JSON over HTTP
              ▼
@@ -69,9 +69,12 @@ Not just a viewer — a full-stack compliance workflow platform.
        (schema in backend/migrations)
 ```
 
-**Frontend** — `src/`, entry `stig-viewer.jsx`. React 19 with the AWS Cloudscape
-design system, built with Vite 6. ESLint with `jsx-a11y`, `react-hooks`,
-`no-unsanitized`, and `security` plugins; linter runs with `--max-warnings 0`.
+**Frontend** — `frontend/`, entry `frontend/src/main.rs`. Rust with
+[Yew](https://yew.rs) 0.23, compiled to WebAssembly and bundled by
+[Trunk](https://trunkrs.dev). `frontend/src/ui/` is an in-house component kit
+(buttons, tables, modals, selects, charts); pages live in
+`frontend/src/components/`, and the XCCDF/CKL parsers and exporters in
+`frontend/src/utils/`. Clippy runs with `-D warnings`.
 
 **Backend** — `backend/`. Rust with Axum for HTTP, `sqlx` against Postgres,
 `tokio` for async. XCCDF parser in `backend/src/parser/`, DISA sync and scheduler
@@ -100,21 +103,23 @@ That brings up four services:
 
 | Service   | Port | Notes                                                  |
 |-----------|------|--------------------------------------------------------|
-| frontend  | 5173 | Vite dev server, hot-reload                            |
+| frontend  | 5173 | `trunk serve`, rebuilds and reloads on change          |
 | backend   | 8080 | `cargo watch` on `src/` and `migrations/`              |
 | postgres  | 5433 | Mapped off the default to avoid clashes; user `stig`   |
 | keycloak  | 8081 | Dev realm `stig-viewer`, admin `admin` / `admin`       |
 
-Open http://localhost:5173 and sign in through Keycloak.
+Open http://localhost:5173 and sign in through Keycloak. The first start
+compiles the WebAssembly bundle, so the frontend takes a few minutes to come up.
 
 ### Environment overrides
 
 The compose file reads a handful of variables from the shell; defaults are fine
 for local work. The ones you may want to change:
 
-- `VITE_API_URL` — backend origin baked into the frontend bundle. Set when the
-  backend isn't on `localhost:8080` (for example when developing from a second
-  machine).
+- `API_URL` — backend origin compiled into the frontend bundle (and into the
+  production CSP `connect-src`). Set when the backend isn't on
+  `localhost:8080` (for example when developing from a second machine).
+  `VITE_API_URL` is still read as a fallback.
 - `OIDC_INTERNAL_URL` / `OIDC_PUBLIC_URL` / `OIDC_CLIENT_ID` /
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
@@ -137,19 +142,25 @@ docker compose up
 
 ### Frontend-only development
 
-If you want to iterate on the frontend against a running backend without
-rebuilding node_modules in the container:
+To iterate on the frontend against a running backend without the container you
+need a Rust toolchain with the wasm target, plus Trunk:
 
 ```bash
-npm install
-VITE_API_URL=http://localhost:8080 npm run dev
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked
+cd frontend
+API_URL=http://localhost:8080 trunk serve     # http://localhost:5173
 ```
+
+`trunk build --release` writes the static site to `frontend/dist/`, with the
+production Content-Security-Policy injected into `index.html`.
 
 ### Lint and tests
 
 ```bash
-npm run lint         # frontend ESLint, zero warnings
-npm run test:e2e     # Playwright suite (requires the stack running)
+cd frontend && cargo clippy --target wasm32-unknown-unknown -- -D warnings
+cd frontend && cargo test          # parsers, exporters, markdown, diff
+npm ci && npm run test:e2e         # Playwright suite (requires the stack running)
 cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
 ```
@@ -158,9 +169,11 @@ cd backend && cargo clippy -- -D warnings
 
 ```
 .
-├── src/                  React + Cloudscape frontend
-├── stig-viewer.jsx       Frontend entry
-├── public/               Static assets
+├── frontend/
+│   ├── src/              Yew app: ui kit, components, utils
+│   ├── styles/           Stylesheet
+│   ├── public/           Static assets (fonts)
+│   └── Trunk.toml        Build / dev-server config
 ├── e2e/                  Playwright specs
 ├── backend/
 │   ├── src/              Axum handlers, parser, sync, auth, policy

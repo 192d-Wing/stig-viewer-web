@@ -26,9 +26,10 @@ export default defineConfig({
       reuseExistingServer: true,
     },
     {
+      // `trunk serve`; a cold start compiles the wasm bundle first.
       command: "npm run dev",
       port: 5173,
-      timeout: 30_000,
+      timeout: 600_000,
       reuseExistingServer: true,
     },
   ],

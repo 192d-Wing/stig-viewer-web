@@ -1,0 +1,21 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Emit an external bootstrap module instead of Trunk's inline <script>, so the
+# production policy can stay at `script-src 'self' 'wasm-unsafe-eval'` with no
+# 'unsafe-inline'. boot.js reads the hashed asset URLs from these <link> tags.
+pattern_script = '<link id="app-js" rel="modulepreload" href="{base}{js}" crossorigin="anonymous"><link id="app-wasm" rel="preload" href="{base}{wasm}" as="fetch" type="application/wasm" crossorigin="anonymous"><script type="module" src="{base}boot.js"></script>'
+pattern_preload = ''
+
+[serve]
+addresses = ["0.0.0.0"]
+port = 5173
+# Dev policy: `trunk serve` injects an inline auto-reload script and a
+# WebSocket, so script-src/connect-src are relaxed here. Release builds get the
+# strict policy as a <meta> tag (scripts/inject-csp.sh).
+headers = { "X-Content-Type-Options" = "nosniff", "X-Frame-Options" = "DENY", "Referrer-Policy" = "no-referrer", "Permissions-Policy" = "camera=(), microphone=(), geolocation=()", "Content-Security-Policy" = "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src *; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'" }
+
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["scripts/inject-csp.sh"]
