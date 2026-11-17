@@ -130,8 +130,13 @@ for local work. The ones you may want to change:
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
   how the browser does.
-- `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs. Set to a large
-  number to effectively disable the sync (CI does this to keep startup fast).
+- `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs.
+- `STIG_SYNC_ON_START` — run the first DISA sync at boot (default `true`).
+  `false` delays the first run by one interval; CI sets it to `false` so the
+  e2e run never contacts DISA. (A large interval alone does not skip the
+  boot sync.) A source URL that answers 404/410 is logged as a warning naming
+  the entry and counted as a stale URL in the scheduler summary; update
+  `backend/stig-sources.toml` when you see one.
 - `ALLOW_TEST_AUTH_HEADER` — enables the `X-User-Id` test bypass (any client
   can act as any user). Off unless set to `true`/`1`; the compose file turns it
   on for local dev and the E2E suite.
@@ -142,6 +147,23 @@ for local work. The ones you may want to change:
 Both test hooks must stay unset in production. The backend refuses to start if
 either is enabled while `STIG_ENV=production`, and with neither set
 `/api/test/*` returns 404 and `X-User-Id` is ignored.
+
+### STIG data directory
+
+The tracked `backend/data/stigs` is a read-only seed. It is never written by
+the running stack: compose sets `DATA_DIR=/data`, a named volume (`stig_data`)
+holding synced and uploaded STIGs, drafts, attachments and archives. A
+dev-only `STIG_SEED_DIR` (set to `/app/data/stigs` in compose) makes the
+backend copy seed files that are missing from `DATA_DIR/stigs` at start and
+add catalog rows for any STIG file that has none; it never overwrites an
+existing file. Production leaves `STIG_SEED_DIR` unset and points `DATA_DIR`
+at its own persistent storage. The sync skips writing (and archiving) a STIG
+whose serialised bytes are unchanged, so a no-op sync leaves files alone.
+
+`task reset` also drops the `stig_data` volume. Dev drafts and attachments
+created under the old `DATA_DIR` (inside the checkout, `backend/data`) are not
+migrated to the new volume; recreate them. `task data:restore` is gone
+because nothing rewrites the tracked files any more.
 
 Catalog uploads (`POST /api/upload`, `POST /api/upload/library`) require a
 signed-in user with the `admin` role and accept bodies up to 500 MB. Other

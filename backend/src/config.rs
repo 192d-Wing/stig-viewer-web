@@ -28,6 +28,13 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// How often the sync scheduler runs (hours).
     pub sync_interval_hours: u64,
+    /// Run a DISA sync as soon as the server starts (`STIG_SYNC_ON_START`,
+    /// default true). The periodic schedule is unaffected.
+    pub sync_on_start: bool,
+    /// Dev-only read-only directory of seed STIG JSON (`STIG_SEED_DIR`).
+    /// Missing files are copied into `data_dir/stigs` at start; unset in
+    /// production.
+    pub seed_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -47,6 +54,13 @@ impl Config {
                 .unwrap_or_else(|_| "24".into())
                 .parse()
                 .context("STIG_SYNC_INTERVAL_HOURS must be a positive integer")?,
+            sync_on_start: parse_flag_default_true(
+                std::env::var("STIG_SYNC_ON_START").ok().as_deref(),
+            ),
+            seed_dir: std::env::var("STIG_SEED_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from),
         })
     }
 }
@@ -58,6 +72,15 @@ pub fn parse_flag(raw: Option<&str>) -> bool {
     matches!(
         raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("true") | Some("1")
+    )
+}
+
+/// Opt-out boolean env value: on unless explicitly `false` / `0` (trimmed,
+/// case-insensitive), so unset, empty or a typo keeps the default behaviour.
+pub fn parse_flag_default_true(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false") | Some("0")
     )
 }
 
@@ -140,6 +163,17 @@ pub fn load_sources() -> Result<Vec<StigSource>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_on_start_defaults_on_and_only_false_or_zero_disable() {
+        assert!(parse_flag_default_true(None));
+        for on in ["", "true", "1", "yes", "tru"] {
+            assert!(parse_flag_default_true(Some(on)), "{on:?}");
+        }
+        for off in ["false", "FALSE", " false ", "0"] {
+            assert!(!parse_flag_default_true(Some(off)), "{off:?}");
+        }
+    }
 
     #[test]
     fn parse_flag_is_off_unless_explicitly_true() {

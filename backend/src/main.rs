@@ -10,6 +10,7 @@ mod db_checklists;
 mod db_drafts;
 mod parser;
 mod scheduler_log;
+mod seed;
 mod severity;
 mod stig_id;
 mod sync;
@@ -252,6 +253,10 @@ async fn main() -> Result<()> {
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
     let _ = stig_id::warn_non_conforming(&pool).await;
+
+    if let Some(seed_dir) = &config.seed_dir {
+        seed::seed(seed_dir, &config.data_dir.join("stigs"), &pool, &sources).await;
+    }
 
     // ── Signing (optional) ──────────────────────────────────────────────────
     let signing = api::signing::SigningState::from_env()?;
@@ -678,8 +683,15 @@ async fn main() -> Result<()> {
         let src = sources.clone();
         let db = pool.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
+            let period = Duration::from_secs(cfg.sync_interval_hours * 3600);
+            // `interval` fires its first tick immediately; with
+            // STIG_SYNC_ON_START=false start the schedule one period out.
+            let mut interval = if cfg.sync_on_start {
+                tokio::time::interval(period)
+            } else {
+                info!("STIG_SYNC_ON_START is off: first DISA sync in {} hour(s)", cfg.sync_interval_hours);
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+            };
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "sync", || async {
