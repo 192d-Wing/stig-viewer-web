@@ -227,7 +227,9 @@ Verification steps (implemented by `verify_bundle` in `signing.rs`):
 6. Require every signer's `keyId` to be the fingerprint of the key you pinned
    (first 8 bytes of SHA-256 of the raw public key, hex).
 7. Verify every signature over `SIGN_DOMAIN || payload`.
-8. If you hold the artifact, require its SHA-256 to equal `sha256`.
+8. Require the artifact's SHA-256 to equal `sha256` (hex, compared
+   case-insensitively). `verify_bundle` makes this mandatory;
+   `verify_bundle_document_only` skips it and binds no artifact.
 
 v1 is detected by the absence of `version` (and of `payload`); v1 verifiers,
 which checked a signature over a rebuilt document, break against v2 and must
@@ -236,23 +238,66 @@ be updated. ML-DSA is not supported yet. Adding it means a new entry in both
 verify, so stripping a post-quantum signature is detected. Export bundles do
 not use this envelope.
 
-Worked example (Python, `cryptography` package):
+Worked example (Python, `cryptography` package). It uses explicit `raise`
+rather than `assert` (which `python -O` strips) and strict base64:
 
 ```python
-import base64, json
+import base64, hashlib, json
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-b = json.load(open("bundle.json"))
-payload = base64.urlsafe_b64decode(b["payload"] + "=" * (-len(b["payload"]) % 4))
-doc = json.loads(payload)
-assert doc["version"] == 2
-assert [(s["algorithm"], s["keyId"]) for s in doc["signers"]] == \
-       [(s["algorithm"], s["keyId"]) for s in b["signatures"]] == [("ed25519", PINNED_KEY_ID)]
-pub = Ed25519PublicKey.from_public_bytes(PINNED_PUBLIC_KEY_BYTES)
-pub.verify(base64.b64decode(b["signatures"][0]["signature"]),
-           b"stig-viewer/sign/v2\0" + payload)   # raises on failure
-assert doc["sha256"] == sha256_of_artifact_hex
+def no_dupes(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate JSON key: " + k)
+        d[k] = v
+    return d
+
+def verify(bundle_path, pinned_pub: Ed25519PublicKey, artifact_sha256_hex: str):
+    b = json.load(open(bundle_path), object_pairs_hook=no_dupes)
+    p = b["payload"]
+    if "=" in p:
+        raise ValueError("payload must be unpadded base64url")
+    # Strict: rejects characters outside the URL-safe alphabet.
+    payload = base64.b64decode(p + "=" * (-len(p) % 4), altchars=b"-_", validate=True)
+    doc = json.loads(payload, object_pairs_hook=no_dupes)
+
+    if doc.get("version") != 2:
+        raise ValueError("unsupported version")
+    signers = [(s["algorithm"], s["keyId"]) for s in doc["signers"]]
+    sigs = [(s["algorithm"], s["keyId"]) for s in b["signatures"]]
+    if not signers or len(signers) > 8 or len(set(signers)) != len(signers):
+        raise ValueError("bad signer list")
+    if signers[0] != (doc["algorithm"], doc["keyId"]):
+        raise ValueError("algorithm/keyId do not match signers[0]")
+    pub_raw = pinned_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    pinned_id = hashlib.sha256(pub_raw).digest()[:8].hex()
+    if signers != [("ed25519", pinned_id)]:   # reject unknown algorithms; never skip
+        raise ValueError("signers are not exactly the pinned ed25519 key")
+    if sorted(sigs) != sorted(signers):
+        raise ValueError("signatures do not match signers")
+
+    sig = base64.b64decode(b["signatures"][0]["signature"], validate=True)
+    pinned_pub.verify(sig, b"stig-viewer/sign/v2\0" + payload)  # raises on failure
+
+    if doc["sha256"].lower() != artifact_sha256_hex.lower():
+        raise ValueError("artifact hash mismatch")
+    return doc
 ```
+
+The Rust verifier uses `verify_strict`, which rejects non-canonical
+signatures and small-order keys. OpenSSL's Ed25519 verify (used by
+`cryptography`) may be more permissive about non-canonical signatures; that is
+harmless for authenticity here but means the two verifiers can disagree on
+malformed input. Generalise the single-signer check above to a loop over
+`signers` once more algorithms exist.
+
+Rollout note: verifiers must support ML-DSA before the server starts emitting
+it, because unknown algorithms are rejected rather than skipped. When ML-DSA is
+added, derive key ids over `algorithm || pubkey` (so equal key bytes under two
+algorithms cannot share an id) and have `verify_bundle` take pinned keys keyed
+by `(algorithm, keyId)`.
 
 ### Database
 

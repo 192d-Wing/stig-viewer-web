@@ -124,13 +124,19 @@ fn pubkey_response(sk: &SigningState) -> PubkeyResponse {
     }
 }
 
+/// 503 unless a signing key is configured.
+fn require_signing(
+    signing: &Option<SigningState>,
+) -> Result<&SigningState, (StatusCode, &'static str)> {
+    signing
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "signing is not configured"))
+}
+
 pub async fn pubkey_handler(
     State(state): State<AppState>,
 ) -> Result<Json<PubkeyResponse>, (StatusCode, &'static str)> {
-    let sk = state
-        .signing
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "signing is not configured"))?;
+    let sk = require_signing(&state.signing)?;
     Ok(Json(pubkey_response(sk)))
 }
 
@@ -311,19 +317,44 @@ struct SignatureIn {
     signature: String,
 }
 
+/// Maximum number of entries accepted in `signers`.
+const MAX_SIGNERS: usize = 8;
+
 /// Reference verifier for the v2 envelope. Only `payload` and `signatures`
 /// are read from the envelope; `document`, `signature`, `keyId` and `version`
 /// at the top level are unauthenticated and ignored.
 ///
-/// Steps: decode `payload`; parse it; require signed `version == 2`; require a
-/// non-empty duplicate-free `signers` list whose first entry equals the signed
-/// `algorithm`/`keyId`; reject any unsupported signer algorithm; require the
-/// `signatures` set to equal the `signers` set; require every signer's keyId
-/// to be the pinned key's fingerprint; verify every signature over
-/// `SIGN_DOMAIN || payload`; and, if given, require `sha256` to equal the hash
-/// of the artifact.
+/// Steps: decode `payload` (strict base64url, no padding); parse it (duplicate
+/// keys and trailing bytes are errors); require signed `version == 2`; require
+/// a non-empty `signers` list of at most 8 entries whose first entry equals the
+/// signed `algorithm`/`keyId`; reject any unsupported signer algorithm; require
+/// every signer's keyId to be the pinned key's fingerprint; reject duplicate
+/// signers; require the `signatures` set to equal the `signers` set; verify
+/// every signature over `SIGN_DOMAIN || payload`; and require the signed
+/// `sha256` to equal `artifact_sha256`. The hash comparison is
+/// case-insensitive (hex), and the hash is mandatory so a valid bundle for a
+/// different artifact cannot be accepted.
 #[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
 pub fn verify_bundle(
+    bundle_json: &[u8],
+    pinned: &VerifyingKey,
+    artifact_sha256: &str,
+) -> Result<VerifiedDocument, VerifyError> {
+    verify_inner(bundle_json, pinned, Some(artifact_sha256))
+}
+
+/// Same checks as [`verify_bundle`] but without an artifact hash: it proves
+/// the pinned key signed the document and does NOT bind any artifact. Callers
+/// must compare `sha256` against their artifact themselves.
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+pub fn verify_bundle_document_only(
+    bundle_json: &[u8],
+    pinned: &VerifyingKey,
+) -> Result<VerifiedDocument, VerifyError> {
+    verify_inner(bundle_json, pinned, None)
+}
+
+fn verify_inner(
     bundle_json: &[u8],
     pinned: &VerifyingKey,
     artifact_sha256: Option<&str>,
@@ -343,17 +374,22 @@ pub fn verify_bundle(
     if first.algorithm != doc.algorithm || first.key_id != doc.key_id {
         return Err(VerifyError::BadSignerSet);
     }
-    for (i, s) in doc.signers.iter().enumerate() {
+    if doc.signers.len() > MAX_SIGNERS {
+        return Err(VerifyError::BadSignerSet);
+    }
+    let pinned_id = compute_key_id(pinned);
+    for s in &doc.signers {
         if s.algorithm != ALGORITHM {
             return Err(VerifyError::UnsupportedAlgorithm(s.algorithm.clone()));
         }
+        if s.key_id != pinned_id {
+            return Err(VerifyError::KeyIdMismatch);
+        }
+    }
+    for (i, s) in doc.signers.iter().enumerate() {
         if doc.signers[..i].contains(s) {
             return Err(VerifyError::BadSignerSet);
         }
-    }
-    let pinned_id = compute_key_id(pinned);
-    if doc.signers.iter().any(|s| s.key_id != pinned_id) {
-        return Err(VerifyError::KeyIdMismatch);
     }
 
     for (i, sig) in env.signatures.iter().enumerate() {
@@ -451,10 +487,7 @@ pub async fn sign_handler(
     Extension(user): Extension<AuthUser>,
     Json(body): Json<SignRequest>,
 ) -> Result<Json<SignedBundle>, (StatusCode, String)> {
-    let sk = state.signing.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "signing is not configured".into(),
-    ))?;
+    let sk = require_signing(&state.signing).map_err(|(c, m)| (c, m.to_string()))?;
 
     let (bundle, bytes) = sign_request(sk, &user, &body)?;
 
@@ -534,11 +567,12 @@ mod tests {
         st: &SigningState,
         hash: Option<&str>,
     ) -> Result<VerifiedDocument, VerifyError> {
-        verify_bundle(
-            &serde_json::to_vec(v).unwrap(),
-            &st.signing_key.verifying_key(),
-            hash,
-        )
+        let bytes = serde_json::to_vec(v).unwrap();
+        let vk = st.signing_key.verifying_key();
+        match hash {
+            Some(h) => verify_bundle(&bytes, &vk, h),
+            None => verify_bundle_document_only(&bytes, &vk),
+        }
     }
 
     /// Re-signs an arbitrary payload value with the test key, returning a wire envelope.
@@ -666,7 +700,7 @@ mod tests {
     #[test]
     fn wrong_pinned_key_rejected() {
         let st = test_state();
-        let r = verify_bundle(&serde_json::to_vec(&wire(&st)).unwrap(), &other_key(), None);
+        let r = verify_bundle_document_only(&serde_json::to_vec(&wire(&st)).unwrap(), &other_key());
         assert_eq!(r, Err(VerifyError::KeyIdMismatch));
     }
 
@@ -724,6 +758,164 @@ mod tests {
             verify(&resign(&st, &p), &st, None),
             Err(VerifyError::BadSignerSet)
         );
+    }
+
+    fn resign_raw(st: &SigningState, bytes: &[u8]) -> Value {
+        let sig = BASE64.encode(st.signing_key.sign(&signing_input(bytes)).to_bytes());
+        json!({
+            "payload": URL_SAFE_NO_PAD.encode(bytes),
+            "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": sig}]
+        })
+    }
+
+    #[test]
+    fn duplicate_signers_rejected() {
+        let st = test_state();
+        let mut p = payload_value(&wire(&st));
+        let a = p["signers"][0].clone();
+        p["signers"] = json!([a, a]);
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::BadSignerSet)
+        );
+    }
+
+    #[test]
+    fn too_many_signers_rejected() {
+        let st = test_state();
+        let mut p = payload_value(&wire(&st));
+        let a = p["signers"][0].clone();
+        p["signers"] = json!(vec![a; MAX_SIGNERS + 1]);
+        assert_eq!(
+            verify(&resign(&st, &p), &st, None),
+            Err(VerifyError::BadSignerSet)
+        );
+    }
+
+    #[test]
+    fn wrong_pinned_key_is_reported_before_duplicates() {
+        let st = test_state();
+        let mut p = payload_value(&wire(&st));
+        let a = p["signers"][0].clone();
+        p["signers"] = json!([a, a]);
+        let bytes = serde_json::to_vec(&resign(&st, &p)).unwrap();
+        assert_eq!(
+            verify_bundle_document_only(&bytes, &other_key()),
+            Err(VerifyError::KeyIdMismatch)
+        );
+    }
+
+    #[test]
+    fn duplicate_signatures_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        let first = v["signatures"][0].clone();
+        v["signatures"].as_array_mut().unwrap().push(first);
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::UnexpectedSignature));
+    }
+
+    #[test]
+    fn padded_standard_alphabet_and_noncanonical_payload_rejected() {
+        let st = test_state();
+        // Padded: try three resource lengths so every padding amount is covered.
+        let mut padded_cases = 0;
+        let mut bits_cases = 0;
+        for extra in ["", "a", "aa"] {
+            let mut p = payload_value(&wire(&st));
+            p["resource"] = format!("windows-11{extra}").into();
+            let raw = serde_json::to_vec(&p).unwrap();
+            let v = resign_raw(&st, &raw);
+            assert!(verify(&v, &st, None).is_ok());
+            let good = v["payload"].as_str().unwrap().to_string();
+            let mut padded = good.clone();
+            while !padded.len().is_multiple_of(4) {
+                padded.push('=');
+            }
+            if padded != good {
+                padded_cases += 1;
+                let mut bad = v.clone();
+                bad["payload"] = padded.into();
+                assert_eq!(verify(&bad, &st, None), Err(VerifyError::BadPayloadEncoding));
+                // Non-canonical trailing bits: same length, last char differs in the
+                // unused low bits.
+                let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let mut chars: Vec<char> = good.chars().collect();
+                let last = chars.len() - 1;
+                let idx = alphabet.find(chars[last]).unwrap();
+                chars[last] = alphabet.chars().nth(idx ^ 1).unwrap();
+                let mut bad = v.clone();
+                bad["payload"] = chars.into_iter().collect::<String>().into();
+                assert_eq!(verify(&bad, &st, None), Err(VerifyError::BadPayloadEncoding));
+                bits_cases += 1;
+            }
+        }
+        assert!(padded_cases >= 1 && bits_cases >= 1);
+        // Standard alphabet: find bytes whose encoding uses '-' or '_'.
+        let mut payload = payload_value(&wire(&st));
+        payload["resource"] = "???>>>~~~".into();
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let url = URL_SAFE_NO_PAD.encode(&raw);
+        let std_alpha = BASE64.encode(&raw).trim_end_matches('=').to_string();
+        assert_ne!(url, std_alpha, "fixture must exercise - and _");
+        let mut v = resign_raw(&st, &raw);
+        assert!(verify(&v, &st, None).is_ok());
+        v["payload"] = std_alpha.into();
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadPayloadEncoding));
+    }
+
+    #[test]
+    fn trailing_bytes_after_payload_json_rejected() {
+        let st = test_state();
+        let mut raw = serde_json::to_vec(&payload_value(&wire(&st))).unwrap();
+        raw.extend_from_slice(b" ");
+        assert!(verify(&resign_raw(&st, &raw), &st, None).is_ok());
+        raw.extend_from_slice(b"x");
+        assert_eq!(
+            verify(&resign_raw(&st, &raw), &st, None),
+            Err(VerifyError::MalformedDocument)
+        );
+    }
+
+    #[test]
+    fn duplicate_key_in_payload_json_rejected() {
+        let st = test_state();
+        let mut raw = serde_json::to_vec(&payload_value(&wire(&st))).unwrap();
+        raw.pop();
+        raw.extend_from_slice(br#","sha256":"00"}"#);
+        assert_eq!(
+            verify(&resign_raw(&st, &raw), &st, None),
+            Err(VerifyError::MalformedDocument)
+        );
+    }
+
+    #[test]
+    fn invalid_signature_encoding_rejected() {
+        let st = test_state();
+        let mut v = wire(&st);
+        let sig = v["signatures"][0]["signature"].as_str().unwrap().to_string();
+        v["signatures"][0]["signature"] = format!("!{}", &sig[1..]).into();
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadSignatureEncoding));
+        v["signatures"][0]["signature"] = sig[..10].into();
+        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadSignatureEncoding));
+    }
+
+    #[test]
+    fn artifact_hash_is_mandatory_in_verify_bundle() {
+        let st = test_state();
+        let bytes = serde_json::to_vec(&wire(&st)).unwrap();
+        let vk = st.signing_key.verifying_key();
+        assert!(verify_bundle(&bytes, &vk, &"AB".repeat(32)).is_ok());
+        assert_eq!(
+            verify_bundle(&bytes, &vk, ""),
+            Err(VerifyError::ArtifactHashMismatch)
+        );
+    }
+
+    #[test]
+    fn missing_signing_key_is_503() {
+        let err = require_signing(&None).err().unwrap();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(require_signing(&Some(test_state())).is_ok());
     }
 
     #[test]
@@ -803,7 +995,7 @@ mod tests {
         let doc = verify_bundle(
             &wire,
             &st.signing_key.verifying_key(),
-            Some(&hex::encode(Sha256::digest(b"hello"))),
+            &hex::encode(Sha256::digest(b"hello")),
         )
         .unwrap();
         assert_eq!(doc.signed_by, "u1");
