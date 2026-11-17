@@ -341,6 +341,49 @@ test.describe("Backup + restore — API", () => {
     expect(body.error).toMatch(/not empty|force=true/);
   });
 
+  test("restore of a backup with a corrupted entry returns 400", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+
+    const backupRes = await request.get(`${BACKEND}/api/admin/backup`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    const original = Buffer.from(await backupRes.body());
+    const entry = listZipEntries(original).find(
+      (e) => e.name === "tables/users.jsonl",
+    );
+    // Flip one byte inside that entry's stored data. Whether the zip layer or
+    // the manifest digest catches it, the restore must be refused untouched.
+    const lh = entry.localHeaderOffset;
+    const dataStart =
+      lh + 30 + original.readUInt16LE(lh + 26) + original.readUInt16LE(lh + 28);
+    const corrupted = Buffer.from(original);
+    corrupted[dataStart + Math.floor(entry.compSize / 2)] ^= 0xff;
+
+    const restoreRes = await request.post(
+      `${BACKEND}/api/admin/restore?force=true`,
+      {
+        headers: { "X-User-Id": "alice" },
+        multipart: {
+          file: {
+            name: "corrupt-backup.zip",
+            mimeType: "application/zip",
+            buffer: corrupted,
+          },
+        },
+      },
+    );
+    expect(restoreRes.status()).toBe(400);
+
+    // The data is untouched: alice can still list users.
+    const stillThere = await request.get(`${BACKEND}/api/admin/users`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    expect(stillThere.ok()).toBe(true);
+  });
+
   test("restore with mismatched schemaMigration returns 400", async ({
     request,
   }) => {

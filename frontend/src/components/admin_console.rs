@@ -421,6 +421,32 @@ struct RestoreResult {
     restored: HashMap<String, i64>,
     attachments_written: i64,
     forced: Option<bool>,
+    /// `verified`, `unsigned` or `unknown_key`.
+    signature_status: String,
+}
+
+impl RestoreResult {
+    /// Alert kind and text for the outcome. Anything but a verified signature
+    /// is a warning that the backup's integrity was not verified.
+    fn summary(&self) -> (&'static str, String) {
+        let base = format!(
+            "Restored {} rows across {} tables and {} attachment blob(s){}.",
+            self.restored.values().sum::<i64>(),
+            self.restored.len(),
+            self.attachments_written,
+            if self.forced == Some(true) { " (force overwrite)" } else { "" },
+        );
+        match self.signature_status.as_str() {
+            "verified" => ("success", format!("{base} Signature verified.")),
+            other => (
+                "warning",
+                format!(
+                    "{base} Warning: this backup's integrity was not verified (signature status: {}).",
+                    if other.is_empty() { "unknown" } else { other }
+                ),
+            ),
+        }
+    }
 }
 
 // ── Shared console state ────────────────────────────────────────────────────
@@ -2329,15 +2355,12 @@ fn BackupSection(props: &SectionProps) -> Html {
                         <Alert kind="error" testid="restore-error">{e.clone()}</Alert>
                     }
                     if let Some(r) = &*restore_result {
-                        <Alert kind="success" testid="restore-success">
-                            {format!(
-                                "Restored {} rows across {} tables and {} attachment blob(s){}.",
-                                r.restored.values().sum::<i64>(),
-                                r.restored.len(),
-                                r.attachments_written,
-                                if r.forced == Some(true) { " (force overwrite)" } else { "" },
-                            )}
-                        </Alert>
+                        {{
+                            let (kind, text) = r.summary();
+                            html! {
+                                <Alert kind={kind} testid="restore-success">{text}</Alert>
+                            }
+                        }}
                     }
                 </SpaceBetween>
             </ColumnLayout>
@@ -2348,6 +2371,28 @@ fn BackupSection(props: &SectionProps) -> Html {
 #[cfg(test)]
 mod audit_event_tests {
     use super::*;
+
+    #[test]
+    fn restore_summary_warns_unless_the_signature_was_verified() {
+        let ok: RestoreResult = serde_json::from_value(json!({
+            "restored": { "users": 2 }, "attachmentsWritten": 1, "signatureStatus": "verified"
+        }))
+        .unwrap();
+        let (kind, text) = ok.summary();
+        assert_eq!(kind, "success");
+        assert!(text.contains("Signature verified"), "{text}");
+        for status in ["unsigned", "unknown_key"] {
+            let r: RestoreResult =
+                serde_json::from_value(json!({ "signatureStatus": status })).unwrap();
+            let (kind, text) = r.summary();
+            assert_eq!(kind, "warning");
+            assert!(text.contains("integrity was not verified") && text.contains(status), "{text}");
+        }
+        // An older backend sends no status.
+        let (kind, _) = RestoreResult::default().summary();
+        assert_eq!(kind, "warning");
+    }
+
 
     fn event(detail: Value) -> AuditEventRow {
         AuditEventRow { detail, ..AuditEventRow::default() }

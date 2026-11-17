@@ -16,7 +16,7 @@
 //! a `type` string, checked on verification.
 
 use base64::{engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD}, Engine as _};
-use ed25519_dalek::{Signature as EdSignature, Signer, Verifier};
+use ed25519_dalek::{Signature as EdSignature, Signer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
@@ -56,9 +56,6 @@ pub struct Envelope {
     /// base64url (no padding) of the exact signed bytes.
     pub payload: String,
     pub signatures: Vec<EnvelopeSignature>,
-    /// Convenience copy of the payload for humans. NOT authenticated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<serde_json::Value>,
 }
 
 /// Lowercase hex SHA-512.
@@ -92,7 +89,6 @@ pub fn seal(
     kind: &str,
     payload: &[u8],
     key: Option<&SigningState>,
-    manifest_copy: Option<serde_json::Value>,
 ) -> Envelope {
     let signatures = key
         .map(|k| {
@@ -109,7 +105,6 @@ pub fn seal(
         kind: kind.into(),
         payload: URL_SAFE_NO_PAD.encode(payload),
         signatures,
-        manifest: manifest_copy,
     }
 }
 
@@ -240,7 +235,7 @@ pub fn verify_envelope(
                     .map_err(|_| IntegrityError::BadSignatureEncoding)?;
                 k.signing_key
                     .verifying_key()
-                    .verify(&input, &ed)
+                    .verify_strict(&input, &ed)
                     .map_err(|_| IntegrityError::SignatureInvalid)?;
             }
         }
@@ -268,7 +263,7 @@ mod tests {
     }
 
     fn sealed(domain: &[u8], kind: &str, key: Option<&SigningState>) -> Vec<u8> {
-        serde_json::to_vec(&seal(domain, kind, &payload(kind, key), key, None)).unwrap()
+        serde_json::to_vec(&seal(domain, kind, &payload(kind, key), key)).unwrap()
     }
 
     #[test]
@@ -284,7 +279,7 @@ mod tests {
         let k = test_key(1);
         // Same key, same payload bytes shape; only the domain differs.
         let p = payload(BACKUP_TYPE, Some(&k));
-        let env = serde_json::to_vec(&seal(ARCHIVE_DOMAIN, BACKUP_TYPE, &p, Some(&k), None)).unwrap();
+        let env = serde_json::to_vec(&seal(ARCHIVE_DOMAIN, BACKUP_TYPE, &p, Some(&k))).unwrap();
         assert_eq!(
             verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &env, None, Some(&k)).err(),
             Some(IntegrityError::SignatureInvalid)
@@ -301,7 +296,7 @@ mod tests {
     fn export_domain_signature_is_not_accepted() {
         let k = test_key(1);
         let p = payload(BACKUP_TYPE, Some(&k));
-        let env = serde_json::to_vec(&seal(b"stig-viewer/sign/v2\0", BACKUP_TYPE, &p, Some(&k), None)).unwrap();
+        let env = serde_json::to_vec(&seal(b"stig-viewer/sign/v2\0", BACKUP_TYPE, &p, Some(&k))).unwrap();
         assert_eq!(
             verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &env, None, Some(&k)).err(),
             Some(IntegrityError::SignatureInvalid)
