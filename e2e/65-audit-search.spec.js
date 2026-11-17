@@ -343,20 +343,27 @@ test.describe("Audit log search", () => {
 
     await setUserRole("alice", "admin");
     await seedActivity(request, "alice", "events-host", []);
-    const res = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
+    // The 403 above is itself recorded centrally (authz.denied); look at the
+    // seeded event by action.
+    const res = await request.get(`${BACKEND}/api/audit/events?action=checklist.create`, { headers: { "X-User-Id": "alice" } });
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({ page: 1, pageSize: 50 });
     expect(body.totalCount).toBe(1);
     const row = body.rows[0];
+    for (const key of ["repeatCount", "lastOccurredAt"]) expect(row).toHaveProperty(key);
+    expect(row.repeatCount).toBe(1);
     for (const key of ["id", "occurredAt", "byName", "assetName", "stigTitle", "action", "outcome", "detail"]) {
       expect(row).toHaveProperty(key);
     }
     expect(row.action).toBe("checklist.create");
     expect(row.assetName).toBe("events-host");
 
-    const none = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
-    expect((await none.json()).totalCount).toBe(0);
+    const denials = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
+    const denialBody = await denials.json();
+    expect(denialBody.totalCount).toBe(1);
+    expect(denialBody.rows[0]).toMatchObject({ action: "authz.denied", outcome: "denied" });
+    expect(denialBody.rows[0].detail).toEqual({ method: "GET", route: "/api/audit/events" });
     const bad = await request.get(`${BACKEND}/api/audit/events?from=nope`, { headers: { "X-User-Id": "alice" } });
     expect(bad.status()).toBe(400);
   });
@@ -376,6 +383,8 @@ test.describe("Audit log search", () => {
     await page.getByTestId("audit-search-button").click();
     await expect(table).toContainText("checklist.create", { timeout: 10_000 });
     await expect(table).toContainText("requests-ui-host");
+    // Collapsed denials show a count (column header and per-row value).
+    await expect(table).toContainText("Count");
 
     // Switching back restores the rule-change view.
     await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();

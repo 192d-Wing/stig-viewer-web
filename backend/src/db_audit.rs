@@ -87,6 +87,47 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
     Ok(())
 }
 
+/// Identical `denied`/`rejected` events from the same user within this many
+/// seconds of the first one are collapsed into it (see [`collapse`]).
+pub const COLLAPSE_WINDOW_SECS: i64 = 300;
+
+/// Collapse a repeated denied/rejected event into the newest matching row
+/// (same user, action, outcome, the three id columns and `detail.reason`)
+/// whose first occurrence is within [`COLLAPSE_WINDOW_SECS`]. Only
+/// `repeat_count` and `last_occurred_at` change; the row keeps the first
+/// request's `request_id`, `source_ip` and `detail`. Returns whether a row was
+/// updated. Not atomic with the insert that follows a miss: a race yields at
+/// worst two rows.
+async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<bool> {
+    if !matches!(ev.outcome, "denied" | "rejected") {
+        return Ok(false);
+    }
+    let reason = detail.get("reason").and_then(Value::as_str);
+    let n = sqlx::query(
+        "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() \
+         WHERE id = (SELECT id FROM audit_events \
+                      WHERE user_id = $1 AND action = $2 AND outcome = $3 \
+                        AND asset_id IS NOT DISTINCT FROM $4::text \
+                        AND checklist_id IS NOT DISTINCT FROM $5::text \
+                        AND stig_id IS NOT DISTINCT FROM $6::text \
+                        AND detail->>'reason' IS NOT DISTINCT FROM $7::text \
+                        AND occurred_at > NOW() - make_interval(secs => $8) \
+                      ORDER BY id DESC LIMIT 1)",
+    )
+    .bind(ev.user_id)
+    .bind(ev.action)
+    .bind(ev.outcome)
+    .bind(&ids.asset_id)
+    .bind(&ids.checklist_id)
+    .bind(&ids.stig_id)
+    .bind(reason)
+    .bind(COLLAPSE_WINDOW_SECS as f64)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
     insert(pool, ev, &bounded(ev), &ev.detail).await
@@ -105,6 +146,11 @@ pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
     }
     let ids = bounded(&ev);
     let attempt = async {
+        match collapse(pool, &ev, &ids, &ev.detail).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(target: "audit", action = ev.action, "audit event collapse failed, inserting: {e:#}"),
+        }
         if let Err(first) = insert(pool, &ev, &ids, &ev.detail).await {
             tracing::warn!(target: "audit", action = ev.action, "audit event insert failed, retrying without detail: {first:#}");
             insert(pool, &ev, &ids, &json!({ "detailDropped": true })).await?;
@@ -193,6 +239,74 @@ mod tests {
         let outcomes: Vec<&str> = got.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(outcomes, ["ok", "partial", "denied", "rejected"]);
         assert!(got.iter().all(|r| r.1 == "1" && r.2.as_deref() == Some("a1")));
+    }
+
+    async fn rows(pool: &PgPool) -> Vec<(String, i32, bool, Option<String>)> {
+        sqlx::query_as(
+            "SELECT outcome, repeat_count, last_occurred_at IS NOT NULL, request_id FROM audit_events ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn identical_denials_collapse_and_keep_the_first_context(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for i in 0..5 {
+            let mut c = ctx();
+            c.request_id = format!("req-{i}");
+            let mut e = ev("denied", json!({ "reason": "not_owner" }));
+            e.ctx = Some(&c);
+            record_or_log(&pool, e).await;
+        }
+        let got = rows(&pool).await;
+        assert_eq!(got, vec![("denied".to_string(), 5, true, Some("req-0".to_string()))]);
+        // Only repeat_count and last_occurred_at move: detail is untouched.
+        let d: String = sqlx::query_scalar("SELECT detail::text FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&d).unwrap(), json!({ "reason": "not_owner" }));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_different_reason_asset_user_or_a_late_repeat_is_a_new_row(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        seed_user(&pool, "u2").await;
+        record_or_log(&pool, ev("rejected", json!({ "reason": "a" }))).await;
+        record_or_log(&pool, ev("rejected", json!({ "reason": "b" }))).await;
+        let mut other_asset = ev("rejected", json!({ "reason": "a" }));
+        other_asset.asset_id = Some("a2");
+        record_or_log(&pool, other_asset).await;
+        let mut other_user = ev("rejected", json!({ "reason": "a" }));
+        other_user.user_id = "u2";
+        record_or_log(&pool, other_user).await;
+        let mut other_action = ev("rejected", json!({ "reason": "a" }));
+        other_action.action = "checklist.create";
+        record_or_log(&pool, other_action).await;
+        assert_eq!(rows(&pool).await.len(), 5);
+
+        // Age the first row past the window: the next identical event inserts.
+        sqlx::query("UPDATE audit_events SET occurred_at = NOW() - INTERVAL '6 minutes' WHERE id = (SELECT MIN(id) FROM audit_events)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        record_or_log(&pool, ev("rejected", json!({ "reason": "a" }))).await;
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 6);
+        assert!(got.iter().all(|r| r.1 == 1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn ok_and_partial_events_are_never_collapsed(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for outcome in ["ok", "ok", "partial", "partial"] {
+            record_or_log(&pool, ev(outcome, json!({ "n": 1 }))).await;
+        }
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 4);
+        assert!(got.iter().all(|r| r.1 == 1 && !r.2));
     }
 
     #[sqlx::test]

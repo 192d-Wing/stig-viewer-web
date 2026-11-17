@@ -107,6 +107,8 @@ struct EventRow {
     source_ip: Option<String>,
     request_id: Option<String>,
     user_role: Option<String>,
+    repeat_count: i32,
+    last_occurred_at: Option<DateTime<Utc>>,
     /// `detail::text`, re-parsed into JSON when archived.
     detail: String,
 }
@@ -140,9 +142,10 @@ async fn run_prune_events_batched(
         let rows: Vec<EventRow> = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT id, occurred_at, user_id, action, outcome, asset_id, checklist_id, stig_id,
-                   source_ip, request_id, user_role, detail::text AS detail
+                   source_ip, request_id, user_role, repeat_count, last_occurred_at,
+                   detail::text AS detail
             FROM audit_events
-            WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL
+            WHERE COALESCE(last_occurred_at, occurred_at) < NOW() - ($1 || ' days')::INTERVAL
             ORDER BY id ASC
             LIMIT $2
             "#,
@@ -240,6 +243,8 @@ async fn write_event_archive(data_dir: &Path, rows: &[EventRow]) -> Result<()> {
                 "source_ip": row.source_ip,
                 "request_id": row.request_id,
                 "user_role": row.user_role,
+                "repeat_count": row.repeat_count,
+                "last_occurred_at": row.last_occurred_at,
                 "detail": detail,
             }))
             .context("serialize audit event")?;
@@ -296,6 +301,39 @@ async fn write_archive(data_dir: &Path, rows: &[AuditRow]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_fixtures::seed_user;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_events_keys_on_the_last_repeat_and_archives_the_counter(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        // Both rows were first seen 10 days ago; only one was repeated recently.
+        for (reason, last) in [("stale", "NOW() - INTERVAL '10 days'"), ("fresh", "NOW()")] {
+            sqlx::query(&format!(
+                "INSERT INTO audit_events (user_id, action, outcome, occurred_at, last_occurred_at, repeat_count, detail) \
+                 VALUES ('u1', 'checklist.save', 'denied', NOW() - INTERVAL '10 days', {last}, 4, $1::jsonb)"
+            ))
+            .bind(format!("{{\"reason\":\"{reason}\"}}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let n = run_prune_events(&pool, &dir, 5, true).await.unwrap();
+        assert_eq!(n, 1);
+        let left: Vec<String> = sqlx::query_scalar("SELECT detail->>'reason' FROM audit_events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, ["fresh"]);
+        let mut archived = String::new();
+        for entry in std::fs::read_dir(dir.join("audit_archive")).unwrap() {
+            archived.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+        }
+        let line: serde_json::Value = serde_json::from_str(archived.trim()).unwrap();
+        assert_eq!(line["repeat_count"], 4);
+        assert!(line["last_occurred_at"].is_string());
+        assert_eq!(line["detail"]["reason"], "stale");
+    }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]

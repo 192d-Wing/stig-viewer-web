@@ -425,6 +425,8 @@ struct AuditEventDbRow {
     source_ip: Option<String>,
     request_id: Option<String>,
     user_role: Option<String>,
+    repeat_count: i32,
+    last_occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,6 +443,8 @@ pub struct AuditEventRow {
     pub source_ip: Option<String>,
     pub request_id: Option<String>,
     pub user_role: Option<String>,
+    pub repeat_count: i32,
+    pub last_occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -522,7 +526,8 @@ pub async fn events_handler(
                 ast.name AS asset_name, \
                 COALESCE(sc.title, e.stig_id) AS stig_title, \
                 e.action, e.outcome, e.detail::text AS detail, \
-                e.source_ip, e.request_id, e.user_role \
+                e.source_ip, e.request_id, e.user_role, \
+                e.repeat_count, e.last_occurred_at \
            FROM audit_events e \
            LEFT JOIN users u ON u.id = e.user_id \
            LEFT JOIN assets ast ON ast.id = e.asset_id \
@@ -556,6 +561,8 @@ pub async fn events_handler(
             source_ip: r.source_ip,
             request_id: r.request_id,
             user_role: r.user_role,
+            repeat_count: r.repeat_count,
+            last_occurred_at: r.last_occurred_at,
         })
         .collect();
 
@@ -635,6 +642,8 @@ mod events_tests {
 
         let Json(some) = call(&state, "admin", query(Some("checklist.create"))).await.unwrap();
         assert_eq!(some.total_count, 1);
+        assert_eq!(some.rows[0].repeat_count, 1);
+        assert!(some.rows[0].last_occurred_at.is_none());
         assert_eq!(some.rows[0].outcome, "denied");
 
         // A huge page does not overflow the offset.

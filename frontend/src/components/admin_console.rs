@@ -359,6 +359,9 @@ struct AuditEventRow {
     source_ip: Option<String>,
     request_id: Option<String>,
     user_role: Option<String>,
+    /// How many identical denied/rejected requests this row stands for.
+    repeat_count: i64,
+    last_occurred_at: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
@@ -366,6 +369,18 @@ struct AuditEventRow {
 struct AuditEvents {
     total_count: i64,
     rows: Vec<AuditEventRow>,
+}
+
+/// The Count cell: "×N" for a collapsed row (with the last occurrence), else "1".
+fn repeat_label(e: &AuditEventRow) -> String {
+    if e.repeat_count > 1 {
+        match e.last_occurred_at.as_deref().filter(|s| !s.is_empty()) {
+            Some(last) => format!("\u{d7}{} (last {})", e.repeat_count, to_locale_string(last)),
+            None => format!("\u{d7}{}", e.repeat_count),
+        }
+    } else {
+        "1".into()
+    }
 }
 
 /// One-line summary of an event's `detail` (counts and reason codes only).
@@ -1291,6 +1306,7 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("request", "Request ID", |r: &AuditEventRow| {
             html! { <UiBox variant="code">{r.request_id.clone().unwrap_or_else(|| "—".into())}</UiBox> }
         }),
+        Column::new("count", "Count", |r: &AuditEventRow| html! { {repeat_label(r)} }),
         Column::new("summary", "Summary", |r: &AuditEventRow| html! { {event_summary(r)} }),
     ];
     let requests_view = *view == "requests";
@@ -2348,6 +2364,16 @@ mod audit_event_tests {
         // Rows written before the context columns existed have none.
         let old: AuditEventRow = serde_json::from_value(json!({ "action": "checklist.save" })).unwrap();
         assert!(old.source_ip.is_none() && old.request_id.is_none() && old.user_role.is_none());
+    }
+
+    #[test]
+    fn repeat_count_deserializes_and_labels_collapsed_rows() {
+        let r: AuditEventRow = serde_json::from_value(json!({ "repeatCount": 7 })).unwrap();
+        assert_eq!(r.repeat_count, 7);
+        assert_eq!(repeat_label(&r), "\u{d7}7");
+        let old: AuditEventRow = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(repeat_label(&old), "1");
+        assert!(old.last_occurred_at.is_none());
     }
 
     #[test]

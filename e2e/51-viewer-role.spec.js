@@ -65,6 +65,34 @@ test.describe("Read-only viewer role", () => {
     expect(body.error).toBe("viewer role is read-only");
   });
 
+  test("API: a viewer write is recorded as authz.denied with the route template, repeats collapse", async ({
+    request,
+  }) => {
+    const { checklistId, ruleId } = await seedChecklist(request);
+    await setUserRole("alice", "viewer");
+    const url = `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}`;
+    for (let i = 0; i < 3; i++) {
+      const res = await request.patch(url, {
+        headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+        data: { status: "open" },
+      });
+      expect(res.status()).toBe(403);
+    }
+
+    await setUserRole("audit-admin", "admin");
+    const res = await request.get(`${BACKEND}/api/audit/events?action=authz.denied`, {
+      headers: { "X-User-Id": "audit-admin" },
+    });
+    expect(res.status()).toBe(200);
+    const { rows } = await res.json();
+    // Three identical denials collapse into one row with a count.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ outcome: "denied", userRole: "viewer", repeatCount: 3 });
+    expect(rows[0].detail.method).toBe("PATCH");
+    expect(rows[0].detail.route).toMatch(/^\/api\/checklists\/:\w+\/rules\/:\w+$/);
+    expect(JSON.stringify(rows[0])).not.toContain(checklistId);
+  });
+
   test("API: viewer GETs still work (assets / dashboard / diff)", async ({
     request,
   }) => {

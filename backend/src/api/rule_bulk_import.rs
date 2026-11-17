@@ -835,8 +835,8 @@ mod tests {
         run(&state, "owner", &ok, true).await.unwrap();
         assert_eq!(run(&state, "owner", "a,b\n1,2\n", true).await.unwrap_err(), StatusCode::BAD_REQUEST);
 
-        let ev: Vec<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
-            "SELECT action, outcome, stig_id, detail FROM audit_events ORDER BY id",
+        let ev: Vec<(String, String, Option<String>, serde_json::Value, i32)> = sqlx::query_as(
+            "SELECT action, outcome, stig_id, detail, repeat_count FROM audit_events ORDER BY id",
         )
         .fetch_all(&pool)
         .await
@@ -847,7 +847,8 @@ mod tests {
             [
                 ("rules.bulk_import", "ok"),
                 ("rules.bulk_import", "partial"),
-                ("rules.bulk_import", "denied"),
+                // The second (dry-run) denial is identical in user, action,
+                // ids and reason, so it collapses into the first.
                 ("rules.bulk_import", "denied"),
                 ("rules.bulk_import", "rejected"),
             ]
@@ -857,8 +858,8 @@ mod tests {
         assert_eq!(ev[1].3["pending"], 1);
         assert_eq!(ev[1].3["errors"], 1);
         assert_eq!(ev[2].3["dryRun"], false);
-        assert_eq!(ev[3].3["dryRun"], true);
-        assert_eq!(ev[4].3["reason"], "missing_columns");
+        assert_eq!(ev[2].4, 2);
+        assert_eq!(ev[3].3["reason"], "missing_columns");
     }
 
     #[sqlx::test]

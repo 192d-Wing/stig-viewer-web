@@ -610,6 +610,12 @@ async fn main() -> Result<()> {
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
         .route_layer(middleware::from_fn(api::viewer_guard::viewer_guard))
+        // Central `authz.denied` recorder: inside request_ctx (needs its
+        // `RequestCtx`), outside viewer_guard so viewer 403s are observed.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::authz_audit::authz_audit,
+        ))
         // Per-request audit context (request id, source IP, role). Needs
         // `AuthUser`; added before `rate_limit`, so it runs after it and just
         // before `viewer_guard`, and its `X-Request-Id` header covers the
@@ -618,7 +624,7 @@ async fn main() -> Result<()> {
         // Per-user token-bucket rate limiter. Also needs `AuthUser` in
         // extensions, so it sits inside the auth layer too. Added AFTER
         // `viewer_guard` so the layer ordering is:
-        //   auth_middleware -> rate_limit -> request_ctx -> viewer_guard -> handler
+        //   auth_middleware -> rate_limit -> request_ctx -> authz_audit -> viewer_guard -> handler
         // i.e. we throttle before we let a request reach the read-only
         // gate (or any business logic), but only after we know who's
         // calling so we can key the bucket on `user.id`.
