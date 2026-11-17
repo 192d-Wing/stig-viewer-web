@@ -99,7 +99,13 @@ a compose shim) and nothing else.
 docker compose up
 ```
 
-That brings up four services:
+Or, with [Task](https://taskfile.dev) installed, `task dev` starts postgres,
+keycloak and the backend in containers and serves the frontend on the host with
+Trunk (faster rebuilds than the frontend container). It picks Docker or Podman
+automatically; run `task` to list the other tasks (`down`, `logs`, `test`,
+`e2e`, ...).
+
+`docker compose up` brings up four services:
 
 | Service   | Port | Notes                                                  |
 |-----------|------|--------------------------------------------------------|

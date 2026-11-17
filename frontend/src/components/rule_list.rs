@@ -25,7 +25,7 @@ pub fn RuleList(p: &RuleListProps) -> Html {
     html! {
         <div style="display:flex;flex-direction:column;height:100%;overflow:hidden;">
             // Search bar
-            <div style="padding:10px 12px;border-bottom:1px solid #232f3e;flex-shrink:0;">
+            <div style="padding:10px 12px;border-bottom:1px solid var(--border);flex-shrink:0;">
                 <TextFilter
                     filtering_text={p.search_term.clone()}
                     on_change={p.on_search_change.clone()}
@@ -55,23 +55,23 @@ pub fn RuleList(p: &RuleListProps) -> Html {
                         };
                         let style = format!(
                             "display:block;width:100%;padding:10px 14px;border:none;\
-                             border-bottom:1px solid #1a2332;border-left:3px solid {};\
+                             border-bottom:1px solid var(--border);border-left:3px solid {};\
                              background:{};text-align:left;cursor:pointer;",
-                            if is_selected { "#539fe5" } else { "transparent" },
-                            if is_selected { "#539fe510" } else { "transparent" },
+                            if is_selected { "var(--primary)" } else { "transparent" },
+                            if is_selected { "var(--bg-selected)" } else { "transparent" },
                         );
                         html! {
                             <button key={rule.id.clone()} type="button" role="option"
                                     aria-selected={is_selected.to_string()} {onclick} {style}>
                                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-                                    <span style="font-family:'JetBrains Mono', monospace;font-size:12px;font-weight:700;\
-                                                 color:#539fe5;min-width:65px;flex-shrink:0;">
+                                    <span style="font-family:var(--mono);font-size:12px;font-weight:700;\
+                                                 color:var(--primary);min-width:65px;flex-shrink:0;">
                                         {rule.stig_id.clone()}
                                     </span>
                                     <SeverityBadge severity={rule.severity.clone()} />
                                     <StatusBadge status={rule.status.clone()} />
                                 </div>
-                                <p style="font-size:13px;color:#d1d5db;line-height:1.4;display:-webkit-box;\
+                                <p style="font-size:13px;color:var(--text);line-height:1.4;display:-webkit-box;\
                                           -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;\
                                           text-align:left;margin:0;">
                                     {rule.title.clone()}

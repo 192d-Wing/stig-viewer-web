@@ -715,8 +715,8 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
                     }}>
                         <LineChart
                             series={vec![
-                                ChartSeries::line("Open", series(|p| p.open)).color("#d13212"),
-                                ChartSeries::line("Reviewed", series(|p| p.reviewed)).color("#1d8102"),
+                                ChartSeries::line("Open", series(|p| p.open)).color(CHART_NEGATIVE),
+                                ChartSeries::line("Reviewed", series(|p| p.reviewed)).color(CHART_POSITIVE),
                             ]}
                             x_scale_type="time"
                             x_title="Time"
@@ -732,7 +732,7 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
                         <LineChart
                             series={vec![
                                 ChartSeries::line("Compliance", series(|p| p.compliance_score.unwrap_or(0.0)))
-                                    .color("#1d8102"),
+                                    .color(CHART_POSITIVE),
                             ]}
                             x_scale_type="time"
                             x_title="Time"

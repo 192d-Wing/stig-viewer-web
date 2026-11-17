@@ -53,8 +53,8 @@ pub fn DropZone(p: &DropZoneProps) -> Html {
     let upload_area_style = format!(
         "border:2px dashed {};border-radius:12px;padding:48px 32px;background:{};\
          transition:border-color 0.2s, background 0.2s;",
-        if *drag_over { "#539fe5" } else { "#354150" },
-        if *drag_over { "#539fe510" } else { "transparent" },
+        if *drag_over { "var(--primary)" } else { "var(--border)" },
+        if *drag_over { "var(--bg-selected)" } else { "transparent" },
     );
 
     html! {
@@ -64,9 +64,8 @@ pub fn DropZone(p: &DropZoneProps) -> Html {
                 // Brand
                 <div style="display:inline-flex;align-items:center;gap:12px;margin-bottom:8px;">
                     <svg width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
-                        <rect width="40" height="40" rx="8" fill="#539fe5" />
-                        <path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1b2e" />
-                        <path d="M28 22l4 4-4 4" stroke="#0f1b2e" stroke-width="2.5"
+                        <path d="M20 3l14 5v10c0 9-5.6 15.6-14 19C11.600 33.600 6 27 6 18V8z" fill="#3ec6b3" />
+                        <path d="M13 20l5 5 9-10" stroke="#04211d" stroke-width="3.5"
                               stroke-linecap="round" stroke-linejoin="round" />
                     </svg>
                     <Header variant="h1" description="Web Edition v3.0">
@@ -79,8 +78,8 @@ pub fn DropZone(p: &DropZoneProps) -> Html {
                     <UiBox text_align="center">
                         <SpaceBetween size="m">
                             <svg width="48" height="48" viewBox="0 0 48 48" fill="none"
-                                 style="margin:0 auto;display:block;opacity:0.5;" aria-hidden="true">
-                                <path d="M24 32V16m0 0l-8 8m8-8l8 8M8 36h32" stroke="#8d99a8" stroke-width="2"
+                                 style="margin:0 auto;display:block;opacity:0.7;color:var(--text-secondary);" aria-hidden="true">
+                                <path d="M24 32V16m0 0l-8 8m8-8l8 8M8 36h32" stroke="currentColor" stroke-width="2"
                                       stroke-linecap="round" stroke-linejoin="round" />
                             </svg>
                             <FileUpload

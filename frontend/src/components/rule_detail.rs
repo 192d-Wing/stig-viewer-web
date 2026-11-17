@@ -44,8 +44,8 @@ pub fn RuleDetail(p: &RuleDetailProps) -> Html {
     html! {
         <div ref={panel_ref} style="flex:1;overflow-y:auto;display:flex;flex-direction:column;min-width:0;">
             // Header
-            <div style="padding:16px 20px;border-bottom:1px solid #232f3e;position:sticky;top:0;z-index:10;\
-                        background:#0f1b2eee;backdrop-filter:blur(12px);flex-shrink:0;">
+            <div style="padding:16px 20px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10;\
+                        background:var(--bg);flex-shrink:0;">
                 <Header
                     variant="h2"
                     actions={html! {
@@ -74,7 +74,7 @@ pub fn RuleDetail(p: &RuleDetailProps) -> Html {
             </div>
 
             // Status selector
-            <div style="padding:16px 20px;border-bottom:1px solid #232f3e;flex-shrink:0;">
+            <div style="padding:16px 20px;border-bottom:1px solid var(--border);flex-shrink:0;">
                 <UiBox margin_bottom="xs" font_size="body-s" font_weight="bold" color="text-label">
                     {"Compliance Status"}
                 </UiBox>
@@ -90,11 +90,11 @@ pub fn RuleDetail(p: &RuleDetailProps) -> Html {
                 <SpaceBetween size="m">
                     { for content_sections(rule).into_iter().filter(|(_, _, text)| !text.is_empty()).map(|(label, mono, text)| {
                         let style = format!(
-                            "font-size:{}px;line-height:1.65;color:#8d99a8;background:#0f1b2e80;\
-                             border:1px solid #354150;border-radius:6px;padding:12px 14px;\
+                            "font-size:{}px;line-height:1.65;color:var(--text-secondary);background:var(--bg-input);\
+                             border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;\
                              white-space:pre-wrap;word-break:break-word;font-family:{};margin:0;",
                             if mono { 12 } else { 13 },
-                            if mono { "'JetBrains Mono', monospace" } else { "inherit" },
+                            if mono { "var(--mono)" } else { "inherit" },
                         );
                         html! {
                             <ExpandableSection key={label} header_text={label} default_expanded=true>

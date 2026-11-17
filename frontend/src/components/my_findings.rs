@@ -15,8 +15,9 @@ const DUE_SOON_DAYS: u32 = 7;
 
 fn severity_badge(severity: &str) -> &'static str {
     match severity {
-        "CAT I" => "red",
-        "CAT II" => "blue",
+        "CAT I" => "severity-high",
+        "CAT II" => "severity-medium",
+        "CAT III" => "severity-low",
         _ => "grey",
     }
 }
@@ -531,5 +532,18 @@ pub fn MyFindings(_props: &MyFindingsProps) -> Html {
                 </Modal>
             </SpaceBetween>
         </UiBox>
+    }
+}
+
+#[cfg(test)]
+mod severity_badge_tests {
+    use super::*;
+
+    #[test]
+    fn maps_cat_levels_to_severity_classes() {
+        assert_eq!(severity_badge("CAT I"), "severity-high");
+        assert_eq!(severity_badge("CAT II"), "severity-medium");
+        assert_eq!(severity_badge("CAT III"), "severity-low");
+        assert_eq!(severity_badge("bogus"), "grey");
     }
 }

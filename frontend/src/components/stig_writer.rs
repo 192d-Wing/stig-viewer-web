@@ -25,8 +25,9 @@ const SEVERITIES: [(&str, &str); 3] =
 
 fn severity_badge_color(severity: &str) -> &'static str {
     match severity {
-        "CAT I" => "red",
-        "CAT II" => "blue",
+        "CAT I" => "severity-high",
+        "CAT II" => "severity-medium",
+        "CAT III" => "severity-low",
         _ => "grey",
     }
 }
@@ -525,9 +526,9 @@ impl Workflow {
     }
 }
 
-const PREVIEW_STYLE: &str = "font-size:12px;line-height:1.6;color:#8d99a8;background:#0f1b2e80;\
-    border:1px solid #354150;border-radius:6px;padding:16px;white-space:pre-wrap;word-break:break-word;\
-    font-family:'JetBrains Mono', monospace;margin:0;max-height:70vh;overflow:auto;";
+const PREVIEW_STYLE: &str = "font-size:12px;line-height:1.6;color:var(--text-secondary);background:var(--bg-input);\
+    border:1px solid var(--border);border-radius:var(--radius);padding:16px;white-space:pre-wrap;word-break:break-word;\
+    font-family:var(--mono);margin:0;max-height:70vh;overflow:auto;";
 
 #[derive(Properties, PartialEq)]
 struct DraftEditorProps {
@@ -1419,4 +1420,17 @@ pub fn StigWriter(props: &StigWriterProps) -> Html {
         Callback::from(move |id: String| active_draft_id.set(Some(id)))
     };
     html! { <DraftsTable {on_open_draft} /> }
+}
+
+#[cfg(test)]
+mod severity_badge_tests {
+    use super::*;
+
+    #[test]
+    fn maps_cat_levels_to_severity_classes() {
+        assert_eq!(severity_badge_color("CAT I"), "severity-high");
+        assert_eq!(severity_badge_color("CAT II"), "severity-medium");
+        assert_eq!(severity_badge_color("CAT III"), "severity-low");
+        assert_eq!(severity_badge_color("bogus"), "grey");
+    }
 }

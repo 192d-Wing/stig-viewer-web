@@ -27,8 +27,11 @@ impl ChartSeries {
 }
 
 pub const CHART_PALETTE: [&str; 8] = [
-    "#539fe5", "#ff4444", "#22c55e", "#8b5cf6", "#e0ca57", "#f89256", "#2ea597", "#da7596",
+    "#3ec6b3", "#ff7a7a", "#62c26a", "#b39bf5", "#e8bd45", "#f59b4c", "#82aee8", "#e58fb1",
 ];
+
+pub const CHART_NEGATIVE: &str = "#ff7a7a";
+pub const CHART_POSITIVE: &str = "#62c26a";
 
 #[derive(Properties, PartialEq)]
 pub struct LineChartProps {
