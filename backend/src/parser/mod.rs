@@ -669,8 +669,8 @@ mod tests {
 
     /// The seed is committed to a public repository, so it must not hold CUI:
     /// no marking in any string, none of the withheld `CUI_` products, and no
-    /// repeated rule ids. The file-count floor makes a dropped directory fail
-    /// without pinning an exact count that every regeneration would change.
+    /// repeated rule ids. `seed/stigs.allowlist` pins the exact set of ids, so
+    /// every added or dropped file is a deliberate, reviewable change.
     #[test]
     fn seeded_catalog_holds_no_cui_and_has_unique_rule_ids() {
         fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
@@ -697,8 +697,25 @@ mod tests {
             "tie dxl",
             "joint regional security stack",
         ];
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed/stigs");
-        let mut checked = 0;
+        // Exact hyphen-separated id sequences of the withheld products.
+        const CUI_ID_SEQUENCES: &[&[&str]] = &[
+            &["policy", "auditor"],
+            &["rogue", "sensor"],
+            &["staging", "server"],
+            &["mcafee", "ens"],
+            &["trellix", "agent"],
+        ];
+        let seed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed");
+        let dir = seed.join("stigs");
+        let allow: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(seed.join("stigs.allowlist"))
+                .expect("read seed/stigs.allowlist")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+        let mut present = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(&dir).expect("read seed/stigs") {
             let path = entry.expect("dir entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -715,8 +732,12 @@ mod tests {
             strings(&value, &mut all);
             for s in all {
                 let l = s.to_lowercase();
+                let t = l.trim();
                 assert!(
-                    !l.contains("cui//") && !l.contains("controlled unclassified"),
+                    !l.contains("cui//")
+                        && !l.contains("controlled unclassified")
+                        && t != "cui"
+                        && t != "(cui)",
                     "{name}: a string carries a CUI marking"
                 );
             }
@@ -728,7 +749,13 @@ mod tests {
                     && !id.contains("trellix-ens")
                     && !id.contains("tie-dxl")
                     && !id.contains("joint-regional")
-                    && !id_words.contains(&"ess"),
+                    && !id_words.iter().any(|w| {
+                        ["ess", "epo", "jrss", "staging-server"].contains(w)
+                    })
+                    && !CUI_ID_SEQUENCES.iter().any(|seq| {
+                        let n = seq.len();
+                        id_words.windows(n).any(|win| win == *seq)
+                    }),
                 "{name}: id or title matches a withheld CUI product ({:?})",
                 stig.title
             );
@@ -737,9 +764,12 @@ mod tests {
             for r in &stig.rules {
                 assert!(seen.insert(r.id.as_str()), "{name}: duplicate rule id {}", r.id);
             }
-            checked += 1;
+            present.insert(id);
         }
-        assert!(checked >= 200, "only {checked} seed files in {}; expected at least 200", dir.display());
+        let unlisted: Vec<_> = present.difference(&allow).collect();
+        let missing: Vec<_> = allow.difference(&present).collect();
+        assert!(unlisted.is_empty(), "seed files not on seed/stigs.allowlist: {unlisted:?}");
+        assert!(missing.is_empty(), "allowlisted ids with no seed file: {missing:?}");
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
