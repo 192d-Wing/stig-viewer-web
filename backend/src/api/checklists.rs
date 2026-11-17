@@ -787,3 +787,34 @@ fn map_unique_conflict(e: anyhow::Error) -> StatusCode {
         map_db(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, auth, seed_asset, seed_user, STIG_ID};
+    use sqlx::PgPool;
+
+    async fn create(state: &AppState, user: &str, stig_id: &str) -> Result<StatusCode, StatusCode> {
+        create_handler(
+            State(state.clone()),
+            Extension(auth(user, "author")),
+            Path("a1".into()),
+            Json(CreateChecklistRequest { stig_id: stig_id.into() }),
+        )
+        .await
+        .map(|(code, _)| code)
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn create_handler_keeps_its_403_400_and_409_paths(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_user(&pool, "other").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        let (state, _dir) = app_state(pool.clone());
+        assert_eq!(create(&state, "other", STIG_ID).await, Err(StatusCode::FORBIDDEN));
+        assert_eq!(create(&state, "owner", "../x").await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(create(&state, "owner", STIG_ID).await, Ok(StatusCode::CREATED));
+        assert_eq!(create(&state, "owner", STIG_ID).await, Err(StatusCode::CONFLICT));
+    }
+}

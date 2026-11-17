@@ -10,6 +10,8 @@ mod parser;
 mod scheduler_log;
 mod severity;
 mod sync;
+#[cfg(test)]
+mod test_fixtures;
 
 use anyhow::Result;
 use axum::{extract::DefaultBodyLimit, handler::Handler, middleware, routing::{get, post}, Router};

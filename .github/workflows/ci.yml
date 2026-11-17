@@ -43,6 +43,27 @@ jobs:
   backend:
     runs-on: ubuntu-latest
 
+    services:
+      # sqlx::test creates a throwaway database per test, so the user must be
+      # allowed to CREATE DATABASE (the image's POSTGRES_USER is a superuser).
+      # The account is ephemeral and test-only; its password is not the dev one.
+      postgres:
+        image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+        env:
+          POSTGRES_USER: stig
+          POSTGRES_PASSWORD: ci_throwaway
+          POSTGRES_DB: stig_viewer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stig -d stig_viewer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://stig:ci_throwaway@localhost:5432/stig_viewer
+
     defaults:
       run:
         working-directory: backend
@@ -59,8 +80,11 @@ jobs:
         with:
           workspaces: backend
 
-      - run: cargo clippy --locked -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # In this repo `#[ignore]` means "needs Postgres"; run exactly those
+      # tests against the service.
+      - run: cargo test --locked -- --ignored
 
   e2e:
     needs: [lint-and-build, backend]
