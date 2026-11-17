@@ -46,7 +46,9 @@ jobs:
 
   e2e:
     needs: [lint-and-build, backend]
-    runs-on: ubuntu-latest
+    # Pinned: Playwright 1.58 cannot install Chromium on ubuntu-latest
+    # (now 26.04). Return to ubuntu-latest after upgrading Playwright.
+    runs-on: ubuntu-24.04
 
     env:
       # Skip the DISA sync scheduler in CI — keeps backend startup fast and
