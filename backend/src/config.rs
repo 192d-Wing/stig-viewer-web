@@ -165,6 +165,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shipped_sources_manifest_is_valid_and_unique() {
+        // cargo test runs from backend/, where the manifest lives.
+        let sources = load_sources().expect("stig-sources.toml parses");
+        assert!(!sources.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for s in &sources {
+            assert!(crate::stig_id::is_valid_new(&s.id), "bad id {}", s.id);
+            assert!(seen.insert(s.id.clone()), "duplicate id {}", s.id);
+            assert!(s.url.starts_with("https://dl.dod.cyber.mil/"), "{}", s.url);
+        }
+        // The e2e suite reads these two from the seed.
+        assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    #[test]
     fn sync_on_start_defaults_on_and_only_false_or_zero_disable() {
         assert!(parse_flag_default_true(None));
         for on in ["", "true", "1", "yes", "tru"] {
