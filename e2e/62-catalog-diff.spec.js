@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAs, resetDb, BACKEND } from "./helpers.js";
+import { loginAs, resetDb, showEdgeInLibrary, BACKEND } from "./helpers.js";
 
 /**
  * Seed a catalog_archive row for `edge` with the given rule list. The
@@ -141,9 +141,9 @@ test.describe("Catalog version diff", () => {
     await page.goto("/");
     // Find the edge row's Diff button via the per-row testid set by
     // the StigLibrary column definition.
-    // `ms-edge` has the same title with a newer release, so the library
-    // hides `edge` as "Superseded" until the toggle is on.
-    await page.getByText(/Show superseded/).click();
+    // Filtered, superseded shown, one page: `ms-edge` hides `edge` by default
+    // and the catalog no longer fits on page 1.
+    await showEdgeInLibrary(page);
     const diffBtn = page.getByTestId("diff-button-edge");
     await expect(diffBtn).toBeVisible({ timeout: 10_000 });
     await diffBtn.click();
