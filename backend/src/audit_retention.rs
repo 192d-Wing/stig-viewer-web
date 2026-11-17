@@ -104,6 +104,9 @@ struct EventRow {
     asset_id: Option<String>,
     checklist_id: Option<String>,
     stig_id: Option<String>,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+    user_role: Option<String>,
     /// `detail::text`, re-parsed into JSON when archived.
     detail: String,
 }
@@ -137,7 +140,7 @@ async fn run_prune_events_batched(
         let rows: Vec<EventRow> = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT id, occurred_at, user_id, action, outcome, asset_id, checklist_id, stig_id,
-                   detail::text AS detail
+                   source_ip, request_id, user_role, detail::text AS detail
             FROM audit_events
             WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL
             ORDER BY id ASC
@@ -234,6 +237,9 @@ async fn write_event_archive(data_dir: &Path, rows: &[EventRow]) -> Result<()> {
                 "asset_id": row.asset_id,
                 "checklist_id": row.checklist_id,
                 "stig_id": row.stig_id,
+                "source_ip": row.source_ip,
+                "request_id": row.request_id,
+                "user_role": row.user_role,
                 "detail": detail,
             }))
             .context("serialize audit event")?;

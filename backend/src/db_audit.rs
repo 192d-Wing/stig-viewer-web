@@ -11,6 +11,8 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+use crate::api::request_ctx::RequestCtx;
+
 /// At most this many rejected rules are listed in an event's `detail`.
 pub const MAX_REJECTED_LISTED: usize = 100;
 
@@ -24,6 +26,8 @@ pub struct NewAuditEvent<'a> {
     pub checklist_id: Option<&'a str>,
     pub stig_id: Option<&'a str>,
     pub detail: Value,
+    /// Request context (source IP, request id, role). `None` outside a request.
+    pub ctx: Option<&'a RequestCtx>,
 }
 
 /// Upper bound on one audit write (both attempts of [`record_or_log`]), so a
@@ -37,6 +41,15 @@ pub const MAX_ID_CHARS: usize = 128;
 /// characters, anything outside ASCII alphanumerics and `._:-` replaced by `?`.
 pub fn bound_id(id: &str) -> String {
     sanitize(id, MAX_ID_CHARS)
+}
+
+/// Longest `source_ip` kept.
+pub const MAX_SOURCE_IP_CHARS: usize = 64;
+
+/// A client-supplied address made safe to store and log (bounded, ASCII
+/// alphanumerics and `._:-` only).
+pub fn sanitize_source_ip(ip: &str) -> String {
+    sanitize(ip, MAX_SOURCE_IP_CHARS)
 }
 
 fn sanitize(id: &str, max: usize) -> String {
@@ -64,8 +77,9 @@ fn bounded(ev: &NewAuditEvent<'_>) -> BoundedIds {
 
 async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<()> {
     sqlx::query(
-        "INSERT INTO audit_events (user_id, action, outcome, asset_id, checklist_id, stig_id, detail) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)",
+        "INSERT INTO audit_events (user_id, action, outcome, asset_id, checklist_id, stig_id, detail, \
+                                  source_ip, request_id, user_role) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)",
     )
     .bind(ev.user_id)
     .bind(ev.action)
@@ -74,6 +88,9 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
     .bind(&ids.checklist_id)
     .bind(&ids.stig_id)
     .bind(detail.to_string())
+    .bind(ev.ctx.and_then(|c| c.source_ip.as_deref()))
+    .bind(ev.ctx.map(|c| c.request_id.as_str()))
+    .bind(ev.ctx.map(|c| c.role.as_str()))
     .execute(pool)
     .await?;
     Ok(())
@@ -92,6 +109,9 @@ async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
 /// jsonb rejects) can suppress the row. Both attempts share [`WRITE_TIMEOUT`].
 pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
+    if let Some(ctx) = ev.ctx {
+        ctx.audited.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let ids = bounded(&ev);
     let attempt = async {
         if let Err(first) = insert(pool, &ev, &ids, &ev.detail).await {
@@ -111,6 +131,7 @@ pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
         user_id = ev.user_id,
         action = ev.action,
         outcome = ev.outcome,
+        request_id = ev.ctx.map(|c| c.request_id.as_str()),
         asset_id = ids.asset_id.as_deref(),
         checklist_id = ids.checklist_id.as_deref(),
         stig_id = ids.stig_id.as_deref(),
@@ -150,6 +171,7 @@ mod tests {
             checklist_id: None,
             stig_id: None,
             detail,
+            ctx: None,
         }
     }
 
@@ -242,5 +264,59 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((a as usize, b as usize), (MAX_ID_CHARS, MAX_ID_CHARS));
+    }
+
+    fn ctx() -> RequestCtx {
+        RequestCtx {
+            request_id: "req-1".into(),
+            source_ip: Some("203.0.113.7".into()),
+            role: "author".into(),
+            audited: Default::default(),
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_context_columns_are_written_and_audited_is_set(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let c = ctx();
+        let mut e = ev("ok", json!({}));
+        e.ctx = Some(&c);
+        record_or_log(&pool, e).await;
+        assert!(c.audited.load(std::sync::atomic::Ordering::Relaxed));
+        let got: (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT source_ip, request_id, user_role FROM audit_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(got, (Some("203.0.113.7".into()), Some("req-1".into()), Some("author".into())));
+
+        // No context: the columns stay NULL.
+        record_or_log(&pool, ev("ok", json!({}))).await;
+        let nulls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE source_ip IS NULL AND request_id IS NULL AND user_role IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(nulls, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_detail_dropped_retry_keeps_the_context(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let c = ctx();
+        let mut e = ev("ok", json!({ "ruleId": "a\u{0}b" }));
+        e.ctx = Some(&c);
+        record_or_log(&pool, e).await;
+        let got: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT detail::text, source_ip, request_id, user_role FROM audit_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&got.0).unwrap(), json!({ "detailDropped": true }));
+        assert_eq!((got.1.as_deref(), got.2.as_deref(), got.3.as_deref()), (Some("203.0.113.7"), Some("req-1"), Some("author")));
     }
 }

@@ -13,6 +13,7 @@ use crate::api::auth::AuthUser;
 use crate::api::finding_approvals;
 use crate::api::webhooks;
 use crate::db_assets;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_audit;
 use crate::db_checklists;
 use crate::AppState;
@@ -53,10 +54,11 @@ pub struct ChecklistDetail {
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(asset_id): Path<String>,
     Json(req): Json<CreateChecklistRequest>,
 ) -> Result<(StatusCode, Json<db_checklists::ChecklistRow>), StatusCode> {
-    tokio::spawn(create_work(state, user, asset_id, req))
+    tokio::spawn(create_work(state, user, ctx, asset_id, req))
         .await
         .map_err(|e| {
             tracing::error!("create checklist task failed: {e}");
@@ -67,6 +69,7 @@ pub async fn create_handler(
 async fn create_work(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     asset_id: String,
     req: CreateChecklistRequest,
 ) -> Result<(StatusCode, Json<db_checklists::ChecklistRow>), StatusCode> {
@@ -84,6 +87,7 @@ async fn create_work(
             state.pool.as_ref(),
             db_audit::NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "checklist.create",
                 outcome,
                 asset_id: Some(&asset_id),
@@ -117,6 +121,7 @@ async fn create_work(
         state.pool.as_ref(),
         db_audit::NewAuditEvent {
             user_id: &user.id,
+            ctx: Some(&ctx),
             action: "checklist.create",
             outcome: "ok",
             asset_id: Some(&asset_id),
@@ -882,6 +887,7 @@ mod tests {
         create_handler(
             State(state.clone()),
             Extension(auth(user, "author")),
+            Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
             Json(CreateChecklistRequest { stig_id: stig_id.into() }),
         )
@@ -911,6 +917,7 @@ mod tests {
         let (code, Json(row)) = create_handler(
             State(state.clone()),
             Extension(auth("owner", "author")),
+            Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
             Json(CreateChecklistRequest { stig_id: STIG_ID.into() }),
         )

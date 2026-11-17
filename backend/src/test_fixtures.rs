@@ -205,3 +205,13 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
     };
     (state, guard)
 }
+
+/// A request context as the `request_ctx` middleware would build it.
+pub fn ctx() -> crate::api::request_ctx::RequestCtx {
+    crate::api::request_ctx::RequestCtx {
+        request_id: "test-request".to_string(),
+        source_ip: Some("198.51.100.4".to_string()),
+        role: "author".to_string(),
+        audited: Default::default(),
+    }
+}

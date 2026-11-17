@@ -381,4 +381,80 @@ test.describe("Audit log search", () => {
     await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();
     await expect(page.getByTestId("audit-search-table")).toBeVisible();
   });
+
+  test("API: a search is audited as audit.read with request context, visible under Requests", async ({ request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "read-host", [{ status: "open", findingDetails: "x" }]);
+
+    const search = await request.get(`${BACKEND}/api/audit/search?from=2020-01-01`, {
+      headers: { "X-User-Id": "alice", "X-Forwarded-For": "203.0.113.9", "X-Request-Id": "attacker-chosen" },
+    });
+    expect(search.status()).toBe(200);
+    // The inbound id is never trusted; the generated one is echoed.
+    const requestId = search.headers()["x-request-id"];
+    expect(requestId).toBeTruthy();
+    expect(requestId).not.toBe("attacker-chosen");
+
+    const res = await request.get(`${BACKEND}/api/audit/events?action=audit.read`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    const body = await res.json();
+    expect(body.totalCount).toBe(1);
+    const row = body.rows[0];
+    expect(row).toMatchObject({ action: "audit.read", outcome: "ok", sourceIp: "203.0.113.9", userRole: "admin", requestId });
+    expect(row.detail).toMatchObject({ view: "rules", page: 1, filters: { from: "2020-01-01" } });
+  });
+
+  test("UI: a search shows up as audit.read under Requests", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "read-ui-host", [{ status: "open", findingDetails: "x" }]);
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-search-button").click();
+    await expect(page.getByTestId("audit-search-table")).toContainText("alice", { timeout: 10_000 });
+
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await page.getByTestId("audit-search-button").click();
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toContainText("audit.read", { timeout: 10_000 });
+  });
+
+  test("UI: a late rule-changes response never fills the Requests table", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "stale-host", [{ status: "open", findingDetails: "stale marker" }]);
+
+    // Hold the first /api/audit/search response until the view has switched.
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    let held = false;
+    await page.route("**/api/audit/search*", async (route) => {
+      if (held) return route.continue();
+      held = true;
+      const response = await route.fetch();
+      await gate;
+      await route.fulfill({ response });
+    });
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-search-button").click();
+    await expect.poll(() => held).toBe(true);
+
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await page.getByTestId("audit-search-button").click();
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toContainText("checklist.create", { timeout: 10_000 });
+
+    release();
+    // Let the stale response arrive and be ignored.
+    await page.waitForTimeout(500);
+    await expect(table).not.toContainText("stale marker");
+    await expect(table).toContainText("checklist.create");
+  });
 });

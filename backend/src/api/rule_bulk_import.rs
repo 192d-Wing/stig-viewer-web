@@ -24,6 +24,7 @@ use crate::api::rule_bulk_status::{
     ALREADY_PENDING, MAX_FINDING_DETAILS_BYTES, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets::{self, AssetRow};
+use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRow, ChecklistRuleRow};
 use crate::AppState;
@@ -167,11 +168,13 @@ fn record_event<'a>(
     user: &'a AuthUser,
     asset: &'a AssetRow,
     checklist: &'a ChecklistRow,
+    ctx: &'a RequestCtx,
     outcome: &'static str,
     detail: serde_json::Value,
 ) -> NewAuditEvent<'a> {
     NewAuditEvent {
         user_id: &user.id,
+        ctx: Some(ctx),
         action: "rules.bulk_import",
         outcome,
         asset_id: Some(&asset.id),
@@ -186,13 +189,14 @@ fn record_event<'a>(
 async fn reject_event(
     pool: &sqlx::PgPool,
     user: &AuthUser,
+    ctx: &RequestCtx,
     asset: &AssetRow,
     checklist: &ChecklistRow,
     dry_run: bool,
     reason: &'static str,
 ) {
     if !dry_run {
-        db_audit::record_or_log(pool, record_event(user, asset, checklist, "rejected", json!({ "reason": reason })))
+        db_audit::record_or_log(pool, record_event(user, asset, checklist, ctx, "rejected", json!({ "reason": reason })))
             .await;
     }
 }
@@ -202,6 +206,7 @@ async fn reject_event(
 pub(crate) async fn authorise(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     checklist_id: String,
     dry_run: bool,
 ) -> Result<(ChecklistRow, AssetRow), StatusCode> {
@@ -219,7 +224,7 @@ pub(crate) async fn authorise(
     if !asset_acl::user_can(pool, &asset.id, &user, "write").await {
         db_audit::record_or_log(
             pool,
-            record_event(&user, &asset, &checklist, "denied", json!({ "reason": "forbidden", "dryRun": dry_run })),
+            record_event(&user, &asset, &checklist, &ctx, "denied", json!({ "reason": "forbidden", "dryRun": dry_run })),
         )
         .await;
         return Err(StatusCode::FORBIDDEN);
@@ -247,12 +252,13 @@ pub(crate) async fn authorise(
 pub async fn bulk_import_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(checklist_id): Path<String>,
     Query(query): Query<BulkImportQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
     let (checklist, asset) =
-        tokio::spawn(authorise(state.clone(), user.clone(), checklist_id, query.dry_run))
+        tokio::spawn(authorise(state.clone(), user.clone(), ctx.clone(), checklist_id, query.dry_run))
             .await
             .map_err(join_failed)??;
 
@@ -287,15 +293,15 @@ pub async fn bulk_import_handler(
         let reason = read_error.unwrap_or("no_file");
         let st = state.clone();
         let dry_run = query.dry_run;
-        let (u, a, c) = (user.clone(), asset.clone(), checklist.clone());
+        let (u, a, c, x) = (user.clone(), asset.clone(), checklist.clone(), ctx.clone());
         let _ = tokio::spawn(async move {
-            reject_event(st.pool.as_ref(), &u, &a, &c, dry_run, reason).await;
+            reject_event(st.pool.as_ref(), &u, &x, &a, &c, dry_run, reason).await;
         })
         .await;
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    run_import(state, user, checklist, asset, csv_bytes, query.dry_run).await
+    run_import(state, user, ctx, checklist, asset, csv_bytes, query.dry_run).await
 }
 
 /// Run [`import_work`] in its own task so it finishes (events included) even
@@ -303,12 +309,13 @@ pub async fn bulk_import_handler(
 pub(crate) async fn run_import(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     checklist: ChecklistRow,
     asset: AssetRow,
     csv_bytes: Vec<u8>,
     dry_run: bool,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
-    tokio::spawn(import_work(state, user, checklist, asset, csv_bytes, dry_run))
+    tokio::spawn(import_work(state, user, ctx, checklist, asset, csv_bytes, dry_run))
         .await
         .map_err(join_failed)?
 }
@@ -316,6 +323,7 @@ pub(crate) async fn run_import(
 pub(crate) async fn import_work(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     checklist: ChecklistRow,
     // Superseded by the fresh read below; kept so callers pass what authorise returned.
     _asset: AssetRow,
@@ -341,6 +349,7 @@ pub(crate) async fn import_work(
                 &user,
                 &asset,
                 &checklist,
+                &ctx,
                 "denied",
                 json!({ "reason": "forbidden", "dryRun": dry_run, "recheck": true }),
             ),
@@ -351,7 +360,7 @@ pub(crate) async fn import_work(
     let raw = match parse_csv(&csv_bytes) {
         Ok(r) => r,
         Err(rej) => {
-            reject_event(pool, &user, &asset, &checklist, dry_run, rej.reason()).await;
+            reject_event(pool, &user, &ctx, &asset, &checklist, dry_run, rej.reason()).await;
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -360,7 +369,7 @@ pub(crate) async fn import_work(
         Ok(v) => v,
         Err(code) => {
             if code == StatusCode::BAD_REQUEST || code == StatusCode::NOT_FOUND {
-                reject_event(pool, &user, &asset, &checklist, dry_run, "stig_unavailable").await;
+                reject_event(pool, &user, &ctx, &asset, &checklist, dry_run, "stig_unavailable").await;
             }
             return Err(code);
         }
@@ -553,6 +562,7 @@ pub(crate) async fn import_work(
                 &user,
                 &asset,
                 &checklist,
+                &ctx,
                 if error_count > 0 { "partial" } else { "ok" },
                 json!({
                     "requested": total_rows,
@@ -647,8 +657,8 @@ mod tests {
 
     async fn run_bytes(state: &AppState, user: &str, csv: &[u8], dry: bool) -> Result<BulkImportResponse, StatusCode> {
         let u = auth(user, "author");
-        let (c, a) = authorise(state.clone(), u.clone(), "c1".into(), dry).await?;
-        run_import(state.clone(), u, c, a, csv.to_vec(), dry).await.map(|j| j.0)
+        let (c, a) = authorise(state.clone(), u.clone(), crate::test_fixtures::ctx(), "c1".into(), dry).await?;
+        run_import(state.clone(), u, crate::test_fixtures::ctx(), c, a, csv.to_vec(), dry).await.map(|j| j.0)
     }
 
     async fn rule(pool: &PgPool, rule_id: &str) -> Option<(String, String, String)> {
@@ -873,11 +883,11 @@ mod tests {
     async fn import_work_and_event_survive_the_future_being_dropped(pool: PgPool) {
         let (state, _d) = setup(&pool, false).await;
         let u = auth("owner", "author");
-        let (c, a) = authorise(state.clone(), u.clone(), "c1".into(), false).await.unwrap();
+        let (c, a) = authorise(state.clone(), u.clone(), crate::test_fixtures::ctx(), "c1".into(), false).await.unwrap();
         let csv = format!("rule_id,status\n{},open\n", RULES[0]).into_bytes();
         let st = state.clone();
         let h = tokio::spawn(async move {
-            let _ = run_import(st, u, c, a, csv, false).await;
+            let _ = run_import(st, u, crate::test_fixtures::ctx(), c, a, csv, false).await;
         });
         tokio::task::yield_now().await;
         h.abort();
@@ -934,6 +944,7 @@ mod tests {
         bulk_import_handler(
             State(state.clone()),
             Extension(auth("owner", "author")),
+            Extension(crate::test_fixtures::ctx()),
             Path("c1".into()),
             Query(BulkImportQuery { dry_run: dry }),
             multipart_with(body).await,
@@ -981,9 +992,9 @@ mod tests {
         let u = auth("owner", "author");
         let csv = format!("rule_id,status,finding_details\n{},not_a_finding,why\n", RULES[0]).into_bytes();
         // Approval switched on between authorise and import_work.
-        let (c, a) = authorise(state.clone(), u.clone(), "c1".into(), false).await.unwrap();
+        let (c, a) = authorise(state.clone(), u.clone(), crate::test_fixtures::ctx(), "c1".into(), false).await.unwrap();
         sqlx::query("UPDATE assets SET requires_approval = TRUE WHERE id = 'a1'").execute(&pool).await.unwrap();
-        let r = run_import(state.clone(), u.clone(), c, a, csv.clone(), false).await.unwrap().0;
+        let r = run_import(state.clone(), u.clone(), crate::test_fixtures::ctx(), c, a, csv.clone(), false).await.unwrap().0;
         assert_eq!((r.applied_count, r.pending_count), (0, 1));
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 1);
@@ -991,10 +1002,10 @@ mod tests {
         seed_user(&pool, "bob").await;
         crate::test_fixtures::seed_acl(&pool, "a1", "bob", "write").await;
         let bob = auth("bob", "author");
-        let (c, a) = authorise(state.clone(), bob.clone(), "c1".into(), false).await.unwrap();
+        let (c, a) = authorise(state.clone(), bob.clone(), crate::test_fixtures::ctx(), "c1".into(), false).await.unwrap();
         sqlx::query("DELETE FROM asset_acl WHERE user_id = 'bob'").execute(&pool).await.unwrap();
         let before = count(&pool, "SELECT COUNT(*) FROM finding_approvals").await;
-        let err = run_import(state.clone(), bob, c, a, csv, false).await.unwrap_err();
+        let err = run_import(state.clone(), bob, crate::test_fixtures::ctx(), c, a, csv, false).await.unwrap_err();
         assert_eq!(err, StatusCode::FORBIDDEN);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, before);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events WHERE outcome = 'denied'").await, 1);

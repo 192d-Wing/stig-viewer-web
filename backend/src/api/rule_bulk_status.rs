@@ -21,6 +21,7 @@ use crate::api::auth::AuthUser;
 use crate::api::checklists::{load_stig_json, take_rules};
 use crate::api::finding_approvals;
 use crate::db_assets;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow};
 use crate::AppState;
@@ -145,10 +146,11 @@ pub(crate) fn plan_rule(
 pub async fn bulk_status_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(checklist_id): Path<String>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<BulkStatusResponse>, StatusCode> {
-    tokio::spawn(bulk_status_work(state, user, checklist_id, req))
+    tokio::spawn(bulk_status_work(state, user, ctx, checklist_id, req))
         .await
         .map_err(|e| {
             tracing::error!("bulk status task failed: {e}");
@@ -159,6 +161,7 @@ pub async fn bulk_status_handler(
 async fn bulk_status_work(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     checklist_id: String,
     req: BulkStatusRequest,
 ) -> Result<Json<BulkStatusResponse>, StatusCode> {
@@ -177,6 +180,7 @@ async fn bulk_status_work(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "rules.bulk_status",
                 outcome,
                 asset_id: Some(&asset.id),
@@ -661,6 +665,7 @@ mod tests {
         bulk_status_handler(
             State(state.clone()),
             Extension(crate::test_fixtures::auth(user, "author")),
+            Extension(crate::test_fixtures::ctx()),
             Path(checklist.into()),
             Json(BulkStatusRequest {
                 rule_ids: rule_ids.iter().map(|s| s.to_string()).collect(),
@@ -1071,6 +1076,7 @@ mod tests {
             let Json(out) = save_handler(
                 State(state.clone()),
                 Extension(crate::test_fixtures::auth("owner", "author")),
+                Extension(crate::test_fixtures::ctx()),
                 Path(asset),
                 Json(SaveRequest { stig_id: STIG_ID.into(), rules }),
             )

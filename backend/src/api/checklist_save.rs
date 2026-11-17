@@ -31,6 +31,7 @@ use crate::api::rule_bulk_status::{
     apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow};
 use crate::AppState;
@@ -124,10 +125,11 @@ fn merge_entry(existing: Option<&ChecklistRuleRow>, e: &SaveRule) -> Option<Merg
 pub async fn save_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(asset_id): Path<String>,
     Json(req): Json<SaveRequest>,
 ) -> Result<Json<SaveResponse>, StatusCode> {
-    tokio::spawn(save_work(state, user, asset_id, req))
+    tokio::spawn(save_work(state, user, ctx, asset_id, req))
         .await
         .map_err(|e| {
             tracing::error!("save task failed: {e}");
@@ -138,6 +140,7 @@ pub async fn save_handler(
 async fn save_work(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     asset_id: String,
     req: SaveRequest,
 ) -> Result<Json<SaveResponse>, StatusCode> {
@@ -153,6 +156,7 @@ async fn save_work(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "checklist.save",
                 outcome,
                 asset_id: Some(&asset.id),
@@ -212,6 +216,7 @@ async fn save_work(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "checklist.create",
                 outcome: "ok",
                 asset_id: Some(&asset.id),
@@ -263,6 +268,7 @@ async fn save_work(
         pool,
         NewAuditEvent {
             user_id: &user.id,
+            ctx: Some(&ctx),
             action: "checklist.save",
             outcome: if count("error") > 0 { "partial" } else { "ok" },
             asset_id: Some(&asset.id),
@@ -619,6 +625,7 @@ mod tests {
         save_handler(
             State(state.clone()),
             Extension(auth(user, role)),
+            Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
             Json(SaveRequest { stig_id: stig_id.into(), rules }),
         )

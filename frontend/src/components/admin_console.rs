@@ -356,6 +356,9 @@ struct AuditEventRow {
     action: String,
     outcome: String,
     detail: Value,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+    user_role: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
@@ -1283,6 +1286,11 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("stig", "STIG", |r: &AuditEventRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} }),
         Column::new("action", "Action", |r: &AuditEventRow| html! { {r.action.clone()} }),
         Column::new("outcome", "Outcome", |r: &AuditEventRow| html! { {r.outcome.clone()} }),
+        Column::new("role", "Role", |r: &AuditEventRow| html! { {r.user_role.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("ip", "Source IP", |r: &AuditEventRow| html! { {r.source_ip.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("request", "Request ID", |r: &AuditEventRow| {
+            html! { <UiBox variant="code">{r.request_id.clone().unwrap_or_else(|| "—".into())}</UiBox> }
+        }),
         Column::new("summary", "Summary", |r: &AuditEventRow| html! { {event_summary(r)} }),
     ];
     let requests_view = *view == "requests";
@@ -2327,6 +2335,19 @@ mod audit_event_tests {
 
     fn event(detail: Value) -> AuditEventRow {
         AuditEventRow { detail, ..AuditEventRow::default() }
+    }
+
+    #[test]
+    fn event_rows_deserialize_the_request_context() {
+        let r: AuditEventRow =
+            serde_json::from_value(json!({ "sourceIp": "10.0.0.1", "requestId": "abc", "userRole": "admin" })).unwrap();
+        assert_eq!(
+            (r.source_ip.as_deref(), r.request_id.as_deref(), r.user_role.as_deref()),
+            (Some("10.0.0.1"), Some("abc"), Some("admin"))
+        );
+        // Rows written before the context columns existed have none.
+        let old: AuditEventRow = serde_json::from_value(json!({ "action": "checklist.save" })).unwrap();
+        assert!(old.source_ip.is_none() && old.request_id.is_none() && old.user_role.is_none());
     }
 
     #[test]

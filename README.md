@@ -183,6 +183,25 @@ cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
 ```
 
+## Operations: audit
+
+- Durable request events live in `audit_events` (see `/api/audit/events`).
+  Each row carries the user's role at the time, a server-generated request id
+  (also returned in the `X-Request-Id` response header; an inbound
+  `X-Request-Id` is ignored) and the source IP. Reading the audit log is itself
+  recorded, as `audit.read` (view, bounded filters, page and rows returned).
+- Audit writes fail open: if a row cannot be written, the request still
+  completes and the backend logs an error on the `audit` target containing
+  `failed to write audit event`, with the user, action, outcome and ids. Alert
+  on that line, and ship the application logs to a retained store, since it is
+  the only record of an event that missed the database (AU-5).
+- `source_ip` is taken from `X-Forwarded-For` / `X-Real-IP`, the same way
+  sessions record it. It is client-asserted unless the backend sits behind a
+  trusted proxy that overwrites those headers; do not expose the backend
+  directly if you rely on it.
+- IP addresses are retained with the audit rows, in the retention archive and
+  in backups.
+
 ## Repository layout
 
 ```

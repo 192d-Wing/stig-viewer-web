@@ -7,6 +7,8 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
+use crate::db_audit::{self, audit_safe_id, NewAuditEvent};
 use crate::AppState;
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -172,9 +174,51 @@ fn parse_date_param(raw: &str, end: bool) -> Result<DateTime<Utc>, StatusCode> {
     Ok(Utc.from_utc_datetime(&ndt))
 }
 
+/// Record that an admin read an audit view. Fails open like every audit event.
+/// Filter values are bounded and sanitised; nothing else from the request is kept.
+#[allow(clippy::too_many_arguments)]
+async fn record_audit_read(
+    state: &AppState,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    view: &'static str,
+    filters: &[(&'static str, &Option<String>)],
+    page: i64,
+    page_size: i64,
+    returned: usize,
+) {
+    let mut f = serde_json::Map::new();
+    for (k, v) in filters {
+        if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
+            f.insert((*k).to_string(), serde_json::Value::String(audit_safe_id(v)));
+        }
+    }
+    db_audit::record_or_log(
+        state.pool.as_ref(),
+        NewAuditEvent {
+            user_id: &user.id,
+            action: "audit.read",
+            outcome: "ok",
+            asset_id: None,
+            checklist_id: None,
+            stig_id: None,
+            detail: serde_json::json!({
+                "view": view,
+                "filters": f,
+                "page": page,
+                "pageSize": page_size,
+                "returned": returned,
+            }),
+            ctx: Some(ctx),
+        },
+    )
+    .await;
+}
+
 pub async fn search_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Query(params): Query<AuditSearchQuery>,
 ) -> Result<Json<AuditSearchResponse>, StatusCode> {
     if user.role != "admin" {
@@ -319,6 +363,24 @@ pub async fn search_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    record_audit_read(
+        &state,
+        &user,
+        &ctx,
+        "rules",
+        &[
+            ("userId", &params.user_id),
+            ("assetId", &params.asset_id),
+            ("checklistId", &params.checklist_id),
+            ("from", &params.from),
+            ("to", &params.to),
+        ],
+        page,
+        page_size,
+        rows.len(),
+    )
+    .await;
+
     Ok(Json(AuditSearchResponse {
         total_count,
         page,
@@ -358,6 +420,9 @@ struct AuditEventDbRow {
     outcome: String,
     /// `detail::text`; sqlx's json feature is not enabled.
     detail: String,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+    user_role: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -371,6 +436,9 @@ pub struct AuditEventRow {
     pub action: String,
     pub outcome: String,
     pub detail: serde_json::Value,
+    pub source_ip: Option<String>,
+    pub request_id: Option<String>,
+    pub user_role: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +483,7 @@ fn push_event_filters<'a>(
 pub async fn events_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Query(params): Query<AuditEventsQuery>,
 ) -> Result<Json<AuditEventsResponse>, StatusCode> {
     if user.role != "admin" {
@@ -450,7 +519,8 @@ pub async fn events_handler(
                 COALESCE(u.display_name, e.user_id) AS by_name, \
                 ast.name AS asset_name, \
                 COALESCE(sc.title, e.stig_id) AS stig_title, \
-                e.action, e.outcome, e.detail::text AS detail \
+                e.action, e.outcome, e.detail::text AS detail, \
+                e.source_ip, e.request_id, e.user_role \
            FROM audit_events e \
            LEFT JOIN users u ON u.id = e.user_id \
            LEFT JOIN assets ast ON ast.id = e.asset_id \
@@ -470,7 +540,7 @@ pub async fn events_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let rows = db_rows
+    let rows: Vec<AuditEventRow> = db_rows
         .into_iter()
         .map(|r| AuditEventRow {
             id: r.id,
@@ -481,8 +551,31 @@ pub async fn events_handler(
             action: r.action,
             outcome: r.outcome,
             detail: serde_json::from_str(&r.detail).unwrap_or(serde_json::Value::Null),
+            source_ip: r.source_ip,
+            request_id: r.request_id,
+            user_role: r.user_role,
         })
         .collect();
+
+    record_audit_read(
+        &state,
+        &user,
+        &ctx,
+        "events",
+        &[
+            ("userId", &params.user_id),
+            ("assetId", &params.asset_id),
+            ("checklistId", &params.checklist_id),
+            ("action", &params.action),
+            ("outcome", &params.outcome),
+            ("from", &params.from),
+            ("to", &params.to),
+        ],
+        page,
+        page_size,
+        rows.len(),
+    )
+    .await;
 
     Ok(Json(AuditEventsResponse { total_count, page, page_size, rows }))
 }
@@ -508,7 +601,7 @@ mod events_tests {
     }
 
     async fn call(state: &AppState, role: &str, q: AuditEventsQuery) -> Result<Json<AuditEventsResponse>, StatusCode> {
-        events_handler(State(state.clone()), Extension(auth("u1", role)), Query(q)).await
+        events_handler(State(state.clone()), Extension(auth("u1", role)), Extension(crate::test_fixtures::ctx()), Query(q)).await
     }
 
     #[sqlx::test]
@@ -545,5 +638,73 @@ mod events_tests {
         q.page = Some(i64::MAX);
         let Json(far) = call(&state, "admin", q).await.unwrap();
         assert!(far.rows.is_empty());
+    }
+
+    fn search_query() -> AuditSearchQuery {
+        AuditSearchQuery {
+            user_id: Some("who\"ever".repeat(40)),
+            asset_id: None,
+            checklist_id: None,
+            from: Some("2024-01-02".into()),
+            to: None,
+            page: Some(2),
+            page_size: Some(500),
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn both_audit_reads_are_recorded_with_bounded_filters_and_context(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let ctx = crate::test_fixtures::ctx();
+        let _ = search_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(search_query()))
+            .await
+            .unwrap();
+        let mut q = query(Some("checklist.save"));
+        q.outcome = Some("denied".into());
+        let _ = events_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(q))
+            .await
+            .unwrap();
+
+        type Row = (String, String, String, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT action, outcome, detail::text, source_ip, request_id FROM audit_events ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.0 == "audit.read" && r.1 == "ok"));
+        assert!(rows.iter().all(|r| r.3.as_deref() == Some("198.51.100.4") && r.4.as_deref() == Some("test-request")));
+        let a: serde_json::Value = serde_json::from_str(&rows[0].2).unwrap();
+        assert_eq!(a["view"], "rules");
+        assert_eq!((a["page"].as_i64(), a["pageSize"].as_i64(), a["returned"].as_i64()), (Some(2), Some(200), Some(0)));
+        assert_eq!(a["filters"]["from"], "2024-01-02");
+        let uid = a["filters"]["userId"].as_str().unwrap();
+        assert_eq!(uid.len(), 64);
+        assert!(!uid.contains('"'));
+        let b: serde_json::Value = serde_json::from_str(&rows[1].2).unwrap();
+        assert_eq!(b["view"], "events");
+        assert_eq!(b["filters"]["action"], "checklist.save");
+        assert_eq!(b["filters"]["outcome"], "denied");
+        // The first audit read is itself in the events view's `returned` only
+        // if it was committed before the query ran: it was, but the filter excluded it.
+        assert_eq!(b["returned"].as_i64(), Some(0));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_forbidden_audit_read_writes_no_event(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let ctx = crate::test_fixtures::ctx();
+        for role in ["author", "reviewer", "viewer"] {
+            let s = search_handler(State(state.clone()), Extension(auth("u1", role)), Extension(ctx.clone()), Query(search_query())).await;
+            assert_eq!(s.err(), Some(StatusCode::FORBIDDEN));
+            assert_eq!(call(&state, role, query(None)).await.err(), Some(StatusCode::FORBIDDEN));
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
     }
 }
