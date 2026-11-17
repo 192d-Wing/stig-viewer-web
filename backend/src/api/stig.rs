@@ -14,8 +14,8 @@ pub async fn get_stig(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
-    // Sanitise the id — only allow alphanumeric + hyphens to prevent path traversal
-    if !id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    // Shared id rule; also prevents path traversal
+    if !crate::stig_id::is_valid(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 

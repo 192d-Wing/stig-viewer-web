@@ -10,6 +10,18 @@ use crate::{
     parser::{extract_xccdf_from_zip, parse_xccdf},
 };
 
+/// Reject a source whose id is not a valid new STIG id, before any I/O.
+fn validate_source(source: &StigSource) -> Result<()> {
+    if !crate::stig_id::is_valid_new(&source.id) {
+        anyhow::bail!(
+            "STIG id {:?} is invalid (1-{} lower-case ASCII letters, digits or hyphens); skipped",
+            source.id.chars().take(64).collect::<String>(),
+            crate::stig_id::MAX_BYTES
+        );
+    }
+    Ok(())
+}
+
 /// Download, parse, and index one STIG from DISA.
 async fn sync_one(
     source: &StigSource,
@@ -17,12 +29,7 @@ async fn sync_one(
     pool: &PgPool,
     data_dir: &Path,
 ) -> Result<()> {
-    if source.id.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
-        anyhow::bail!(
-            "STIG id exceeds {} bytes; skipped",
-            crate::api::checklists::MAX_STIG_ID_BYTES
-        );
-    }
+    validate_source(source)?;
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
     // 1. Download ZIP
@@ -222,4 +229,21 @@ pub async fn run_sync(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    fn src(id: &str) -> StigSource {
+        StigSource { id: id.into(), title: "t".into(), category: "c".into(), url: "u".into() }
+    }
+
+    #[test]
+    fn validate_source_rejects_bad_ids() {
+        for bad in ["../x", "a.b", "a b", "", "Upper", "é"] {
+            assert!(validate_source(&src(bad)).is_err(), "{bad}");
+        }
+        assert!(validate_source(&src("windows-10")).is_ok());
+    }
 }

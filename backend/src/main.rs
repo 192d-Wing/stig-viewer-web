@@ -11,6 +11,7 @@ mod db_drafts;
 mod parser;
 mod scheduler_log;
 mod severity;
+mod stig_id;
 mod sync;
 #[cfg(test)]
 mod test_fixtures;
@@ -250,6 +251,7 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
+    stig_id::warn_non_conforming(&pool).await;
 
     // ── Signing (optional) ──────────────────────────────────────────────────
     let signing = api::signing::SigningState::from_env()?;

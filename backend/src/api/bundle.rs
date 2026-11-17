@@ -588,7 +588,7 @@ fn status_to_xccdf(status: &str) -> &'static str {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 async fn load_stig_json(state: &AppState, stig_id: &str) -> Option<Value> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(stig_id) {
         return None;
     }
     let path = state
