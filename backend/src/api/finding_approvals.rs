@@ -169,6 +169,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for FindingApprovalView {
 /// proposed status to the rule via the existing upsert path (preserving
 /// any concurrent comments/assignee/due_date the requester left intact)
 /// and stamps the decision metadata.
+#[allow(clippy::result_large_err)] // axum handler: Response is the error type
 pub async fn approve_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -237,6 +238,7 @@ pub struct RejectRequest {
 /// POST /api/approvals/:id/reject — reviewer/admin only. Stamps the
 /// decision metadata + decision_reason; does NOT change the rule's
 /// status (it stays whatever the upstream value was, typically 'open').
+#[allow(clippy::result_large_err)] // axum handler: Response is the error type
 pub async fn reject_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,

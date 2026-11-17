@@ -224,7 +224,7 @@ fn element_with_id<'a>(xml: &'a str, wanted_id: &str) -> Option<&'a str> {
     let open_at = xml[..id_at].rfind('<')?;
     // The element's local name.
     let tail = &xml[open_at + 1..];
-    let space_or_gt = tail.find(|c: char| c == ' ' || c == '>')?;
+    let space_or_gt = tail.find([' ', '>'])?;
     let tag_name = &tail[..space_or_gt];
     let local = tag_name.rsplit(':').next().unwrap_or(tag_name);
     extract_element_after(xml, local, open_at)

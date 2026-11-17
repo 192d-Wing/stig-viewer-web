@@ -268,7 +268,7 @@ fn render_pdf(
     layer_ref.use_text("Fleet Compliance Report", SIZE_TITLE, Mm(MARGIN_L), Mm(y), &f_bold);
     y -= LH * 1.6;
     layer_ref.use_text(
-        &Utc::now().format("Generated %Y-%m-%d %H:%M UTC").to_string(),
+        Utc::now().format("Generated %Y-%m-%d %H:%M UTC").to_string(),
         SIZE_BODY,
         Mm(MARGIN_L),
         Mm(y),
@@ -276,7 +276,7 @@ fn render_pdf(
     );
     y -= LH * 0.8;
     layer_ref.use_text(
-        &format!("Window: last {range_days} days"),
+        format!("Window: last {range_days} days"),
         SIZE_SMALL,
         Mm(MARGIN_L),
         Mm(y),
@@ -302,7 +302,7 @@ fn render_pdf(
         ),
     ];
     for (k, v) in &kpis {
-        layer_ref.use_text(&format!("{k}:"), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_bold);
+        layer_ref.use_text(format!("{k}:"), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_bold);
         layer_ref.use_text(v, SIZE_BODY, Mm(MARGIN_L + 32.0), Mm(y), &f_reg);
         y -= LH;
     }
@@ -334,7 +334,7 @@ fn render_pdf(
                 layer_ref = doc.get_page(np).get_layer(nl);
                 y = PAGE_H - MARGIN_T;
             }
-            layer_ref.use_text(&truncate(&a.name, 28), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_reg);
+            layer_ref.use_text(truncate(&a.name, 28), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_reg);
             layer_ref.use_text(
                 &a.classification,
                 SIZE_BODY,
@@ -343,21 +343,21 @@ fn render_pdf(
                 &f_reg,
             );
             layer_ref.use_text(
-                &truncate(&a.owner_name, 16),
+                truncate(&a.owner_name, 16),
                 SIZE_BODY,
                 Mm(MARGIN_L + 95.0),
                 Mm(y),
                 &f_reg,
             );
             layer_ref.use_text(
-                &format!("{:.1}%", a.compliance_score),
+                format!("{:.1}%", a.compliance_score),
                 SIZE_BODY,
                 Mm(MARGIN_L + 130.0),
                 Mm(y),
                 &f_reg,
             );
             layer_ref.use_text(
-                &a.open_count.to_string(),
+                a.open_count.to_string(),
                 SIZE_BODY,
                 Mm(MARGIN_L + 160.0),
                 Mm(y),
@@ -388,7 +388,7 @@ fn render_pdf(
         for r in top_rules {
             layer_ref.use_text(&r.rule_id, SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_reg);
             layer_ref.use_text(
-                &format!("{} affected", r.affected),
+                format!("{} affected", r.affected),
                 SIZE_BODY,
                 Mm(MARGIN_L + 80.0),
                 Mm(y),
