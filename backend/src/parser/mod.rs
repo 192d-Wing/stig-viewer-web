@@ -240,11 +240,18 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                             // here used to overwrite every rule title with
                             // "DPMS Target …".
                             "title" if depth == rule_depth + 1 => rule.title = text,
-                            "description" => {
+                            // First non-empty value wins, like the title: a
+                            // later duplicate or nested element of the same
+                            // name must not overwrite the Rule's own text.
+                            "description" if rule.description.is_empty() => {
                                 rule.description = clean_description(&text)
                             }
-                            "fixtext" | "fix-text" => rule.fix_text = text,
-                            "check-content" => rule.check_text = text,
+                            "fixtext" | "fix-text" if rule.fix_text.is_empty() => {
+                                rule.fix_text = text
+                            }
+                            "check-content" if rule.check_text.is_empty() => {
+                                rule.check_text = text
+                            }
                             "ident" => {
                                 // Only retain idents whose `system` URI
                                 // names a CCI source — DISA, NIST, and
@@ -607,6 +614,24 @@ mod tests {
         let (entries, errors) = extract_all_from_library(&outer);
         assert!(entries.is_empty());
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn description_fixtext_and_check_content_are_first_wins() {
+        let xml = r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>B</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title>
+              <description>first desc</description>
+              <reference><description>later desc</description></reference>
+              <fixtext>first fix</fixtext>
+              <reference><fixtext>later fix</fixtext></reference>
+              <check><check-content>first check</check-content></check>
+              <check><check-content>later check</check-content></check>
+            </Rule></Group></Benchmark>"#;
+        let stig = parse_xccdf(xml).unwrap();
+        let r = &stig.rules[0];
+        assert_eq!(r.description, "first desc");
+        assert_eq!(r.fix_text, "first fix");
+        assert_eq!(r.check_text, "first check");
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
