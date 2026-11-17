@@ -332,7 +332,7 @@ async fn main() -> Result<()> {
         .with_state(saml_state);
 
     // Draft + asset + /api/users/me routes — require an authenticated session.
-    let draft_routes = Router::new()
+    let draft_routes = api::authz_audit::protected_stack(Router::new()
         .route("/api/assets", get(list_assets_handler).post(create_asset_handler))
         .route("/api/assets/import", post(import_assets_handler))
         .route(
@@ -606,29 +606,9 @@ async fn main() -> Result<()> {
             "/api/upload/library",
             post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
-        // Viewer-role read-only gate. Sits inside the auth layer so the
-        // `AuthUser` extension is populated before it runs (outer layer runs
-        // first, so `auth_middleware` is added LAST below).
-        .route_layer(middleware::from_fn(api::viewer_guard::viewer_guard))
-        // Central `authz.denied` recorder: inside request_ctx (needs its
-        // `RequestCtx`), outside viewer_guard so viewer 403s are observed.
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            api::authz_audit::authz_audit,
-        ))
-        // Per-request audit context (request id, source IP, role). Needs
-        // `AuthUser`; added before `rate_limit`, so it runs after it and just
-        // before `viewer_guard`, and its `X-Request-Id` header covers the
-        // viewer_guard 403s.
-        .route_layer(middleware::from_fn(api::request_ctx::request_ctx))
-        // Per-user token-bucket rate limiter. Also needs `AuthUser` in
-        // extensions, so it sits inside the auth layer too. Added AFTER
-        // `viewer_guard` so the layer ordering is:
-        //   auth_middleware -> rate_limit -> request_ctx -> authz_audit -> viewer_guard -> handler
-        // i.e. we throttle before we let a request reach the read-only
-        // gate (or any business logic), but only after we know who's
-        // calling so we can key the bucket on `user.id`.
-        .route_layer(middleware::from_fn(api::rate_limit::rate_limit))
+        // Viewer gate, central authz.denied recorder, request context and
+        // rate limiter (see `authz_audit::protected_stack` for the order).
+        , &state)
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,

@@ -340,6 +340,8 @@ test.describe("Audit log search", () => {
     await ensureUser(request, "alice");
     const denied = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
     expect(denied.status()).toBe(403);
+    const deniedSearch = await request.get(`${BACKEND}/api/audit/search`, { headers: { "X-User-Id": "alice" } });
+    expect(deniedSearch.status()).toBe(403);
 
     await setUserRole("alice", "admin");
     await seedActivity(request, "alice", "events-host", []);
@@ -361,9 +363,12 @@ test.describe("Audit log search", () => {
 
     const denials = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
     const denialBody = await denials.json();
-    expect(denialBody.totalCount).toBe(1);
-    expect(denialBody.rows[0]).toMatchObject({ action: "authz.denied", outcome: "denied" });
-    expect(denialBody.rows[0].detail).toEqual({ method: "GET", route: "/api/audit/events" });
+    expect(denialBody.totalCount).toBe(2);
+    expect(denialBody.rows.map((r) => r.detail.route).sort()).toEqual(["/api/audit/events", "/api/audit/search"]);
+    for (const r of denialBody.rows) {
+      expect(r).toMatchObject({ action: "authz.denied", outcome: "denied" });
+      expect(r.detail.method).toBe("GET");
+    }
     const bad = await request.get(`${BACKEND}/api/audit/events?from=nope`, { headers: { "X-User-Id": "alice" } });
     expect(bad.status()).toBe(400);
   });
@@ -385,6 +390,9 @@ test.describe("Audit log search", () => {
     await expect(table).toContainText("requests-ui-host");
     // Collapsed denials show a count (column header and per-row value).
     await expect(table).toContainText("Count");
+    // The seeded checklist.create row is not collapsed: its Count cell is "1".
+    const createRow = table.getByRole("row").filter({ hasText: "checklist.create" }).first();
+    await expect(createRow.getByRole("cell").nth(9)).toHaveText("1");
 
     // Switching back restores the rule-change view.
     await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();

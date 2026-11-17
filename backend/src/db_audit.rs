@@ -92,8 +92,8 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
 pub const COLLAPSE_WINDOW_SECS: i64 = 300;
 
 /// Collapse a repeated denied/rejected event into the newest matching row
-/// (same user, action, outcome, the three id columns and `detail.reason`)
-/// whose first occurrence is within [`COLLAPSE_WINDOW_SECS`]. Only
+/// (same user, action, outcome, the three id columns, the exact `detail`,
+/// `source_ip` and `user_role`) whose first occurrence is within [`COLLAPSE_WINDOW_SECS`]. Only
 /// `repeat_count` and `last_occurred_at` change; the row keeps the first
 /// request's `request_id`, `source_ip` and `detail`. Returns whether a row was
 /// updated. Not atomic with the insert that follows a miss: a race yields at
@@ -102,7 +102,6 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
     if !matches!(ev.outcome, "denied" | "rejected") {
         return Ok(false);
     }
-    let reason = detail.get("reason").and_then(Value::as_str);
     let n = sqlx::query(
         "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() \
          WHERE id = (SELECT id FROM audit_events \
@@ -110,7 +109,9 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
                         AND asset_id IS NOT DISTINCT FROM $4::text \
                         AND checklist_id IS NOT DISTINCT FROM $5::text \
                         AND stig_id IS NOT DISTINCT FROM $6::text \
-                        AND detail->>'reason' IS NOT DISTINCT FROM $7::text \
+                        AND detail IS NOT DISTINCT FROM $7::jsonb \
+                        AND source_ip IS NOT DISTINCT FROM $9::text \
+                        AND user_role IS NOT DISTINCT FROM $10::text \
                         AND occurred_at > NOW() - make_interval(secs => $8) \
                       ORDER BY id DESC LIMIT 1)",
     )
@@ -120,8 +121,10 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
     .bind(&ids.asset_id)
     .bind(&ids.checklist_id)
     .bind(&ids.stig_id)
-    .bind(reason)
+    .bind(detail.to_string())
     .bind(COLLAPSE_WINDOW_SECS as f64)
+    .bind(ev.ctx.and_then(|c| c.source_ip.as_deref()))
+    .bind(ev.ctx.map(|c| bound_id(&c.role)))
     .execute(pool)
     .await?
     .rows_affected();
@@ -295,6 +298,55 @@ mod tests {
         let got = rows(&pool).await;
         assert_eq!(got.len(), 6);
         assert!(got.iter().all(|r| r.1 == 1));
+    }
+
+    fn ctx_with(ip: &str, role: &str) -> RequestCtx {
+        RequestCtx { source_ip: Some(ip.into()), role: role.into(), ..ctx() }
+    }
+
+    async fn denied_authz(pool: &PgPool, c: &RequestCtx, method: &str, route: &str) {
+        let mut e = ev("denied", json!({ "method": method, "route": route }));
+        e.action = "authz.denied";
+        e.asset_id = None;
+        e.ctx = Some(c);
+        record_or_log(pool, e).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn only_exact_repeats_collapse(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let c = ctx_with("203.0.113.7", "author");
+        denied_authz(&pool, &c, "POST", "/api/a").await;
+        denied_authz(&pool, &c, "POST", "/api/b").await; // other route
+        denied_authz(&pool, &c, "PUT", "/api/a").await; // other method
+        denied_authz(&pool, &ctx_with("203.0.113.8", "author"), "POST", "/api/a").await; // other ip
+        denied_authz(&pool, &ctx_with("203.0.113.7", "viewer"), "POST", "/api/a").await; // other role
+        assert_eq!(rows(&pool).await.len(), 5);
+        // An exact repeat with a different request id collapses; the first id is kept.
+        let mut again = ctx_with("203.0.113.7", "author");
+        again.request_id = "req-other".into();
+        denied_authz(&pool, &again, "POST", "/api/a").await;
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0], ("denied".to_string(), 2, true, Some("req-1".to_string())));
+        assert!(got[1..].iter().all(|r| r.1 == 1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_window_boundary_is_five_minutes(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        let age = |secs: i32| {
+            sqlx::query("UPDATE audit_events SET occurred_at = NOW() - make_interval(secs => $1)").bind(secs as f64).execute(&pool)
+        };
+        age(299).await.unwrap(); // 4m59s: still inside
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        assert_eq!(rows(&pool).await.len(), 1);
+        age(301).await.unwrap(); // 5m01s: outside
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        assert_eq!(rows(&pool).await.len(), 2);
     }
 
     #[sqlx::test]

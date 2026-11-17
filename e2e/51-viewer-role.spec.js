@@ -68,6 +68,8 @@ test.describe("Read-only viewer role", () => {
   test("API: a viewer write is recorded as authz.denied with the route template, repeats collapse", async ({
     request,
   }) => {
+    // Depends on resetDb (beforeEach) clearing audit_events: the row count and
+    // repeatCount below assume no earlier authz.denied rows exist.
     const { checklistId, ruleId } = await seedChecklist(request);
     await setUserRole("alice", "viewer");
     const url = `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}`;

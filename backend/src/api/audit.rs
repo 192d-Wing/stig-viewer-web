@@ -708,7 +708,7 @@ mod events_tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn a_forbidden_audit_read_writes_no_event(pool: PgPool) {
+    async fn a_forbidden_audit_read_handler_writes_no_event_itself(pool: PgPool) {
         seed_user(&pool, "u1").await;
         let (state, _dir) = app_state(pool.clone());
         let ctx = crate::test_fixtures::ctx();

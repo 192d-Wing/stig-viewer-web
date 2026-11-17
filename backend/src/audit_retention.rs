@@ -145,7 +145,8 @@ async fn run_prune_events_batched(
                    source_ip, request_id, user_role, repeat_count, last_occurred_at,
                    detail::text AS detail
             FROM audit_events
-            WHERE COALESCE(last_occurred_at, occurred_at) < NOW() - ($1 || ' days')::INTERVAL
+            WHERE occurred_at < NOW() - ($1 || ' days')::INTERVAL
+              AND (last_occurred_at IS NULL OR last_occurred_at < NOW() - ($1 || ' days')::INTERVAL)
             ORDER BY id ASC
             LIMIT $2
             "#,
