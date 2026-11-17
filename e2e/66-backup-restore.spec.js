@@ -178,7 +178,7 @@ test.describe("Backup + restore — API", () => {
           .get(`${BACKEND}/api/audit/events${query}`, { headers: { "X-User-Id": "alice" } })
           .then((r) => r.json())
       ).rows;
-    // A forced restore also records a backup.restore event after it commits.
+    // A forced restore also records a backup.restore event inside the restore transaction.
     const listEvents = async () =>
       (await fetchEvents()).filter((e) => e.action !== "audit.read" && e.action !== "backup.restore");
     const before = await listEvents();

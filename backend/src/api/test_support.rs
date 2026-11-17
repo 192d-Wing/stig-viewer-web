@@ -37,6 +37,37 @@ const VALID_SCHEDULERS: &[&str] = &[
     "compliance_report",
 ];
 
+/// The reset transaction: `TRUNCATE ... CASCADE` in audit `test` mode.
+pub(crate) async fn reset_db(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::db_audit::set_maintenance(&mut tx, "test").await?;
+    sqlx::query(
+        "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
+                  email_deliveries, login_notice_acks CASCADE",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The backdate transaction: shift matching `rule_audit` rows into the past.
+pub(crate) async fn backdate_audit(pool: &sqlx::PgPool, rule_id: &str, days: i64) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    crate::db_audit::set_maintenance(&mut tx, "test").await?;
+    sqlx::query(
+        "UPDATE rule_audit \
+         SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
+         WHERE rule_id = $2",
+    )
+    .bind(days.to_string())
+    .bind(rule_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
 /// Only registered when `STIG_ENABLE_TEST_ROUTES=true` (which startup refuses
 /// under `STIG_ENV=production`).
@@ -46,19 +77,7 @@ pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
     // don't leak between specs.
     // CASCADE from `users` reaches the audit tables, whose guard triggers need
     // the `test` maintenance mode.
-    let result: anyhow::Result<()> = async {
-        let mut tx = state.pool.begin().await?;
-        crate::db_audit::set_maintenance(&mut tx, "test").await?;
-        sqlx::query(
-            "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
-                      email_deliveries, login_notice_acks CASCADE",
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-    .await;
+    let result = reset_db(state.pool.as_ref()).await;
 
     match result {
         Ok(_) => {
@@ -281,22 +300,7 @@ pub async fn backdate_audit_handler(
     State(state): State<AppState>,
     Json(req): Json<BackdateAuditRequest>,
 ) -> StatusCode {
-    let result: anyhow::Result<()> = async {
-        let mut tx = state.pool.begin().await?;
-        crate::db_audit::set_maintenance(&mut tx, "test").await?;
-        sqlx::query(
-            "UPDATE rule_audit \
-             SET occurred_at = occurred_at - ($1 || ' days')::INTERVAL \
-             WHERE rule_id = $2",
-        )
-        .bind(req.days.to_string())
-        .bind(&req.rule_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-    .await;
+    let result = backdate_audit(state.pool.as_ref(), &req.rule_id, req.days).await;
 
     match result {
         Ok(_) => StatusCode::NO_CONTENT,
@@ -535,4 +539,28 @@ pub async fn inject_scheduler_error_handler(
     }
     scheduler_log::inject_failure(&req.name);
     StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::seed_user;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn backdate_and_reset_work_under_the_audit_guard(pool: sqlx::PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
+            .execute(&pool).await.unwrap();
+        backdate_audit(&pool, "r1", 60).await.unwrap();
+        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit WHERE occurred_at < NOW() - INTERVAL '59 days'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(old, 1);
+        reset_db(&pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 0);
+    }
 }

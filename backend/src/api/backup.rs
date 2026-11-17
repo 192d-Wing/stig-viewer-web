@@ -376,13 +376,20 @@ pub async fn restore_handler(
     // ── Transactional insert ────────────────────────────────────────────
     // Structured record before anything is changed, so the external log has it
     // even if the database write below fails.
+    // Only counts for known tables: the manifest comes from the uploaded ZIP.
+    let backup_counts: Vec<(&str, i64)> = TABLES
+        .iter()
+        .filter_map(|t| manifest.counts.get(*t).map(|n| (*t, *n)))
+        .collect();
+    let backup_rows: i64 = backup_counts.iter().map(|(_, n)| n).sum();
     tracing::warn!(
         target: "audit",
         actor = %user.id,
         source_ip = ctx.source_ip.as_deref(),
         request_id = %ctx.request_id,
         forced = q.force,
-        backup_counts = ?manifest.counts,
+        backup_rows = backup_rows,
+        backup_counts = ?backup_counts,
         "backup restore starting"
     );
     let mut tx = pool.begin().await.map_err(|e| {
@@ -456,9 +463,18 @@ pub async fn restore_handler(
     let restored_rows: i64 = restored.values().sum();
     record_restore(&mut tx, &user.id, &ctx, q.force, restored_rows, actor_row.as_ref())
         .await
-        .map_err(|e| {
-            tracing::error!(target: "audit", "restore audit record failed, rolling back: {e:#}");
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to record restore")
+        .map_err(|e| match e {
+            RecordRestoreError::NoActor => {
+                tracing::error!(target: "audit", actor = %user.id, "restore rolled back: acting user not in restored data");
+                err_response(
+                    StatusCode::CONFLICT,
+                    "restore rolled back: the acting admin is not present in the backup (matched neither by id nor by identity provider subject); nothing was changed",
+                )
+            }
+            RecordRestoreError::Db(e) => {
+                tracing::error!(target: "audit", "restore audit record failed, rolling back: {e:#}");
+                err_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to record restore")
+            }
         })?;
 
     tx.commit().await.map_err(|e| {
@@ -504,8 +520,23 @@ pub async fn restore_handler(
     }))
 }
 
-/// Put the acting user's row back if the restored data lacks it, then record
-/// `backup.restore` on the same transaction.
+#[derive(Debug)]
+enum RecordRestoreError {
+    /// The acting user is in the restored data neither by id nor by (provider, sub).
+    NoActor,
+    Db(anyhow::Error),
+}
+
+impl From<sqlx::Error> for RecordRestoreError {
+    fn from(e: sqlx::Error) -> Self {
+        RecordRestoreError::Db(e.into())
+    }
+}
+
+/// Put the acting user's row back if the restored data lacks it, resolve the
+/// user the event is attributed to (the same id, else the same IdP identity
+/// under the id the restored data uses), then record `backup.restore` on the
+/// same transaction.
 async fn record_restore(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor: &str,
@@ -513,27 +544,50 @@ async fn record_restore(
     forced: bool,
     restored_rows: i64,
     actor_row: Option<&Value>,
-) -> anyhow::Result<()> {
+) -> Result<(), RecordRestoreError> {
     if let Some(row) = actor_row {
         sqlx::query("INSERT INTO users SELECT * FROM jsonb_populate_record(NULL::users, $1) ON CONFLICT DO NOTHING")
             .bind(row)
             .execute(&mut **tx)
             .await?;
     }
+    let mut attributed: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(actor)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if attributed.is_none() {
+        let provider = actor_row.and_then(|r| r.get("provider")).and_then(Value::as_str);
+        let sub = actor_row.and_then(|r| r.get("sub")).and_then(Value::as_str);
+        if let (Some(provider), Some(sub)) = (provider, sub) {
+            attributed = sqlx::query_scalar("SELECT id FROM users WHERE provider = $1 AND sub = $2")
+                .bind(provider)
+                .bind(sub)
+                .fetch_optional(&mut **tx)
+                .await?;
+        }
+    }
+    let Some(attributed) = attributed else {
+        return Err(RecordRestoreError::NoActor);
+    };
+    let mut detail = json!({ "forced": forced, "restoredRows": restored_rows });
+    if attributed != actor {
+        detail["actorIdBeforeRestore"] = json!(actor);
+    }
     crate::db_audit::record_in_tx(
         tx,
         &crate::db_audit::NewAuditEvent {
-            user_id: actor,
+            user_id: &attributed,
             ctx: Some(ctx),
             action: "backup.restore",
             outcome: "ok",
             asset_id: None,
             checklist_id: None,
             stig_id: None,
-            detail: json!({ "forced": forced, "restoredRows": restored_rows }),
+            detail,
         },
     )
     .await
+    .map_err(RecordRestoreError::Db)
 }
 
 /// Walk the ZIP once, returning `(manifest, table->rows, attachment_id->bytes)`.
@@ -643,10 +697,54 @@ mod restore_record_tests {
         crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
         sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
         // No actor row to restore: the event's user FK fails.
-        assert!(record_restore(&mut tx, "admin1", &ctx(), true, 0, None).await.is_err());
+        assert!(matches!(
+            record_restore(&mut tx, "admin1", &ctx(), true, 0, None).await,
+            Err(RecordRestoreError::NoActor)
+        ));
         drop(tx);
         let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!((users, events), (1, 1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_attributes_to_the_restored_id_of_the_same_idp_identity(pool: PgPool) {
+        seed_user(&pool, "admin1").await; // provider 'test', sub 'admin1'
+        let row = actor_row(&pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
+        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
+        // The backup holds the same (provider, sub) under another id.
+        sqlx::query("INSERT INTO users (id, display_name, email, role, sub, provider) VALUES ('old-id', 'x', '', 'admin', 'admin1', 'test')")
+            .execute(&mut *tx).await.unwrap();
+        record_restore(&mut tx, "admin1", &ctx(), true, 0, Some(&row)).await.unwrap();
+        tx.commit().await.unwrap();
+        let rows: Vec<(String, Value)> = sqlx::query_as("SELECT user_id, detail FROM audit_events WHERE action = 'backup.restore'")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "old-id");
+        assert_eq!(rows[0].1["actorIdBeforeRestore"], "admin1");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_with_no_matching_actor_is_a_conflict_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let mut row = actor_row(&pool).await;
+        // Only an identity that the restored data does not contain.
+        row["id"] = json!("ghost");
+        row["sub"] = json!("ghost-sub");
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
+        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
+        // Re-inserting the captured row would restore it, so omit the row.
+        assert!(matches!(
+            record_restore(&mut tx, "ghost", &ctx(), true, 0, None).await,
+            Err(RecordRestoreError::NoActor)
+        ));
+        drop(tx);
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
+        assert_eq!(users, 1);
     }
 }

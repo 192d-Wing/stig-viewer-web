@@ -129,7 +129,8 @@ async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detai
         return Ok(false);
     }
     let n = sqlx::query(
-        "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW() \
+        "UPDATE audit_events SET repeat_count = repeat_count + 1, \
+             last_occurred_at = GREATEST(NOW(), COALESCE(last_occurred_at, occurred_at)) \
          WHERE id = (SELECT id FROM audit_events \
                       WHERE user_id = $1 AND action = $2 AND outcome = $3 \
                         AND asset_id IS NOT DISTINCT FROM $4::text \
@@ -341,17 +342,31 @@ mod tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn guard_survives_replica_role_and_migration_mode_allows_update_only(pool: PgPool) {
+    async fn guard_triggers_are_always_enabled_and_migration_mode_allows_update_only(pool: PgPool) {
         seed_both(&pool).await;
-        let mut tx = pool.begin().await.unwrap();
-        sqlx::query("SET LOCAL session_replication_role = replica").execute(&mut *tx).await.ok();
-        // (SET may be refused for a non-superuser; if it is accepted the trigger must still fire.)
-        let e = sqlx::query("DELETE FROM rule_audit").execute(&mut *tx).await;
-        assert!(e.is_err());
-        drop(tx);
+        let enabled: Vec<(String, String)> = sqlx::query_as(
+            "SELECT tgname::text, tgenabled::text FROM pg_trigger WHERE tgname LIKE '%\\_guard\\_%' ORDER BY tgname",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(enabled.len(), 4);
+        assert!(enabled.iter().all(|(_, e)| e == "A"), "{enabled:?}");
         in_mode(&pool, "migration", "UPDATE rule_audit SET field = 'y'").await.unwrap();
         assert!(is_guard_error(&in_mode(&pool, "migration", "DELETE FROM rule_audit").await.unwrap_err()));
         assert!(is_guard_error(&in_mode(&pool, "migration", "TRUNCATE rule_audit").await.unwrap_err()));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn collapse_onto_a_row_whose_last_occurrence_is_slightly_in_the_future_still_collapses(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        in_mode(&pool, "test", "UPDATE audit_events SET last_occurred_at = NOW() + INTERVAL '30 seconds'").await.unwrap();
+        record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
+        let got = rows(&pool).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, 2);
     }
 
     fn ev(outcome: &'static str, detail: Value) -> NewAuditEvent<'static> {
