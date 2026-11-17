@@ -304,25 +304,22 @@ pub(crate) fn expected_status(
 
 /// The write for a `Plan::Apply`: which columns change and which guards the
 /// locked row must pass.
-fn build_patch<'a>(
-    status: &'a str,
-    write_status: bool,
-    expect_status: Option<&'a str>,
-    finding_details: Option<&'a str>,
-    comments: Option<&'a str>,
-) -> db_checklists::RulePatch<'a> {
+fn build_patch<'a>(op: &RuleOp<'a>) -> db_checklists::RulePatch<'a> {
     db_checklists::RulePatch {
-        status: write_status.then_some(status),
-        finding_details,
-        comments,
-        require_details: write_status && requires_finding_details(status),
-        expect_status: if write_status { expect_status } else { None },
+        status: op.write_status.then_some(op.status),
+        finding_details: op.finding_details,
+        comments: op.comments,
+        assignee_id: op.assignee_id,
+        due_date: op.due_date,
+        require_details: op.write_status && requires_finding_details(op.status),
+        expect_status: if op.write_status { op.expect_status } else { None },
     }
 }
 
 /// One rule's work for [`apply_plans`]. `finding_details` / `comments` are
 /// `Some` only when the caller wants to overwrite that column; `None` keeps
-/// the value stored at write time. `write_status` false leaves the stored
+/// the value stored at write time. `assignee_id` / `due_date` are tri-state:
+/// `Some(None)` clears the column. `write_status` false leaves the stored
 /// status alone (text-only update). A closing status is re-checked for
 /// finding details against the locked row at write time.
 pub(crate) struct RuleOp<'a> {
@@ -332,12 +329,15 @@ pub(crate) struct RuleOp<'a> {
     pub expect_status: Option<&'a str>,
     pub finding_details: Option<&'a str>,
     pub comments: Option<&'a str>,
+    pub assignee_id: Option<Option<&'a str>>,
+    pub due_date: Option<Option<chrono::NaiveDate>>,
     pub plan: Plan,
 }
 
 /// Carry out the [`Plan`] of every op against one checklist, in three
-/// phases: rule writes, approval requests, then the comments of rules whose
-/// status went to the approval queue (comments are not gated). Each phase
+/// phases: rule writes, approval requests, then the non-status fields
+/// (comments, assignee, due date) of rules whose status went to the approval
+/// queue (those fields are not gated). Each phase
 /// is chunked by the db layer. Results are in `ops` order.
 pub(crate) async fn apply_plans(
     pool: &sqlx::PgPool,
@@ -362,7 +362,7 @@ pub(crate) async fn apply_plans(
         .iter()
         .map(|&i| {
             let op = &ops[i];
-            (op.rule_id, build_patch(op.status, op.write_status, op.expect_status, op.finding_details, op.comments))
+            (op.rule_id, build_patch(op))
         })
         .collect();
     let outcomes = db_checklists::patch_rules(pool, checklist_id, user_id, &patches).await;
@@ -396,17 +396,27 @@ pub(crate) async fn apply_plans(
             }
             finding_approvals::ApprovalOutcome::Failed => Err("failed to request approval".to_string()),
         });
-        if matches!(out[i], Some(Ok(_))) && ops[i].comments.is_some() {
+        if matches!(out[i], Some(Ok(_)))
+            && (ops[i].comments.is_some() || ops[i].assignee_id.is_some() || ops[i].due_date.is_some())
+        {
             with_comments.push(i);
         }
     }
 
-    // Phase 3: comments for pending rules. Status and details wait for
-    // approval; the comments are kept rather than dropping user input.
+    // Phase 3: non-status fields of pending rules. Status and details wait
+    // for approval; the rest is kept rather than dropping user input.
     let comment_patches: Vec<(&str, db_checklists::RulePatch<'_>)> = with_comments
         .iter()
         .map(|&i| {
-            (ops[i].rule_id, db_checklists::RulePatch { comments: ops[i].comments, ..Default::default() })
+            (
+                ops[i].rule_id,
+                db_checklists::RulePatch {
+                    comments: ops[i].comments,
+                    assignee_id: ops[i].assignee_id,
+                    due_date: ops[i].due_date,
+                    ..Default::default()
+                },
+            )
         })
         .collect();
     let outcomes = db_checklists::patch_rules(pool, checklist_id, user_id, &comment_patches).await;
@@ -478,6 +488,8 @@ async fn apply_bulk(
             expect_status: expect.as_deref(),
             finding_details: details,
             comments: None,
+            assignee_id: None,
+            due_date: None,
             plan,
         })
         .collect();
@@ -581,13 +593,27 @@ mod tests {
         }
     }
 
+    fn op<'a>(status: &'a str, write_status: bool, expect: Option<&'a str>, comments: Option<&'a str>) -> RuleOp<'a> {
+        RuleOp {
+            rule_id: "r",
+            status,
+            write_status,
+            expect_status: expect,
+            finding_details: None,
+            comments,
+            assignee_id: None,
+            due_date: None,
+            plan: Plan::Reject("x"),
+        }
+    }
+
     #[test]
     fn build_patch_carries_expect_status_only_when_status_is_written() {
-        let p = build_patch("not_a_finding", true, Some("not_a_finding"), None, None);
+        let p = build_patch(&op("not_a_finding", true, Some("not_a_finding"), None));
         assert_eq!(p.expect_status, Some("not_a_finding"));
         assert_eq!(p.status, Some("not_a_finding"));
         assert!(p.require_details);
-        let text_only = build_patch("open", false, Some("open"), None, Some("c"));
+        let text_only = build_patch(&op("open", false, Some("open"), Some("c")));
         assert_eq!(text_only.expect_status, None);
         assert_eq!(text_only.status, None);
         assert!(!text_only.require_details);
@@ -1068,5 +1094,51 @@ mod tests {
         assert_eq!(d["reason"], "finding_details_invalid");
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn apply_plans_writes_assignee_and_due_date_for_queued_rules(pool: PgPool) {
+        let (_state, _d) = setup(&pool).await;
+        let due = chrono::NaiveDate::from_ymd_opt(2031, 5, 6);
+        let ops = [
+            RuleOp {
+                rule_id: RULES[0],
+                status: "not_a_finding",
+                write_status: true,
+                expect_status: None,
+                finding_details: Some("why"),
+                comments: None,
+                assignee_id: Some(Some("other")),
+                due_date: Some(due),
+                plan: Plan::RequestApproval { finding_details: "why".into() },
+            },
+            RuleOp {
+                rule_id: RULES[1],
+                status: "open",
+                write_status: true,
+                expect_status: None,
+                finding_details: None,
+                comments: None,
+                assignee_id: Some(Some("other")),
+                due_date: Some(due),
+                plan: Plan::Apply { finding_details: String::new() },
+            },
+        ];
+        let out = apply_plans(&pool, "c1", "owner", &ops).await;
+        assert_eq!(out[0].as_ref().unwrap().status, "pending_approval");
+        assert_eq!(out[1].as_ref().unwrap().status, "applied");
+        let rows: Vec<(String, String, Option<String>, Option<chrono::NaiveDate>)> = sqlx::query_as(
+            "SELECT rule_id, status, assignee_id, due_date FROM checklist_rules ORDER BY rule_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // The queued rule keeps its status (a fresh row) but gets the non-gated fields.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (RULES[0].to_string(), "not_reviewed".into(), Some("other".into()), due));
+        assert_eq!(rows[1], (RULES[1].to_string(), "open".into(), Some("other".into()), due));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
     }
 }

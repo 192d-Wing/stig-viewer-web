@@ -259,6 +259,10 @@ pub struct RulePatch<'a> {
     pub status: Option<&'a str>,
     pub finding_details: Option<&'a str>,
     pub comments: Option<&'a str>,
+    /// `None` keeps the stored assignee, `Some(None)` clears it.
+    pub assignee_id: Option<Option<&'a str>>,
+    /// `None` keeps the stored due date, `Some(None)` clears it.
+    pub due_date: Option<Option<NaiveDate>>,
     /// Abort ([`PatchRejected::DetailsRequired`]) when the finding details
     /// that would be stored are blank, judged against the locked row.
     pub require_details: bool,
@@ -327,8 +331,14 @@ fn resolve_patch(
         status,
         finding_details,
         comments,
-        assignee_id: existing.and_then(|e| e.assignee_id.clone()),
-        due_date: existing.and_then(|e| e.due_date),
+        assignee_id: match patch.assignee_id {
+            Some(v) => v.map(str::to_string),
+            None => existing.and_then(|e| e.assignee_id.clone()),
+        },
+        due_date: match patch.due_date {
+            Some(v) => v,
+            None => existing.and_then(|e| e.due_date),
+        },
     })
 }
 
@@ -683,6 +693,29 @@ mod tests {
         assert_eq!(resolve_patch(Some(&existing), &patch).unwrap().finding_details, "because");
         let documented = row("open", "already");
         assert_eq!(resolve_patch(Some(&documented), &closing()).unwrap().finding_details, "already");
+    }
+
+    #[test]
+    fn assignee_and_due_date_are_tri_state() {
+        let existing = row("open", "");
+        let keep = resolve_patch(Some(&existing), &RulePatch::default()).unwrap();
+        assert_eq!((keep.assignee_id.as_deref(), keep.due_date), (Some("u"), existing.due_date));
+        let clear = resolve_patch(
+            Some(&existing),
+            &RulePatch { assignee_id: Some(None), due_date: Some(None), ..RulePatch::default() },
+        )
+        .unwrap();
+        assert_eq!((clear.assignee_id, clear.due_date), (None, None));
+        let d = NaiveDate::from_ymd_opt(2031, 5, 6);
+        let set = resolve_patch(
+            Some(&existing),
+            &RulePatch { assignee_id: Some(Some("new")), due_date: Some(d), ..RulePatch::default() },
+        )
+        .unwrap();
+        assert_eq!((set.assignee_id.as_deref(), set.due_date), (Some("new"), d));
+        // No row yet: keep means none.
+        let fresh = resolve_patch(None, &RulePatch::default()).unwrap();
+        assert_eq!((fresh.assignee_id, fresh.due_date), (None, None));
     }
 
     #[test]
@@ -1260,5 +1293,52 @@ mod tests {
         // An expectation that holds writes through.
         let c = upsert_rule_expecting(&pool, w("r2"), Some("open")).await.unwrap();
         assert!(c.is_ok());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_assignee_and_due_audit_rows_match_upsert_rule(pool: PgPool) {
+        setup(&pool).await;
+        seed_user(&pool, "u2").await;
+        let due = NaiveDate::from_ymd_opt(2031, 5, 6);
+        type Audit = Vec<(String, Option<String>, Option<String>)>;
+        let audit = |pool: PgPool, from: i64| async move {
+            let a: Audit = sqlx::query_as(
+                "SELECT field, from_value, to_value FROM rule_audit WHERE id > $1 ORDER BY field",
+            )
+            .bind(from)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            a
+        };
+        seed_rule(&pool, "c1", "r1", "open", "d", "c", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        upsert_rule(
+            &pool,
+            RuleWrite {
+                checklist_id: "c1",
+                rule_id: "r1",
+                status: "open",
+                finding_details: "d",
+                comments: "c",
+                updated_by: "u1",
+                assignee_id: Some("u2"),
+                due_date: due,
+            },
+        )
+        .await
+        .unwrap();
+        let single = audit(pool.clone(), mark).await;
+
+        sqlx::query("DELETE FROM checklist_rules").execute(&pool).await.unwrap();
+        seed_rule(&pool, "c1", "r1", "open", "d", "c", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        let patch = RulePatch { assignee_id: Some(Some("u2")), due_date: Some(due), ..RulePatch::default() };
+        let out = patch_rules(&pool, "c1", "u1", &[("r1", patch)]).await;
+        assert_eq!(out, [PatchOutcome::Written]);
+        let batch = audit(pool.clone(), mark).await;
+        assert_eq!(single.len(), 2);
+        assert_eq!(single, batch);
     }
 }

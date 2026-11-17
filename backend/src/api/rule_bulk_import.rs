@@ -465,6 +465,8 @@ pub(crate) async fn import_work(
                 expect_status: p.expect.as_deref(),
                 finding_details: p.details.as_deref(),
                 comments: None,
+                assignee_id: None,
+                due_date: None,
                 plan: match &p.plan {
                     Plan::Apply { finding_details } => Plan::Apply { finding_details: finding_details.clone() },
                     Plan::RequestApproval { finding_details } => {
