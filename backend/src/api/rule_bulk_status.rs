@@ -49,7 +49,7 @@ pub(crate) struct Applied {
     pub note: Option<&'static str>,
 }
 
-const MAX_FINDING_DETAILS_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_FINDING_DETAILS_BYTES: usize = 32 * 1024;
 
 pub(crate) const VALID_STATUSES: &[&str] = &["not_reviewed", "open", "not_a_finding", "not_applicable"];
 
@@ -58,7 +58,7 @@ pub(crate) fn has_nul(s: &str) -> bool {
     s.contains('\0')
 }
 
-fn requires_finding_details(status: &str) -> bool {
+pub(crate) fn requires_finding_details(status: &str) -> bool {
     matches!(status, "not_a_finding" | "not_applicable")
 }
 
