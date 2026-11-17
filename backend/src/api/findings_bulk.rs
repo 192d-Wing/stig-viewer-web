@@ -20,7 +20,7 @@ use crate::api::auth::AuthUser;
 use crate::api::checklists::{load_stig_json, take_rules};
 use crate::api::rule_bulk_status::{
     apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_FINDING_DETAILS_BYTES, MAX_RULES,
-    VALID_STATUSES,
+    STATUS_PENDING_APPROVAL, VALID_STATUSES,
 };
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow};
@@ -233,19 +233,23 @@ async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<
         .map(|(id, asset_id, stig_id, requires_approval)| (id, Resolved { asset_id, stig_id, requires_approval }))
         .collect();
 
-    // One write check per distinct asset, then the request-order walk.
+    // Request-order walk; the write check runs lazily, once per distinct
+    // asset, and the first unknown or forbidden target ends the request.
     let mut can_write: HashMap<&str, bool> = HashMap::new();
-    for r in resolved.values() {
-        if !can_write.contains_key(r.asset_id.as_str()) {
-            let ok = asset_acl::user_can(pool, &r.asset_id, &user, "write").await;
-            can_write.insert(r.asset_id.as_str(), ok);
-        }
-    }
     for t in &req.targets {
         let Some(r) = resolved.get(&t.checklist_id) else {
+            rejected_event("unknown_checklist").await;
             return Err(StatusCode::NOT_FOUND);
         };
-        if !can_write.get(r.asset_id.as_str()).copied().unwrap_or(false) {
+        let ok = match can_write.get(r.asset_id.as_str()) {
+            Some(v) => *v,
+            None => {
+                let v = asset_acl::user_can(pool, &r.asset_id, &user, "write").await;
+                can_write.insert(r.asset_id.as_str(), v);
+                v
+            }
+        };
+        if !ok {
             db_audit::record_or_log(
                 pool,
                 NewAuditEvent {
@@ -311,7 +315,10 @@ async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<
                         .filter_map(|x| x.get("id").and_then(|v| v.as_str()).map(str::to_string))
                         .collect::<HashSet<String>>(),
                 ),
-                Err(_) => None,
+                Err(code) => {
+                    tracing::warn!("findings bulk: STIG {} unavailable ({code}) for checklist {checklist_id}", r.stig_id);
+                    None
+                }
             };
             stigs.insert(r.stig_id.clone(), known);
         }
@@ -360,8 +367,8 @@ async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<
         let mut rejected: Vec<(String, String)> = Vec::new();
         for (rule_id, res) in rule_ids.iter().zip(results) {
             match res {
-                Ok(("pending_approval", true)) => already += 1,
-                Ok(("pending_approval", false)) => queued += 1,
+                Ok((STATUS_PENDING_APPROVAL, true)) => already += 1,
+                Ok((STATUS_PENDING_APPROVAL, false)) => queued += 1,
                 Ok(_) => applied += 1,
                 Err(error) => {
                     errors += 1;
@@ -552,6 +559,11 @@ mod tests {
             call(&state, targets(&[("bad\u{0}id", RULES[0])]), json!({ "status": "open" })).await.unwrap_err(),
             StatusCode::NOT_FOUND
         );
+        let long = "c".repeat(MAX_CHECKLIST_ID_BYTES + 1);
+        assert_eq!(
+            call(&state, targets(&[(long.as_str(), RULES[0])]), json!({ "status": "open" })).await.unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(
             call_as(&state, "other", "author", t.clone(), json!({ "status": "open" })).await.unwrap_err(),
             StatusCode::FORBIDDEN
@@ -560,6 +572,9 @@ mod tests {
         let many: Vec<(&str, &str)> = (0..MAX_RULES + 1).map(|_| ("c1", RULES[0])).collect();
         assert_eq!(call(&state, targets(&many), json!({ "status": "open" })).await.unwrap_err(), StatusCode::BAD_REQUEST);
         assert_eq!(call(&state, t.clone(), json!({ "comments": "a\u{0}b" })).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(call(&state, t.clone(), json!({ "findingDetails": "a\u{0}b" })).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        let big_comments = "x".repeat(MAX_FINDING_DETAILS_BYTES + 1);
+        assert_eq!(call(&state, t.clone(), json!({ "comments": big_comments })).await.unwrap_err(), StatusCode::BAD_REQUEST);
         let big = "x".repeat(MAX_FINDING_DETAILS_BYTES + 1);
         assert_eq!(call(&state, t.clone(), json!({ "findingDetails": big })).await.unwrap_err(), StatusCode::BAD_REQUEST);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
@@ -632,11 +647,16 @@ mod tests {
         assert_eq!(row.2, "cc");
         assert_eq!(row.3.as_deref(), Some("other"));
         assert_eq!(row.4.map(|d| d.to_string()).as_deref(), Some("2031-05-06"));
-        let fields: Vec<String> = sqlx::query_scalar("SELECT field FROM rule_audit ORDER BY field")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(fields, ["assignee_id", "comments", "due_date"]);
+        let audit: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT field, from_value, to_value FROM rule_audit ORDER BY field")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let norm = |v: &Option<String>| v.clone().unwrap_or_default();
+        assert_eq!(audit.len(), 3);
+        assert_eq!((audit[0].0.as_str(), norm(&audit[0].1).as_str(), norm(&audit[0].2).as_str()), ("assignee_id", "", "other"));
+        assert_eq!((audit[1].0.as_str(), norm(&audit[1].1).as_str(), norm(&audit[1].2).as_str()), ("comments", "", "cc"));
+        assert_eq!((audit[2].0.as_str(), norm(&audit[2].1).as_str(), norm(&audit[2].2).as_str()), ("due_date", "", "2031-05-06"));
     }
 
     #[sqlx::test]
@@ -765,16 +785,17 @@ mod tests {
         let (state, _d) = setup(&pool, false).await;
         let t = targets(&[("c1", RULES[0])]);
         let _ = call_as(&state, "other", "author", t.clone(), json!({ "status": "open" })).await;
-        let _ = call(&state, t.clone(), json!({ "status": "bogus" })).await;
+        let _ = call(&state, t.clone(), json!({ "status": "BOGUSSTATUS" })).await;
         let _ = call(&state, t.clone(), json!({ "assigneeId": "ghost" })).await;
-        // 404 is not recorded.
         let _ = call(&state, targets(&[("nope", RULES[0])]), json!({ "status": "open" })).await;
         let ev: Vec<(String, Option<String>, serde_json::Value)> =
             sqlx::query_as("SELECT outcome, checklist_id, detail FROM audit_events ORDER BY id")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(ev.len(), 3);
+        assert_eq!(ev.len(), 4);
+        assert!(!ev.iter().any(|e| e.2.to_string().contains("BOGUSSTATUS") || e.2.to_string().contains("nope")));
+        assert_eq!(ev[3].2["reason"], "unknown_checklist");
         assert_eq!((ev[0].0.as_str(), ev[0].1.as_deref(), ev[0].2["reason"].as_str()), ("denied", Some("c1"), Some("forbidden")));
         assert_eq!((ev[1].0.as_str(), ev[1].1.as_deref(), ev[1].2["reason"].as_str()), ("rejected", None, Some("invalid_status")));
         assert_eq!(ev[2].2["reason"], "unknown_assignee");
@@ -820,5 +841,22 @@ mod tests {
         }
         assert_eq!(seen, 2);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 2);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn findings_bulk_unavailable_stig_fails_only_that_checklist(pool: PgPool) {
+        let (state, _d) = setup(&pool, false).await;
+        // A second STIG id that has no file; c3 on a2 uses it.
+        sqlx::query("INSERT INTO checklists (id, asset_id, stig_id) VALUES ('c3', 'a2', 'MISSING-STIG')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let t = targets(&[("c3", RULES[0]), ("c3", RULES[1]), ("c3", RULES[0]), ("c1", RULES[0])]);
+        let r = call(&state, t, json!({ "status": "open" })).await.unwrap();
+        assert_eq!((r.updated, r.error_count), (1, 2));
+        assert!(r.errors.iter().all(|e| e.checklist_id == "c3" && e.error == "STIG unavailable for this checklist"));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules WHERE checklist_id = 'c3'").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules WHERE checklist_id = 'c1'").await, 1);
     }
 }

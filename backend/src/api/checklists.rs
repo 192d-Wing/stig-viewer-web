@@ -618,6 +618,14 @@ pub async fn update_rule_handler(
     {
         Ok(row) => row,
         Err(rejected) => {
+            tracing::warn!(
+                target: "audit",
+                user_id = %user.id,
+                asset_id = %asset.id,
+                checklist_id = %id,
+                rule_id = %crate::db_audit::audit_safe_id(&rule_id),
+                "single-rule write refused: rule changed while saving"
+            );
             return Err((
                 StatusCode::CONFLICT,
                 Json(json!({ "error": rejected.to_string() })),

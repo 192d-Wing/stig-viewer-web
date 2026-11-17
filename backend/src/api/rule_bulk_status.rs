@@ -42,6 +42,10 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(64).collect()
 }
 
+/// [`Applied::status`] values.
+pub(crate) const STATUS_APPLIED: &str = "applied";
+pub(crate) const STATUS_PENDING_APPROVAL: &str = "pending_approval";
+
 /// Outcome of [`apply_plans`] for one rule.
 pub(crate) struct Applied {
     /// "applied" | "pending_approval"
@@ -96,7 +100,7 @@ pub struct BulkStatusResponse {
 }
 
 /// What to do with one rule, decided without touching the database.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Plan {
     /// Write the rule row with these finding details.
     Apply { finding_details: String },
@@ -368,7 +372,7 @@ pub(crate) async fn apply_plans(
     let outcomes = db_checklists::patch_rules(pool, checklist_id, user_id, &patches).await;
     for (&i, outcome) in applies.iter().zip(outcomes) {
         out[i] = Some(match outcome {
-            PatchOutcome::Written => Ok(Applied { status: "applied", note: None }),
+            PatchOutcome::Written => Ok(Applied { status: STATUS_APPLIED, note: None }),
             PatchOutcome::Rejected(r) => Err(r.to_string()),
             PatchOutcome::Failed => Err("failed to save".to_string()),
         });
@@ -390,9 +394,9 @@ pub(crate) async fn apply_plans(
     let mut with_comments = Vec::new();
     for (&i, outcome) in approvals.iter().zip(queued) {
         out[i] = Some(match outcome {
-            finding_approvals::ApprovalOutcome::Queued { .. } => Ok(Applied { status: "pending_approval", note: None }),
+            finding_approvals::ApprovalOutcome::Queued { .. } => Ok(Applied { status: STATUS_PENDING_APPROVAL, note: None }),
             finding_approvals::ApprovalOutcome::AlreadyPending => {
-                Ok(Applied { status: "pending_approval", note: Some(ALREADY_PENDING) })
+                Ok(Applied { status: STATUS_PENDING_APPROVAL, note: Some(ALREADY_PENDING) })
             }
             finding_approvals::ApprovalOutcome::Failed => Err("failed to request approval".to_string()),
         });

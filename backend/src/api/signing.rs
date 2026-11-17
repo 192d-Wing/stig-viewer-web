@@ -45,10 +45,12 @@ impl SigningState {
     /// the var is unset or empty so the server starts cleanly without
     /// signing. Returns `Err` only for malformed hex or wrong-length input.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
-        let Some(hex_str) = std::env::var("SIGNING_KEY_HEX")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-        else {
+        Self::from_hex(std::env::var("SIGNING_KEY_HEX").ok().as_deref())
+    }
+
+    /// Pure parsing behind [`Self::from_env`]: `None` or blank means disabled.
+    pub fn from_hex(value: Option<&str>) -> anyhow::Result<Option<Self>> {
+        let Some(hex_str) = value.filter(|s| !s.trim().is_empty()) else {
             return Ok(None);
         };
         let bytes = hex::decode(hex_str.trim())
@@ -229,25 +231,17 @@ mod tests {
     }
 
     #[test]
-    fn from_env_returns_none_when_unset() {
-        // Guard against leakage from parallel tests on the same process.
-        let prior = std::env::var("SIGNING_KEY_HEX").ok();
-        // Safety: tests run single-threaded via cargo test by default; the
-        // env var is read-reset-written in this test only.
-        std::env::remove_var("SIGNING_KEY_HEX");
-        let got = SigningState::from_env().unwrap();
-        assert!(got.is_none());
-        if let Some(v) = prior {
-            std::env::set_var("SIGNING_KEY_HEX", v);
-        }
+    fn from_hex_returns_none_when_unset_or_blank() {
+        assert!(SigningState::from_hex(None).unwrap().is_none());
+        assert!(SigningState::from_hex(Some("  ")).unwrap().is_none());
     }
 
     #[test]
-    fn from_env_rejects_short_key() {
-        std::env::set_var("SIGNING_KEY_HEX", "deadbeef");
-        let err = SigningState::from_env().unwrap_err();
+    fn from_hex_rejects_short_key() {
+        let err = SigningState::from_hex(Some("deadbeef")).unwrap_err();
         assert!(err.to_string().contains("32 bytes"));
-        std::env::remove_var("SIGNING_KEY_HEX");
+        assert!(SigningState::from_hex(Some("zz")).is_err());
+        assert!(SigningState::from_hex(Some(&"ab".repeat(32))).unwrap().is_some());
     }
 
     #[test]

@@ -317,11 +317,37 @@ pub(crate) async fn import_work(
     state: AppState,
     user: AuthUser,
     checklist: ChecklistRow,
-    asset: AssetRow,
+    // Superseded by the fresh read below; kept so callers pass what authorise returned.
+    _asset: AssetRow,
     csv_bytes: Vec<u8>,
     dry_run: bool,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
     let pool = state.pool.as_ref();
+    // The upload may have taken arbitrarily long to arrive: re-read the
+    // checklist and asset and re-check write access, so a policy flip or a
+    // revoked grant made meanwhile applies to this import.
+    let checklist = db_checklists::get_checklist(pool, &checklist.id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let asset = db_assets::get_asset(pool, &checklist.asset_id)
+        .await
+        .map_err(map_db)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if !asset_acl::user_can(pool, &asset.id, &user, "write").await {
+        db_audit::record_or_log(
+            pool,
+            record_event(
+                &user,
+                &asset,
+                &checklist,
+                "denied",
+                json!({ "reason": "forbidden", "dryRun": dry_run, "recheck": true }),
+            ),
+        )
+        .await;
+        return Err(StatusCode::FORBIDDEN);
+    }
     let raw = match parse_csv(&csv_bytes) {
         Ok(r) => r,
         Err(rej) => {
@@ -467,13 +493,7 @@ pub(crate) async fn import_work(
                 comments: None,
                 assignee_id: None,
                 due_date: None,
-                plan: match &p.plan {
-                    Plan::Apply { finding_details } => Plan::Apply { finding_details: finding_details.clone() },
-                    Plan::RequestApproval { finding_details } => {
-                        Plan::RequestApproval { finding_details: finding_details.clone() }
-                    }
-                    Plan::Reject(m) => Plan::Reject(m),
-                },
+                plan: p.plan.clone(),
             })
             .collect();
         let outcomes = apply_plans(pool, &checklist.id, &user.id, &ops).await;
@@ -871,5 +891,112 @@ mod tests {
         }
         assert_eq!(seen, 1);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn import_long_or_nul_text_is_a_row_error(pool: PgPool) {
+        let (state, _d) = setup(&pool, false).await;
+        let long_id = "x".repeat(MAX_RULE_ID_BYTES + 1);
+        let big = "d".repeat(MAX_FINDING_DETAILS_BYTES + 1);
+        let csv = format!(
+            "rule_id,status,finding_details\n{long_id},open,\n{},op\u{0}en,\n{},not_a_finding,a\u{0}b\nr\u{0}x,open,\n{},not_a_finding,{big}\n",
+            RULES[0], RULES[1], RULES[2]
+        );
+        let r = run(&state, "owner", &csv, false).await.unwrap();
+        let errs: Vec<&str> = r.rows.iter().map(|x| x.error.as_deref().unwrap_or("")).collect();
+        assert_eq!(
+            errs,
+            [
+                "rule id too long",
+                "text contains a NUL character",
+                "text contains a NUL character",
+                "text contains a NUL character",
+                "finding_details too long"
+            ]
+        );
+        assert_eq!((r.applied_count, r.error_count), (0, 5));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 0);
+    }
+
+    async fn multipart_with(body: String) -> Multipart {
+        use axum::extract::FromRequest;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "multipart/form-data; boundary=B")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        Multipart::from_request(req, &()).await.unwrap()
+    }
+
+    async fn handler(state: &AppState, dry: bool, body: String) -> Result<Json<BulkImportResponse>, StatusCode> {
+        bulk_import_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Path("c1".into()),
+            Query(BulkImportQuery { dry_run: dry }),
+            multipart_with(body).await,
+        )
+        .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn import_handler_no_file_and_multipart_error_are_400_with_commit_only_events(pool: PgPool) {
+        let (state, _d) = setup(&pool, false).await;
+        let no_file = "--B\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\nx\r\n--B--\r\n".to_string();
+        assert_eq!(handler(&state, true, no_file.clone()).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events").await, 0);
+        assert_eq!(handler(&state, false, no_file).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        // Truncated body: the file field never terminates.
+        let broken = "--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nrule_id,status".to_string();
+        assert_eq!(handler(&state, false, broken).await.unwrap_err(), StatusCode::BAD_REQUEST);
+        let ev: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT outcome, detail FROM audit_events ORDER BY id").fetch_all(&pool).await.unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!((ev[0].0.as_str(), ev[0].1["reason"].as_str()), ("rejected", Some("no_file")));
+        assert_eq!((ev[1].0.as_str(), ev[1].1["reason"].as_str()), ("rejected", Some("multipart_error")));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn import_missing_stig_file_is_404_with_a_commit_only_event(pool: PgPool) {
+        let (state, _d) = setup(&pool, false).await;
+        std::fs::remove_file(state.config.data_dir.join("stigs").join(format!("{STIG_ID}.json"))).unwrap();
+        let csv = format!("rule_id,status\n{},open\n", RULES[0]);
+        assert_eq!(run(&state, "owner", &csv, true).await.unwrap_err(), StatusCode::NOT_FOUND);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events").await, 0);
+        assert_eq!(run(&state, "owner", &csv, false).await.unwrap_err(), StatusCode::NOT_FOUND);
+        let ev: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT outcome, detail FROM audit_events").fetch_all(&pool).await.unwrap();
+        assert_eq!(ev.len(), 1);
+        assert_eq!((ev[0].0.as_str(), ev[0].1["reason"].as_str()), ("rejected", Some("stig_unavailable")));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn import_rechecks_policy_and_access_after_the_upload(pool: PgPool) {
+        let (state, _d) = setup(&pool, false).await;
+        let u = auth("owner", "author");
+        let csv = format!("rule_id,status,finding_details\n{},not_a_finding,why\n", RULES[0]).into_bytes();
+        // Approval switched on between authorise and import_work.
+        let (c, a) = authorise(state.clone(), u.clone(), "c1".into(), false).await.unwrap();
+        sqlx::query("UPDATE assets SET requires_approval = TRUE WHERE id = 'a1'").execute(&pool).await.unwrap();
+        let r = run_import(state.clone(), u.clone(), c, a, csv.clone(), false).await.unwrap().0;
+        assert_eq!((r.applied_count, r.pending_count), (0, 1));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 1);
+        // Write access lost in between.
+        seed_user(&pool, "bob").await;
+        crate::test_fixtures::seed_acl(&pool, "a1", "bob", "write").await;
+        let bob = auth("bob", "author");
+        let (c, a) = authorise(state.clone(), bob.clone(), "c1".into(), false).await.unwrap();
+        sqlx::query("DELETE FROM asset_acl WHERE user_id = 'bob'").execute(&pool).await.unwrap();
+        let before = count(&pool, "SELECT COUNT(*) FROM finding_approvals").await;
+        let err = run_import(state.clone(), bob, c, a, csv, false).await.unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, before);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events WHERE outcome = 'denied'").await, 1);
     }
 }

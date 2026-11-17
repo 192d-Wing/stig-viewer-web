@@ -972,6 +972,9 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                             Some(name) => format!("Reassigned {count} finding{} to {name}.", plural(count)),
                             None => format!("Unassigned {count} finding{}.", plural(count)),
                         };
+                        if result.pending_approval > 0 {
+                            message.push_str(&format!(" {} sent for approval.", result.pending_approval));
+                        }
                         if result.error_count > 0 {
                             message.push_str(&format!(" {} not changed.", result.error_count));
                         }

@@ -1341,4 +1341,24 @@ mod tests {
         assert_eq!(single.len(), 2);
         assert_eq!(single, batch);
     }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_treats_a_missing_row_as_not_reviewed(pool: PgPool) {
+        setup(&pool).await;
+        let w = RuleWrite {
+            checklist_id: "c1",
+            rule_id: "r9",
+            status: "not_a_finding",
+            finding_details: "d",
+            comments: "",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        let rejected = upsert_rule_expecting(&pool, w, Some("not_a_finding")).await.unwrap();
+        assert_eq!(rejected.unwrap_err(), PatchRejected::StatusChanged);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert!(upsert_rule_expecting(&pool, w, Some("not_reviewed")).await.unwrap().is_ok());
+    }
 }
