@@ -685,3 +685,25 @@ pub fn issue_list<'a>(rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>
         </ul>
     }
 }
+
+/// The two per-rule lists of a result alert, from `(rule id, status, error,
+/// note)` rows: rules that carry a note, then rules whose status is "error"
+/// (a failed rule with no error text is still listed, with an empty reason).
+/// `failed_more_suffix` is appended to the failed list's "…and N more" line.
+pub fn result_issue_lists<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, Option<&'a str>, Option<&'a str>)>,
+    failed_more_suffix: &str,
+) -> Html {
+    let rows: Vec<_> = rows.into_iter().collect();
+    let noted = rows.iter().map(|&(id, _, _, note)| (id, note));
+    let failed = rows
+        .iter()
+        .filter(|&&(_, status, _, _)| status == "error")
+        .map(|&(id, _, error, _)| (id, Some(error.unwrap_or_default())));
+    html! {
+        <>
+            {issue_list(noted, "")}
+            {issue_list(failed, failed_more_suffix)}
+        </>
+    }
+}

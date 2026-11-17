@@ -1202,14 +1202,7 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                 <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} dismissible=true
                        on_dismiss={dismiss} testid="set-status-result">
                     {bulk_status_summary(&status_label(status), r)}
-                    {issue_list(r.results.iter().map(|x| (x.rule_id.as_str(), x.note.as_deref())), "")}
-                    {issue_list(
-                        r.results
-                            .iter()
-                            .filter(|x| x.status == "error")
-                            .map(|x| (x.rule_id.as_str(), Some(x.error.as_deref().unwrap_or_default()))),
-                        " (still selected)",
-                    )}
+                    {result_issue_lists(r.results.iter().map(|x| (x.rule_id.as_str(), x.status.as_str(), x.error.as_deref(), x.note.as_deref())), " (still selected)")}
                 </Alert>
             }
         }
