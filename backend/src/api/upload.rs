@@ -67,14 +67,13 @@ pub async fn upload_stig(
                 let text = field.text().await.map_err(|e| {
                     (StatusCode::BAD_REQUEST, format!("Failed to read id field: {e}"))
                 })?;
-                // Validate id — alphanumeric + hyphens only
-                if !text.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                    return Err((StatusCode::BAD_REQUEST, "id must be alphanumeric with hyphens only".into()));
-                }
-                if text.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
+                if !crate::stig_id::is_valid_new(&text) {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        format!("id must be at most {} bytes", crate::api::checklists::MAX_STIG_ID_BYTES),
+                        format!(
+                            "id must be 1-{} lower-case ASCII letters, digits or hyphens",
+                            crate::stig_id::MAX_BYTES
+                        ),
                     ));
                 }
                 id = Some(text);

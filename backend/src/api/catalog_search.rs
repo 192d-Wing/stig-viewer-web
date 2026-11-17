@@ -123,6 +123,9 @@ pub async fn search_handler(
         //    scan so a query that matches both title and a rule still
         //    surfaces individual rule hits — useful for "edge" where
         //    operators want to jump to specific rules.
+        if !crate::stig_id::is_valid(&entry.id) {
+            continue;
+        }
         let path = state
             .config
             .data_dir
@@ -385,4 +388,24 @@ mod tests {
         assert!(s.contains("&lt;script&gt;"), "got: {s}");
         assert!(s.contains("<mark>edge</mark>"), "got: {s}");
     }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn search_skips_catalog_entries_with_invalid_ids(pool: sqlx::PgPool) {
+        sqlx::query("INSERT INTO stigs_catalog (id, title, category, json_path) VALUES ('a.b', 'Findme Title', 'c', 'p')")
+            .execute(&pool)
+            .await
+            .expect("seed catalog");
+        let (state, _dir) = crate::test_fixtures::app_state(pool);
+        let r = search_handler(
+            State(state),
+            Query(SearchQuery { q: Some("findme".into()), limit: None }),
+        )
+        .await
+        .expect("search succeeds");
+        // Title still matches; the file scan is skipped without error.
+        assert_eq!(r.0.results.len(), 1);
+        assert!(r.0.results[0].rule_id.is_none());
+    }
 }
+

@@ -10,6 +10,18 @@ use crate::{
     parser::{extract_xccdf_from_zip, parse_xccdf},
 };
 
+/// Reject a source whose id is not a valid new STIG id, before any I/O.
+fn validate_source(source: &StigSource) -> Result<()> {
+    if !crate::stig_id::is_valid_new(&source.id) {
+        anyhow::bail!(
+            "STIG id {:?} is invalid (1-{} lower-case ASCII letters, digits or hyphens); skipped",
+            source.id.chars().take(64).collect::<String>(),
+            crate::stig_id::MAX_BYTES
+        );
+    }
+    Ok(())
+}
+
 /// Download, parse, and index one STIG from DISA.
 async fn sync_one(
     source: &StigSource,
@@ -17,12 +29,7 @@ async fn sync_one(
     pool: &PgPool,
     data_dir: &Path,
 ) -> Result<()> {
-    if source.id.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
-        anyhow::bail!(
-            "STIG id exceeds {} bytes; skipped",
-            crate::api::checklists::MAX_STIG_ID_BYTES
-        );
-    }
+    validate_source(source)?;
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
     // 1. Download ZIP
@@ -122,8 +129,7 @@ async fn archive_previous_catalog(
     let archive_dir = data_dir.join("stigs").join("archive");
     tokio::fs::create_dir_all(&archive_dir).await?;
 
-    let release_safe = sanitize_release(&old_release);
-    let archive_name = format!("{stig_id}-v{old_version}-r{release_safe}.json");
+    let archive_name = archive_file_name(stig_id, &old_version, &old_release);
     let archive_abs = archive_dir.join(&archive_name);
 
     // Copy the file regardless — if a previous archive run already
@@ -166,6 +172,24 @@ async fn archive_previous_catalog(
         );
     }
     Ok(())
+}
+
+/// Archive file name for a replaced STIG version. The sanitised version and
+/// release are readable but lossy (`1.2` and `1-2` agree), so a hash of the
+/// raw pair keeps distinct versions from overwriting each other.
+pub(crate) fn archive_file_name(stig_id: &str, version: &str, release_info: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(version.as_bytes());
+    h.update([0u8]);
+    h.update(release_info.as_bytes());
+    let digest = h.finalize();
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{stig_id}-v{}-r{}-{short}.json",
+        sanitize_release(version),
+        sanitize_release(release_info)
+    )
 }
 
 /// Replace whitespace and other filesystem-unfriendly characters in a
@@ -222,4 +246,33 @@ pub async fn run_sync(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    fn src(id: &str) -> StigSource {
+        StigSource { id: id.into(), title: "t".into(), category: "c".into(), url: "u".into() }
+    }
+
+    #[test]
+    fn archive_names_differ_for_colliding_versions() {
+        let a = archive_file_name("x", "1.2", "R 1");
+        let b = archive_file_name("x", "1-2", "R 1");
+        let c = archive_file_name("x", "1.2", "R-1");
+        assert!(a.starts_with("x-v1-2-rR-1-") && a.ends_with(".json"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a, archive_file_name("x", "1.2", "R 1"));
+    }
+
+    #[test]
+    fn validate_source_rejects_bad_ids() {
+        for bad in ["../x", "a.b", "a b", "", "Upper", "é"] {
+            assert!(validate_source(&src(bad)).is_err(), "{bad}");
+        }
+        assert!(validate_source(&src("windows-10")).is_ok());
+        assert!(validate_source(&src("a")).is_ok());
+    }
 }

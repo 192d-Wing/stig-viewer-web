@@ -393,7 +393,7 @@ pub fn filename_to_id(zip_name: &str) -> String {
     // Slugify: lowercase, non-alphanum → hyphen, collapse repeated hyphens
     let raw: String = base
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
         .collect();
 
     let mut slug = String::with_capacity(raw.len());
@@ -547,6 +547,10 @@ pub fn extract_all_from_library(
             if id.is_empty() {
                 id = outer_id.clone();
             }
+            if id.is_empty() {
+                errors.push((xccdf_name.chars().take(64).collect(), "could not derive a valid id from the file name; skipped".into()));
+                continue;
+            }
             if !seen_ids.insert(id.clone()) {
                 let base = id.clone();
                 let mut n = 2;
@@ -556,10 +560,12 @@ pub fn extract_all_from_library(
                 id = format!("{base}-{n}");
             }
 
-            if id.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
+            // Defensive: `filename_to_id` already yields lower-case ASCII, so
+            // in practice this only fires for an over-long id.
+            if !crate::stig_id::is_valid_new(&id) {
                 errors.push((
                     id.chars().take(64).collect(),
-                    format!("derived id exceeds {} bytes; skipped", crate::api::checklists::MAX_STIG_ID_BYTES),
+                    format!("derived id is not a valid STIG id (max {} bytes); skipped", crate::stig_id::MAX_BYTES),
                 ));
                 continue;
             }
@@ -585,6 +591,23 @@ pub fn extract_all_from_library(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filename_to_id_is_ascii_lower_only() {
+        assert_eq!(filename_to_id("U_Caf\u{e9}_Server_V1R1_STIG.zip"), "caf-server");
+        assert_eq!(filename_to_id("U_\u{e9}\u{e9}_STIG.zip"), "");
+        assert_eq!(filename_to_id("!!!.zip"), "");
+        assert!(crate::stig_id::is_valid_new(&filename_to_id("U_MS_Windows_11_V2R3_STIG.zip")));
+    }
+
+    #[test]
+    fn library_import_skips_and_reports_empty_id() {
+        let inner = zip_of(&[("x_xccdf.xml", &benchmark("T"))]);
+        let outer = zip_of(&[("U_\u{e9}\u{e9}_V1R1_STIG.zip", &inner)]);
+        let (entries, errors) = extract_all_from_library(&outer);
+        assert!(entries.is_empty());
+        assert_eq!(errors.len(), 1);
+    }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write;
@@ -654,7 +677,7 @@ mod tests {
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["short"]);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].1.contains("exceeds"), "{errors:?}");
+        assert!(errors[0].1.contains("not a valid STIG id"), "{errors:?}");
         assert!(errors[0].0.len() <= 64);
     }
 
