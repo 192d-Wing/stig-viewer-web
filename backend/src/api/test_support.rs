@@ -3,12 +3,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use axum_extra::extract::cookie::{CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::asset_email_cc::run_asset_email_schedules;
-use crate::api::auth::{client_ip, user_agent};
+use crate::api::auth::{
+    client_ip, cookie_secure, session_cookie, user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
+};
 use crate::api::compliance_report;
 use crate::api::dashboard::take_snapshot;
 use crate::api::rate_limit;
@@ -341,12 +343,14 @@ pub async fn saml_login_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let cookie = Cookie::build(("stig_session", session_id.clone()))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .max_age(time::Duration::hours(8))
-        .build();
+    let cookie = session_cookie(
+        SESSION_COOKIE,
+        session_id.clone(),
+        "/",
+        SameSite::Lax,
+        time::Duration::hours(SESSION_LIFETIME_HOURS),
+        cookie_secure(),
+    );
 
     Ok((
         jar.add(cookie),
