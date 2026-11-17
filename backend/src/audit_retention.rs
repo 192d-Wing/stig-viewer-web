@@ -38,7 +38,7 @@
 //! stops with an error and nothing is deleted; if the delete fails after a
 //! successful archive, the retry skips the already-archived ids.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -100,18 +100,33 @@ struct SegmentManifest {
     signers: Vec<SignerId>,
 }
 
-/// `(first, last)` from `<stream>-<date>.<first>-<last>.jsonl`, if `name` is a
-/// segment of `stream` on `date`.
-fn segment_range(name: &str, stream: &str, date: &str) -> Option<(i64, i64)> {
-    let rest = name
-        .strip_prefix(&format!("{stream}-{date}."))?
-        .strip_suffix(".jsonl")?;
-    let (a, b) = rest.split_once('-')?;
+/// `(first, last)` from the part of a segment name after `<stream>-<date>.`:
+/// `<first>-<last>` or, for a collision-free rewrite, `<first>-<last>.r<n>`.
+fn parse_range(rest: &str) -> Option<(i64, i64)> {
+    let (range, rev) = match rest.split_once('.') {
+        Some((r, v)) => (r, Some(v)),
+        None => (rest, None),
+    };
+    if let Some(v) = rev {
+        let n = v.strip_prefix('r')?;
+        if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    let (a, b) = range.split_once('-')?;
     let digits = |x: &str| !x.is_empty() && x.bytes().all(|c| c.is_ascii_digit());
     if !digits(a) || !digits(b) {
         return None;
     }
     Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// `(first, last)` if `name` is a segment of `stream` on `date`.
+fn segment_range(name: &str, stream: &str, date: &str) -> Option<(i64, i64)> {
+    parse_range(
+        name.strip_prefix(&format!("{stream}-{date}."))?
+            .strip_suffix(".jsonl")?,
+    )
 }
 
 #[derive(Deserialize)]
@@ -153,44 +168,70 @@ fn preserve_rejected(dir: &Path, name: &str) {
     }
 }
 
-/// What the verified segments of `stream` on `date` hold: id -> SHA-512 of the
-/// exact line. Only a segment that VERIFIES contributes (sidecar present;
+/// What the verified segments of `stream` on `date` hold: id -> SHA-512s of
+/// the exact lines. A segment counts only if it VERIFIES (sidecar present;
 /// digest, row count and id range correct; a verified signature when a key is
-/// configured). A segment that fails is logged, preserved as
-/// `*.rejected-<time>` and ignored. Legacy append-mode files are never read.
+/// configured).
+///
+/// - A DEFINITE failure (bad signature, digest, count or range mismatch, a
+///   missing or unparseable sidecar) is logged, the segment and sidecar are
+///   preserved as `*.rejected-<time>`, and it is not counted.
+/// - Anything inexact (an I/O error, or `Unsigned` / `UnknownKey` while a key
+///   is configured, as after a key change) is logged, not counted, and left
+///   untouched. New segments are written under non-colliding names.
 ///
 /// The caller skips a row only when its id maps to the identical line, so a
 /// planted segment with a consistent digest cannot hide a real row, with or
-/// without a signing key.
+/// without a signing key. Legacy append-mode files are never read.
 fn archived_lines(
     dir: &Path,
     stream: &str,
     date: &str,
     key: Option<&SigningState>,
-) -> Result<HashMap<i64, String>> {
-    let mut seen = HashMap::new();
+) -> Result<HashMap<i64, HashSet<String>>> {
+    let mut seen: HashMap<i64, HashSet<String>> = HashMap::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if segment_range(&name, stream, date).is_none() {
             continue;
         }
-        let verified = verify_segment(dir, &name, key).and_then(|v| {
-            if key.is_some() && v.status != SignatureStatus::Verified {
-                anyhow::bail!("signature status is {}", v.status.as_str());
-            }
-            lines_in(&v.body)
-        });
-        match verified {
-            Ok(lines) => seen.extend(lines),
-            Err(e) => {
+        let v = match verify_segment(dir, &name, key) {
+            Ok(v) => v,
+            Err(SegmentError::Definite(e)) => {
                 tracing::warn!(
                     target: "audit",
                     segment = ?name,
                     "audit archive segment failed verification, its rows will be archived again: {e:#}"
                 );
                 preserve_rejected(dir, &name);
+                continue;
             }
+            Err(SegmentError::Transient(e)) => {
+                tracing::warn!(target: "audit", segment = ?name, "audit archive segment could not be read, left in place and not counted: {e:#}");
+                continue;
+            }
+        };
+        if key.is_some() && v.status != SignatureStatus::Verified {
+            tracing::warn!(
+                target: "audit",
+                segment = ?name,
+                "audit archive segment is {} under the configured key, left in place and not counted",
+                v.status.as_str()
+            );
+            continue;
+        }
+        match lines_in(&v.body) {
+            Ok(lines) => {
+                for (id, digest) in lines {
+                    let set = seen.entry(id).or_default();
+                    set.insert(digest);
+                    if key.is_none() && set.len() > 1 {
+                        tracing::warn!(target: "audit", segment = ?name, id, "audit archive holds different lines for one id across verified segments");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(target: "audit", segment = ?name, "audit archive segment unreadable, not counted: {e:#}"),
         }
     }
     Ok(seen)
@@ -231,10 +272,13 @@ fn write_segment(
         body.extend_from_slice(l.line.as_bytes());
         body.push(b'\n');
     }
-    let name = format!("{stream}-{date}.{}-{}.jsonl", first.id, last.id);
-    // A file of this name that was not accepted (or holds other lines) is kept.
-    if dir.join(&name).exists() {
-        preserve_rejected(dir, &name);
+    // Never replace an existing file (a verified segment, or one left in place):
+    // pick `.r<n>` until neither the segment nor its sidecar exists.
+    let mut name = format!("{stream}-{date}.{}-{}.jsonl", first.id, last.id);
+    let mut n = 0u32;
+    while dir.join(&name).exists() || dir.join(format!("{name}.manifest.json")).exists() {
+        n += 1;
+        name = format!("{stream}-{date}.{}-{}.r{n}.jsonl", first.id, last.id);
     }
     write_atomic(dir, &name, &body)?;
     let manifest = SegmentManifest {
@@ -263,7 +307,7 @@ fn write_segment(
 }
 
 /// Verified archived lines (id -> line digest) per UTC date, for one sweep.
-type SeenCache = HashMap<String, HashMap<i64, String>>;
+type SeenCache = HashMap<String, HashMap<i64, HashSet<String>>>;
 
 fn archive_blocking(
     data_dir: &Path,
@@ -286,11 +330,13 @@ fn archive_blocking(
         }
         let seen = cache.entry(date.clone()).or_default();
         // Skip a row only when a verified segment holds this exact line.
-        group.retain(|l| seen.get(&l.id) != Some(&integrity::sha512_hex(l.line.as_bytes())));
+        group.retain(|l| !seen.get(&l.id).is_some_and(|h| h.contains(&integrity::sha512_hex(l.line.as_bytes()))));
         group.sort_by_key(|l| l.id);
         group.dedup_by_key(|l| l.id);
         write_segment(&dir, stream, &date, &group, key)?;
-        seen.extend(group.iter().map(|l| (l.id, integrity::sha512_hex(l.line.as_bytes()))));
+        for l in &group {
+            seen.entry(l.id).or_default().insert(integrity::sha512_hex(l.line.as_bytes()));
+        }
     }
     Ok(())
 }
@@ -330,21 +376,37 @@ pub fn verify_segment(
     dir: &Path,
     segment: &str,
     key: Option<&SigningState>,
+) -> Result<VerifiedSegment, SegmentError> {
+    let body = std::fs::read(dir.join(segment))
+        .map_err(|e| SegmentError::Transient(anyhow::Error::from(e).context("read segment")))?;
+    let sidecar = match std::fs::read(dir.join(format!("{segment}.manifest.json"))) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SegmentError::Definite(anyhow::anyhow!("sidecar manifest is missing")))
+        }
+        Err(e) => return Err(SegmentError::Transient(anyhow::Error::from(e).context("read sidecar"))),
+    };
+    check_segment(segment, &body, &sidecar, key).map_err(SegmentError::Definite)
+}
+
+fn check_segment(
+    segment: &str,
+    body: &[u8],
+    sidecar: &[u8],
+    key: Option<&SigningState>,
 ) -> Result<VerifiedSegment> {
-    let body = std::fs::read(dir.join(segment))?;
-    let sidecar = std::fs::read(dir.join(format!("{segment}.manifest.json")))?;
     let v = integrity::verify_envelope(
         integrity::ARCHIVE_DOMAIN,
         integrity::ARCHIVE_TYPE,
-        &sidecar,
+        sidecar,
         None,
         key,
     )?;
     let m: SegmentManifest = serde_json::from_slice(&v.payload)?;
     anyhow::ensure!(m.file == segment, "manifest is for another file");
     anyhow::ensure!(m.digest.algorithm == "sha-512", "unsupported digest algorithm");
-    anyhow::ensure!(m.digest.value == integrity::sha512_hex(&body), "segment digest mismatch");
-    let ids: Vec<i64> = lines_in(&body)?.into_iter().map(|(i, _)| i).collect();
+    anyhow::ensure!(m.digest.value == integrity::sha512_hex(body), "segment digest mismatch");
+    let ids: Vec<i64> = lines_in(body)?.into_iter().map(|(i, _)| i).collect();
     anyhow::ensure!(ids.len() as u64 == m.rows, "row count mismatch");
     let range = segment_range_any(segment).context("segment file name is not a segment name")?;
     anyhow::ensure!(
@@ -355,15 +417,31 @@ pub fn verify_segment(
         ids.iter().min() == Some(&m.first_id) && ids.iter().max() == Some(&m.last_id),
         "id range mismatch"
     );
-    Ok(VerifiedSegment { status: v.status, body })
+    Ok(VerifiedSegment { status: v.status, body: body.to_vec() })
 }
+
+/// Why a segment did not verify. Only a `Definite` failure justifies
+/// quarantining the files; an I/O error proves nothing about them.
+#[derive(Debug)]
+pub enum SegmentError {
+    Definite(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Definite(e) | Self::Transient(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SegmentError {}
 
 /// Range from a segment file name of any stream and date.
 fn segment_range_any(name: &str) -> Option<(i64, i64)> {
-    let rest = name.strip_suffix(".jsonl")?;
-    let (_, range) = rest.rsplit_once('.')?;
-    let (a, b) = range.split_once('-')?;
-    Some((a.parse().ok()?, b.parse().ok()?))
+    let (_, rest) = name.strip_suffix(".jsonl")?.split_once('.')?;
+    parse_range(rest)
 }
 
 // ── rule_audit ──────────────────────────────────────────────────────────────
@@ -870,8 +948,10 @@ mod tests {
             std::fs::copy(forged.join("audit_archive").join(f), ad.join(f)).unwrap();
         }
         archive_blocking(&dir, STREAM_RULES, vec![line(6, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
-        // The unsigned segment was replaced (same name) by a signed one.
-        assert_eq!(verify_segment(&ad, "rules-2024-01-01.6-6.jsonl", Some(&k)).unwrap().status, SignatureStatus::Verified);
+        // The unsigned segment is left in place; a signed sibling holds the row.
+        assert_eq!(verify_segment(&ad, "rules-2024-01-01.6-6.r1.jsonl", Some(&k)).unwrap().status, SignatureStatus::Verified);
+        // Only the sidecar-less plant from the first step was quarantined.
+        assert_eq!(rejected(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&forged);
     }
@@ -920,6 +1000,10 @@ mod tests {
         }
     }
 
+    fn ad_has(dir: &Path, name: &str) -> bool {
+        dir.join("audit_archive").join(name).exists()
+    }
+
     fn forged_line(id: i64, date: &str) -> ArchiveLine {
         ArchiveLine { line: format!("{{\"id\":{id},\"v\":\"FORGED\"}}"), ..line(id, date) }
     }
@@ -932,14 +1016,13 @@ mod tests {
         plant(&forged, &dir);
         archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
         let ad = dir.join("audit_archive");
-        let seg = "rules-2024-01-01.5-5.jsonl";
-        let v = verify_segment(&ad, seg, None).unwrap();
-        assert!(String::from_utf8(v.body).unwrap().contains("\"x\"") );
-        // The forged file is kept as evidence, with its sidecar.
-        let kept = rejected(&dir);
-        assert_eq!(kept.len(), 2, "{kept:?}");
-        let seg_kept = kept.iter().find(|n| !n.contains(".manifest.json")).unwrap();
-        assert!(std::fs::read_to_string(ad.join(seg_kept)).unwrap().contains("FORGED"));
+        // The forged segment is left untouched and still verifies; the real
+        // line is in a non-colliding sibling.
+        let forged_seg = verify_segment(&ad, "rules-2024-01-01.5-5.jsonl", None).unwrap();
+        assert!(String::from_utf8(forged_seg.body).unwrap().contains("FORGED"));
+        let real = verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", None).unwrap();
+        assert!(String::from_utf8(real.body).unwrap().contains("\"x\""));
+        assert!(rejected(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&forged);
     }
@@ -967,17 +1050,19 @@ mod tests {
         assert!(rejected(&dir).is_empty());
         // No key, different line: archived.
         archive_blocking(&dir, STREAM_RULES, vec![forged_line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
-        assert_eq!(rejected(&dir).len(), 2);
+        assert!(ad_has(&dir, "rules-2024-01-01.5-5.r1.jsonl"));
         // With key B the key-A segment is unknown_key: rejected and rewritten, verified.
         let (dir2, other2) = (temp_dir(), temp_dir());
         archive_blocking(&other2, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&a), &mut SeenCache::new()).unwrap();
         plant(&other2, &dir2);
         archive_blocking(&dir2, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&b), &mut SeenCache::new()).unwrap();
-        assert_eq!(rejected(&dir2).len(), 2);
+        // Nothing is renamed; the key-A segment stays, and the row lands in a sibling.
+        assert!(rejected(&dir2).is_empty());
         assert_eq!(
-            verify_segment(&dir2.join("audit_archive"), "rules-2024-01-01.5-5.jsonl", Some(&b)).unwrap().status,
+            verify_segment(&dir2.join("audit_archive"), "rules-2024-01-01.5-5.r1.jsonl", Some(&b)).unwrap().status,
             SignatureStatus::Verified
         );
+        assert!(ad_has(&dir2, "rules-2024-01-01.5-5.jsonl"));
         for d in [dir, other, dir2, other2] {
             let _ = std::fs::remove_dir_all(&d);
         }
@@ -991,6 +1076,59 @@ mod tests {
         std::fs::write(ad.join("rules-2024-01-01.5-5.jsonl.rejected-20240101T000000.000Z"), "{\"id\":5}\n").unwrap();
         archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
+    }
+
+    #[test]
+    fn a_transient_read_error_leaves_the_segment_in_place_and_uncounted() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        // A directory under the segment's name: reading it is an I/O error.
+        std::fs::create_dir_all(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap();
+        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        assert!(ad.join("rules-2024-01-01.5-5.jsonl").is_dir());
+        assert!(rejected(&dir).is_empty());
+        assert!(verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", None).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_a_key_is_added_an_unsigned_segment_is_left_and_its_rows_rearchived_beside_it() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        let before = std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap();
+        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        assert!(rejected(&dir).is_empty());
+        assert_eq!(std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap(), before);
+        assert_eq!(
+            verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", Some(&k)).unwrap().status,
+            SignatureStatus::Verified
+        );
+        // A further sweep under the key finds the signed sibling and writes nothing.
+        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        assert_eq!(segments(&dir).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_with_the_same_id_range_as_a_verified_segment_goes_to_an_r_file() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        archive_blocking(&dir, STREAM_RULES, vec![line(1, "2024-01-01"), line(3, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        let orig = "rules-2024-01-01.1-3.jsonl";
+        let before = std::fs::read(ad.join(orig)).unwrap();
+        // Rows 1 and 3 now have different lines: same first and last id.
+        archive_blocking(&dir, STREAM_RULES, vec![forged_line(1, "2024-01-01"), forged_line(3, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        assert_eq!(std::fs::read(ad.join(orig)).unwrap(), before);
+        assert_eq!(verify_segment(&ad, orig, Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert_eq!(verify_segment(&ad, "rules-2024-01-01.1-3.r1.jsonl", Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert!(rejected(&dir).is_empty());
+        // The `.rN` form parses, and a bad suffix does not.
+        assert_eq!(segment_range("rules-2024-01-01.1-3.r12.jsonl", "rules", "2024-01-01"), Some((1, 3)));
+        assert_eq!(segment_range("rules-2024-01-01.1-3.x1.jsonl", "rules", "2024-01-01"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[sqlx::test]
@@ -1008,17 +1146,19 @@ mod tests {
             .await
             .unwrap();
         }
-        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM rule_audit ORDER BY id").fetch_all(&pool).await.unwrap();
+        let rows: Vec<(i64, DateTime<Utc>)> = sqlx::query_as("SELECT id, occurred_at FROM rule_audit ORDER BY id").fetch_all(&pool).await.unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
         let dir = temp_dir();
         assert_eq!(run_prune(&pool, &dir, 5, true, Some(&k)).await.unwrap(), 2);
         // Put the rows back under their ids: as if the delete had failed after the archive was written.
-        for (id, rule) in ids.iter().zip(["a", "b"]) {
+        for ((id, at), rule) in rows.iter().zip(["a", "b"]) {
             sqlx::query(
                 "INSERT INTO rule_audit (id, user_id, checklist_id, rule_id, field, occurred_at) \
-                 VALUES ($1, 'u1', 'c', $2, 'status', NOW() - INTERVAL '10 days')",
+                 VALUES ($1, 'u1', 'c', $2, 'status', $3)",
             )
             .bind(id)
             .bind(rule)
+            .bind(at)
             .execute(&pool)
             .await
             .unwrap();

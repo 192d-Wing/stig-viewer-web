@@ -284,14 +284,21 @@ cannot pass at all. Without a key the digest is not a secret, so a planted
 segment can be self-consistent; it still cannot hide a real row, because its
 line would have to equal the row's actual line. A segment that fails
 verification, or holds a different line, is logged on the `audit` target and its
-rows are archived again (a duplicate is harmless, a lost row is not). A rejected
-segment and its sidecar are first renamed to `<name>.rejected-<UTC timestamp>`
-and kept as evidence; such files are never counted. Each segment is read once,
-and the verified bytes are the bytes used.
+rows are archived again (a duplicate is harmless, a lost row is not). Only a definite
+verification failure (bad signature, digest, row-count or id-range mismatch, a
+missing or unparseable sidecar) renames the segment and its sidecar to
+`<name>.rejected-<UTC timestamp>`, keeping them as evidence; such files are
+never counted. An I/O error, or a segment that is `unsigned` or `unknown_key`
+while a key is configured, is logged and not counted but left untouched. A
+verified or left-in-place file is never replaced: new rows that would collide
+with an existing name go to `<stream>-<date>.<first>-<last>.r<n>.jsonl`. Each
+segment is read once, and the verified bytes are the bytes used. Without a key,
+a warning is logged if verified segments hold different lines for one id.
 
-After a key rotation, or when signing is switched on or off, existing segments
-no longer verify (or are `unknown_key`), so the rows still in the database are
-archived again and the old files are preserved as `.rejected-*`.
+After a key rotation, or when signing is switched on or off, older segments
+are `unknown_key` or `unsigned` under the new configuration: they stay where
+they are, the rows still in the database are archived again into new signed
+segments beside them, and nothing is renamed.
 
 Files named `<date>.jsonl` and `events-<date>.jsonl` come from earlier
 versions (append mode). They are legacy: never rewritten, **unsigned**, with no
