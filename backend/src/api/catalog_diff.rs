@@ -243,12 +243,8 @@ pub async fn seed_archive_handler(
     if !crate::stig_id::is_valid_new(&req.stig_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let release_safe = sanitize_release(&req.release_info);
-    let version_safe = sanitize_release(&req.version);
-    let filename = format!(
-        "{}-v{}-r{}.json",
-        req.stig_id, version_safe, release_safe
-    );
+    let filename =
+        crate::sync::disa::archive_file_name(&req.stig_id, &req.version, &req.release_info);
     let rel_path = format!("stigs/archive/{filename}");
     let abs_path = state.config.data_dir.join(&rel_path);
 
@@ -394,30 +390,6 @@ fn compute_diff(
     )
 }
 
-/// Mirrors the sanitiser in `sync::disa` so test-seeded archive
-/// filenames look the same as real ones. Whitespace + punctuation →
-/// hyphen, collapse repeats, trim trailing hyphens.
-fn sanitize_release(release_info: &str) -> String {
-    let mut out = String::with_capacity(release_info.len());
-    let mut prev_dash = false;
-    for c in release_info.chars() {
-        if c.is_alphanumeric() {
-            out.push(c);
-            prev_dash = false;
-        } else if !prev_dash && !out.is_empty() {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
-}
 
 #[cfg(test)]
 mod id_tests {

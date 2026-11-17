@@ -55,14 +55,15 @@ test.describe("Catalog upload — authentication", () => {
     expect(ok.status).toBe(422); // length accepted; the bogus ZIP then fails parsing
   });
 
-  test("empty, path-like and upper-case ids are rejected with 400", async () => {
+  test("empty, path-like and upper-case ids are rejected with 400", async ({ request }) => {
     await setUserRole("upload-admin", "admin");
     for (const id of ["", "a/b", "Upper-Case"]) {
       const res = await uploadStigAs("upload-admin", { ...bogus, id });
       expect(res.status).toBe(400);
       if (id === "Upper-Case") expect(await res.text()).toContain("lower-case");
     }
-    const listed = await (await fetch(`${BACKEND}/api/stigs`)).json();
-    expect(listed.map((e) => e.id)).not.toContain("Upper-Case");
+    const listedRes = await request.get(`${BACKEND}/api/catalog`);
+    expect(listedRes.ok()).toBeTruthy();
+    expect((await listedRes.json()).map((e) => e.id)).not.toContain("Upper-Case");
   });
 });

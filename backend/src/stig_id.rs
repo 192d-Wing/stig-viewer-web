@@ -43,8 +43,9 @@ pub fn warning_message(rows: &[(String, String)]) -> Option<String> {
 }
 
 /// Log a startup warning listing catalog and checklist ids that fail the
-/// read rule. Nothing is migrated or renamed.
-pub async fn warn_non_conforming(pool: &sqlx::PgPool) {
+/// read rule. Nothing is migrated or renamed. Returns the `(source, id)`
+/// rows it found (empty on a query error).
+pub async fn warn_non_conforming(pool: &sqlx::PgPool) -> Vec<(String, String)> {
     let rows: Result<Vec<(String, String)>, _> = sqlx::query_as(
         "SELECT 'catalog', id FROM stigs_catalog
          UNION
@@ -58,8 +59,12 @@ pub async fn warn_non_conforming(pool: &sqlx::PgPool) {
             if let Some(msg) = warning_message(&rows) {
                 tracing::warn!("{msg}");
             }
+            rows.into_iter().filter(|(_, id)| !is_valid(id)).collect()
         }
-        Err(e) => tracing::warn!("could not check STIG ids against the id rule: {e:#}"),
+        Err(e) => {
+            tracing::warn!("could not check STIG ids against the id rule: {e:#}");
+            Vec::new()
+        }
     }
 }
 
@@ -99,5 +104,23 @@ mod tests {
         rows.extend((0..59).map(|i| ("catalog".to_string(), format!("bad.{i}"))));
         let m = warning_message(&rows).expect("message");
         assert!(m.starts_with("60 STIG id(s)") && m.ends_with("and 10 more"), "{m}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn warn_query_finds_bad_catalog_and_checklist_ids(pool: sqlx::PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u").await;
+        crate::test_fixtures::seed_asset(&pool, "a1", "u", false).await;
+        sqlx::query("INSERT INTO stigs_catalog (id, title, category, json_path) VALUES ('bad.cat', 't', 'c', 'p'), ('good-cat', 't', 'c', 'p')")
+            .execute(&pool)
+            .await
+            .expect("seed catalog");
+        crate::test_fixtures::seed_checklist(&pool, "c1", "a1", "bad id").await;
+        crate::test_fixtures::seed_checklist(&pool, "c2", "a1", "good-cl").await;
+        let found = warn_non_conforming(&pool).await;
+        assert_eq!(
+            found,
+            [("catalog".to_string(), "bad.cat".to_string()), ("checklist".to_string(), "bad id".to_string())]
+        );
     }
 }

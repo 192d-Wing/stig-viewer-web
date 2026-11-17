@@ -867,6 +867,10 @@ fn map_unique_conflict(e: anyhow::Error) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
+    use sqlx::PgPool;
+
     #[tokio::test]
     async fn load_stig_json_rejects_invalid_ids() {
         let (state, _dir) = crate::test_fixtures::lazy_state();
@@ -874,10 +878,6 @@ mod tests {
             assert_eq!(load_stig_json(&state, &id).await.err(), Some(StatusCode::BAD_REQUEST), "{id:?}");
         }
     }
-
-    use super::*;
-    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
-    use sqlx::PgPool;
 
     async fn create(state: &AppState, user: &str, stig_id: &str) -> Result<StatusCode, StatusCode> {
         create_handler(
