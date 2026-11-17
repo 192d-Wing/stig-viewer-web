@@ -1,6 +1,7 @@
 //! Server-backed checklist view: the rules table for one applied STIG, the
 //! rule editor modal (status, assignee, evidence attachments, threaded
-//! comments with reactions) and the bulk CSV status import.
+//! comments with reactions), the bulk CSV status import and the multi-select
+//! "Set status" action.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -247,6 +248,39 @@ struct BulkRow {
 struct BulkResponse {
     rows: Vec<BulkRow>,
     applied_count: u64,
+}
+
+/// One rule's outcome from `POST …/rules/bulk-status`.
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BulkStatusRow {
+    rule_id: String,
+    /// "applied" | "pending_approval" | "error"
+    status: String,
+    error: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BulkStatusResponse {
+    results: Vec<BulkStatusRow>,
+    applied_count: u64,
+    pending_count: u64,
+    error_count: u64,
+}
+
+/// Summary line shown after a multi-select status change.
+fn bulk_status_summary(status_label: &str, r: &BulkStatusResponse) -> String {
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let mut parts = vec![format!("Set {} rule{} to {status_label}.", r.applied_count, plural(r.applied_count))];
+    if r.pending_count > 0 {
+        parts.push(format!("{} submitted for review.", r.pending_count));
+    }
+    if r.error_count > 0 {
+        parts.push(format!("{} not changed.", r.error_count));
+    }
+    parts.join(" ")
 }
 
 // ── Editor draft ────────────────────────────────────────────────────────────
@@ -672,6 +706,15 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let users = use_state(Vec::<UserSummary>::new);
     let filter = use_state(String::new);
 
+    // Multi-select "Set status" state.
+    let selected = use_state(Vec::<String>::new);
+    let set_status_open = use_state(|| false);
+    let set_status_value = use_state(|| "not_a_finding".to_string());
+    let set_status_details = use_state(String::new);
+    let set_status_busy = use_state(|| false);
+    let set_status_error = use_state(|| None::<String>);
+    let set_status_result = use_state(|| None::<(String, BulkStatusResponse)>);
+
     let s = ViewState {
         checklist_id: props.checklist_id.clone(),
         detail: use_state(|| None),
@@ -1085,6 +1128,112 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
             }
         })
     };
+    // ── Multi-select "Set status" ───────────────────────────────────────────
+    // Only rules that still exist in the checklist count as selected.
+    // Rows hidden by the text filter are not acted on either.
+    let visible_ids: std::collections::HashSet<&str> = filtered_rules.iter().map(|r| r.id()).collect();
+    let selected_ids: Vec<String> =
+        selected.iter().filter(|id| visible_ids.contains(id.as_str())).cloned().collect();
+    let on_selection_change = {
+        let selected = selected.clone();
+        Callback::from(move |rows: Vec<Rc<RuleRow>>| selected.set(rows.iter().map(|r| r.id().to_string()).collect()))
+    };
+    let open_set_status = {
+        let (open, details, error) = (set_status_open.clone(), set_status_details.clone(), set_status_error.clone());
+        Callback::from(move |_: MouseEvent| {
+            details.set(String::new());
+            error.set(None);
+            open.set(true);
+        })
+    };
+    let close_set_status = {
+        let open = set_status_open.clone();
+        Callback::from(move |_: ()| open.set(false))
+    };
+    let apply_set_status = {
+        let s = s.clone();
+        let (selected, open, busy, error, result) = (
+            selected.clone(),
+            set_status_open.clone(),
+            set_status_busy.clone(),
+            set_status_error.clone(),
+            set_status_result.clone(),
+        );
+        let (rule_ids, status, details) =
+            (selected_ids.clone(), (*set_status_value).clone(), (*set_status_details).clone());
+        Callback::from(move |_: MouseEvent| {
+            let s = s.clone();
+            let (selected, open, busy, error, result) =
+                (selected.clone(), open.clone(), busy.clone(), error.clone(), result.clone());
+            let status = status.clone();
+            let body = json!({ "ruleIds": rule_ids, "status": status, "findingDetails": details });
+            spawn_local(async move {
+                busy.set(true);
+                error.set(None);
+                let path = format!("/api/checklists/{}/rules/bulk-status", s.checklist_id);
+                match api_json::<BulkStatusResponse, _>(&path, "POST", Some(&body)).await {
+                    Ok(r) => {
+                        // Rules that could not be changed stay selected so
+                        // they can be retried with a justification.
+                        selected.set(
+                            r.results.iter().filter(|x| x.status == "error").map(|x| x.rule_id.clone()).collect(),
+                        );
+                        result.set(Some((status, r)));
+                        open.set(false);
+                        s.refresh().await;
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
+                busy.set(false);
+            });
+        })
+    };
+    let status_label = |value: &str| {
+        STATUSES.iter().find(|(v, _, _)| *v == value).map(|(_, l, _)| *l).unwrap_or_default().to_string()
+    };
+    let set_status_closing = CLOSING_STATUSES.contains(&set_status_value.as_str());
+    let set_status_alert = match &*set_status_result {
+        Some((status, r)) => {
+            let failed: Vec<&BulkStatusRow> = r.results.iter().filter(|x| x.status == "error").collect();
+            let noted: Vec<&BulkStatusRow> = r.results.iter().filter(|x| x.note.is_some()).collect();
+            let dismiss = {
+                let result = set_status_result.clone();
+                Callback::from(move |_: ()| result.set(None))
+            };
+            html! {
+                <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} dismissible=true
+                       on_dismiss={dismiss} testid="set-status-result">
+                    {bulk_status_summary(&status_label(status), r)}
+                    if !noted.is_empty() {
+                        <ul style="margin:6px 0 0;padding-left:18px;">
+                            { for noted.iter().take(10).map(|x| html! {
+                                <li key={x.rule_id.clone()}>
+                                    <code>{x.rule_id.clone()}</code>{": "}{x.note.clone().unwrap_or_default()}
+                                </li>
+                            }) }
+                            if noted.len() > 10 {
+                                <li>{format!("…and {} more.", noted.len() - 10)}</li>
+                            }
+                        </ul>
+                    }
+                    if !failed.is_empty() {
+                        <ul style="margin:6px 0 0;padding-left:18px;">
+                            { for failed.iter().take(10).map(|x| html! {
+                                <li key={x.rule_id.clone()}>
+                                    <code>{x.rule_id.clone()}</code>{": "}{x.error.clone().unwrap_or_default()}
+                                </li>
+                            }) }
+                            if failed.len() > 10 {
+                                <li>{format!("…and {} more (still selected).", failed.len() - 10)}</li>
+                            }
+                        </ul>
+                    }
+                </Alert>
+            }
+        }
+        None => Html::default(),
+    };
+
     // Inline data: URL for the "Download template" link. Three columns +
     // one example row keep the CSV tiny and self-documenting.
     let bulk_template_href = format!(
@@ -1115,6 +1264,11 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                         description={format!("{} · {} rules", detail.asset_name, detail.rules.len())}
                         actions={html! {
                             <SpaceBetween direction="horizontal" size="xs">
+                                <Button onclick={open_set_status} disabled={!is_owner || selected_ids.is_empty()}
+                                        testid="set-status-button">
+                                    {if selected_ids.is_empty() { "Set status".to_string() }
+                                     else { format!("Set status ({})", selected_ids.len()) }}
+                                </Button>
                                 <Button onclick={open_bulk} disabled={!is_owner} testid="bulk-import-button">
                                     {"Bulk import"}
                                 </Button>
@@ -1134,10 +1288,15 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                     </ColumnLayout>
                 </Container>
 
+                {set_status_alert}
+
                 <Table<Rc<RuleRow>>
                     variant="container"
                     items={filtered_rules.clone()}
                     track_by={Callback::from(|r: Rc<RuleRow>| r.id().to_string())}
+                    selection_type={is_owner.then_some(AttrValue::Static("multi"))}
+                    selected_keys={selected_ids.clone()}
+                    {on_selection_change}
                     columns={rule_columns}
                     header={html! {
                         <Header counter={format!("({} of {})", filtered_rules.len(), detail.rules.len())}>
@@ -1172,6 +1331,52 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                 }}
             >
                 {edit_body}
+            </Modal>
+
+            <Modal
+                visible={*set_status_open}
+                on_dismiss={close_set_status.clone()}
+                header={format!("Set status for {} rule{}", selected_ids.len(), if selected_ids.len() == 1 { "" } else { "s" })}
+                testid="set-status-modal"
+                footer={html! {
+                    <UiBox float="right">
+                        <SpaceBetween direction="horizontal" size="xs">
+                            <Button variant="link" onclick={close_set_status.reform(|_: MouseEvent| ())}>{"Cancel"}</Button>
+                            <Button variant="primary" loading={*set_status_busy}
+                                    disabled={*set_status_busy || selected_ids.is_empty()}
+                                    onclick={apply_set_status} testid="set-status-apply">
+                                {"Apply"}
+                            </Button>
+                        </SpaceBetween>
+                    </UiBox>
+                }}
+            >
+                <SpaceBetween direction="vertical" size="m">
+                    <FormField label="Status">
+                        <RadioGroup
+                            value={AttrValue::from((*set_status_value).clone())}
+                            on_change={{ let v = set_status_value.clone(); Callback::from(move |x: AttrValue| v.set(x.to_string())) }}
+                            items={STATUSES.iter().map(|(v, l, _)| RadioItem::new(*v, *l)).collect::<Vec<_>>()}
+                        />
+                    </FormField>
+                    <FormField
+                        label="Finding details"
+                        description={if set_status_closing {
+                            "Applied to every selected rule. Leave blank to keep each rule's own details; \
+                             rules with none cannot be closed and are left unchanged."
+                        } else {
+                            "Optional. Applied to every selected rule; leave blank to keep each rule's own details."
+                        }}
+                    >
+                        <Textarea
+                            value={(*set_status_details).clone()}
+                            on_change={{ let d = set_status_details.clone(); Callback::from(move |x: String| d.set(x)) }}
+                            rows={4}
+                            testid="set-status-details"
+                        />
+                    </FormField>
+                    {error_alert(&set_status_error)}
+                </SpaceBetween>
             </Modal>
 
             <Modal
@@ -1345,6 +1550,25 @@ fn comment_item(s: &ViewState, rule_id: &str, c: &Comment, current_user_id: Opti
                 {content}
             </SpaceBetween>
         </UiBox>
+    }
+}
+
+#[cfg(test)]
+mod bulk_status_summary_tests {
+    use super::*;
+
+    #[test]
+    fn single_rule_wording() {
+        let r = BulkStatusResponse { applied_count: 1, ..Default::default() };
+        assert_eq!(bulk_status_summary("Open", &r), "Set 1 rule to Open.");
+    }
+
+    #[test]
+    fn mentions_review_and_unchanged_counts() {
+        let r = BulkStatusResponse { applied_count: 3, pending_count: 2, ..Default::default() };
+        assert_eq!(bulk_status_summary("Open", &r), "Set 3 rules to Open. 2 submitted for review.");
+        let r = BulkStatusResponse { applied_count: 0, error_count: 4, ..Default::default() };
+        assert_eq!(bulk_status_summary("Open", &r), "Set 0 rules to Open. 4 not changed.");
     }
 }
 

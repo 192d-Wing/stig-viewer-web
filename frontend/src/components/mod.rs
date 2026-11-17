@@ -13,6 +13,7 @@ pub mod drop_zone;
 pub mod my_findings;
 pub mod poam_export_modal;
 pub mod rule_detail;
+pub mod save_to_system_modal;
 pub mod rule_list;
 pub mod stig_library;
 pub mod stig_view;

@@ -67,26 +67,33 @@ pub async fn create_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let (applied_version, applied_release) =
-        db_checklists::catalog_version(state.pool.as_ref(), &req.stig_id)
-            .await
-            .map_err(map_db)?;
+    let row = create_checklist(state.pool.as_ref(), &asset_id, &req.stig_id)
+        .await
+        .map_err(map_unique_conflict)?;
+
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// Stamp the catalog version and insert a new `in_progress` checklist.
+pub(crate) async fn create_checklist(
+    pool: &sqlx::PgPool,
+    asset_id: &str,
+    stig_id: &str,
+) -> anyhow::Result<db_checklists::ChecklistRow> {
+    let (applied_version, applied_release) = db_checklists::catalog_version(pool, stig_id).await?;
     let now = chrono::Utc::now();
     let row = db_checklists::ChecklistRow {
         id: uuid::Uuid::new_v4().to_string(),
-        asset_id: asset_id.clone(),
-        stig_id: req.stig_id,
+        asset_id: asset_id.to_string(),
+        stig_id: stig_id.to_string(),
         status: "in_progress".into(),
         created_at: now,
         updated_at: now,
         applied_version,
         applied_release,
     };
-    db_checklists::insert_checklist(state.pool.as_ref(), &row)
-        .await
-        .map_err(map_unique_conflict)?;
-
-    Ok((StatusCode::CREATED, Json(row)))
+    db_checklists::insert_checklist(pool, &row).await?;
+    Ok(row)
 }
 
 /// GET /api/assets/:asset_id/checklists — list checklists for an asset.
@@ -656,7 +663,7 @@ async fn fire_assigned_event(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn is_valid_stig_id(id: &str) -> bool {
+pub(crate) fn is_valid_stig_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '-')
 }
 

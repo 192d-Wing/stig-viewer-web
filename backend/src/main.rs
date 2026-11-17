@@ -126,6 +126,8 @@ use api::{
     oscal::export_handler as asset_oscal_handler,
     report::report_handler as asset_report_handler,
     rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
+    checklist_save::save_handler as checklist_save_handler,
+    rule_bulk_status::bulk_status_handler as rule_bulk_status_handler,
     rule_comments::{
         add_reaction_handler as add_comment_reaction_handler,
         create_handler as create_rule_comment_handler,
@@ -180,6 +182,14 @@ const DEFAULT_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Evidence attachments: the handler enforces 25 MiB of file data; leave
 /// headroom for multipart framing.
 const ATTACHMENT_BODY_LIMIT: usize = 26 * 1024 * 1024;
+/// Bulk status change: up to 2000 rule ids plus one finding-details text
+/// capped at 32 KiB by the handler; 256 KiB covers that with headroom.
+const BULK_STATUS_BODY_LIMIT: usize = 256 * 1024;
+/// "Save to system": a whole STIG's worth of per-rule status, finding details
+/// and comments. Each text field is capped at 32 KiB by the handler, but a
+/// real checklist averages a few KiB per rule across 300-1000 rules, so 4 MiB
+/// fits any realistic STIG while keeping the worst-case write fan-out small.
+const SAVE_TO_SYSTEM_BODY_LIMIT: usize = 4 * 1024 * 1024;
 /// `/api/sign` takes base64 JSON of up to 100 MiB of content (the handler
 /// enforces the decoded size); base64 inflates that by 4/3.
 const SIGN_BODY_LIMIT: usize = 140 * 1024 * 1024;
@@ -340,6 +350,10 @@ async fn main() -> Result<()> {
             post(send_asset_email_report_handler),
         )
         .route(
+            "/api/assets/:id/checklists/save",
+            post(checklist_save_handler.layer(DefaultBodyLimit::max(SAVE_TO_SYSTEM_BODY_LIMIT))),
+        )
+        .route(
             "/api/asset-groups",
             get(list_asset_groups_handler).post(create_asset_group_handler),
         )
@@ -387,6 +401,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/checklists/:id/rules/bulk-import",
             post(rule_bulk_import_handler),
+        )
+        .route(
+            "/api/checklists/:id/rules/bulk-status",
+            post(rule_bulk_status_handler.layer(DefaultBodyLimit::max(BULK_STATUS_BODY_LIMIT))),
         )
         .route(
             "/api/checklists/:id/rules/:rule_id/history",

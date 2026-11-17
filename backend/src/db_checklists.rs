@@ -57,6 +57,21 @@ pub async fn get_checklist(pool: &PgPool, id: &str) -> Result<Option<ChecklistRo
     Ok(row)
 }
 
+pub async fn find_checklist(
+    pool: &PgPool,
+    asset_id: &str,
+    stig_id: &str,
+) -> Result<Option<ChecklistRow>> {
+    let row = sqlx::query_as::<_, ChecklistRow>(
+        "SELECT * FROM checklists WHERE asset_id = $1 AND stig_id = $2",
+    )
+    .bind(asset_id)
+    .bind(stig_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO checklists \
@@ -162,6 +177,7 @@ pub async fn upsert_rule(
     due_date: Option<NaiveDate>,
 ) -> Result<ChecklistRuleRow> {
     let mut tx = pool.begin().await?;
+    lock_checklist(&mut tx, checklist_id).await?;
 
     // Snapshot existing state (if any) so we can emit audit diffs.
     let existing: Option<ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
@@ -172,6 +188,168 @@ pub async fn upsert_rule(
     .fetch_optional(&mut *tx)
     .await?;
 
+    write_rule_tx(
+        tx,
+        existing,
+        checklist_id,
+        rule_id,
+        status,
+        finding_details,
+        comments,
+        updated_by,
+        assignee_id,
+        due_date,
+    )
+    .await
+}
+
+/// Columns a caller wants to change on one rule; `None` keeps whatever the
+/// row holds at write time.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RulePatch<'a> {
+    pub status: Option<&'a str>,
+    pub finding_details: Option<&'a str>,
+    pub comments: Option<&'a str>,
+    /// Abort ([`PatchRejected::DetailsRequired`]) when the finding details
+    /// that would be stored are blank, judged against the locked row.
+    pub require_details: bool,
+    /// Abort ([`PatchRejected::StatusChanged`]) unless the locked row's
+    /// status equals this.
+    pub expect_status: Option<&'a str>,
+}
+
+/// Why `patch_rule` refused to write.
+#[derive(Debug, PartialEq)]
+pub enum PatchRejected {
+    /// A closing status would be stored with blank finding details.
+    DetailsRequired,
+    /// The stored status is not the one the caller relied on.
+    StatusChanged,
+}
+
+impl std::fmt::Display for PatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DetailsRequired => "finding details required for this status",
+            Self::StatusChanged => "rule changed while saving; try again",
+        })
+    }
+}
+
+impl std::error::Error for PatchRejected {}
+
+/// Column values a patch resolves to against the locked row.
+#[derive(Debug, PartialEq)]
+struct Resolved {
+    status: String,
+    finding_details: String,
+    comments: String,
+    assignee_id: Option<String>,
+    due_date: Option<NaiveDate>,
+}
+
+/// Pure decision for `patch_rule`: merge the patch over the stored row and
+/// apply the write-time guards.
+fn resolve_patch(
+    existing: Option<&ChecklistRuleRow>,
+    patch: &RulePatch<'_>,
+) -> Result<Resolved, PatchRejected> {
+    let cur_status = existing.map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+    if let Some(expected) = patch.expect_status {
+        if expected != cur_status {
+            return Err(PatchRejected::StatusChanged);
+        }
+    }
+    let status = patch.status.unwrap_or(cur_status).to_string();
+    let finding_details = patch
+        .finding_details
+        .or(existing.map(|e| e.finding_details.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let comments = patch
+        .comments
+        .or(existing.map(|e| e.comments.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if patch.require_details && finding_details.trim().is_empty() {
+        return Err(PatchRejected::DetailsRequired);
+    }
+    Ok(Resolved {
+        status,
+        finding_details,
+        comments,
+        assignee_id: existing.and_then(|e| e.assignee_id.clone()),
+        due_date: existing.and_then(|e| e.due_date),
+    })
+}
+
+/// Take the parent checklist row lock. Every rule writer calls this first so
+/// locks are always taken checklist-then-rule (no deadlock between writers),
+/// and it serialises first writes to a rule row that does not exist yet.
+/// `FOR NO KEY UPDATE` is enough to conflict with other writers without
+/// blocking foreign-key `KEY SHARE` checks.
+async fn lock_checklist(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    checklist_id: &str,
+) -> Result<()> {
+    sqlx::query("SELECT id FROM checklists WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(checklist_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Change some columns of a rule while preserving the rest. The existing row
+/// is read inside the write transaction with `FOR UPDATE`, so a concurrent
+/// edit of a column this call does not touch (comments, assignee, due date,
+/// ...) is never reverted by a stale snapshot. Audit rows and the checklist
+/// `updated_at` bump match `upsert_rule`.
+pub async fn patch_rule(
+    pool: &PgPool,
+    checklist_id: &str,
+    rule_id: &str,
+    patch: RulePatch<'_>,
+    updated_by: &str,
+) -> Result<ChecklistRuleRow> {
+    let mut tx = pool.begin().await?;
+    lock_checklist(&mut tx, checklist_id).await?;
+    let existing: Option<ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
+        "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = $2 FOR UPDATE",
+    )
+    .bind(checklist_id)
+    .bind(rule_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let r = resolve_patch(existing.as_ref(), &patch)?;
+
+    write_rule_tx(
+        tx,
+        existing,
+        checklist_id,
+        rule_id,
+        &r.status,
+        &r.finding_details,
+        &r.comments,
+        updated_by,
+        r.assignee_id.as_deref(),
+        r.due_date,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_rule_tx(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    existing: Option<ChecklistRuleRow>,
+    checklist_id: &str,
+    rule_id: &str,
+    status: &str,
+    finding_details: &str,
+    comments: &str,
+    updated_by: &str,
+    assignee_id: Option<&str>,
+    due_date: Option<NaiveDate>,
+) -> Result<ChecklistRuleRow> {
     let row = sqlx::query_as::<_, ChecklistRuleRow>(
         r#"
         INSERT INTO checklist_rules
@@ -254,4 +432,73 @@ pub async fn upsert_rule(
 
     tx.commit().await?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(status: &str, details: &str) -> ChecklistRuleRow {
+        ChecklistRuleRow {
+            checklist_id: "c".into(),
+            rule_id: "r".into(),
+            status: status.into(),
+            finding_details: details.into(),
+            comments: "stored comments".into(),
+            updated_at: Utc::now(),
+            updated_by: None,
+            assignee_id: Some("u".into()),
+            due_date: NaiveDate::from_ymd_opt(2026, 12, 31),
+        }
+    }
+
+    fn closing<'a>() -> RulePatch<'a> {
+        RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() }
+    }
+
+    #[test]
+    fn closing_with_blank_stored_details_is_rejected() {
+        let existing = row("open", "  ");
+        assert_eq!(resolve_patch(Some(&existing), &closing()), Err(PatchRejected::DetailsRequired));
+        assert_eq!(resolve_patch(None, &closing()), Err(PatchRejected::DetailsRequired));
+    }
+
+    #[test]
+    fn closing_is_accepted_with_details_in_patch_or_stored() {
+        let existing = row("open", "");
+        let patch = RulePatch { finding_details: Some("because"), ..closing() };
+        assert_eq!(resolve_patch(Some(&existing), &patch).unwrap().finding_details, "because");
+        let documented = row("open", "already");
+        assert_eq!(resolve_patch(Some(&documented), &closing()).unwrap().finding_details, "already");
+    }
+
+    #[test]
+    fn guard_is_off_when_not_required() {
+        let existing = row("open", "");
+        let patch = RulePatch { require_details: false, ..closing() };
+        assert!(resolve_patch(Some(&existing), &patch).is_ok());
+    }
+
+    #[test]
+    fn none_fields_keep_stored_values() {
+        let existing = row("open", "details");
+        let r = resolve_patch(Some(&existing), &RulePatch::default()).unwrap();
+        assert_eq!(r.status, "open");
+        assert_eq!(r.finding_details, "details");
+        assert_eq!(r.comments, "stored comments");
+        assert_eq!(r.assignee_id.as_deref(), Some("u"));
+        assert_eq!(r.due_date, NaiveDate::from_ymd_opt(2026, 12, 31));
+        let fresh = resolve_patch(None, &RulePatch::default()).unwrap();
+        assert_eq!((fresh.status.as_str(), fresh.finding_details.as_str()), ("not_reviewed", ""));
+    }
+
+    #[test]
+    fn expect_status_must_match_the_locked_row() {
+        let closed = row("not_a_finding", "d");
+        let patch = RulePatch { expect_status: Some("not_a_finding"), ..closing() };
+        assert!(resolve_patch(Some(&closed), &patch).is_ok());
+        let reopened = row("open", "d");
+        assert_eq!(resolve_patch(Some(&reopened), &patch), Err(PatchRejected::StatusChanged));
+        assert_eq!(resolve_patch(None, &patch), Err(PatchRejected::StatusChanged));
+    }
 }
