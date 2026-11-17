@@ -94,6 +94,44 @@ tasks:
       - cd frontend && cargo test
       - cd backend && cargo test
 
+  test:db:
+    desc: Backend tests including the database-backed ones, against a throwaway Postgres on 127.0.0.1:55432
+    deps: [engine]
+    vars:
+      DB_PORT: '{{.DB_PORT | default "55432"}}'
+      DB_NAME: '{{.DB_NAME | default "stig-dbtest"}}'
+      # Same digest-pinned image as CI.
+      DB_IMAGE: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    cmds:
+      - defer: '{{.ENGINE}} rm -f {{.DB_NAME}} >/dev/null 2>&1 || true'
+      # Never point this at the dev database: sqlx::test creates and drops
+      # _sqlx_test_* databases on whatever server DATABASE_URL names. The
+      # container is ephemeral, test-only and loopback-only, and gets a password
+      # generated fresh on every run (passed to sqlx through PGPASSWORD, not
+      # in the URL), so no credential is stored in the repo.
+      # Unlike CI (which runs only the ignored DB tests in a separate step),
+      # this runs the whole suite, DB tests included.
+      - |
+        name={{.DB_NAME}}
+        pw="$(openssl rand -hex 24)"
+        cleanup() { {{.ENGINE}} rm -f "$name" >/dev/null 2>&1 || true; }
+        # Reap a container leaked by an interrupted earlier run, and clean up
+        # on any exit, including Ctrl-C and a half-failed `run`.
+        cleanup
+        trap cleanup EXIT
+        {{.ENGINE}} run -d --rm --name "$name" \
+          -e POSTGRES_USER=stig -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=stig_viewer \
+          -p 127.0.0.1:{{.DB_PORT}}:5432 {{.DB_IMAGE}} >/dev/null
+        ready=0
+        for _ in $(seq 1 60); do
+          if {{.ENGINE}} exec "$name" pg_isready -U stig -d stig_viewer >/dev/null 2>&1; then ready=1; break; fi
+          sleep 1
+        done
+        [ "$ready" = 1 ] || { echo "Postgres did not become ready" >&2; exit 1; }
+        cd backend
+        PGPASSWORD="$pw" DATABASE_URL=postgres://stig@127.0.0.1:{{.DB_PORT}}/stig_viewer \
+          cargo test --locked -- --include-ignored
+
   e2e:
     desc: "Playwright suite; needs 'task dev' running (extra args: task e2e -- e2e/02-library.spec.js)"
     deps: [node-modules]

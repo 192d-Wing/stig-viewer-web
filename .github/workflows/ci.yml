@@ -59,8 +59,36 @@ jobs:
         with:
           workspaces: backend
 
-      - run: cargo clippy --locked -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # sqlx::test creates a throwaway database per test, so the user must be
+      # allowed to CREATE DATABASE (the image's POSTGRES_USER is a superuser).
+      # The server lives only for this job, listens on loopback only, and gets
+      # a password generated fresh for every run; nothing is stored in the repo.
+      # The password travels in PGPASSWORD (which sqlx reads), not in the URL.
+      - name: Start a throwaway Postgres with a random password
+        env:
+          DB_IMAGE: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+        run: |
+          pw="$(openssl rand -hex 24)"
+          echo "::add-mask::$pw"
+          docker run -d --name ci-postgres \
+            -e POSTGRES_USER=stig -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=stig_viewer \
+            -p 127.0.0.1:5432:5432 "$DB_IMAGE"
+          ready=0
+          for _ in $(seq 1 60); do
+            if docker exec ci-postgres pg_isready -U stig -d stig_viewer >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          [ "$ready" = 1 ] || { echo "Postgres did not become ready" >&2; docker logs ci-postgres; exit 1; }
+          {
+            echo "PGPASSWORD=$pw"
+            echo "DATABASE_URL=postgres://stig@127.0.0.1:5432/stig_viewer"
+          } >> "$GITHUB_ENV"
+
+      # In this repo `#[ignore]` means "needs Postgres"; run exactly those
+      # tests against the server started above.
+      - run: cargo test --locked -- --ignored
 
   e2e:
     needs: [lint-and-build, backend]
