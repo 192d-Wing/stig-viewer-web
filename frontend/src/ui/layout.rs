@@ -657,3 +657,31 @@ pub fn Tabs(p: &TabsProps) -> Html {
         </div>
     }
 }
+
+// ── Issue list (per-rule lines in a result alert) ───────────────────────────
+
+/// How many per-rule lines a result alert shows before "…and N more".
+const ISSUE_LIST_CAP: usize = 10;
+
+/// Bulleted `rule id: text` list for a result alert. Rows whose text is
+/// `None` are skipped; at most ten are listed, followed by
+/// "…and N more{more_suffix}." when rows were left out. Renders nothing when
+/// there are no rows to show.
+pub fn issue_list<'a>(rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>, more_suffix: &str) -> Html {
+    let (lines, more) = crate::util::issue_lines(rows, ISSUE_LIST_CAP);
+    if lines.is_empty() {
+        return Html::default();
+    }
+    html! {
+        <ul style="margin:6px 0 0;padding-left:18px;">
+            { for lines.iter().map(|(id, text)| html! {
+                <li key={id.clone()}>
+                    <code>{id.clone()}</code>{": "}{text.clone()}
+                </li>
+            }) }
+            if more > 0 {
+                <li>{format!("…and {more} more{more_suffix}.")}</li>
+            }
+        </ul>
+    }
+}

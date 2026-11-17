@@ -130,7 +130,7 @@ impl RuleUpdate {
 pub fn visible_selection(filtered_ids: &[&str], selected: &[String]) -> Vec<String> {
     let sel: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let mut seen = HashSet::new();
-    filtered_ids.iter().filter(|id| sel.contains(**id) && seen.insert(**id)).map(|id| id.to_string()).collect()
+    filtered_ids.iter().copied().filter(|id| sel.contains(id) && seen.insert(*id)).map(str::to_string).collect()
 }
 
 #[cfg(test)]

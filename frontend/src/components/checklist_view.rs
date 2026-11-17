@@ -16,7 +16,7 @@ use crate::api::{api_fetch, api_fetch_json, api_get, api_json, api_upload, api_u
 use crate::auth::use_current_user;
 use crate::model::visible_selection;
 use crate::ui::*;
-use crate::util::{encode_uri_component, event_value, issue_lines, spawn_local, to_locale_string};
+use crate::util::{encode_uri_component, event_value, spawn_local, to_locale_string};
 
 fn format_bytes(n: Option<f64>) -> String {
     match n {
@@ -1194,15 +1194,6 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let set_status_closing = CLOSING_STATUSES.contains(&set_status_value.as_str());
     let set_status_alert = match &*set_status_result {
         Some((status, r)) => {
-            let (failed, failed_more) = issue_lines(
-                r.results
-                    .iter()
-                    .filter(|x| x.status == "error")
-                    .map(|x| (x.rule_id.as_str(), Some(x.error.as_deref().unwrap_or_default()))),
-                10,
-            );
-            let (noted, noted_more) =
-                issue_lines(r.results.iter().map(|x| (x.rule_id.as_str(), x.note.as_deref())), 10);
             let dismiss = {
                 let result = set_status_result.clone();
                 Callback::from(move |_: ()| result.set(None))
@@ -1211,30 +1202,14 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                 <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} dismissible=true
                        on_dismiss={dismiss} testid="set-status-result">
                     {bulk_status_summary(&status_label(status), r)}
-                    if !noted.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for noted.iter().map(|(id, text)| html! {
-                                <li key={id.clone()}>
-                                    <code>{id.clone()}</code>{": "}{text.clone()}
-                                </li>
-                            }) }
-                            if noted_more > 0 {
-                                <li>{format!("…and {noted_more} more.")}</li>
-                            }
-                        </ul>
-                    }
-                    if !failed.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for failed.iter().map(|(id, text)| html! {
-                                <li key={id.clone()}>
-                                    <code>{id.clone()}</code>{": "}{text.clone()}
-                                </li>
-                            }) }
-                            if failed_more > 0 {
-                                <li>{format!("…and {failed_more} more (still selected).")}</li>
-                            }
-                        </ul>
-                    }
+                    {issue_list(r.results.iter().map(|x| (x.rule_id.as_str(), x.note.as_deref())), "")}
+                    {issue_list(
+                        r.results
+                            .iter()
+                            .filter(|x| x.status == "error")
+                            .map(|x| (x.rule_id.as_str(), Some(x.error.as_deref().unwrap_or_default()))),
+                        " (still selected)",
+                    )}
                 </Alert>
             }
         }
