@@ -329,6 +329,8 @@ fn extract_xccdf_nested(zip_bytes: &[u8], depth_left: u8) -> Result<String> {
 
         // Inner ZIP — extract it and recurse one level
         if name.ends_with(".zip") {
+            // This error is swallowed by the `if let Ok` below by design: a too-deep
+            // inner ZIP is skipped and the caller reports "No *_xccdf.xml found".
             if depth_left == 0 {
                 bail!("ZIP nesting exceeds {MAX_ZIP_DEPTH} levels");
             }
@@ -723,7 +725,8 @@ mod tests {
         for (_, method_off) in header_offsets(&z, "U_X-xccdf.xml") {
             z[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
         }
-        assert!(extract_xccdf_from_zip(&z).is_err());
+        let e = extract_xccdf_from_zip(&z).unwrap_err().to_string();
+        assert!(e.contains("compression method not supported: 12"), "{e}");
     }
 
     #[test]
@@ -734,6 +737,12 @@ mod tests {
         }
         let err = extract_xccdf_from_zip(&z).unwrap_err().to_string();
         assert!(err.contains("No *_xccdf.xml found"), "{err}");
+        // Boundary: an XCCDF MAX_ZIP_DEPTH levels down is found, one more is not.
+        let mut over = zip_of(&[("a-xccdf.xml", &benchmark("Deep"))]);
+        for _ in 0..=MAX_ZIP_DEPTH {
+            over = zip_of(&[("inner.zip", &over)]);
+        }
+        assert!(extract_xccdf_from_zip(&over).is_err());
         // An XCCDF within the limit is still found.
         let mut ok = zip_of(&[("a-xccdf.xml", &benchmark("Deep"))]);
         for _ in 0..MAX_ZIP_DEPTH {

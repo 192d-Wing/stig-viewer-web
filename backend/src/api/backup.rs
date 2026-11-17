@@ -583,7 +583,7 @@ mod tests {
         let smaller = (data.len() as u32 - 5).to_le_bytes();
         bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
         let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
-        assert!(err.contains("size") || err.contains("crc") || err.contains("checksum"), "{err}");
+        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
     }
 
     #[test]
@@ -597,11 +597,12 @@ mod tests {
                 bytes[pos + 10..pos + 12].copy_from_slice(&12u16.to_le_bytes());
             }
         }
-        assert!(parse_backup_zip(&bytes).is_err());
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string();
+        assert!(err.contains("compression method not supported: 12"), "{err}");
     }
 
     #[test]
-    fn restore_does_not_allocate_from_an_enormous_declared_size() {
+    fn restore_parses_an_entry_with_an_enormous_declared_size() {
         let data = serde_json::to_vec(&manifest()).unwrap();
         let mut bytes = zip_with("manifest.json", &data);
         let huge = u32::MAX.to_le_bytes();
