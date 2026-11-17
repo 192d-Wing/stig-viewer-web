@@ -233,14 +233,27 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
 `SELECT set_config('stig.audit_maintenance', '<mode>', true)`:
 
 - `retention`: DELETE (the audit retention sweep);
-- `restore`: TRUNCATE and DELETE (a forced backup restore, which also records
-  a `backup.restore` event after it commits);
+- `restore`: TRUNCATE only (a forced backup restore);
+- `migration`: UPDATE only (a data migration that backfills audit rows);
 - `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
   which exist only under `STIG_ENABLE_TEST_ROUTES`).
 
-The one update always allowed is the collapse of a repeated denial: only
-`repeat_count` (strictly increasing) and `last_occurred_at` (not moving
-backwards) may change.
+The one update always allowed is the collapse of a repeated denial: on a
+`denied` or `rejected` `audit_events` row only `repeat_count` (exactly +1) and
+`last_occurred_at` (not before the row's last occurrence, not more than a
+minute in the future) may change. The triggers are `ENABLE ALWAYS`, so
+`session_replication_role = replica` does not skip them.
+
+A forced restore records `backup.restore` inside the restore transaction,
+re-inserting the acting admin's user row first if the backup lacks it. If the
+record cannot be written the whole restore rolls back. A structured `audit`
+log line is also written before the restore starts and after it commits
+(including how many attachment blobs were written).
+
+Migration authors: a migration that UPDATEs, backfills or DELETEs audit rows
+fails with 42501. A data migration must first run
+`SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
+transaction (UPDATE only). Never use `test` mode in production code.
 
 Limit: this is a guard, not a privilege boundary. Any code that can run SQL as
 the application role can set the mode, and a DBA or the table owner can
