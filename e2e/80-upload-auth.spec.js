@@ -45,4 +45,13 @@ test.describe("Catalog upload — authentication", () => {
     const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
     expect(catalog.map((e) => e.id)).not.toContain(bogus.id);
   });
+
+  test("an over-long id is rejected before the parser runs", async () => {
+    await setUserRole("upload-admin", "admin");
+    const res = await uploadStigAs("upload-admin", { ...bogus, id: "a".repeat(129) });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("at most 128 bytes");
+    const ok = await uploadStigAs("upload-admin", { ...bogus, id: "a".repeat(128) });
+    expect(ok.status).toBe(422); // length accepted; the bogus ZIP then fails parsing
+  });
 });

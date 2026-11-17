@@ -547,6 +547,14 @@ pub fn extract_all_from_library(
                 id = format!("{base}-{n}");
             }
 
+            if id.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
+                errors.push((
+                    id.chars().take(64).collect(),
+                    format!("derived id exceeds {} bytes; skipped", crate::api::checklists::MAX_STIG_ID_BYTES),
+                ));
+                continue;
+            }
+
             let stig = match parse_xccdf(&xccdf) {
                 Ok(s) => s,
                 Err(e) => {
@@ -625,6 +633,20 @@ mod tests {
                 ("ms-windows-11".to_string(), "Microsoft Windows 11".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn library_import_skips_and_reports_an_over_long_derived_id() {
+        let long_name = format!("U_{}_V1R1_STIG.zip", "A".repeat(200));
+        let inner = zip_of(&[("x-xccdf.xml", &benchmark("Long"))]);
+        let ok_inner = zip_of(&[("y-xccdf.xml", &benchmark("Short"))]);
+        let library = zip_of(&[(long_name.as_str(), &inner), ("U_Short_V1R1_STIG.zip", &ok_inner)]);
+        let (entries, errors) = extract_all_from_library(&library);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["short"]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].1.contains("exceeds"), "{errors:?}");
+        assert!(errors[0].0.len() <= 64);
     }
 
     /// XCCDF fragment with one rule carrying two CCI idents plus one

@@ -241,6 +241,93 @@ test.describe("Save to system — API", () => {
   });
 });
 
+test.describe("Save to system — audit events and creator", () => {
+  test.beforeEach(async () => {
+    await resetDb();
+  });
+
+  async function events(request) {
+    await setUserRole("audit-admin", "admin");
+    const res = await request.get(`${BACKEND}/api/audit/events`, {
+      headers: { "X-User-Id": "audit-admin" },
+    });
+    expect(res.status()).toBe(200);
+    return (await res.json()).rows;
+  }
+
+  test("a save that creates the checklist leaves create and save events and sets createdBy", async ({ request }) => {
+    const asset = await seedAsset(request);
+    const ids = await edgeRuleIds(request);
+    const secret = "E2E-SECRET-COMMENT";
+    const out = await save(request, asset.id, {
+      rules: [
+        { ruleId: ids[0], status: "open", comments: secret },
+        { ruleId: "SV-not-in-this-stig", status: "open" },
+      ],
+    }).then((r) => r.json());
+    expect(out.created).toBe(true);
+
+    const rows = await events(request);
+    const create = rows.filter((r) => r.action === "checklist.create");
+    const saves = rows.filter((r) => r.action === "checklist.save");
+    expect(create).toHaveLength(1);
+    expect(create[0].detail.via).toBe("save");
+    expect(saves).toHaveLength(1);
+    expect(saves[0].outcome).toBe("partial");
+    expect(saves[0].detail.created).toBe(true);
+    expect(saves[0].detail.applied).toBe(1);
+    expect(saves[0].detail.errors).toBe(1);
+    expect(JSON.stringify(rows)).not.toContain(secret);
+
+    const me = await request.get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    const detail = await request
+      .get(`${BACKEND}/api/checklists/${out.checklistId}`, { headers: { "X-User-Id": "alice" } })
+      .then((r) => r.json());
+    expect(detail.checklist.createdBy).toBe(me.id);
+  });
+
+  test("creating through POST /checklists sets createdBy and leaves a create event", async ({ request }) => {
+    const asset = await seedAsset(request);
+    const created = await request
+      .post(`${BACKEND}/api/assets/${asset.id}/checklists`, { headers: JSON_HEADERS("alice"), data: { stigId: "edge" } })
+      .then((r) => r.json());
+    const me = await request.get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    expect(created.createdBy).toBe(me.id);
+    const rows = await events(request);
+    expect(rows.filter((r) => r.action === "checklist.create" && r.detail.via === "create")).toHaveLength(1);
+  });
+
+  test("an over-long stigId on create is refused and never stored in an event", async ({ request }) => {
+    const asset = await seedAsset(request);
+    const huge = "A".repeat(100_000);
+    const create = (user) =>
+      request.post(`${BACKEND}/api/assets/${asset.id}/checklists`, { headers: JSON_HEADERS(user), data: { stigId: huge } });
+    expect((await create("mallory")).status()).toBe(403);
+    expect((await create("alice")).status()).toBe(400);
+    const rows = (await events(request)).filter((r) => r.action === "checklist.create");
+    expect(rows.map((r) => [r.outcome, r.detail.reason]).sort()).toEqual([
+      ["denied", "forbidden"],
+      ["rejected", "invalid_stig_id"],
+    ]);
+    for (const r of rows) expect(r.stigTitle).toBeNull();
+    expect(JSON.stringify(rows).length).toBeLessThan(2000);
+  });
+
+  test("a 403 leaves a denied event; a 400 leaves a rejected event", async ({ request }) => {
+    const asset = await seedAsset(request);
+    const ids = await edgeRuleIds(request);
+    const rules = [{ ruleId: ids[0], status: "open" }];
+    expect((await save(request, asset.id, { rules }, "mallory")).status()).toBe(403);
+    expect((await save(request, asset.id, { stigId: "../etc", rules })).status()).toBe(400);
+    const rows = (await events(request)).filter((r) => r.action === "checklist.save");
+    expect(rows.map((r) => [r.outcome, r.detail.reason]).sort()).toEqual([
+      ["denied", "forbidden"],
+      ["rejected", "invalid_stig_id"],
+    ]);
+    expect(rows.find((r) => r.outcome === "denied").byName).toBe("mallory");
+  });
+});
+
 test.describe("Save to system — UI", () => {
   test.beforeEach(async () => {
     await resetDb();

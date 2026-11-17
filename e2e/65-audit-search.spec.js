@@ -335,4 +335,50 @@ test.describe("Audit log search", () => {
     await expect(table).toContainText("alice mark 1", { timeout: 10_000 });
     await expect(table).not.toContainText("bob mark");
   });
+
+  test("API: non-admin GET /api/audit/events is 403; admin gets request events", async ({ request }) => {
+    await ensureUser(request, "alice");
+    const denied = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
+    expect(denied.status()).toBe(403);
+
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "events-host", []);
+    const res = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({ page: 1, pageSize: 50 });
+    expect(body.totalCount).toBe(1);
+    const row = body.rows[0];
+    for (const key of ["id", "occurredAt", "byName", "assetName", "stigTitle", "action", "outcome", "detail"]) {
+      expect(row).toHaveProperty(key);
+    }
+    expect(row.action).toBe("checklist.create");
+    expect(row.assetName).toBe("events-host");
+
+    const none = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
+    expect((await none.json()).totalCount).toBe(0);
+    const bad = await request.get(`${BACKEND}/api/audit/events?from=nope`, { headers: { "X-User-Id": "alice" } });
+    expect(bad.status()).toBe(400);
+  });
+
+  test("UI: the Requests switch shows request events", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "requests-ui-host", [{ status: "open", findingDetails: "x" }]);
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await expect(page.getByTestId("audit-search-table")).toHaveCount(0);
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toBeVisible();
+    await page.getByTestId("audit-search-button").click();
+    await expect(table).toContainText("checklist.create", { timeout: 10_000 });
+    await expect(table).toContainText("requests-ui-host");
+
+    // Switching back restores the rule-change view.
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();
+    await expect(page.getByTestId("audit-search-table")).toBeVisible();
+  });
 });

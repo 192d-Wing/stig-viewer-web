@@ -158,6 +158,52 @@ test.describe("Backup + restore — API", () => {
     expect(manifest.schemaMigration).toBeGreaterThan(0);
     expect(manifest.counts).toBeTruthy();
     expect(typeof manifest.counts.users).toBe("number");
+    expect(typeof manifest.counts.audit_events).toBe("number");
+    expect(names).toContain("tables/audit_events.jsonl");
+  });
+
+  test("audit events survive a backup round trip and the id sequence continues", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const asset = await createAsset(request, "backup-host-events");
+    await applyStig(request, asset.id);
+
+    const listEvents = async () =>
+      (
+        await request
+          .get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } })
+          .then((r) => r.json())
+      ).rows;
+    const before = await listEvents();
+    expect(before.map((e) => e.action)).toContain("checklist.create");
+
+    const backupBytes = await request
+      .get(`${BACKEND}/api/admin/backup`, { headers: { "X-User-Id": "alice" } })
+      .then((r) => r.body());
+
+    await resetDb();
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    expect(await listEvents()).toHaveLength(0);
+
+    const restoreRes = await request.post(`${BACKEND}/api/admin/restore?force=true`, {
+      headers: { "X-User-Id": "alice" },
+      multipart: { file: { name: "backup.zip", mimeType: "application/zip", buffer: backupBytes } },
+    });
+    expect(restoreRes.status()).toBe(200);
+    expect((await restoreRes.json()).restored.audit_events).toBe(before.length);
+
+    const after = await listEvents();
+    expect(after.map((e) => e.id)).toEqual(before.map((e) => e.id));
+
+    // New events are numbered after the restored ones.
+    const asset2 = await createAsset(request, "backup-host-events-2");
+    await applyStig(request, asset2.id);
+    const later = await listEvents();
+    expect(later.length).toBe(before.length + 1);
+    expect(Math.max(...later.map((e) => e.id))).toBeGreaterThan(Math.max(...before.map((e) => e.id)));
   });
 
   test("round-trip: backup → reset → force-restore brings data back", async ({

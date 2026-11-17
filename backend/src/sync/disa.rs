@@ -17,6 +17,12 @@ async fn sync_one(
     pool: &PgPool,
     data_dir: &Path,
 ) -> Result<()> {
+    if source.id.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
+        anyhow::bail!(
+            "STIG id exceeds {} bytes; skipped",
+            crate::api::checklists::MAX_STIG_ID_BYTES
+        );
+    }
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
     // 1. Download ZIP

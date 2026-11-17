@@ -345,6 +345,58 @@ struct AuditSearch {
     rows: Vec<AuditRow>,
 }
 
+/// One request-level event from `/api/audit/events`.
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AuditEventRow {
+    occurred_at: Option<String>,
+    by_name: String,
+    asset_name: Option<String>,
+    stig_title: Option<String>,
+    action: String,
+    outcome: String,
+    detail: Value,
+}
+
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AuditEvents {
+    total_count: i64,
+    rows: Vec<AuditEventRow>,
+}
+
+/// One-line summary of an event's `detail` (counts and reason codes only).
+fn event_summary(e: &AuditEventRow) -> String {
+    let d = &e.detail;
+    if let Some(reason) = d.get("reason").and_then(Value::as_str) {
+        return reason.replace('_', " ");
+    }
+    let n = |k: &str| d.get(k).and_then(Value::as_i64);
+    let mut parts = Vec::new();
+    if let Some(s) = d.get("targetStatus").and_then(Value::as_str) {
+        parts.push(format!("status {s}"));
+    }
+    for (key, label) in [
+        ("requested", "requested"),
+        ("applied", "applied"),
+        ("pending", "pending"),
+        ("unchanged", "unchanged"),
+        ("errors", "errors"),
+    ] {
+        if let Some(v) = n(key) {
+            parts.push(format!("{v} {label}"));
+        }
+    }
+    if d.get("created").and_then(Value::as_bool) == Some(true) {
+        parts.push("checklist created".into());
+    }
+    if parts.is_empty() {
+        "—".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
 #[derive(Clone, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct RestoreResult {
@@ -1069,6 +1121,9 @@ fn AuditSection(props: &SectionProps) -> Html {
     let to = use_state(String::new);
     let page = use_state(|| 1usize);
     let rows = use_state(Vec::<AuditRow>::new);
+    let event_rows = use_state(Vec::<AuditEventRow>::new);
+    // "rules" (rule_audit) or "requests" (audit_events).
+    let view = use_state(|| "rules".to_string());
     let total = use_state(|| 0i64);
     let loading = use_state(|| false);
     let error = use_state(|| None::<String>);
@@ -1082,8 +1137,9 @@ fn AuditSection(props: &SectionProps) -> Html {
     // to 1) so a click always lands on page 1 even if the previous run
     // was on a later page.
     {
-        let (rows, total, loading, error) = (rows.clone(), total.clone(), loading.clone(), error.clone());
-        use_effect_with((*search_tick, *page, (*submitted).clone()), move |(tick, page, filters)| {
+        let (rows, event_rows, total, loading, error) =
+            (rows.clone(), event_rows.clone(), total.clone(), loading.clone(), error.clone());
+        use_effect_with((*search_tick, *page, (*submitted).clone(), (*view).clone()), move |(tick, page, filters, view)| {
             let cancelled = Rc::new(Cell::new(false));
             if *tick != 0 {
                 let mut qs = Vec::new();
@@ -1099,21 +1155,40 @@ fn AuditSection(props: &SectionProps) -> Html {
                 }
                 qs.push(format!("page={page}"));
                 qs.push(format!("pageSize={AUDIT_PAGE_SIZE}"));
-                let path = format!("/api/audit/search?{}", qs.join("&"));
+                let requests = view == "requests";
+                let endpoint = if requests { "events" } else { "search" };
+                let path = format!("/api/audit/{endpoint}?{}", qs.join("&"));
                 let cancelled = cancelled.clone();
                 spawn_local(async move {
                     loading.set(true);
                     error.set(None);
-                    let result = api_get::<AuditSearch>(&path).await;
-                    if cancelled.get() {
-                        return;
-                    }
-                    match result {
-                        Ok(res) => {
-                            rows.set(res.rows);
-                            total.set(res.total_count);
+                    // Apply a response only if this effect run is still current
+                    // (cancelled is set by the cleanup on a view/page/filter change),
+                    // so a late response never fills the table under the wrong view.
+                    if requests {
+                        let result = api_get::<AuditEvents>(&path).await;
+                        if cancelled.get() {
+                            return;
                         }
-                        Err(e) => error.set(Some(e)),
+                        match result {
+                            Ok(res) => {
+                                event_rows.set(res.rows);
+                                total.set(res.total_count);
+                            }
+                            Err(e) => error.set(Some(e)),
+                        }
+                    } else {
+                        let result = api_get::<AuditSearch>(&path).await;
+                        if cancelled.get() {
+                            return;
+                        }
+                        match result {
+                            Ok(res) => {
+                                rows.set(res.rows);
+                                total.set(res.total_count);
+                            }
+                            Err(e) => error.set(Some(e)),
+                        }
                     }
                     loading.set(false);
                 });
@@ -1143,6 +1218,22 @@ fn AuditSection(props: &SectionProps) -> Html {
             // Force a re-fetch on page change. Submitted filters
             // are reused; the tick bump is what wakes the effect.
             search_tick.set(*search_tick + 1);
+        })
+    };
+    // Switching the view drops the other view's results and waits for a new
+    // Search, so a stale table never sits under the wrong columns.
+    let on_view = {
+        let (view, rows, event_rows, total) = (view.clone(), rows.clone(), event_rows.clone(), total.clone());
+        let (page, search_tick, error, loading) = (page.clone(), search_tick.clone(), error.clone(), loading.clone());
+        Callback::from(move |id: AttrValue| {
+            view.set(id.to_string());
+            rows.set(Vec::new());
+            event_rows.set(Vec::new());
+            total.set(0);
+            page.set(1);
+            search_tick.set(0);
+            error.set(None);
+            loading.set(false);
         })
     };
     let on_user = {
@@ -1183,6 +1274,18 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("from", "From", move |r: &AuditRow| clipped(&r.from_value)),
         Column::new("to", "To", move |r: &AuditRow| clipped(&r.to_value)),
     ];
+    let event_columns = vec![
+        Column::new("when", "When", |r: &AuditEventRow| {
+            html! { {r.occurred_at.as_deref().filter(|s| !s.is_empty()).map(to_locale_string).unwrap_or_else(|| "—".into())} }
+        }),
+        Column::new("by", "By", |r: &AuditEventRow| html! { {r.by_name.clone()} }),
+        Column::new("asset", "Asset", |r: &AuditEventRow| html! { {r.asset_name.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("stig", "STIG", |r: &AuditEventRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("action", "Action", |r: &AuditEventRow| html! { {r.action.clone()} }),
+        Column::new("outcome", "Outcome", |r: &AuditEventRow| html! { {r.outcome.clone()} }),
+        Column::new("summary", "Summary", |r: &AuditEventRow| html! { {event_summary(r)} }),
+    ];
+    let requests_view = *view == "requests";
     let pages_count = usize::try_from((*total + AUDIT_PAGE_SIZE - 1) / AUDIT_PAGE_SIZE).unwrap_or(1).max(1);
     let empty_text = if *search_tick == 0 {
         "Click Search to query the audit log."
@@ -1192,11 +1295,17 @@ fn AuditSection(props: &SectionProps) -> Html {
 
     html! {
         <Container header={html! {
-            <Header description="Cross-cutting search over rule_audit. Filter by user, asset, and date range; results are paginated server-side.">
+            <Header description="Cross-cutting search over rule changes and request-level events. Filter by user, asset, and date range; results are paginated server-side.">
                 {"Audit log"}
             </Header>
         }}>
             <SpaceBetween direction="vertical" size="m">
+                <SegmentedControl
+                    options={vec![SegmentOption::new("rules", "Rule changes"), SegmentOption::new("requests", "Requests")]}
+                    selected_id={AttrValue::from((*view).clone())}
+                    on_change={on_view}
+                    label="Audit log view"
+                    testid="audit-view-switch" />
                 <div style="display:grid;grid-template-columns:repeat(4, minmax(0, 1fr));gap:var(--space-scaled-m, 12px);">
                     <FormField label="User">
                         <Select placeholder="Any user"
@@ -1227,24 +1336,45 @@ fn AuditSection(props: &SectionProps) -> Html {
                 if let Some(e) = &*error {
                     <Alert kind="error">{e.clone()}</Alert>
                 }
-                <Table<AuditRow>
-                    variant="embedded"
-                    items={(*rows).clone()}
-                    loading={*loading}
-                    loading_text="Searching audit log"
-                    empty={empty_note(empty_text)}
-                    {columns}
-                    pagination={html! {
-                        <Pagination current_page_index={*page} {pages_count} on_change={on_page} />
-                    }}
-                    header={html! {
-                        <Header counter={format!("({})", *total)}
-                                description="Newest first. Truncated values show the full text on hover.">
-                            {"Results"}
-                        </Header>
-                    }}
-                    testid="audit-search-table"
-                />
+                if requests_view {
+                    <Table<AuditEventRow>
+                        variant="embedded"
+                        items={(*event_rows).clone()}
+                        loading={*loading}
+                        loading_text="Searching audit log"
+                        empty={empty_note(empty_text)}
+                        columns={event_columns}
+                        pagination={html! {
+                            <Pagination current_page_index={*page} {pages_count} on_change={on_page.clone()} />
+                        }}
+                        header={html! {
+                            <Header counter={format!("({})", *total)}
+                                    description="Bulk status changes, saves to a system and checklist creations, including rejected and denied requests. Newest first.">
+                                {"Requests"}
+                            </Header>
+                        }}
+                        testid="audit-events-table"
+                    />
+                } else {
+                    <Table<AuditRow>
+                        variant="embedded"
+                        items={(*rows).clone()}
+                        loading={*loading}
+                        loading_text="Searching audit log"
+                        empty={empty_note(empty_text)}
+                        {columns}
+                        pagination={html! {
+                            <Pagination current_page_index={*page} {pages_count} on_change={on_page} />
+                        }}
+                        header={html! {
+                            <Header counter={format!("({})", *total)}
+                                    description="Newest first. Truncated values show the full text on hover.">
+                                {"Results"}
+                            </Header>
+                        }}
+                        testid="audit-search-table"
+                    />
+                }
             </SpaceBetween>
         </Container>
     }
@@ -2188,5 +2318,30 @@ fn BackupSection(props: &SectionProps) -> Html {
                 </SpaceBetween>
             </ColumnLayout>
         </Container>
+    }
+}
+
+#[cfg(test)]
+mod audit_event_tests {
+    use super::*;
+
+    fn event(detail: Value) -> AuditEventRow {
+        AuditEventRow { detail, ..AuditEventRow::default() }
+    }
+
+    #[test]
+    fn summary_shows_the_reason_for_denied_and_rejected_requests() {
+        assert_eq!(event_summary(&event(json!({ "reason": "invalid_status" }))), "invalid status");
+    }
+
+    #[test]
+    fn summary_lists_counts_and_creation() {
+        let e = event(json!({ "targetStatus": "open", "requested": 3, "applied": 2, "errors": 1, "created": true }));
+        assert_eq!(event_summary(&e), "status open, 3 requested, 2 applied, 1 errors, checklist created");
+    }
+
+    #[test]
+    fn summary_of_an_empty_detail_is_a_dash() {
+        assert_eq!(event_summary(&event(json!({}))), "—");
     }
 }

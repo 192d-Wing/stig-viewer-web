@@ -71,6 +71,12 @@ pub async fn upload_stig(
                 if !text.chars().all(|c| c.is_alphanumeric() || c == '-') {
                     return Err((StatusCode::BAD_REQUEST, "id must be alphanumeric with hyphens only".into()));
                 }
+                if text.len() > crate::api::checklists::MAX_STIG_ID_BYTES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("id must be at most {} bytes", crate::api::checklists::MAX_STIG_ID_BYTES),
+                    ));
+                }
                 id = Some(text);
             }
             Some("category") => {
