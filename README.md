@@ -251,6 +251,39 @@ wide) to speed up the first paint. To swap it, replace the file and adjust
 background accent colour is the `--login-accent` variable in
 `frontend/styles/app.css`.
 
+## SAML service provider
+
+Env: `SAML_IDP_SSO_URL` (enables SAML), `SAML_IDP_CERT_PEM` (required to
+verify; pinned), `SAML_IDP_ENTITY_ID` (if set, the Assertion Issuer must equal
+it), `SAML_SP_ENTITY_ID` (Audience, default `{frontend}/saml/sp`),
+`SAML_SP_ACS_URL` (Recipient/Destination, default `{PUBLIC_BASE}/auth/saml/acs`),
+`SAML_CLOCK_SKEW_SECS` (default 120, clamped 0-300).
+
+The ACS accepts exactly one Assertion, a direct child of `samlp:Response`.
+Accepted signature layouts: Assertion signed, Response signed, or both; a
+`ds:Signature` must be a direct child of the Response or the Assertion, with one
+Reference to its parent's ID, RSA-SHA256 and SHA-256 only. Identity is read only
+from the signed scope. Required: Status Success, a bearer SubjectConfirmation
+with matching Recipient and unexpired NotOnOrAfter, Conditions, and an
+AudienceRestriction naming the SP; Destination is checked when present. DOCTYPE,
+comments, processing instructions and EncryptedAssertion are rejected. Failed
+ACS attempts return a generic 401 and log an `auth.saml_acs` audit line.
+
+Only RSA-SHA256 with keys of at least 2048 bits is accepted (a weaker
+`SAML_IDP_CERT_PEM` stops startup). `SignedInfo` and the signed element must
+declare every namespace they use themselves (the `ds` namespace included), since
+bindings outside the signed bytes are not authenticated. `POST /auth/saml/acs`
+shares the per-IP pre-auth rate limit (429 when exceeded) and answers every
+failure with a generic 401; reasons go to the audit log as fixed codes.
+
+Limitation: exclusive canonicalisation is not implemented yet. Signatures are
+verified over the bytes as sent, so IdPs that do not emit canonical XML will
+fail closed until c14n is added.
+
+`SAML_INSECURE_SKIP_VERIFY=true` skips only the signature check (all other
+checks still run) and is for local development. The backend **refuses to start**
+if it is set with `STIG_ENV=production`.
+
 ## System use notification (AC-8)
 
 The sign-in screen shows the DoD Notice and Consent text and requires "I Agree"

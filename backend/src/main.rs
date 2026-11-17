@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
     // SSO URL is configured the login route returns 503 with a helpful
     // message but /metadata still works (useful when handing the SP
     // metadata to an IdP admin to register us).
-    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin));
+    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin)?);
     info!(
         "SAML SP ready (configured={}, sp_entity_id={}, acs_url={})",
         saml_config.is_configured(),
@@ -339,7 +339,10 @@ async fn main() -> Result<()> {
     };
     let saml_routes: Router = Router::new()
         .route("/auth/saml/login", get(saml_login_handler))
-        .route("/auth/saml/acs", post(saml_acs_handler))
+        .route(
+            "/auth/saml/acs",
+            post(saml_acs_handler).layer(axum::extract::DefaultBodyLimit::max(api::saml::ACS_BODY_LIMIT)),
+        )
         .route("/auth/saml/metadata", get(saml_metadata_handler))
         .with_state(saml_state);
 
