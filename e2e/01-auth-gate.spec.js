@@ -135,7 +135,9 @@ test.describe("Login screen", () => {
 
   test("Enter on SAML button navigates to the SAML login", async ({ page }) => {
     // The SAML IdP may not be configured in the e2e stack, so assert the
-    // request to /auth/saml/login and that its response is a redirect.
+    // request to /auth/saml/login and that its response is either a redirect
+    // to the IdP or the backend's 503 for "SAML not configured"
+    // (see saml.rs, `saml_login_unconfigured_is_503_and_keeps_proof`).
     const respP = page.waitForResponse((r) => /\/auth\/saml\/login/.test(r.url()));
     await page.goto("/");
     await acknowledgeNotice(page);
@@ -144,7 +146,7 @@ test.describe("Login screen", () => {
     await page.keyboard.press("Enter");
     const resp = await respP;
     expect(resp.request().url()).toMatch(/\/auth\/saml\/login/);
-    expect([301, 302, 303, 307, 308]).toContain(resp.status());
+    expect([301, 302, 303, 307, 308, 503]).toContain(resp.status());
   });
 
   test("login buttons use the requested colours", async ({ page }) => {
