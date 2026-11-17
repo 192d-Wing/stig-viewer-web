@@ -31,7 +31,7 @@ async function seedThreeOpenFindings(request) {
       },
     );
   }
-  return { checklistId: checklist.id, ruleIds };
+  return { assetId: asset.id, checklistId: checklist.id, ruleIds };
 }
 
 test.describe("Bulk operations on findings", () => {
@@ -60,6 +60,8 @@ test.describe("Bulk operations on findings", () => {
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(body.updated).toBe(3);
+    expect(body.pendingApproval).toBe(0);
+    expect(body.alreadyPending).toBe(0);
 
     // All three findings are now not_a_finding.
     const naf = await request
@@ -83,6 +85,87 @@ test.describe("Bulk operations on findings", () => {
       },
     });
     expect(res.status()).toBe(403);
+  });
+
+  test("API: on an approval asset closing is queued, not applied", async ({
+    request,
+  }) => {
+    const { assetId, checklistId, ruleIds } =
+      await seedThreeOpenFindings(request);
+    const policy = await request.patch(
+      `${BACKEND}/api/assets/${assetId}/approval-policy`,
+      {
+        headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+        data: { requiresApproval: true },
+      },
+    );
+    expect(policy.status()).toBe(200);
+
+    const res = await request.patch(`${BACKEND}/api/findings/bulk`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: {
+        targets: ruleIds.map((ruleId) => ({ checklistId, ruleId })),
+        patch: {
+          status: "not_a_finding",
+          findingDetails: "closed by smoke test",
+          comments: "queued note",
+        },
+      },
+    });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.updated).toBe(0);
+    expect(body.pendingApproval).toBe(3);
+
+    const open = await request
+      .get(`${BACKEND}/api/findings?status=open`, {
+        headers: { "X-User-Id": "alice" },
+      })
+      .then((r) => r.json());
+    expect(open.length).toBe(3);
+    expect(open.every((f) => f.comments === "queued note")).toBe(true);
+  });
+
+  test("API: closing without finding details is a per-target error", async ({
+    request,
+  }) => {
+    const { checklistId, ruleIds } = await seedThreeOpenFindings(request);
+    const res = await request.patch(`${BACKEND}/api/findings/bulk`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: {
+        targets: [{ checklistId, ruleId: ruleIds[0] }],
+        patch: { status: "not_a_finding" },
+      },
+    });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.updated).toBe(0);
+    expect(body.errorCount).toBe(1);
+    expect(body.errors[0].ruleId).toBe(ruleIds[0]);
+  });
+
+  test("API: an ACL write-holder may bulk update", async ({ request }) => {
+    const { assetId, checklistId, ruleIds } =
+      await seedThreeOpenFindings(request);
+    const bobId = (
+      await request
+        .get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": "bob" } })
+        .then((r) => r.json())
+    ).id;
+    const grant = await request.post(`${BACKEND}/api/assets/${assetId}/acl`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: { userId: bobId, permission: "write" },
+    });
+    expect(grant.status()).toBe(201);
+    const res = await request.patch(`${BACKEND}/api/findings/bulk`, {
+      headers: { "X-User-Id": "bob", "Content-Type": "application/json" },
+      data: {
+        targets: [{ checklistId, ruleId: ruleIds[0] }],
+        patch: { comments: "by bob" },
+      },
+    });
+    expect(res.status()).toBe(200);
+    expect((await res.json()).updated).toBe(1);
   });
 
   test("API: empty targets rejected with 400", async ({ request }) => {
@@ -118,5 +201,24 @@ test.describe("Bulk operations on findings", () => {
     const bulkBtn = page.getByRole("button", { name: /^Bulk update$/ });
     await expect(bulkBtn).toBeVisible();
     await expect(bulkBtn).toBeDisabled();
+  });
+
+  test("UI: bulk update shows a result flash", async ({ page, request }) => {
+    await seedThreeOpenFindings(request);
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "Dashboard", exact: true }).click();
+    await page.getByRole("button", { name: /view details/i }).click();
+    const drilldown = page.getByRole("table", { name: /open findings/i });
+    await expect(drilldown).toBeVisible({ timeout: 10_000 });
+    await drilldown.locator('input[type="checkbox"]').first().check();
+    await page.getByRole("button", { name: /^Bulk update/ }).click();
+    const modal = page.getByRole("dialog");
+    await modal.getByLabel("Comments").fill("from the UI");
+    await modal.getByRole("button", { name: "Apply" }).click();
+    await expect(page.getByTestId("bulk-update-flash")).toContainText(
+      "3 updated",
+      { timeout: 10_000 },
+    );
   });
 });

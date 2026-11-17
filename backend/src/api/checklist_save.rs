@@ -424,6 +424,8 @@ async fn apply_entries(
             expect_status: expect.as_deref(),
             finding_details: merged.finding_details.as_deref(),
             comments: merged.comments.as_deref(),
+            assignee_id: None,
+            due_date: None,
             plan,
         })
         .collect();

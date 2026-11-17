@@ -210,6 +210,22 @@ pub struct RuleWrite<'a> {
 }
 
 pub async fn upsert_rule(pool: &PgPool, w: RuleWrite<'_>) -> Result<ChecklistRuleRow> {
+    // With no expectation the guarded write cannot be rejected.
+    match upsert_rule_expecting(pool, w, None).await? {
+        Ok(row) => Ok(row),
+        Err(rejected) => Err(rejected.into()),
+    }
+}
+
+/// `upsert_rule` with a write-time status guard: when `expect_status` is
+/// `Some(s)` and the row, read under the checklist lock, holds a different
+/// status (`not_reviewed` when there is no row), nothing is written and
+/// `PatchRejected::StatusChanged` comes back.
+pub async fn upsert_rule_expecting(
+    pool: &PgPool,
+    w: RuleWrite<'_>,
+    expect_status: Option<&str>,
+) -> Result<Result<ChecklistRuleRow, PatchRejected>> {
     let mut tx = pool.begin().await?;
     lock_checklist(&mut tx, w.checklist_id).await?;
 
@@ -222,10 +238,18 @@ pub async fn upsert_rule(pool: &PgPool, w: RuleWrite<'_>) -> Result<ChecklistRul
     .fetch_optional(&mut *tx)
     .await?;
 
+    if let Some(expected) = expect_status {
+        let cur = existing.as_ref().map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+        if cur != expected {
+            tx.rollback().await?;
+            return Ok(Err(PatchRejected::StatusChanged));
+        }
+    }
+
     let row = write_rule(&mut tx, existing.as_ref(), &w).await?;
     touch_checklist(&mut tx, w.checklist_id).await?;
     tx.commit().await?;
-    Ok(row)
+    Ok(Ok(row))
 }
 
 /// Columns a caller wants to change on one rule; `None` keeps whatever the
@@ -235,6 +259,10 @@ pub struct RulePatch<'a> {
     pub status: Option<&'a str>,
     pub finding_details: Option<&'a str>,
     pub comments: Option<&'a str>,
+    /// `None` keeps the stored assignee, `Some(None)` clears it.
+    pub assignee_id: Option<Option<&'a str>>,
+    /// `None` keeps the stored due date, `Some(None)` clears it.
+    pub due_date: Option<Option<NaiveDate>>,
     /// Abort ([`PatchRejected::DetailsRequired`]) when the finding details
     /// that would be stored are blank, judged against the locked row.
     pub require_details: bool,
@@ -303,8 +331,14 @@ fn resolve_patch(
         status,
         finding_details,
         comments,
-        assignee_id: existing.and_then(|e| e.assignee_id.clone()),
-        due_date: existing.and_then(|e| e.due_date),
+        assignee_id: match patch.assignee_id {
+            Some(v) => v.map(str::to_string),
+            None => existing.and_then(|e| e.assignee_id.clone()),
+        },
+        due_date: match patch.due_date {
+            Some(v) => v,
+            None => existing.and_then(|e| e.due_date),
+        },
     })
 }
 
@@ -659,6 +693,29 @@ mod tests {
         assert_eq!(resolve_patch(Some(&existing), &patch).unwrap().finding_details, "because");
         let documented = row("open", "already");
         assert_eq!(resolve_patch(Some(&documented), &closing()).unwrap().finding_details, "already");
+    }
+
+    #[test]
+    fn assignee_and_due_date_are_tri_state() {
+        let existing = row("open", "");
+        let keep = resolve_patch(Some(&existing), &RulePatch::default()).unwrap();
+        assert_eq!((keep.assignee_id.as_deref(), keep.due_date), (Some("u"), existing.due_date));
+        let clear = resolve_patch(
+            Some(&existing),
+            &RulePatch { assignee_id: Some(None), due_date: Some(None), ..RulePatch::default() },
+        )
+        .unwrap();
+        assert_eq!((clear.assignee_id, clear.due_date), (None, None));
+        let d = NaiveDate::from_ymd_opt(2031, 5, 6);
+        let set = resolve_patch(
+            Some(&existing),
+            &RulePatch { assignee_id: Some(Some("new")), due_date: Some(d), ..RulePatch::default() },
+        )
+        .unwrap();
+        assert_eq!((set.assignee_id.as_deref(), set.due_date), (Some("new"), d));
+        // No row yet: keep means none.
+        let fresh = resolve_patch(None, &RulePatch::default()).unwrap();
+        assert_eq!((fresh.assignee_id, fresh.due_date), (None, None));
     }
 
     #[test]
@@ -1186,5 +1243,122 @@ mod tests {
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
         let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
         assert!(out.iter().all(|o| *o == PatchOutcome::Written));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_rejects_a_changed_status_and_leaves_no_trace(pool: PgPool) {
+        setup(&pool).await;
+        let w = |status| RuleWrite {
+            checklist_id: "c1",
+            rule_id: "r1",
+            status,
+            finding_details: "why",
+            comments: "",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        upsert_rule(&pool, w("open")).await.unwrap();
+        let audit = count(&pool, "SELECT COUNT(*) FROM rule_audit").await;
+        let out = upsert_rule_expecting(&pool, w("not_a_finding"), Some("not_a_finding"))
+            .await
+            .unwrap();
+        assert_eq!(out.unwrap_err(), PatchRejected::StatusChanged);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, audit);
+        let st: String = sqlx::query_scalar("SELECT status FROM checklist_rules WHERE rule_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(st, "open");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_none_matches_upsert_rule(pool: PgPool) {
+        setup(&pool).await;
+        let w = |rule_id| RuleWrite {
+            checklist_id: "c1",
+            rule_id,
+            status: "open",
+            finding_details: "d",
+            comments: "c",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        let a = upsert_rule(&pool, w("r1")).await.unwrap();
+        let b = upsert_rule_expecting(&pool, w("r2"), None).await.unwrap().unwrap();
+        assert_eq!((a.status, a.finding_details, a.comments), (b.status, b.finding_details, b.comments));
+        // An expectation that holds writes through.
+        let c = upsert_rule_expecting(&pool, w("r2"), Some("open")).await.unwrap();
+        assert!(c.is_ok());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_assignee_and_due_audit_rows_match_upsert_rule(pool: PgPool) {
+        setup(&pool).await;
+        seed_user(&pool, "u2").await;
+        let due = NaiveDate::from_ymd_opt(2031, 5, 6);
+        type Audit = Vec<(String, Option<String>, Option<String>)>;
+        let audit = |pool: PgPool, from: i64| async move {
+            let a: Audit = sqlx::query_as(
+                "SELECT field, from_value, to_value FROM rule_audit WHERE id > $1 ORDER BY field",
+            )
+            .bind(from)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            a
+        };
+        seed_rule(&pool, "c1", "r1", "open", "d", "c", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        upsert_rule(
+            &pool,
+            RuleWrite {
+                checklist_id: "c1",
+                rule_id: "r1",
+                status: "open",
+                finding_details: "d",
+                comments: "c",
+                updated_by: "u1",
+                assignee_id: Some("u2"),
+                due_date: due,
+            },
+        )
+        .await
+        .unwrap();
+        let single = audit(pool.clone(), mark).await;
+
+        sqlx::query("DELETE FROM checklist_rules").execute(&pool).await.unwrap();
+        seed_rule(&pool, "c1", "r1", "open", "d", "c", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        let patch = RulePatch { assignee_id: Some(Some("u2")), due_date: Some(due), ..RulePatch::default() };
+        let out = patch_rules(&pool, "c1", "u1", &[("r1", patch)]).await;
+        assert_eq!(out, [PatchOutcome::Written]);
+        let batch = audit(pool.clone(), mark).await;
+        assert_eq!(single.len(), 2);
+        assert_eq!(single, batch);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_rule_expecting_treats_a_missing_row_as_not_reviewed(pool: PgPool) {
+        setup(&pool).await;
+        let w = RuleWrite {
+            checklist_id: "c1",
+            rule_id: "r9",
+            status: "not_a_finding",
+            finding_details: "d",
+            comments: "",
+            updated_by: "u1",
+            assignee_id: None,
+            due_date: None,
+        };
+        let rejected = upsert_rule_expecting(&pool, w, Some("not_a_finding")).await.unwrap();
+        assert_eq!(rejected.unwrap_err(), PatchRejected::StatusChanged);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert!(upsert_rule_expecting(&pool, w, Some("not_reviewed")).await.unwrap().is_ok());
     }
 }

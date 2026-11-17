@@ -15,7 +15,7 @@ pub const MAX_REJECTED_LISTED: usize = 100;
 
 pub struct NewAuditEvent<'a> {
     pub user_id: &'a str,
-    /// "rules.bulk_status" | "checklist.save" | "checklist.create"
+    /// "rules.bulk_status" | "rules.bulk_import" | "checklist.save" | "checklist.create"
     pub action: &'static str,
     /// "ok" | "partial" | "denied" | "rejected"
     pub outcome: &'static str,

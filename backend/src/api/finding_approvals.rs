@@ -354,6 +354,19 @@ pub async fn request_many(
     request_many_with(pool, checklist_id, requested_by, items, db_checklists::CHUNK_LOCK_TIMEOUT).await
 }
 
+/// Rule ids of `checklist_id` that currently have a pending approval request.
+/// A read-only preview helper; the queueing path re-checks under the lock.
+pub async fn pending_rule_ids(pool: &PgPool, checklist_id: &str) -> anyhow::Result<HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT rule_id FROM finding_approvals \
+         WHERE checklist_id = $1 AND status = 'pending'",
+    )
+    .bind(checklist_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
+}
+
 async fn request_many_with(
     pool: &PgPool,
     checklist_id: &str,

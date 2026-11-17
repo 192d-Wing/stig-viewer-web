@@ -174,12 +174,7 @@ test.describe("Rule bulk CSV import — API", () => {
     expect(s0.status).toBe("not_reviewed");
   });
 
-  // upsert_rule is intentionally forgiving — it'll insert a checklist_rules
-  // row for any rule_id whether or not it's in the STIG. The bulk handler
-  // preserves that behavior; the row is "ok" and applied. The override
-  // simply won't surface on the merged rules list because there's no
-  // matching rule to merge into, but the row exists in the DB.
-  test("non-existent rule_id is still inserted (upsert is forgiving)", async ({
+  test("non-existent rule_id is a row error and inserts nothing", async ({
     request,
   }) => {
     const { checklistId } = await seedChecklist(request);
@@ -188,8 +183,76 @@ test.describe("Rule bulk CSV import — API", () => {
     const res = await postCsv(request, checklistId, false, body);
     expect(res.status()).toBe(200);
     const data = await res.json();
+    expect(data.appliedCount).toBe(0);
+    expect(data.errorCount).toBe(1);
+    expect(data.rows[0].status).toBe("error");
+  });
+
+  test("blank finding_details cell keeps the stored text", async ({
+    request,
+  }) => {
+    const { checklistId, ruleIds } = await seedChecklist(request);
+    await postCsv(
+      request,
+      checklistId,
+      false,
+      csv(HEADER, `${ruleIds[0]},open,Stored justification`),
+    );
+    const res = await postCsv(
+      request,
+      checklistId,
+      false,
+      csv(HEADER, `${ruleIds[0]},not_a_finding,`),
+    );
+    const data = await res.json();
     expect(data.appliedCount).toBe(1);
-    expect(data.rows[0].status).toBe("ok");
+    const s = await getRuleState(request, checklistId, ruleIds[0]);
+    expect(s.status).toBe("not_a_finding");
+    expect(s.findingDetails).toBe("Stored justification");
+  });
+
+  test("on an approval asset closing rows are queued, not applied", async ({
+    request,
+  }) => {
+    const { assetId, checklistId, ruleIds } = await seedChecklist(request);
+    await postCsv(request, checklistId, false, csv(HEADER, `${ruleIds[0]},open,`));
+    const policy = await request.patch(
+      `${BACKEND}/api/assets/${assetId}/approval-policy`,
+      {
+        headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+        data: { requiresApproval: true },
+      },
+    );
+    expect(policy.status()).toBe(200);
+    const body = csv(HEADER, `${ruleIds[0]},not_a_finding,Patched per vendor`);
+
+    const dry = await (await postCsv(request, checklistId, true, body)).json();
+    expect(dry.rows[0].status).toBe("pending_approval");
+    expect(dry.appliedCount).toBe(0);
+    expect(dry.pendingCount).toBe(0);
+
+    const first = await (await postCsv(request, checklistId, false, body)).json();
+    expect(first.pendingCount).toBe(1);
+    expect(first.appliedCount).toBe(0);
+    expect(first.rows[0].status).toBe("pending_approval");
+    const s = await getRuleState(request, checklistId, ruleIds[0]);
+    expect(s.status).toBe("open");
+    const pending = await request
+      .get(`${BACKEND}/api/approvals?status=pending`, {
+        headers: { "X-User-Id": "alice" },
+      })
+      .then((r) => r.json());
+    expect(pending.length).toBe(1);
+
+    const second = await (await postCsv(request, checklistId, false, body)).json();
+    expect(second.rows[0].status).toBe("pending_approval");
+    expect(second.rows[0].note).toContain("already pending");
+    const still = await request
+      .get(`${BACKEND}/api/approvals?status=pending`, {
+        headers: { "X-User-Id": "alice" },
+      })
+      .then((r) => r.json());
+    expect(still.length).toBe(1);
   });
 
   test("non-owner gets 403", async ({ request }) => {
@@ -274,5 +337,37 @@ test.describe("Rule bulk CSV import — UI", () => {
     expect(s1.status).toBe("not_a_finding");
     const s2 = await getRuleState(request, checklistId, ruleIds[2]);
     expect(s2.status).toBe("not_applicable");
+  });
+
+  test("preview shows a pending-approval badge on an approval asset", async ({
+    page,
+    request,
+  }) => {
+    const { assetId, ruleIds } = await seedChecklist(request);
+    await request.patch(`${BACKEND}/api/assets/${assetId}/approval-policy`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: { requiresApproval: true },
+    });
+
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "Systems", exact: true }).click();
+    await page.getByRole("button", { name: "bulk-host" }).click();
+    await page.getByRole("button", { name: /edge/i }).first().click();
+    await page.getByTestId("bulk-import-button").click();
+    const modal = page.getByRole("dialog");
+    await modal.getByTestId("bulk-import-input").setInputFiles({
+      name: "rules.csv",
+      mimeType: "text/csv",
+      buffer: Buffer.from(
+        `${HEADER}\n${ruleIds[0]},not_a_finding,Patched per vendor guidance\n`,
+        "utf-8",
+      ),
+    });
+    await expect(modal.getByTestId("bulk-status-2")).toHaveText(
+      "pending approval",
+      { timeout: 10_000 },
+    );
+    await expect(modal.getByTestId("bulk-import-pending-info")).toBeVisible();
   });
 });

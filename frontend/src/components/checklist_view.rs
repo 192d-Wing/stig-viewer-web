@@ -239,9 +239,11 @@ struct BulkRow {
     /// Status value from the CSV (the value being applied to the rule).
     rule_status: String,
     finding_details: String,
-    /// Row-level result: "ok" | "error".
+    /// Row-level result: "ok" | "pending_approval" | "error".
     status: String,
     error: Option<String>,
+    /// Extra information on a non-error row (an approval already pending).
+    note: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
@@ -249,6 +251,30 @@ struct BulkRow {
 struct BulkResponse {
     rows: Vec<BulkRow>,
     applied_count: u64,
+    pending_count: u64,
+    error_count: u64,
+}
+
+/// Summary line shown after a CSV import commit.
+fn bulk_import_summary(r: &BulkResponse) -> String {
+    let plural = if r.applied_count == 1 { "" } else { "s" };
+    let mut parts = vec![format!("Applied {} rule{plural}.", r.applied_count)];
+    if r.pending_count > 0 {
+        parts.push(format!("{} submitted for review.", r.pending_count));
+    }
+    if r.error_count > 0 {
+        parts.push(format!("{} not changed.", r.error_count));
+    }
+    parts.join(" ")
+}
+
+/// Label of the import commit button: rows applied, and rows that go to review.
+fn bulk_commit_label(ok: usize, pending: usize) -> String {
+    if pending > 0 {
+        format!("Apply {ok} rows, submit {pending} for review")
+    } else {
+        format!("Apply {ok} rows")
+    }
 }
 
 /// One rule's outcome from `POST …/rules/bulk-status`.
@@ -631,11 +657,20 @@ impl ViewState {
         self.bulk_error.set(None);
         match self.bulk_request(&file, false).await {
             Ok(data) => {
+                // Rows that failed only at commit time (not in the preview) keep
+                // the modal open so they can be read; otherwise auto-close
+                // shortly after success so the user sees the alert.
+                let preview_errors = self
+                    .bulk_preview
+                    .as_ref()
+                    .map(|p| p.rows.iter().filter(|r| r.status == "error").count() as u64);
+                let as_previewed = preview_errors == Some(data.error_count);
                 self.bulk_success.set(Some(data));
                 self.refresh().await;
-                // Auto-close shortly after success so the user sees the alert.
-                let s = self.clone();
-                Timeout::new(800, move || s.close_bulk()).forget();
+                if as_previewed {
+                    let s = self.clone();
+                    Timeout::new(800, move || s.close_bulk()).forget();
+                }
             }
             Err(e) => self.bulk_error.set(Some(e)),
         }
@@ -1221,10 +1256,16 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
         Column::new("ruleStatus", "Status", |r: &BulkRow| html! { {or_dash(&r.rule_status)} }),
         Column::new("findingDetails", "Finding details", |r: &BulkRow| html! { {or_dash(&r.finding_details)} }),
         Column::new("status", "Result", |r: &BulkRow| {
-            let color = if r.status == "ok" { "green" } else { "red" };
-            html! { <Badge {color} testid={format!("bulk-status-{}", r.row_number)}>{r.status.clone()}</Badge> }
+            let (color, text) = match r.status.as_str() {
+                "ok" => ("green", "ok".to_string()),
+                "pending_approval" => ("blue", "pending approval".to_string()),
+                other => ("red", other.to_string()),
+            };
+            html! { <Badge {color} testid={format!("bulk-status-{}", r.row_number)}>{text}</Badge> }
         }),
-        Column::new("error", "Note", |r: &BulkRow| html! { {r.error.clone().unwrap_or_default()} }),
+        Column::new("error", "Note", |r: &BulkRow| {
+            html! { {r.error.clone().or_else(|| r.note.clone()).unwrap_or_default()} }
+        }),
     ];
     let bulk_rows_with = |preview: &BulkResponse, status: &str| preview.rows.iter().filter(|r| r.status == status).count();
 
@@ -1363,11 +1404,11 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                     <UiBox float="right">
                         <SpaceBetween direction="horizontal" size="xs">
                             <Button variant="link" onclick={close_bulk.reform(|_: MouseEvent| ())}>{"Cancel"}</Button>
-                            if let (BulkStep::Preview, Some(preview)) = (*s.bulk_step, &*s.bulk_preview) {
+                            if let (BulkStep::Preview, Some(preview), None) = (*s.bulk_step, &*s.bulk_preview, &*s.bulk_success) {
                                 <Button variant="primary" loading={*s.bulk_busy}
                                         disabled={*s.bulk_busy || preview.rows.iter().all(|r| r.status == "error")}
                                         onclick={commit_bulk} testid="bulk-import-commit">
-                                    {format!("Apply {} rows", bulk_rows_with(preview, "ok"))}
+                                    {bulk_commit_label(bulk_rows_with(preview, "ok"), bulk_rows_with(preview, "pending_approval"))}
                                 </Button>
                             }
                         </SpaceBetween>
@@ -1395,7 +1436,7 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                     {error_alert(&s.bulk_error)}
                     if let Some(done) = &*s.bulk_success {
                         <Alert kind="success" testid="bulk-import-success">
-                            {format!("Applied {} rule{}.", done.applied_count, if done.applied_count == 1 { "" } else { "s" })}
+                            {bulk_import_summary(done)}
                         </Alert>
                     }
                     if let Some(preview) = &*s.bulk_preview {
@@ -1404,9 +1445,17 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                                 {format!("{} rows have errors and will be skipped.", bulk_rows_with(preview, "error"))}
                             </Alert>
                         }
+                        if bulk_rows_with(preview, "pending_approval") > 0 {
+                            <Alert kind="info" testid="bulk-import-pending-info">
+                                {format!(
+                                    "{} rows close findings on a system that requires approval; they will be submitted for review.",
+                                    bulk_rows_with(preview, "pending_approval")
+                                )}
+                            </Alert>
+                        }
                         <Table<BulkRow>
                             variant="embedded"
-                            items={preview.rows.clone()}
+                            items={s.bulk_success.as_ref().map(|d| d.rows.clone()).unwrap_or_else(|| preview.rows.clone())}
                             track_by={Callback::from(|r: BulkRow| r.row_number.to_string())}
                             columns={bulk_columns}
                             empty={html! { <UiBox>{"No rows."}</UiBox> }}
@@ -1531,6 +1580,16 @@ fn comment_item(s: &ViewState, rule_id: &str, c: &Comment, current_user_id: Opti
 #[cfg(test)]
 mod bulk_status_summary_tests {
     use super::*;
+
+    #[test]
+    fn import_summary_and_commit_label() {
+        let r = BulkResponse { applied_count: 2, ..Default::default() };
+        assert_eq!(bulk_import_summary(&r), "Applied 2 rules.");
+        let r = BulkResponse { applied_count: 1, pending_count: 2, error_count: 3, ..Default::default() };
+        assert_eq!(bulk_import_summary(&r), "Applied 1 rule. 2 submitted for review. 3 not changed.");
+        assert_eq!(bulk_commit_label(4, 0), "Apply 4 rows");
+        assert_eq!(bulk_commit_label(4, 2), "Apply 4 rows, submit 2 for review");
+    }
 
     #[test]
     fn single_rule_wording() {
