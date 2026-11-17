@@ -126,6 +126,13 @@ impl RuleUpdate {
     }
 }
 
+/// Ids from `selected` that are still in `filtered_ids`, in filtered order.
+pub fn visible_selection(filtered_ids: &[&str], selected: &[String]) -> Vec<String> {
+    let sel: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    filtered_ids.iter().filter(|id| sel.contains(**id) && seen.insert(**id)).map(|id| id.to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +176,15 @@ mod tests {
         assert_eq!(id_range(&all, Some("c"), "c"), ids(&["c"]));
         assert_eq!(id_range(&all, None, "c"), ids(&["c"]));
         assert_eq!(id_range(&all, Some("gone"), "c"), ids(&["c"]));
+    }
+
+    #[test]
+    fn visible_selection_is_in_filtered_order_and_drops_hidden() {
+        let selected = ids(&["c", "gone", "a", "hidden"]);
+        assert_eq!(visible_selection(&["a", "b", "c"], &selected), ids(&["a", "c"]));
+        assert!(visible_selection(&[], &selected).is_empty());
+        assert!(visible_selection(&["a"], &[]).is_empty());
+        // Duplicate ids in the filtered rows are acted on once.
+        assert_eq!(visible_selection(&["a", "b", "a"], &ids(&["a", "b"])), ids(&["a", "b"]));
     }
 }

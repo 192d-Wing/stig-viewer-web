@@ -241,6 +241,60 @@ test.describe("Save to system — UI", () => {
     expect(states.filter((x) => x.status === "not_a_finding" && x.findingDetails === "Verified in UI.").length).toBe(1);
   });
 
+  test("a rule the server rejects is listed in the result alert", async ({ page, request }) => {
+    await seedAsset(request);
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    const listbox = page.getByRole("listbox", { name: "Rules" });
+    await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
+    const [ruleId] = await edgeRuleIds(request);
+
+    // Not a Finding without finding details is rejected per rule.
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Not a Finding", exact: true }).click();
+
+    await page.getByTestId("save-to-system").click();
+    await page.getByTestId("save-system-select").click();
+    await page.getByRole("option", { name: new RegExp(ASSET_NAME) }).click();
+    await page.getByTestId("save-system-apply").click();
+
+    const result = page.getByTestId("save-system-result");
+    await expect(result).toContainText("1 not saved");
+    await expect(result.locator("li code")).toHaveCount(1);
+    await expect(result).toContainText(/finding details required/i);
+    await expect(result.locator("li code")).toHaveText(ruleId);
+  });
+
+  test("a closing status already pending is listed with its note", async ({ page, request }) => {
+    const asset = await seedAsset(request);
+    const [ruleId] = await edgeRuleIds(request);
+    await request.patch(`${BACKEND}/api/assets/${asset.id}/approval-policy`, {
+      headers: JSON_HEADERS("alice"),
+      data: { requiresApproval: true },
+    });
+    await save(request, asset.id, {
+      rules: [{ ruleId, status: "not_a_finding", findingDetails: "Verified in UI." }],
+    });
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    const listbox = page.getByRole("listbox", { name: "Rules" });
+    await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Not a Finding", exact: true }).click();
+    await page.getByPlaceholder(/enter finding details/i).fill("Verified in UI.");
+
+    await page.getByTestId("save-to-system").click();
+    await page.getByTestId("save-system-select").click();
+    await page.getByRole("option", { name: new RegExp(ASSET_NAME) }).click();
+    await page.getByTestId("save-system-apply").click();
+
+    const result = page.getByTestId("save-system-result");
+    await expect(result.locator("li code")).toHaveText(ruleId);
+    await expect(result).toContainText(/already pending/i);
+  });
+
   test("selecting a system that already has a checklist shows the overwrite notice", async ({ page, request }) => {
     const asset = await seedAsset(request);
     await request.post(`${BACKEND}/api/assets/${asset.id}/checklists`, {

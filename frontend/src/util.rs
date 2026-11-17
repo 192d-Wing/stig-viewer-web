@@ -155,3 +155,54 @@ pub fn event_checked(e: &web_sys::Event) -> bool {
         .map(|i| i.checked())
         .unwrap_or(false)
 }
+
+/// Rows of a result alert's issue list: the first `cap` `(rule id, text)`
+/// pairs plus how many more were left out. Rows whose text is `None` are
+/// not issues and are skipped.
+pub fn issue_lines<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    cap: usize,
+) -> (Vec<(String, String)>, usize) {
+    let mut issues = rows.into_iter().filter_map(|(id, text)| text.map(|t| (id, t)));
+    let lines: Vec<(String, String)> =
+        issues.by_ref().take(cap).map(|(id, t)| (id.to_string(), t.to_string())).collect();
+    let more = issues.count();
+    (lines, more)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::issue_lines;
+
+    #[test]
+    fn issue_lines_skips_rows_without_text() {
+        let (lines, more) = issue_lines([("a", Some("x")), ("b", None), ("c", Some("z"))], 10);
+        assert_eq!(lines, [("a".to_string(), "x".to_string()), ("c".to_string(), "z".to_string())]);
+        assert_eq!(more, 0);
+    }
+
+    #[test]
+    fn issue_lines_caps_and_counts_the_rest() {
+        let ids: Vec<String> = (0..13).map(|i| format!("r{i}")).collect();
+        let (lines, more) = issue_lines(ids.iter().map(|i| (i.as_str(), Some("e"))), 10);
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[9].0, "r9");
+        assert_eq!(more, 3);
+        let (lines, more) = issue_lines(ids.iter().take(10).map(|i| (i.as_str(), Some("e"))), 10);
+        assert_eq!((lines.len(), more), (10, 0));
+    }
+
+    #[test]
+    fn issue_lines_zero_cap_counts_everything() {
+        let (lines, more) = issue_lines([("a", Some("x")), ("b", None), ("c", Some("z"))], 0);
+        assert!(lines.is_empty());
+        assert_eq!(more, 2);
+    }
+
+    #[test]
+    fn issue_lines_empty() {
+        let (lines, more) = issue_lines(std::iter::empty(), 10);
+        assert!(lines.is_empty());
+        assert_eq!(more, 0);
+    }
+}

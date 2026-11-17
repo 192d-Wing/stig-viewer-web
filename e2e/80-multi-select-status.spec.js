@@ -65,6 +65,29 @@ test.describe("Viewer — multi-select status", () => {
     await expect(rows.nth(1)).toHaveText(untouched);
   });
 
+  test("ticks are discarded when switching STIG tabs", async ({ page }) => {
+    // Open a second tab with the same rule ids so stale ticks would show.
+    await page.getByRole("link", { name: "Browse Library" }).click();
+    await page.getByRole("button", { name: "Open Local File" }).click();
+    await page.getByRole("button", { name: "Load Demo STIG" }).click();
+    const tabs = page.locator("nav .ui-sidenav-item a");
+    await expect(tabs).toHaveCount(2);
+
+    await tabs.nth(1).click();
+    await page.getByTestId("rule-check").nth(0).click();
+    await expect(page.getByTestId("rule-bulk-count")).toHaveText("1 selected");
+
+    await tabs.nth(0).click();
+    await expect(page.getByTestId("rule-check")).toHaveCount(12);
+    await expect(page.getByTestId("rule-bulk-bar")).toHaveCount(0);
+
+    // Switching away discards the ticks: they do not come back on return.
+    await tabs.nth(1).click();
+    await expect(page.getByTestId("rule-check")).toHaveCount(12);
+    await expect(page.getByTestId("rule-bulk-bar")).toHaveCount(0);
+    await expect(page.locator('[data-testid="rule-check"]:checked')).toHaveCount(0);
+  });
+
   test("shift-click selects a range; Clear empties the selection", async ({ page }) => {
     const checks = page.getByTestId("rule-check");
     await checks.nth(1).click();
@@ -320,6 +343,27 @@ test.describe("Checklist bulk status — UI", () => {
     expect(states[ruleIds[1]].findingDetails).toBe("Confirmed compliant during audit.");
     // Selection is cleared once everything applied.
     await expect(setStatus).toBeDisabled();
+  });
+
+  test("a bulk change that fails for every rule lists 10 ids and the overflow", async ({ page, request }) => {
+    await seedChecklist(request);
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "Systems", exact: true }).click();
+    await page.getByRole("button", { name: ASSET_NAME }).click();
+    await page.getByRole("button", { name: /edge/i }).first().click();
+
+    const rowChecks = page.getByRole("checkbox", { name: "Select row" });
+    await expect(rowChecks.first()).toBeVisible();
+    for (let i = 0; i < 11; i++) await rowChecks.nth(i).check();
+    await page.getByTestId("set-status-button").click();
+    // Closing status with no justification: the server rejects every rule.
+    await page.getByTestId("set-status-modal").getByLabel("Not a finding").check();
+    await page.getByTestId("set-status-apply").click();
+
+    const result = page.getByTestId("set-status-result");
+    await expect(result).toContainText("…and 1 more (still selected).");
+    await expect(result.locator("li code")).toHaveCount(10);
   });
 
   test("select all and Set status act only on rows the filter shows", async ({ page, request }) => {

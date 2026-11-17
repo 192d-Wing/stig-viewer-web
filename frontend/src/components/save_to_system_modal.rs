@@ -4,6 +4,7 @@
 use crate::api::{api_fetch_json, api_get};
 use crate::model::Stig;
 use crate::ui::*;
+use crate::util::issue_lines;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
@@ -229,32 +230,39 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
 
     let body = match &*result {
         Some((system, r)) => {
-            let failed: Vec<&SaveRow> = r.results.iter().filter(|x| x.status == "error").collect();
-            let noted: Vec<&SaveRow> = r.results.iter().filter(|x| x.note.is_some()).collect();
+            let (failed, failed_more) = issue_lines(
+                r.results
+                    .iter()
+                    .filter(|x| x.status == "error")
+                    .map(|x| (x.rule_id.as_str(), Some(x.error.as_deref().unwrap_or_default()))),
+                10,
+            );
+            let (noted, noted_more) =
+                issue_lines(r.results.iter().map(|x| (x.rule_id.as_str(), x.note.as_deref())), 10);
             html! {
                 <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} testid="save-system-result">
                     {save_summary(system, r)}
                     if !noted.is_empty() {
                         <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for noted.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.note.clone().unwrap_or_default()}
+                            { for noted.iter().map(|(id, text)| html! {
+                                <li key={id.clone()}>
+                                    <code>{id.clone()}</code>{": "}{text.clone()}
                                 </li>
                             }) }
-                            if noted.len() > 10 {
-                                <li>{format!("…and {} more.", noted.len() - 10)}</li>
+                            if noted_more > 0 {
+                                <li>{format!("…and {noted_more} more.")}</li>
                             }
                         </ul>
                     }
                     if !failed.is_empty() {
                         <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for failed.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.error.clone().unwrap_or_default()}
+                            { for failed.iter().map(|(id, text)| html! {
+                                <li key={id.clone()}>
+                                    <code>{id.clone()}</code>{": "}{text.clone()}
                                 </li>
                             }) }
-                            if failed.len() > 10 {
-                                <li>{format!("…and {} more.", failed.len() - 10)}</li>
+                            if failed_more > 0 {
+                                <li>{format!("…and {failed_more} more.")}</li>
                             }
                         </ul>
                     }
