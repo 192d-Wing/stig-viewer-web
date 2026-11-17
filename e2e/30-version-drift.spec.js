@@ -66,7 +66,7 @@ test.describe("STIG version drift", () => {
     request,
   }) => {
     await seedAssetWithChecklist(request);
-    await bumpStig(request, "windows-11", "99", "99 Dec 2099");
+    await bumpStig(request, "ms-windows-11", "99", "99 Dec 2099");
     const d = await (
       await request.get(`${BACKEND}/api/dashboard`, {
         headers: { "X-User-Id": "alice" },

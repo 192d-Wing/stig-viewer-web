@@ -22,13 +22,61 @@ fn validate_source(source: &StigSource) -> Result<()> {
     Ok(())
 }
 
+/// What happened to one source in a sync pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Downloaded, parsed and indexed (the file may or may not have changed).
+    Synced,
+    /// DISA answered 404 or 410: the URL in stig-sources.toml is out of date.
+    StaleUrl,
+}
+
+/// Totals for one sync pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub synced: usize,
+    pub stale: usize,
+    pub errors: usize,
+}
+
+impl SyncSummary {
+    /// One-line description for the scheduler log.
+    pub fn describe(&self) -> String {
+        format!(
+            "synced {}, {} stale URL(s), {} error(s)",
+            self.synced, self.stale, self.errors
+        )
+    }
+}
+
+/// A 404 or 410 means the manifest URL has gone stale (DISA publishes a new
+/// file name per release); every other non-success status is a real error.
+fn is_stale_status(status: u16) -> bool {
+    matches!(status, 404 | 410)
+}
+
+/// Map a file read to the previous contents: `NotFound` is `None`, any other
+/// error is propagated.
+fn existing_bytes(read: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
+    match read {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// True when the file on disk already holds exactly the new bytes.
+fn is_unchanged(existing: Option<&[u8]>, new: &[u8]) -> bool {
+    existing == Some(new)
+}
+
 /// Download, parse, and index one STIG from DISA.
 async fn sync_one(
     source: &StigSource,
     client: &reqwest::Client,
     pool: &PgPool,
     data_dir: &Path,
-) -> Result<()> {
+) -> Result<Outcome> {
     validate_source(source)?;
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
@@ -39,6 +87,14 @@ async fn sync_one(
         .await
         .context("HTTP request failed")?;
 
+    if is_stale_status(resp.status().as_u16()) {
+        warn!(
+            "source '{}' URL not found (HTTP {}); update stig-sources.toml",
+            source.id,
+            resp.status().as_u16()
+        );
+        return Ok(Outcome::StaleUrl);
+    }
     if !resp.status().is_success() {
         anyhow::bail!("DISA returned HTTP {}", resp.status());
     }
@@ -57,12 +113,22 @@ async fn sync_one(
     tokio::fs::create_dir_all(&stigs_dir).await?;
     let json_path = stigs_dir.join(format!("{}.json", source.id));
 
-    // 4a. If a previous JSON already exists for this STIG, archive it
+    let json_str = serde_json::to_string(&stig)?;
+
+    // 4a. Identical bytes: nothing to write and nothing to archive. (The
+    //     catalog row is still upserted below so a reset database re-indexes.)
+    // Only a missing file counts as "no previous version"; any other read
+    // error must not lead to archiving being skipped and the file replaced.
+    let existing = existing_bytes(tokio::fs::read(&json_path).await)
+        .with_context(|| format!("Cannot read existing {}", json_path.display()))?;
+    let unchanged = is_unchanged(existing.as_deref(), json_str.as_bytes());
+
+    // 4b. If a previous JSON already exists for this STIG, archive it
     //     under stigs/archive/ keyed by the OLD version + release so the
     //     diff endpoint can compare current vs prior. We look up the
     //     pre-sync catalog row to capture the about-to-be-replaced
     //     metadata.
-    if tokio::fs::try_exists(&json_path).await.unwrap_or(false) {
+    if !unchanged && existing.is_some() {
         if let Err(e) =
             archive_previous_catalog(pool, data_dir, &source.id, &json_path).await
         {
@@ -73,8 +139,12 @@ async fn sync_one(
         }
     }
 
-    let json_str = serde_json::to_string(&stig)?;
-    tokio::fs::write(&json_path, json_str).await?;
+    if unchanged {
+        info!("'{}' unchanged; not rewritten", source.id);
+    } else {
+        tokio::fs::write(&json_path, json_str.as_bytes()).await?;
+        info!("Wrote '{}'", json_path.display());
+    }
 
     // 5. Upsert catalog row in Postgres
     let entry = CatalogEntry {
@@ -98,7 +168,7 @@ async fn sync_one(
         stig.rules.len(),
         json_path.display()
     );
-    Ok(())
+    Ok(Outcome::Synced)
 }
 
 /// Copy `${data_dir}/stigs/{id}.json` to
@@ -223,29 +293,34 @@ pub async fn run_sync(
     config: &Arc<Config>,
     sources: &Arc<Vec<StigSource>>,
     pool: &PgPool,
-) -> Result<()> {
+) -> Result<SyncSummary> {
     let client = reqwest::Client::builder()
         .user_agent("stig-viewer-backend/0.1")
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let mut errors = 0usize;
+    let mut summary = SyncSummary::default();
     for source in sources.as_ref() {
-        if let Err(e) = sync_one(source, &client, pool, &config.data_dir).await {
-            error!("Failed to sync '{}': {e:#}", source.id);
-            errors += 1;
+        match sync_one(source, &client, pool, &config.data_dir).await {
+            Ok(Outcome::Synced) => summary.synced += 1,
+            Ok(Outcome::StaleUrl) => summary.stale += 1,
+            Err(e) => {
+                error!("Failed to sync '{}': {e:#}", source.id);
+                summary.errors += 1;
+            }
         }
     }
 
-    if errors == 0 {
-        info!("Sync complete — {} STIGs updated", sources.len());
+    if summary.errors == 0 && summary.stale == 0 {
+        info!("Sync complete — {}", summary.describe());
     } else {
         warn!(
-            "Sync finished with {errors} error(s) out of {} STIGs",
+            "Sync finished: {} (of {} sources)",
+            summary.describe(),
             sources.len()
         );
     }
-    Ok(())
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -265,6 +340,38 @@ mod id_tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_eq!(a, archive_file_name("x", "1.2", "R 1"));
+    }
+
+    #[test]
+    fn only_404_and_410_are_stale() {
+        assert!(is_stale_status(404));
+        assert!(is_stale_status(410));
+        for other in [200, 301, 403, 429, 500, 502, 503] {
+            assert!(!is_stale_status(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn summary_counts_stale_separately() {
+        let s = SyncSummary { synced: 5, stale: 2, errors: 1 };
+        assert_eq!(s.describe(), "synced 5, 2 stale URL(s), 1 error(s)");
+    }
+
+    #[test]
+    fn only_not_found_means_no_previous_file() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(existing_bytes(Ok(b"x".to_vec())).unwrap(), Some(b"x".to_vec()));
+        assert_eq!(existing_bytes(Err(Error::from(ErrorKind::NotFound))).unwrap(), None);
+        let e = existing_bytes(Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn unchanged_only_when_bytes_equal() {
+        assert!(is_unchanged(Some(b"one"), b"one"));
+        assert!(!is_unchanged(Some(b"one"), b"two"));
+        assert!(!is_unchanged(None, b"one"), "a missing file is a change");
+        assert!(!is_unchanged(None, b""));
     }
 
     #[test]

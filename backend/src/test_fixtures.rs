@@ -200,6 +200,8 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
             database_url: String::new(),
             data_dir: dir,
             sync_interval_hours: 100_000,
+            sync_on_start: false,
+            seed_dir: None,
         }),
         signing: None,
     };
@@ -226,6 +228,8 @@ pub fn lazy_state() -> (AppState, StigDir) {
             database_url: String::new(),
             data_dir: dir.clone(),
             sync_interval_hours: 100_000,
+            sync_on_start: false,
+            seed_dir: None,
         }),
         signing: None,
     };

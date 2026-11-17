@@ -205,6 +205,7 @@ pub async fn search_handler(
         b.score
             .cmp(&a.score)
             .then_with(|| a.stig_title.cmp(&b.stig_title))
+            .then_with(|| a.stig_id.cmp(&b.stig_id))
             .then_with(|| a.rule_id.cmp(&b.rule_id))
             .then_with(|| a.field.cmp(&b.field))
     });

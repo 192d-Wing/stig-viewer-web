@@ -127,6 +127,21 @@ export async function loadDemoStig(page) {
   await page.getByRole("button", { name: "Load Demo STIG" }).click();
 }
 
+/**
+ * Open the seeded `edge` STIG (V2 R2) from the library. `ms-edge` has the same
+ * title with a newer release, so the library hides `edge` as "Superseded" by
+ * default and a title match alone would open `ms-edge`. Reveal the superseded
+ * rows, then pick the row that carries the Superseded marker.
+ */
+export async function openEdgeFromLibrary(page) {
+  await page.getByText(/Show superseded/).click();
+  const row = page
+    .getByRole("row")
+    .filter({ hasText: /Microsoft Edge Security Technical/ })
+    .filter({ hasText: "Superseded" });
+  await row.getByText(/Microsoft Edge Security Technical/).click();
+}
+
 export { BACKEND };
 
 /** Frontend origin the specs run against (must match the backend's FRONTEND_URL). */

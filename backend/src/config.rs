@@ -28,6 +28,13 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// How often the sync scheduler runs (hours).
     pub sync_interval_hours: u64,
+    /// Run a DISA sync as soon as the server starts (`STIG_SYNC_ON_START`,
+    /// default true). The periodic schedule is unaffected.
+    pub sync_on_start: bool,
+    /// Dev-only read-only directory of seed STIG JSON (`STIG_SEED_DIR`).
+    /// Missing files are copied into `data_dir/stigs` at start; unset in
+    /// production.
+    pub seed_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -47,6 +54,10 @@ impl Config {
                 .unwrap_or_else(|_| "24".into())
                 .parse()
                 .context("STIG_SYNC_INTERVAL_HOURS must be a positive integer")?,
+            sync_on_start: parse_flag_default_true(
+                std::env::var("STIG_SYNC_ON_START").ok().as_deref(),
+            ),
+            seed_dir: parse_seed_dir(std::env::var("STIG_SEED_DIR").ok().as_deref()),
         })
     }
 }
@@ -59,6 +70,32 @@ pub fn parse_flag(raw: Option<&str>) -> bool {
         raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("true") | Some("1")
     )
+}
+
+/// Opt-out boolean env value: on unless explicitly `false` / `0` (trimmed,
+/// case-insensitive), so unset, empty or a typo keeps the default behaviour.
+pub fn parse_flag_default_true(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false") | Some("0")
+    )
+}
+
+/// `STIG_SEED_DIR` value: unset, empty or whitespace-only means no seeding.
+pub fn parse_seed_dir(raw: Option<&str>) -> Option<PathBuf> {
+    raw.filter(|v| !v.trim().is_empty()).map(PathBuf::from)
+}
+
+/// Startup guard: `STIG_SEED_DIR` is a dev-only convenience, so a production
+/// deployment that sets it refuses to start (like [`TestHooks::validate`]).
+pub fn validate_seed_dir(stig_env: Option<&str>, seed_dir: Option<&std::path::Path>) -> Result<()> {
+    if is_production(stig_env) && seed_dir.is_some() {
+        anyhow::bail!(
+            "refusing to start: STIG_SEED_DIR must not be set when STIG_ENV=production \
+             (it is a dev-only seeding hook)"
+        );
+    }
+    Ok(())
 }
 
 /// True when `STIG_ENV` names production (trimmed, case-insensitive).
@@ -140,6 +177,49 @@ pub fn load_sources() -> Result<Vec<StigSource>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_sources_manifest_is_valid_and_unique() {
+        // cargo test runs from backend/, where the manifest lives.
+        let sources = load_sources().expect("stig-sources.toml parses");
+        assert!(!sources.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for s in &sources {
+            assert!(crate::stig_id::is_valid_new(&s.id), "bad id {}", s.id);
+            assert!(seen.insert(s.id.clone()), "duplicate id {}", s.id);
+            assert!(s.url.starts_with("https://dl.dod.cyber.mil/"), "{}", s.url);
+        }
+        // The e2e suite reads these two from the seed.
+        assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    #[test]
+    fn seed_dir_empty_or_blank_is_none() {
+        assert_eq!(parse_seed_dir(None), None);
+        assert_eq!(parse_seed_dir(Some("")), None);
+        assert_eq!(parse_seed_dir(Some("  \t")), None);
+        assert_eq!(parse_seed_dir(Some("/app/data")), Some(PathBuf::from("/app/data")));
+    }
+
+    #[test]
+    fn production_refuses_seed_dir() {
+        let dir = std::path::Path::new("/seed");
+        assert!(validate_seed_dir(Some(" Production "), Some(dir)).is_err());
+        assert!(validate_seed_dir(Some("production"), None).is_ok());
+        assert!(validate_seed_dir(Some("development"), Some(dir)).is_ok());
+        assert!(validate_seed_dir(None, Some(dir)).is_ok());
+    }
+
+    #[test]
+    fn sync_on_start_defaults_on_and_only_false_or_zero_disable() {
+        assert!(parse_flag_default_true(None));
+        for on in ["", "true", "1", "yes", "tru"] {
+            assert!(parse_flag_default_true(Some(on)), "{on:?}");
+        }
+        for off in ["false", "FALSE", " false ", "0"] {
+            assert!(!parse_flag_default_true(Some(off)), "{off:?}");
+        }
+    }
 
     #[test]
     fn parse_flag_is_off_unless_explicitly_true() {
