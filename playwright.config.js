@@ -21,6 +21,9 @@ export default defineConfig({
   webServer: [
     {
       command: "cd backend && cargo run",
+      // Only used when nothing is listening on 8080 yet. The suite needs the
+      // opt-in test hooks (X-User-Id auth and /api/test/*).
+      env: { ALLOW_TEST_AUTH_HEADER: "true", STIG_ENABLE_TEST_ROUTES: "true" },
       port: 8080,
       timeout: 120_000,
       reuseExistingServer: true,

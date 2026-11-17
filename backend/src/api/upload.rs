@@ -1,18 +1,34 @@
 use axum::{
     extract::{Multipart, State},
     http::StatusCode,
-    Json,
+    Extension, Json,
 };
 use chrono::Utc;
 
 use crate::{
-    api::stig_validator::lint_stig,
+    api::{auth::AuthUser, stig_validator::lint_stig},
     db::{upsert_catalog, CatalogEntry},
     parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf},
     AppState,
 };
 
+/// Body cap for the two catalog upload routes (DISA library ZIPs are large).
+/// Applied per-route in `main.rs`; every other route gets the small default.
+pub const MAX_UPLOAD_BYTES: usize = 500 * 1024 * 1024;
+
+/// Catalog uploads replace shared STIG content for every user, so they are
+/// admin-only. Checked before the multipart body is read.
+fn ensure_admin(user: &AuthUser) -> Result<(), (StatusCode, String)> {
+    if user.role == "admin" {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "admin role required".into()))
+    }
+}
+
 /// POST /api/upload
+///
+/// Requires an authenticated session with the `admin` role.
 ///
 /// Accepts a multipart form upload with the following fields (order-independent):
 ///   file     — the DISA STIG ZIP (required)
@@ -21,13 +37,17 @@ use crate::{
 ///
 /// Example:
 ///   curl -X POST http://localhost:8080/api/upload \
+///        -b "stig_session=<admin session cookie>" \
 ///        -F "file=@U_MS_Windows_11_V2R3_STIG.zip" \
 ///        -F "id=windows-11" \
 ///        -F "category=Windows"
 pub async fn upload_stig(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ensure_admin(&user)?;
+
     let mut zip_bytes: Option<Vec<u8>> = None;
     let mut id: Option<String> = None;
     let mut category: Option<String> = None;
@@ -141,15 +161,20 @@ pub async fn upload_stig(
 /// from the inner filename and a category from the XCCDF title, then writes
 /// JSON files and upserts all catalog rows in one pass.
 ///
-/// Body limit: 500 MB (set on the route in main.rs).
+/// Requires an authenticated session with the `admin` role.
+/// Body limit: `MAX_UPLOAD_BYTES` (set on the route in main.rs).
 ///
 /// Example:
 ///   curl -X POST http://localhost:8080/api/upload/library \
+///        -b "stig_session=<admin session cookie>" \
 ///        -F "file=@U_SRG-STIG_Library_January_2026.zip"
 pub async fn upload_library(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    ensure_admin(&user)?;
+
     // Read the single 'file' field
     let mut zip_bytes: Option<Vec<u8>> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
@@ -239,4 +264,27 @@ pub async fn upload_library(
         "errors": total_errors,
         "errorDetail": all_errors,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(role: &str) -> AuthUser {
+        AuthUser {
+            id: "u1".into(),
+            display_name: "U".into(),
+            email: String::new(),
+            role: role.into(),
+        }
+    }
+
+    #[test]
+    fn only_admins_may_upload() {
+        assert!(ensure_admin(&user("admin")).is_ok());
+        for role in ["author", "reviewer", "viewer", "", "Admin"] {
+            let (status, _) = ensure_admin(&user(role)).unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
+        }
+    }
 }

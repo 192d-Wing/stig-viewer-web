@@ -70,6 +70,11 @@ jobs:
       # Skip the DISA sync scheduler in CI — keeps backend startup fast and
       # avoids depending on the external network.
       STIG_SYNC_INTERVAL_HOURS: "999999"
+      # The suite authenticates with X-User-Id and drives /api/test/*; both
+      # are opt-in on the backend. Set explicitly rather than relying on the
+      # compose defaults.
+      ALLOW_TEST_AUTH_HEADER: "true"
+      STIG_ENABLE_TEST_ROUTES: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

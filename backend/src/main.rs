@@ -12,7 +12,7 @@ mod severity;
 mod sync;
 
 use anyhow::Result;
-use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
+use axum::{extract::DefaultBodyLimit, handler::Handler, middleware, routing::{get, post}, Router};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
@@ -159,7 +159,7 @@ use api::{
         run_retention_handler, run_scheduler_handler,
         saml_login_handler as test_saml_login_handler, set_role_handler,
     },
-    upload::{upload_library, upload_stig},
+    upload::{upload_library, upload_stig, MAX_UPLOAD_BYTES},
     webhooks::{
         create_handler as create_webhook_handler,
         delete_handler as delete_webhook_handler,
@@ -171,8 +171,18 @@ use api::{
         verify_recipe_handler as webhook_verify_recipe_handler,
     },
 };
-use config::{load_sources, Config};
+use config::{load_sources, Config, TestHooks};
 use db::init_pool;
+
+/// Request-body cap for every route that doesn't set its own. Covers JSON
+/// payloads, CSV imports and STIG JSON lint uploads.
+const DEFAULT_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// Evidence attachments: the handler enforces 25 MiB of file data; leave
+/// headroom for multipart framing.
+const ATTACHMENT_BODY_LIMIT: usize = 26 * 1024 * 1024;
+/// `/api/sign` takes base64 JSON of up to 100 MiB of content (the handler
+/// enforces the decoded size); base64 inflates that by 4/3.
+const SIGN_BODY_LIMIT: usize = 140 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -191,6 +201,23 @@ async fn main() -> Result<()> {
         }))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // Test-only hooks are opt-in, and a production deployment that has one
+    // enabled refuses to start — before touching the DB or binding a port.
+    let test_hooks = TestHooks::from_env();
+    test_hooks.validate()?;
+    if test_hooks.enable_test_routes {
+        tracing::warn!(
+            "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted. \
+             Never enable this on a reachable deployment."
+        );
+    }
+    if test_hooks.allow_test_auth_header {
+        tracing::warn!(
+            "ALLOW_TEST_AUTH_HEADER is on: any client can authenticate as any user via \
+             X-User-Id. Never enable this on a reachable deployment."
+        );
+    }
 
     let config = Arc::new(Config::from_env()?);
     let sources = Arc::new(load_sources()?);
@@ -214,7 +241,7 @@ async fn main() -> Result<()> {
     }
 
     // ── OIDC setup ──────────────────────────────────────────────────────────
-    let oidc_env = OidcEnv::from_env()?;
+    let oidc_env = OidcEnv::from_env(test_hooks.allow_test_auth_header)?;
     let frontend_origin = oidc_env.frontend_url.clone();
     let oidc = build_oidc_context(&oidc_env).await?;
     info!(
@@ -229,6 +256,12 @@ async fn main() -> Result<()> {
 
     // CORS — cookie-based auth requires a specific origin (not "*")
     // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
+    // `x-user-id` is only an allowed request header when the test-auth
+    // bypass is on.
+    let mut cors_headers = vec![header::CONTENT_TYPE, header::COOKIE];
+    if test_hooks.allow_test_auth_header {
+        cors_headers.push(header::HeaderName::from_static("x-user-id"));
+    }
     let cors = CorsLayer::new()
         .allow_origin(frontend_origin.parse::<HeaderValue>()?)
         .allow_methods([
@@ -238,7 +271,7 @@ async fn main() -> Result<()> {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::CONTENT_TYPE, header::COOKIE, header::HeaderName::from_static("x-user-id")])
+        .allow_headers(cors_headers)
         .allow_credentials(true);
 
     let state = AppState {
@@ -361,8 +394,10 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/checklists/:id/rules/:rule_id/attachments",
-            get(list_attachments_for_rule_handler)
-                .post(upload_attachment_handler),
+            get(list_attachments_for_rule_handler).post(
+                upload_attachment_handler
+                    .layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),
+            ),
         )
         .route(
             "/api/checklists/:id/rules/:rule_id/comments",
@@ -472,7 +507,12 @@ async fn main() -> Result<()> {
             get(list_scheduler_runs_handler),
         )
         .route("/api/admin/backup", get(admin_backup_download_handler))
-        .route("/api/admin/restore", post(admin_restore_handler))
+        // Backup archives can be as large as the catalog uploads; the
+        // handler is admin-only.
+        .route(
+            "/api/admin/restore",
+            post(admin_restore_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .route(
             "/api/admin/policies",
             get(list_abac_policies_handler).post(create_abac_policy_handler),
@@ -519,7 +559,21 @@ async fn main() -> Result<()> {
         .route("/api/catalog/search", get(catalog_search_handler))
         // Ed25519 detached signing for exported artifacts (.ckl bundles).
         // Returns 503 when SIGNING_KEY_HEX isn't set.
-        .route("/api/sign", post(api::signing::sign_handler))
+        .route(
+            "/api/sign",
+            post(api::signing::sign_handler).layer(DefaultBodyLimit::max(SIGN_BODY_LIMIT)),
+        )
+        // Catalog uploads — admin-only (checked in the handlers) and the
+        // only routes besides restore that accept bodies up to
+        // MAX_UPLOAD_BYTES.
+        .route(
+            "/api/upload",
+            post(upload_stig).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/upload/library",
+            post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         // Viewer-role read-only gate. Sits inside the auth layer so the
         // `AuthUser` extension is populated before it runs (outer layer runs
         // first, so `auth_middleware` is added LAST below).
@@ -542,8 +596,6 @@ async fn main() -> Result<()> {
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
-        .route("/api/upload", post(upload_stig))
-        .route("/api/upload/library", post(upload_library))
         // Public verifier key for offline signature verification. Returns
         // 503 when SIGNING_KEY_HEX isn't set.
         .route("/api/signing/pubkey", get(api::signing::pubkey_handler))
@@ -552,7 +604,10 @@ async fn main() -> Result<()> {
         .merge(saml_routes)
         .merge(draft_routes);
 
-    if std::env::var("STIG_ENV").unwrap_or_default() != "production" {
+    // Unauthenticated test-only routes. Mounted only on explicit opt-in
+    // (`STIG_ENABLE_TEST_ROUTES=true`); `TestHooks::validate` above already
+    // refused that flag under `STIG_ENV=production`.
+    if test_hooks.enable_test_routes {
         let test_router: Router = Router::new()
             .route("/api/test/reset", post(reset_handler))
             .route("/api/test/set-role", post(set_role_handler))
@@ -581,7 +636,7 @@ async fn main() -> Result<()> {
     }
 
     let app = app
-        .layer(DefaultBodyLimit::max(500 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
         .layer(cors);
 
     {

@@ -21,8 +21,7 @@
 //! the same name behaves normally. This exists so the admin job
 //! dashboard's error path can be exercised by E2E — nothing in the
 //! real system errors on demand. The endpoint that arms the flag is
-//! gated by `STIG_ENV != "production"` at registration time in
-//! `main.rs`.
+//! only registered when `STIG_ENABLE_TEST_ROUTES=true` (see `main.rs`).
 
 use std::collections::HashSet;
 use std::fmt::Display;

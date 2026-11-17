@@ -15,15 +15,19 @@ fn field_label(field: &str) -> &str {
     }
 }
 
+/// ~8% tints of `--success` / `--error` (alpha cannot be appended to a `var()`).
+const TINT_ADDED: &str = "rgba(98,194,106,0.08)";
+const TINT_REMOVED: &str = "rgba(255,122,122,0.08)";
+
 const STIG_ID_STYLE: &str =
-    "font-family:'JetBrains Mono', monospace;font-size:12px;font-weight:700;color:#539fe5;";
+    "font-family:var(--mono);font-size:12px;font-weight:700;color:var(--primary);";
 const DIFF_TEXT_STYLE: &str =
-    "font-size:12px;color:#d1d5db;white-space:pre-wrap;word-break:break-word;margin:0;line-height:1.5;";
+    "font-size:12px;color:var(--text);white-space:pre-wrap;word-break:break-word;margin:0;line-height:1.5;";
 
 /// One side of a changed field; `color` is the accent for that side.
-fn diff_side(side: &'static str, color: &str, text: &str) -> Html {
+fn diff_side(side: &'static str, color: &str, tint: &str, text: &str) -> Html {
     html! {
-        <div style={format!("padding:6px 10px;border-radius:4px;border-left:3px solid {color};background:{color}14;")}>
+        <div style={format!("padding:6px 10px;border-radius:4px;border-left:3px solid {color};background:{tint};")}>
             <UiBox font_size="body-s" color="text-status-inactive">{side}</UiBox>
             <pre style={DIFF_TEXT_STYLE}>{text.to_string()}</pre>
         </div>
@@ -43,7 +47,7 @@ fn ChangedEntryView(p: &ChangedEntryViewProps) -> Html {
             header_text={html! {
                 <SpaceBetween direction="horizontal" size="xs" align_items="center">
                     <span style={STIG_ID_STYLE}>{entry.stig_id.clone()}</span>
-                    <span style="font-size:11px;color:#f59e0b;">{entry.fields.join(", ")}</span>
+                    <span style="font-size:11px;color:var(--warning);">{entry.fields.join(", ")}</span>
                 </SpaceBetween>
             }}
         >
@@ -54,8 +58,8 @@ fn ChangedEntryView(p: &ChangedEntryViewProps) -> Html {
                             {field_label(field).to_string()}
                         </UiBox>
                         <ColumnLayout columns={2}>
-                            {diff_side("A", "#ff4444", &entry.a[i])}
-                            {diff_side("B", "#22c55e", &entry.b[i])}
+                            {diff_side("A", "var(--error)", TINT_REMOVED, &entry.a[i])}
+                            {diff_side("B", "var(--success)", TINT_ADDED, &entry.b[i])}
                         </ColumnLayout>
                     </div>
                 }) }
@@ -65,16 +69,16 @@ fn ChangedEntryView(p: &ChangedEntryViewProps) -> Html {
 }
 
 /// Added / removed rule rows; `color` is the accent for the section.
-fn rule_rows(rules: &[Rule], color: &str) -> Html {
+fn rule_rows(rules: &[Rule], color: &str, tint: &str) -> Html {
     html! {
         <SpaceBetween size="xs">
             { for rules.iter().map(|rule| html! {
                 <div key={rule.stig_id.clone()}
-                     style={format!("display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:6px;\
-                                     border-left:3px solid {color};background:{color}14;")}>
+                     style={format!("display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--radius);\
+                                     border-left:3px solid {color};background:{tint};")}>
                     <span style={format!("{STIG_ID_STYLE}min-width:65px;")}>{rule.stig_id.clone()}</span>
                     <SeverityBadge severity={rule.severity.clone()} />
-                    <span style="font-size:13px;color:#d1d5db;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                    <span style="font-size:13px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
                         {rule.title.clone()}
                     </span>
                 </div>
@@ -126,7 +130,7 @@ pub fn DiffView(p: &DiffViewProps) -> Html {
     html! {
         <div style="display:flex;flex-direction:column;flex:1;overflow:hidden;min-height:0;">
             // Selector row
-            <div style="padding:16px 20px;border-bottom:1px solid #354150;flex-shrink:0;">
+            <div style="padding:16px 20px;border-bottom:1px solid var(--border);flex-shrink:0;">
                 <Header variant="h2" actions={html! { <Button onclick={exit_diff}>{"Exit Diff"}</Button> }}>
                     {"STIG Version Diff"}
                 </Header>
@@ -161,7 +165,7 @@ pub fn DiffView(p: &DiffViewProps) -> Html {
                             if result.added.is_empty() {
                                 <UiBox color="text-status-inactive">{"No rules added"}</UiBox>
                             } else {
-                                {rule_rows(&result.added, "#22c55e")}
+                                {rule_rows(&result.added, "var(--success)", TINT_ADDED)}
                             }
                         </ExpandableSection>
 
@@ -171,7 +175,7 @@ pub fn DiffView(p: &DiffViewProps) -> Html {
                             if result.removed.is_empty() {
                                 <UiBox color="text-status-inactive">{"No rules removed"}</UiBox>
                             } else {
-                                {rule_rows(&result.removed, "#ff4444")}
+                                {rule_rows(&result.removed, "var(--error)", TINT_REMOVED)}
                             }
                         </ExpandableSection>
 

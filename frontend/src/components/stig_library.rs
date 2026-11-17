@@ -11,7 +11,7 @@ use gloo_timers::callback::Timeout;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use yew::prelude::*;
 
-use crate::api::{api_fetch, api_get, api_json, api_upload_raw, BACKEND};
+use crate::api::{api_fetch, api_get, api_json, api_post_form, api_upload_raw, BACKEND};
 use crate::hooks::{use_url_state, UrlVal};
 use crate::model::Stig;
 use crate::ui::*;
@@ -323,26 +323,28 @@ async fn public_get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     res.json::<T>().await.map_err(|e| e.to_string())
 }
 
-/// Multipart POST to one of the upload endpoints. On a non-2xx answer the
-/// error is the body's `message`, falling back to "Server returned <status>".
+/// Multipart POST to one of the upload endpoints, which require a signed-in
+/// admin — so this goes through `api_post_form` to carry the session cookie
+/// (and the X-User-Id test-bypass header in E2E). On a non-2xx answer the
+/// error is the JSON body's `message`, else the plain-text body, falling back
+/// to "Server returned <status>".
 async fn post_form<T: DeserializeOwned>(path: &str, form: web_sys::FormData) -> Result<T, String> {
-    let res = Request::post(&format!("{BACKEND}{path}"))
-        .body(form)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = api_post_form(path, form).await?;
     let status = res.status();
-    let ok = res.ok();
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    if !ok {
-        return Err(json
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Server returned {status}")));
+    if res.ok() {
+        return res.json::<T>().await.map_err(|e| e.to_string());
     }
-    serde_json::from_value(json).map_err(|e| e.to_string())
+    let text = res.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|json| json.get("message").and_then(|m| m.as_str()).map(str::to_string));
+    Err(match (message, status) {
+        (Some(m), _) => m,
+        (None, 401) => "Sign in to upload STIGs.".to_string(),
+        (None, 403) => "Uploading STIGs requires the admin role.".to_string(),
+        (None, _) if !text.trim().is_empty() => text,
+        (None, _) => format!("Server returned {status}"),
+    })
 }
 
 fn form_with_file(file: &web_sys::File) -> Result<web_sys::FormData, String> {

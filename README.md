@@ -99,7 +99,13 @@ a compose shim) and nothing else.
 docker compose up
 ```
 
-That brings up four services:
+Or, with [Task](https://taskfile.dev) installed, `task dev` starts postgres,
+keycloak and the backend in containers and serves the frontend on the host with
+Trunk (faster rebuilds than the frontend container). It picks Docker or Podman
+automatically; run `task` to list the other tasks (`down`, `logs`, `test`,
+`e2e`, ...).
+
+`docker compose up` brings up four services:
 
 | Service   | Port | Notes                                                  |
 |-----------|------|--------------------------------------------------------|
@@ -126,9 +132,21 @@ for local work. The ones you may want to change:
   how the browser does.
 - `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs. Set to a large
   number to effectively disable the sync (CI does this to keep startup fast).
-- `ALLOW_TEST_AUTH_HEADER` — enables the `X-User-Id` test bypass. Must stay
-  unset in production; the backend additionally refuses it when
-  `STIG_ENV=production`.
+- `ALLOW_TEST_AUTH_HEADER` — enables the `X-User-Id` test bypass (any client
+  can act as any user). Off unless set to `true`/`1`; the compose file turns it
+  on for local dev and the E2E suite.
+- `STIG_ENABLE_TEST_ROUTES` — mounts the unauthenticated `/api/test/*` routes
+  the E2E suite uses (database reset, role changes, session minting). Off
+  unless set to `true`/`1`; the compose file turns it on.
+
+Both test hooks must stay unset in production. The backend refuses to start if
+either is enabled while `STIG_ENV=production`, and with neither set
+`/api/test/*` returns 404 and `X-User-Id` is ignored.
+
+Catalog uploads (`POST /api/upload`, `POST /api/upload/library`) require a
+signed-in user with the `admin` role and accept bodies up to 500 MB. Other
+routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),
+`/api/sign` and the admin restore.
 
 ### Database
 
