@@ -53,6 +53,11 @@ const MAX_FINDING_DETAILS_BYTES: usize = 32 * 1024;
 
 pub(crate) const VALID_STATUSES: &[&str] = &["not_reviewed", "open", "not_a_finding", "not_applicable"];
 
+/// Postgres `text` cannot hold NUL; such text would fail its whole chunk.
+pub(crate) fn has_nul(s: &str) -> bool {
+    s.contains('\0')
+}
+
 fn requires_finding_details(status: &str) -> bool {
     matches!(status, "not_a_finding" | "not_applicable")
 }
@@ -189,6 +194,8 @@ async fn bulk_status_work(
         Some("too_many_rules")
     } else if req.finding_details.len() > MAX_FINDING_DETAILS_BYTES {
         Some("finding_details_too_long")
+    } else if has_nul(&req.finding_details) {
+        Some("finding_details_invalid")
     } else {
         None
     };
@@ -1046,5 +1053,20 @@ mod tests {
         for (name, d) in report {
             eprintln!("BENCH n={n} runs={RUNS} median {name}: {d:?}");
         }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_rejects_nul_in_the_shared_details_and_records_it(pool: PgPool) {
+        let (state, _dir) = setup(&pool).await;
+        let err = call(&state, "owner", "c1", &RULES, "open", "bad\0text").await.err();
+        assert_eq!(err, Some(StatusCode::BAD_REQUEST));
+        let ev = events(&pool).await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, "rejected");
+        let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
+        assert_eq!(d["reason"], "finding_details_invalid");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
     }
 }

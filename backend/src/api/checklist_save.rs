@@ -28,7 +28,7 @@ use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::api::checklists::{is_valid_stig_id, load_stig_json, take_rules};
 use crate::api::rule_bulk_status::{
-    apply_plans, expected_status, plan_rule, short_id, Plan, RuleOp, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
+    apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets;
 use crate::db_audit::{self, NewAuditEvent};
@@ -355,6 +355,9 @@ fn plan_entry(
     }
     if e.finding_details.len() > MAX_TEXT_BYTES || e.comments.len() > MAX_TEXT_BYTES {
         return Err("finding details or comments too long".into());
+    }
+    if has_nul(&e.finding_details) || has_nul(&e.comments) {
+        return Err("text contains an unsupported character".into());
     }
     if !known {
         // Report unknown rules even when there is nothing to write.
@@ -1080,5 +1083,29 @@ mod tests {
                 ("rejected".to_string(), None, "invalid_stig_id".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn plan_entry_rejects_nul_text() {
+        let msg = Some("text contains an unsupported character");
+        assert_eq!(plan(false, true, None, &entry("open", "a\0b", "")).err().as_deref(), msg);
+        assert_eq!(plan(false, true, None, &entry("open", "", "a\0b")).err().as_deref(), msg);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_applies_other_rules_when_one_entry_has_nul_text(pool: PgPool) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let rules = vec![
+            rule(RULES[0], "open", "bad\0text", ""),
+            rule(RULES[1], "open", "fine", ""),
+            rule(RULES[2], "open", "", "bad\0comment"),
+        ];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (1, 2));
+        assert_eq!(out.results[0].error.as_deref(), Some("text contains an unsupported character"));
+        assert_eq!(out.results[1].status, "applied");
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
     }
 }

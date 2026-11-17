@@ -1068,4 +1068,18 @@ mod tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
     }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_close_without_details_is_a_400_and_files_nothing(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let (state, _dir) = app_state(pool.clone());
+        let (code, body) = patch(&state, RULES[0], "not_a_finding", "  ").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "finding_details required for status not_a_finding");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
 }

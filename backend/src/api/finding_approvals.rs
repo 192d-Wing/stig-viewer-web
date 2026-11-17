@@ -351,6 +351,16 @@ pub async fn request_many(
     requested_by: &str,
     items: &[ApprovalRequest<'_>],
 ) -> Vec<ApprovalOutcome> {
+    request_many_with(pool, checklist_id, requested_by, items, db_checklists::CHUNK_LOCK_TIMEOUT).await
+}
+
+async fn request_many_with(
+    pool: &PgPool,
+    checklist_id: &str,
+    requested_by: &str,
+    items: &[ApprovalRequest<'_>],
+    lock_timeout: &str,
+) -> Vec<ApprovalOutcome> {
     let mut out = Vec::with_capacity(items.len());
     let mut consecutive_failures = 0u8;
     for (i, chunk) in items.chunks(db_checklists::RULE_CHUNK).enumerate() {
@@ -358,14 +368,17 @@ pub async fn request_many(
             out.extend(chunk.iter().map(|_| ApprovalOutcome::Failed));
             continue;
         }
-        match request_chunk(pool, checklist_id, requested_by, chunk).await {
+        match request_chunk(pool, checklist_id, requested_by, chunk, lock_timeout).await {
             Ok(results) => {
                 consecutive_failures = 0;
                 out.extend(results);
             }
             Err(e) => {
                 consecutive_failures += 1;
-                tracing::error!("approval batch failed (checklist {checklist_id}, chunk {i}): {e:#}");
+                tracing::error!(
+                    "approval batch failed (checklist {checklist_id}, chunk {i}): {}",
+                    db_checklists::error_summary(&e)
+                );
                 out.extend(chunk.iter().map(|_| ApprovalOutcome::Failed));
             }
         }
@@ -378,8 +391,10 @@ async fn request_chunk(
     checklist_id: &str,
     requested_by: &str,
     chunk: &[ApprovalRequest<'_>],
+    lock_timeout: &str,
 ) -> anyhow::Result<Vec<ApprovalOutcome>> {
     let mut tx = pool.begin().await?;
+    db_checklists::set_lock_timeout(&mut tx, lock_timeout).await?;
     db_checklists::lock_checklist(&mut tx, checklist_id).await?;
     let wanted: Vec<&str> = chunk.iter().map(|r| r.rule_id).collect();
     let pending: HashSet<String> = sqlx::query_scalar(
@@ -630,5 +645,81 @@ mod tests {
         assert!(out[..n].iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
         assert_eq!(out[n], ApprovalOutcome::AlreadyPending);
         assert_eq!(pending_rows(&pool).await as usize, n);
+    }
+
+    // Timing-dependent: see the twin in `db_checklists`.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_many_chunk_fails_promptly_when_the_checklist_lock_is_held(pool: PgPool) {
+        setup(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        let ids = names(3);
+        let t = std::time::Instant::now();
+        let out = request_many_with(&pool, "c1", "u1", &reqs(&ids), "300ms").await;
+        assert!(t.elapsed() < std::time::Duration::from_secs(4), "took {:?}", t.elapsed());
+        assert!(out.iter().all(|o| *o == ApprovalOutcome::Failed));
+        holder.rollback().await.unwrap();
+        assert_eq!(pending_rows(&pool).await, 0);
+        let out = request_many_with(&pool, "c1", "u1", &reqs(&ids), "300ms").await;
+        assert!(out.iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_batched_request_can_be_approved_or_rejected(pool: PgPool) {
+        use crate::test_fixtures::{app_state, auth};
+        setup(&pool).await;
+        seed_user(&pool, "rev").await;
+        let (state, _dir) = app_state(pool.clone());
+        let ids = names(2);
+        let items = [
+            ApprovalRequest { rule_id: &ids[0], proposed_status: "not_a_finding", finding_details: "fixed it" },
+            ApprovalRequest { rule_id: &ids[1], proposed_status: "not_applicable", finding_details: "n/a here" },
+        ];
+        let out = request_many(&pool, "c1", "u1", &items).await;
+        let (ApprovalOutcome::Queued { id: first }, ApprovalOutcome::Queued { id: second }) = (&out[0], &out[1]) else {
+            panic!("{out:?}")
+        };
+
+        let _ = approve_handler(State(state.clone()), Extension(auth("rev", "reviewer")), Path(first.clone()))
+            .await
+            .map_err(|r| r.status())
+            .unwrap();
+        let (status, details): (String, String) =
+            sqlx::query_as("SELECT status, finding_details FROM checklist_rules WHERE rule_id = 'r000'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((status.as_str(), details.as_str()), ("not_a_finding", "fixed it"));
+        let st: String = sqlx::query_scalar("SELECT status FROM finding_approvals WHERE id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(st, "approved");
+
+        let _ = reject_handler(
+            State(state.clone()),
+            Extension(auth("rev", "reviewer")),
+            Path(second.clone()),
+            Json(RejectRequest { reason: "not enough".into() }),
+        )
+        .await
+        .map_err(|r| r.status())
+        .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules WHERE rule_id = 'r001'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        let (st, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT status, decision_reason FROM finding_approvals WHERE id = $1")
+                .bind(second)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((st.as_str(), reason.as_deref()), ("rejected", Some("not enough")));
+        assert_eq!(pending_rows(&pool).await, 0);
     }
 }

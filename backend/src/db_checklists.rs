@@ -329,7 +329,10 @@ pub(crate) async fn lock_checklist(
 /// edit of a column this call does not touch (comments, assignee, due date,
 /// ...) is never reverted by a stale snapshot. Audit rows and the checklist
 /// `updated_at` bump match `upsert_rule`.
-#[allow(dead_code)] // reference single-rule path; the endpoints batch through `patch_rules`
+///
+/// Single-rule reference implementation, used by tests to compare against
+/// `patch_rules`; the endpoints batch through `patch_rules`.
+#[cfg(test)]
 pub async fn patch_rule(
     pool: &PgPool,
     checklist_id: &str,
@@ -367,6 +370,35 @@ pub async fn patch_rule(
 /// Rules written per transaction by the batch writers.
 pub const RULE_CHUNK: usize = 100;
 
+/// How long a batch chunk waits for the checklist lock before failing.
+pub(crate) const CHUNK_LOCK_TIMEOUT: &str = "5s";
+
+/// Bound lock waits for the rest of the transaction (chunk transactions only).
+pub(crate) async fn set_lock_timeout(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    timeout: &str,
+) -> Result<()> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(timeout)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// One-line description of a failed chunk's error for logs: SQLSTATE and
+/// constraint only, since database error text can carry column values.
+pub(crate) fn error_summary(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(d)) => format!(
+            "sqlstate {} constraint {}",
+            d.code().as_deref().unwrap_or("?"),
+            d.constraint().unwrap_or("-")
+        ),
+        Some(_) => "non-database error".to_string(),
+        None => "unexpected error".to_string(),
+    }
+}
+
 /// Result of one item of [`patch_rules`].
 #[derive(Debug, PartialEq)]
 pub enum PatchOutcome {
@@ -390,6 +422,16 @@ pub async fn patch_rules(
     updated_by: &str,
     items: &[(&str, RulePatch<'_>)],
 ) -> Vec<PatchOutcome> {
+    patch_rules_with(pool, checklist_id, updated_by, items, CHUNK_LOCK_TIMEOUT).await
+}
+
+async fn patch_rules_with(
+    pool: &PgPool,
+    checklist_id: &str,
+    updated_by: &str,
+    items: &[(&str, RulePatch<'_>)],
+    lock_timeout: &str,
+) -> Vec<PatchOutcome> {
     let mut out = Vec::with_capacity(items.len());
     let mut consecutive_failures = 0u8;
     for (i, chunk) in items.chunks(RULE_CHUNK).enumerate() {
@@ -397,7 +439,7 @@ pub async fn patch_rules(
             out.extend(chunk.iter().map(|_| PatchOutcome::Failed));
             continue;
         }
-        match patch_chunk(pool, checklist_id, updated_by, chunk).await {
+        match patch_chunk(pool, checklist_id, updated_by, chunk, lock_timeout).await {
             Ok(results) => {
                 consecutive_failures = 0;
                 out.extend(results.into_iter().map(|r| match r {
@@ -407,7 +449,10 @@ pub async fn patch_rules(
             }
             Err(e) => {
                 consecutive_failures += 1;
-                tracing::error!("rule batch write failed (checklist {checklist_id}, chunk {i}): {e:#}");
+                tracing::error!(
+                    "rule batch write failed (checklist {checklist_id}, chunk {i}): {}",
+                    error_summary(&e)
+                );
                 out.extend(chunk.iter().map(|_| PatchOutcome::Failed));
             }
         }
@@ -420,8 +465,10 @@ async fn patch_chunk(
     checklist_id: &str,
     updated_by: &str,
     chunk: &[(&str, RulePatch<'_>)],
+    lock_timeout: &str,
 ) -> Result<Vec<Result<(), PatchRejected>>> {
     let mut tx = pool.begin().await?;
+    set_lock_timeout(&mut tx, lock_timeout).await?;
     lock_checklist(&mut tx, checklist_id).await?;
     let ids: Vec<&str> = chunk.iter().map(|(id, _)| *id).collect();
     let mut rows: std::collections::HashMap<String, ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
@@ -1119,5 +1166,25 @@ mod tests {
         while let Some(res) = tasks.join_next().await {
             res.unwrap().unwrap();
         }
+    }
+
+    // Timing-dependent: a second transaction holds the checklist lock while
+    // the batch call runs with a short lock timeout.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_chunk_fails_promptly_when_the_checklist_lock_is_held(pool: PgPool) {
+        setup(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        lock_checklist(&mut holder, "c1").await.unwrap();
+        let ids = names(3);
+        let t = std::time::Instant::now();
+        let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
+        assert!(t.elapsed() < std::time::Duration::from_secs(4), "took {:?}", t.elapsed());
+        assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
+        holder.rollback().await.unwrap();
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
+        let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
+        assert!(out.iter().all(|o| *o == PatchOutcome::Written));
     }
 }
