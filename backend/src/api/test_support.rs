@@ -267,6 +267,7 @@ pub async fn run_retention_handler(
         &state.config.data_dir,
         req.retain_days,
         req.archive,
+        state.signing.as_ref(),
     )
     .await;
     let events = audit_retention::run_prune_events(
@@ -274,6 +275,7 @@ pub async fn run_retention_handler(
         &state.config.data_dir,
         req.retain_days,
         req.archive,
+        state.signing.as_ref(),
     )
     .await;
     match (rules, events) {
@@ -455,7 +457,7 @@ pub async fn run_scheduler_handler(
         }
         "audit_retention" => {
             scheduler_log::record(pool, "audit_retention", || async {
-                audit_retention::run_scheduled(pool, &data_dir, 365, false).await
+                audit_retention::run_scheduled(pool, &data_dir, 365, false, None).await
             })
             .await
         }

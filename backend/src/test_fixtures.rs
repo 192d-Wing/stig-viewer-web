@@ -200,6 +200,7 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
             database_url: String::new(),
             data_dir: dir,
             sync_interval_hours: 100_000,
+            backup_require_signature: None,
         }),
         signing: None,
     };
