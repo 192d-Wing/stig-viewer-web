@@ -317,58 +317,7 @@ pub async fn update_policy_handler(
         .map(Json)
 }
 
-// ── Shared helpers reused by checklists.rs::update_rule_handler ────────────
-
-/// Create a `pending` `finding_approvals` row. Called from
-/// `checklists.rs::update_rule_handler` when an asset has
-/// `requires_approval = TRUE` and the proposed status is a closing one.
-pub async fn create_pending(
-    pool: &PgPool,
-    checklist_id: &str,
-    rule_id: &str,
-    requested_by: &str,
-    proposed_status: &str,
-    finding_details: &str,
-) -> anyhow::Result<FindingApprovalRow> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let row = sqlx::query_as::<_, FindingApprovalRow>(
-        r#"
-        INSERT INTO finding_approvals
-            (id, checklist_id, rule_id, requested_by,
-             proposed_status, finding_details, status)
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-        RETURNING *
-        "#,
-    )
-    .bind(&id)
-    .bind(checklist_id)
-    .bind(rule_id)
-    .bind(requested_by)
-    .bind(proposed_status)
-    .bind(finding_details)
-    .fetch_one(pool)
-    .await?;
-    Ok(row)
-}
-
-/// True if a rule already has an outstanding pending approval. Used to
-/// avoid duplicate-row spam when a user re-submits the same close.
-pub async fn has_pending(
-    pool: &PgPool,
-    checklist_id: &str,
-    rule_id: &str,
-) -> anyhow::Result<bool> {
-    let row: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM finding_approvals \
-         WHERE checklist_id = $1 AND rule_id = $2 AND status = 'pending' \
-         LIMIT 1",
-    )
-    .bind(checklist_id)
-    .bind(rule_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.is_some())
-}
+// ── Batch approval requests (also used by the single-rule PATCH) ───────────
 
 /// One approval request for [`request_many`].
 #[derive(Debug, Clone, Copy)]
