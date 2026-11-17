@@ -113,7 +113,26 @@ async fn index_missing_capped(
         .await?
         .into_iter()
         .collect();
-    let mut added = 0;
+    // Directory walking, file reads and JSON parsing are blocking work.
+    let (dir, srcs) = (stigs_dir.to_path_buf(), sources.to_vec());
+    let found = tokio::task::spawn_blocking(move || scan_missing(&dir, &srcs, &existing, max_bytes))
+        .await??;
+    let added = found.len();
+    for catalog in &found {
+        upsert_catalog(pool, catalog).await?;
+    }
+    Ok(added)
+}
+
+/// Blocking half of [`index_missing`]: the catalog entries for every
+/// indexable `{id}.json` in `stigs_dir` whose id is not in `existing`.
+fn scan_missing(
+    stigs_dir: &Path,
+    sources: &[StigSource],
+    existing: &HashSet<String>,
+    max_bytes: u64,
+) -> Result<Vec<CatalogEntry>> {
+    let mut found = Vec::new();
     for entry in std::fs::read_dir(stigs_dir)? {
         let entry = entry?;
         let Ok(meta) = entry.metadata() else { continue };
@@ -173,10 +192,9 @@ async fn index_missing_capped(
             json_path: entry.path().to_string_lossy().into_owned(),
             last_updated: Utc::now(),
         };
-        upsert_catalog(pool, &catalog).await?;
-        added += 1;
+        found.push(catalog);
     }
-    Ok(added)
+    Ok(found)
 }
 
 /// Ids with checklists that the manifest and the seed no longer name.
@@ -198,14 +216,19 @@ pub async fn warn_orphaned_ids(pool: &PgPool, sources: &[StigSource], seed_dir: 
     .fetch_all(pool)
     .await;
     let Ok(ids) = ids else { return };
-    let seed_ids: HashSet<String> = seed_dir
-        .and_then(|d| std::fs::read_dir(d).ok())
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.file_name().to_str().and_then(seed_id).map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let seed_dir = seed_dir.map(Path::to_path_buf);
+    let seed_ids: HashSet<String> = tokio::task::spawn_blocking(move || {
+        seed_dir
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().and_then(seed_id).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
     let orphans = orphaned(&ids, sources, &seed_ids);
     if !orphans.is_empty() {
         let shown: Vec<&str> = orphans.iter().take(50).map(String::as_str).collect();
@@ -220,7 +243,11 @@ pub async fn warn_orphaned_ids(pool: &PgPool, sources: &[StigSource], seed_dir: 
 
 /// Run both seeding steps; failures are logged, never fatal.
 pub async fn seed(seed_dir: &Path, stigs_dir: &Path, pool: &PgPool, sources: &[StigSource]) {
-    match copy_missing(seed_dir, stigs_dir) {
+    let (from, to) = (seed_dir.to_path_buf(), stigs_dir.to_path_buf());
+    let copied = tokio::task::spawn_blocking(move || copy_missing(&from, &to))
+        .await
+        .unwrap_or_else(|e| Err(e.into()));
+    match copied {
         Ok(n) => info!("seed: copied {n} missing file(s) from {}", seed_dir.display()),
         Err(e) => warn!("seed: copy from {} failed: {e:#}", seed_dir.display()),
     }

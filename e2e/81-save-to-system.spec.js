@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAs, loadDemoStig, resetDb, setUserRole, BACKEND } from "./helpers.js";
+import { loginAs, loadDemoStig, openEdgeFromLibrary, resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 /**
  * "Save to system" (issue #19): push a Viewer tab's per-rule status, finding
@@ -337,7 +337,7 @@ test.describe("Save to system — UI", () => {
     const asset = await seedAsset(request);
     await loginAs(page, "alice");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
 
@@ -369,7 +369,7 @@ test.describe("Save to system — UI", () => {
     await seedAsset(request);
     await loginAs(page, "alice");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
     const [ruleId] = await edgeRuleIds(request);
@@ -402,7 +402,7 @@ test.describe("Save to system — UI", () => {
     });
     await loginAs(page, "alice");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
     await listbox.getByRole("option").nth(0).click();
@@ -427,7 +427,7 @@ test.describe("Save to system — UI", () => {
     });
     await loginAs(page, "alice");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
     await page.getByTestId("save-to-system").click();
@@ -441,7 +441,7 @@ test.describe("Save to system — UI", () => {
     await request.post(`${BACKEND}/api/assets`, { headers: JSON_HEADERS("mallory"), data: { name: "mallory-host" } });
     await loginAs(page, "alice");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
     await page.getByTestId("save-to-system").click();
@@ -454,7 +454,7 @@ test.describe("Save to system — UI", () => {
     await seedAsset(request); // alice's system, not writable by carol
     await loginAs(page, "carol");
     await page.goto("/");
-    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    await openEdgeFromLibrary(page);
     const listbox = page.getByRole("listbox", { name: "Rules" });
     await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
     await page.getByTestId("save-to-system").click();

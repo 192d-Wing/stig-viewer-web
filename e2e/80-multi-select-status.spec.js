@@ -377,7 +377,7 @@ test.describe("Checklist bulk status — UI", () => {
     const rowChecks = page.getByRole("checkbox", { name: "Select row" });
     await expect(rowChecks.first()).toBeVisible();
     const total = await rowChecks.count();
-    await page.getByPlaceholder("Filter rules").fill("password");
+    await page.getByPlaceholder("Filter rules").fill("SV-235719");
     await expect(rowChecks).not.toHaveCount(total);
     const visible = await rowChecks.count();
     expect(visible).toBeGreaterThan(0);

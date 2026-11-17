@@ -141,6 +141,9 @@ test.describe("Catalog version diff", () => {
     await page.goto("/");
     // Find the edge row's Diff button via the per-row testid set by
     // the StigLibrary column definition.
+    // `ms-edge` has the same title with a newer release, so the library
+    // hides `edge` as "Superseded" until the toggle is on.
+    await page.getByText(/Show superseded/).click();
     const diffBtn = page.getByTestId("diff-button-edge");
     await expect(diffBtn).toBeVisible({ timeout: 10_000 });
     await diffBtn.click();
