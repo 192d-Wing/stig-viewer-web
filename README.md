@@ -200,3 +200,42 @@ cd backend && cargo clippy -- -D warnings
 ├── dev/keycloak/         Dev realm import
 └── docker-compose.yml    Local dev stack
 ```
+
+## Login emblem
+
+The sign-in screen shows an emblem from `frontend/public/brand/org-emblem.png`
+(served at `/brand/org-emblem.png`). This is the operator-installed seal, and
+the operator is responsible for being authorized to display it (for example
+under DoD seal and insignia policy). PNG is recommended because it has no
+script surface; use at least 512px. The installed file is about 1.5 MB, so
+consider losslessly compressing or downscaling it (it is shown at most 360px
+wide) to speed up the first paint. To swap it, replace the file and adjust
+`LOGIN_EMBLEM_SRC` and `LOGIN_EMBLEM_ALT` in `frontend/src/auth.rs`. The
+background accent colour is the `--login-accent` variable in
+`frontend/styles/app.css`.
+
+## System use notification (AC-8)
+
+The sign-in screen shows the DoD Notice and Consent text and requires "I Agree"
+before the sign-in buttons appear. "I Agree" calls `POST /auth/notice/ack`, which
+sets a 5-minute, single-use, HttpOnly `stig_notice_ack` cookie that
+`/auth/login` and `/auth/saml/login` consume; without it they redirect to the
+banner. A completed login writes an `auth.notice_ack` audit event. The wording
+version is `USE_NOTICE_VERSION` in both `frontend/src/constants.rs` and
+`backend/src/api/notice.rs`; keep them equal. `/auth/callback` and
+`/auth/saml/acs` do not enforce the proof (they only link the audit record).
+
+The `stig_notice_ack` cookie is `SameSite=Strict`, so the frontend and the API
+must be same-site (for example `app.example.mil` and `api.example.mil`), or
+sign-in will always bounce back to the banner. `/auth/notice/ack`,
+`/auth/login` and `/auth/saml/login` share a per-IP token bucket
+(`AUTH_RATE_LIMIT_BURST`, default 30; `AUTH_RATE_LIMIT_PER_MINUTE`, default 60;
+over-limit gives 429 on the ack POST and a redirect to the banner on the login
+GETs). IPv6 clients are limited per /64. The IP is the socket peer address, so
+**behind a reverse proxy every client shares one bucket (the proxy's) unless
+`STIG_TRUST_PROXY_HEADERS=true`**; the backend logs a startup warning when it is
+unset. With it set, the hop `STIG_TRUSTED_PROXY_HOPS` places from the right of
+`X-Forwarded-For` (default 1, the rightmost) is used; set it only behind a
+proxy that appends to that header. `POST /auth/notice/ack` rejects bodies over
+1 KB. Auth cookies are `Secure` in production or
+when `FRONTEND_URL` is https.

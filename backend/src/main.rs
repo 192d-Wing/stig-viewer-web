@@ -3,6 +3,7 @@ mod audit_retention;
 mod config;
 mod db;
 mod db_audit;
+mod db_notice;
 mod db_assets;
 mod db_attachments;
 mod db_checklists;
@@ -266,6 +267,7 @@ async fn main() -> Result<()> {
         oidc_env.internal_issuer_url, oidc_env.allow_test_auth_header
     );
 
+    api::notice::log_proxy_trust_config();
     let auth_state = AppAuthState {
         pool: pool.clone(),
         oidc: oidc.clone(),
@@ -302,6 +304,10 @@ async fn main() -> Result<()> {
         .route("/auth/login", get(login_handler))
         .route("/auth/callback", get(callback_handler))
         .route("/auth/logout", post(logout_handler))
+        .route(
+            "/auth/notice/ack",
+            post(api::notice::ack_handler).layer(axum::extract::DefaultBodyLimit::max(1024)),
+        )
         .with_state(auth_state.clone());
 
     // SAML SP routes — also public. Built statically from env; if no IdP
@@ -850,7 +856,10 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");
 
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

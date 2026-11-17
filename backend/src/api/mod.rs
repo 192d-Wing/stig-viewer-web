@@ -25,6 +25,7 @@ pub mod finding_approvals;
 pub mod findings;
 pub mod findings_bulk;
 pub mod health;
+pub mod notice;
 pub mod notifications;
 pub mod oscal;
 pub mod rate_limit;
