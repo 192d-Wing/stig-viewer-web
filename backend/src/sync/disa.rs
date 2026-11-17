@@ -55,6 +55,16 @@ fn is_stale_status(status: u16) -> bool {
     matches!(status, 404 | 410)
 }
 
+/// Map a file read to the previous contents: `NotFound` is `None`, any other
+/// error is propagated.
+fn existing_bytes(read: std::io::Result<Vec<u8>>) -> std::io::Result<Option<Vec<u8>>> {
+    match read {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// True when the file on disk already holds exactly the new bytes.
 fn is_unchanged(existing: Option<&[u8]>, new: &[u8]) -> bool {
     existing == Some(new)
@@ -107,7 +117,10 @@ async fn sync_one(
 
     // 4a. Identical bytes: nothing to write and nothing to archive. (The
     //     catalog row is still upserted below so a reset database re-indexes.)
-    let existing = tokio::fs::read(&json_path).await.ok();
+    // Only a missing file counts as "no previous version"; any other read
+    // error must not lead to archiving being skipped and the file replaced.
+    let existing = existing_bytes(tokio::fs::read(&json_path).await)
+        .with_context(|| format!("Cannot read existing {}", json_path.display()))?;
     let unchanged = is_unchanged(existing.as_deref(), json_str.as_bytes());
 
     // 4b. If a previous JSON already exists for this STIG, archive it
@@ -342,6 +355,15 @@ mod id_tests {
     fn summary_counts_stale_separately() {
         let s = SyncSummary { synced: 5, stale: 2, errors: 1 };
         assert_eq!(s.describe(), "synced 5, 2 stale URL(s), 1 error(s)");
+    }
+
+    #[test]
+    fn only_not_found_means_no_previous_file() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(existing_bytes(Ok(b"x".to_vec())).unwrap(), Some(b"x".to_vec()));
+        assert_eq!(existing_bytes(Err(Error::from(ErrorKind::NotFound))).unwrap(), None);
+        let e = existing_bytes(Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
     }
 
     #[test]

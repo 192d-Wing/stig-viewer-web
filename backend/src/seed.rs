@@ -99,6 +99,15 @@ pub async fn index_missing(
     stigs_dir: &Path,
     sources: &[StigSource],
 ) -> Result<usize> {
+    index_missing_capped(pool, stigs_dir, sources, MAX_SEED_BYTES).await
+}
+
+async fn index_missing_capped(
+    pool: &PgPool,
+    stigs_dir: &Path,
+    sources: &[StigSource],
+    max_bytes: u64,
+) -> Result<usize> {
     let existing: HashSet<String> = sqlx::query_scalar("SELECT id FROM stigs_catalog")
         .fetch_all(pool)
         .await?
@@ -121,8 +130,8 @@ pub async fn index_missing(
         if existing.contains(id) {
             continue;
         }
-        if meta.len() > MAX_SEED_BYTES {
-            warn!("seed: '{id}' is {} bytes, over the {MAX_SEED_BYTES} cap; not indexed", meta.len());
+        if meta.len() > max_bytes {
+            warn!("seed: '{id}' is {} bytes, over the {max_bytes} cap; not indexed", meta.len());
             continue;
         }
         let bytes = match std::fs::read(entry.path()) {
@@ -336,5 +345,21 @@ mod tests {
         assert_eq!(cat("with-other-cat"), "Other");
         let kept = rows.iter().find(|r| r.0 == "already-there").unwrap();
         assert_eq!((kept.1.as_str(), kept.2.as_str()), ("Keep", "Keep"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn index_missing_skips_files_over_the_size_cap(pool: PgPool) {
+        let dir = Tmp::new();
+        let small = stig_json("");
+        std::fs::write(dir.0.join("small.json"), &small).unwrap();
+        std::fs::write(dir.0.join("big.json"), stig_json(&format!(r#","pad":"{}""#, "x".repeat(500)))).unwrap();
+        let cap = small.len() as u64 + 10;
+        assert_eq!(index_missing_capped(&pool, &dir.0, &[], cap).await.unwrap(), 1);
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM stigs_catalog")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["small".to_string()]);
     }
 }
