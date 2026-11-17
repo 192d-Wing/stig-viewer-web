@@ -23,6 +23,7 @@ pub mod drafts;
 pub mod email;
 pub mod finding_approvals;
 pub mod findings;
+pub mod findings_bulk;
 pub mod health;
 pub mod notifications;
 pub mod oscal;

@@ -121,7 +121,8 @@ use api::{
         reject_handler as reject_finding_handler,
         update_policy_handler as update_asset_approval_policy_handler,
     },
-    findings::{bulk_handler as bulk_findings_handler, list_handler as list_findings_handler},
+    findings::list_handler as list_findings_handler,
+    findings_bulk::bulk_handler as bulk_findings_handler,
     health::get_health,
     notifications::{
         get_handler as get_notifications_handler,

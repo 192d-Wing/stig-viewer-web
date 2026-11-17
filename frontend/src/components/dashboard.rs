@@ -397,6 +397,50 @@ struct BulkDraft {
     comments: String,
 }
 
+/// One target `PATCH /api/findings/bulk` could not change.
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BulkFindingsError {
+    error: String,
+}
+
+/// Response of `PATCH /api/findings/bulk`. The counts are disjoint.
+#[derive(Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BulkFindingsResult {
+    updated: usize,
+    pending_approval: usize,
+    already_pending: usize,
+    error_count: usize,
+    errors: Vec<BulkFindingsError>,
+}
+
+/// Summary line shown after a bulk update, e.g.
+/// "3 updated, 2 sent for approval, 1 not changed (finding details required for this status)".
+fn bulk_result_summary(r: &BulkFindingsResult) -> String {
+    let mut s = format!("{} updated", r.updated);
+    if r.pending_approval > 0 {
+        s.push_str(&format!(", {} sent for approval", r.pending_approval));
+    }
+    if r.already_pending > 0 {
+        s.push_str(&format!(", {} already awaiting approval", r.already_pending));
+    }
+    if r.error_count > 0 {
+        let mut reasons: Vec<&str> = Vec::new();
+        for e in &r.errors {
+            if !reasons.contains(&e.error.as_str()) {
+                reasons.push(e.error.as_str());
+            }
+        }
+        reasons.truncate(3);
+        s.push_str(&format!(", {} not changed", r.error_count));
+        if !reasons.is_empty() {
+            s.push_str(&format!(" ({})", reasons.join("; ")));
+        }
+    }
+    s
+}
+
 /// Counter bumped by Refresh / bulk saves so the baseline-diff effect re-fires
 /// even when the selected baseline is unchanged.
 #[derive(Clone)]
@@ -543,6 +587,8 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
     let bulk_draft = use_state(BulkDraft::default);
     let bulk_saving = use_state(|| false);
     let bulk_error = use_state(|| None::<String>);
+    // Outcome of the last bulk update: (summary, had unchanged targets).
+    let bulk_flash = use_state(|| None::<(String, bool)>);
 
     // Streamlined "Reassign" preset modal — covers the common "just change the
     // assignee" workflow without making power-users wade through the full
@@ -835,6 +881,7 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
         let saving = bulk_saving.clone();
         let err = bulk_error.clone();
         let open = bulk_open.clone();
+        let flash = bulk_flash.clone();
         let selected = selected_findings.clone();
         let refresher = refresher.clone();
         Callback::from(move |_: MouseEvent| {
@@ -859,11 +906,12 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             saving.set(true);
             err.set(None);
             let body = json!({ "targets": targets, "patch": patch });
-            let (saving, err, open, selected, refresher) =
-                (saving.clone(), err.clone(), open.clone(), selected.clone(), refresher.clone());
+            let (saving, err, open, flash, selected, refresher) =
+                (saving.clone(), err.clone(), open.clone(), flash.clone(), selected.clone(), refresher.clone());
             spawn_local(async move {
-                match api_json::<serde_json::Value, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
-                    Ok(_) => {
+                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
+                    Ok(result) => {
+                        flash.set(Some((bulk_result_summary(&result), result.error_count > 0)));
                         open.set(false);
                         selected.set(vec![]);
                         // Refetch the baseline diff + the dashboard counters.
@@ -913,16 +961,20 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             // An explicit JSON `null` is what the bulk endpoint's tri-state
             // assignee_id treats as "unassign"; a user id reassigns.
             let body = json!({ "targets": targets, "patch": { "assigneeId": assignee } });
-            let count = targets.len();
-            let message = match &assignee_name {
-                Some(name) => format!("Reassigned {count} finding{} to {name}.", plural(count)),
-                None => format!("Unassigned {count} finding{}.", plural(count)),
-            };
+            let assignee_name = assignee_name.clone();
             let (saving, err, open, flash, selected, refresher) =
                 (saving.clone(), err.clone(), open.clone(), flash.clone(), selected.clone(), refresher.clone());
             spawn_local(async move {
-                match api_json::<serde_json::Value, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
-                    Ok(_) => {
+                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
+                    Ok(result) => {
+                        let count = result.updated;
+                        let mut message = match &assignee_name {
+                            Some(name) => format!("Reassigned {count} finding{} to {name}.", plural(count)),
+                            None => format!("Unassigned {count} finding{}.", plural(count)),
+                        };
+                        if result.error_count > 0 {
+                            message.push_str(&format!(" {} not changed.", result.error_count));
+                        }
                         flash.set(Some(message));
                         open.set(false);
                         selected.set(vec![]);
@@ -1874,11 +1926,22 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
         let flash = reassign_flash.clone();
         Callback::from(move |_: ()| flash.set(None))
     };
+    let dismiss_bulk_flash = {
+        let flash = bulk_flash.clone();
+        Callback::from(move |_: ()| flash.set(None))
+    };
 
     html! {
         <UiBox padding="m">
             <SpaceBetween direction="vertical" size="l">
                 <Header variant="h1" actions={header_actions}>{"Compliance dashboard"}</Header>
+
+                if let Some((summary, partial)) = &*bulk_flash {
+                    <Alert kind={if *partial { "warning" } else { "success" }} dismissible=true
+                           on_dismiss={dismiss_bulk_flash} testid="bulk-update-flash">
+                        {summary.clone()}
+                    </Alert>
+                }
 
                 if let Some(flash) = &*reassign_flash {
                     <Alert kind="success" dismissible=true on_dismiss={dismiss_flash} testid="reassign-flash">
@@ -2332,6 +2395,34 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
                 </table>
             </div>
         </Container>
+    }
+}
+
+#[cfg(test)]
+mod bulk_result_summary_tests {
+    use super::*;
+
+    fn err(e: &str) -> BulkFindingsError {
+        BulkFindingsError { error: e.into() }
+    }
+
+    #[test]
+    fn plain_and_approval_wording() {
+        let r = BulkFindingsResult { updated: 3, ..Default::default() };
+        assert_eq!(bulk_result_summary(&r), "3 updated");
+        let r = BulkFindingsResult { updated: 3, pending_approval: 2, already_pending: 1, ..Default::default() };
+        assert_eq!(bulk_result_summary(&r), "3 updated, 2 sent for approval, 1 already awaiting approval");
+    }
+
+    #[test]
+    fn lists_up_to_three_distinct_reasons() {
+        let r = BulkFindingsResult {
+            updated: 0,
+            error_count: 5,
+            errors: vec![err("a"), err("a"), err("b"), err("c"), err("d")],
+            ..Default::default()
+        };
+        assert_eq!(bulk_result_summary(&r), "0 updated, 5 not changed (a; b; c)");
     }
 }
 
