@@ -275,13 +275,23 @@ written to a temp file, fsynced and renamed, then gets a sidecar
 `<segment>.manifest.json`. Rows are archived before the delete runs, and a
 failed archive write deletes nothing.
 
-Archiving is idempotent by row id, and fails closed. Only a segment that
-verifies counts as already archived: its sidecar must exist and check out
-(SHA-512, row count, ids inside the range in its name, and, when
-`SIGNING_KEY_HEX` is set, a verified signature). A planted, tampered or
-half-written segment is logged on the `audit` target and ignored, so its rows
-are archived again; a duplicate is harmless, a lost row is not. A segment
-whose sidecar is missing is therefore rewritten, not re-signed in place.
+Archiving is idempotent by row id, without trusting the directory. A row is
+skipped only when a segment that verifies holds the IDENTICAL serialized line
+for it. "Verifies" means the sidecar exists and checks out (SHA-512, row count,
+ids inside the range in the file name) and, when `SIGNING_KEY_HEX` is set, that
+the signature is valid for the configured key. With a key, a planted segment
+cannot pass at all. Without a key the digest is not a secret, so a planted
+segment can be self-consistent; it still cannot hide a real row, because its
+line would have to equal the row's actual line. A segment that fails
+verification, or holds a different line, is logged on the `audit` target and its
+rows are archived again (a duplicate is harmless, a lost row is not). A rejected
+segment and its sidecar are first renamed to `<name>.rejected-<UTC timestamp>`
+and kept as evidence; such files are never counted. Each segment is read once,
+and the verified bytes are the bytes used.
+
+After a key rotation, or when signing is switched on or off, existing segments
+no longer verify (or are `unknown_key`), so the rows still in the database are
+archived again and the old files are preserved as `.rejected-*`.
 
 Files named `<date>.jsonl` and `events-<date>.jsonl` come from earlier
 versions (append mode). They are legacy: never rewritten, **unsigned**, with no
@@ -449,13 +459,17 @@ written to the pre-restore `audit` log line and recorded, with
 `requireSignature`, in the `backup.restore` event's detail. A rejected restore
 is also recorded, as a `backup.restore` event with `outcome = 'failure'` and
 `detail = {reason, signatureStatus, requireSignature}` (`signatureStatus` is
-`invalid` for a bad signature and `unknown` when the backup was refused before
-its signature could be read). Entries are read with a per-entry (1 GiB) and a
-total (4 GiB) decompressed limit.
+`invalid` for a bad signature and `not_evaluated` when the backup was refused
+before its signature was evaluated). Entries are read with a per-entry (1 GiB) and a
+total (4 GiB) decompressed limit; `manifest.json` and `manifest.sig.json` are
+capped at 16 MiB.
 
-With the default policy a restore satisfies the intent of NIST SP 800-53
-CP-9(8) (cryptographic protection of backups) and SI-7(6) (cryptographic
-integrity protection) for backups taken by this server.
+With `SIGNING_KEY_HEX` set (so the default policy requires a verified
+signature) a restore satisfies the intent of NIST SP 800-53 CP-9(8)
+(cryptographic protection of backups) and SI-7(6) (cryptographic integrity
+protection) for backups taken by this server. Without a key, or with
+`BACKUP_REQUIRE_SIGNATURE=false`, it does not: digests alone detect corruption
+only.
 
 **Limits.**
 

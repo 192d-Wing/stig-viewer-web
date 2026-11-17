@@ -442,7 +442,7 @@ impl RestoreResult {
                 "warning",
                 format!(
                     "{base} Warning: this backup's integrity was not verified (signature status: {}).",
-                    if other.is_empty() { "unknown" } else { other }
+                    if other.is_empty() { "not reported" } else { other }
                 ),
             ),
         }

@@ -351,6 +351,11 @@ test.describe("Backup + restore — API", () => {
       headers: { "X-User-Id": "alice" },
     });
     const original = Buffer.from(await backupRes.body());
+    const usersBefore = await (
+      await request.get(`${BACKEND}/api/admin/users`, {
+        headers: { "X-User-Id": "alice" },
+      })
+    ).json();
     const entry = listZipEntries(original).find(
       (e) => e.name === "tables/users.jsonl",
     );
@@ -377,11 +382,12 @@ test.describe("Backup + restore — API", () => {
     );
     expect(restoreRes.status()).toBe(400);
 
-    // The data is untouched: alice can still list users.
+    // The data is untouched: same users before and after.
     const stillThere = await request.get(`${BACKEND}/api/admin/users`, {
       headers: { "X-User-Id": "alice" },
     });
     expect(stillThere.ok()).toBe(true);
+    expect(await stillThere.json()).toEqual(usersBefore);
   });
 
   test("restore with mismatched schemaMigration returns 400", async ({
@@ -399,6 +405,13 @@ test.describe("Backup + restore — API", () => {
     const entries = listZipEntries(original);
     const manifestEntry = entries.find((e) => e.name === "manifest.json");
     const manifest = JSON.parse(readEntryText(original, manifestEntry));
+    // With SIGNING_KEY_HEX set, restore requires a verified signature by default
+    // and an unsigned repacked manifest is refused before the schema gate. The
+    // test API cannot change the backend's environment, so skip in that setup.
+    test.skip(
+      Array.isArray(manifest.signers) && manifest.signers.length > 0,
+      "backend has SIGNING_KEY_HEX set; this test assumes unsigned restores are allowed",
+    );
     manifest.schemaMigration = 9999;
     // The repacked zip holds only the manifest, so drop the digest list and
     // signers (an unsigned, digest-free manifest passes the integrity check

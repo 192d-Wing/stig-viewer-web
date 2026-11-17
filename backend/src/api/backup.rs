@@ -690,7 +690,8 @@ async fn record_restore(
 struct VerifyFailure {
     message: String,
     /// `verified`, `unsigned`, `unknown_key` once known; `invalid` for a bad
-    /// signature; `unknown` when the backup was rejected before that.
+    /// signature; `not_evaluated` when the backup was refused before its
+    /// signature was evaluated.
     status: &'static str,
 }
 
@@ -702,7 +703,7 @@ impl VerifyFailure {
 
 impl From<anyhow::Error> for VerifyFailure {
     fn from(e: anyhow::Error) -> Self {
-        Self::new("unknown", format!("{e:#}"))
+        Self::new("not_evaluated", format!("{e:#}"))
     }
 }
 
@@ -710,16 +711,24 @@ impl From<anyhow::Error> for VerifyFailure {
 /// bounded with `take`, never sized from the entry header.
 const MAX_ENTRY_BYTES: u64 = 1 << 30;
 const MAX_TOTAL_BYTES: u64 = 4 << 30;
+/// `manifest.json` and `manifest.sig.json` are small; read them under a tight cap.
+const MAX_MANIFEST_BYTES: u64 = 16 << 20;
 
-fn read_capped(entry: &mut impl Read, name: &str, total: &mut u64) -> anyhow::Result<Vec<u8>> {
+fn read_capped(
+    entry: &mut impl Read,
+    name: &str,
+    total: &mut u64,
+    entry_limit: u64,
+    total_limit: u64,
+) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    entry.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_ENTRY_BYTES {
-        anyhow::bail!("entry {name:?} is larger than {MAX_ENTRY_BYTES} bytes");
+    entry.take(entry_limit + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > entry_limit {
+        anyhow::bail!("entry {name:?} is larger than {entry_limit} bytes");
     }
     *total += buf.len() as u64;
-    if *total > MAX_TOTAL_BYTES {
-        anyhow::bail!("backup is larger than {MAX_TOTAL_BYTES} bytes uncompressed");
+    if *total > total_limit {
+        anyhow::bail!("backup is larger than {total_limit} bytes uncompressed");
     }
     Ok(buf)
 }
@@ -746,7 +755,7 @@ fn parse_and_verify_backup(
     for i in 0..zip.len() {
         let name = zip.by_index_raw(i).map_err(anyhow::Error::from)?.name().to_string();
         if !seen.insert(name.clone()) {
-            return Err(VerifyFailure::new("unknown", format!("duplicate entry {name:?}")));
+            return Err(VerifyFailure::new("not_evaluated", format!("duplicate entry {name:?}")));
         }
     }
 
@@ -754,18 +763,18 @@ fn parse_and_verify_backup(
         let mut e = zip
             .by_name(MANIFEST_NAME)
             .map_err(|_| anyhow::anyhow!("{MANIFEST_NAME} missing from backup"))?;
-        let buf = read_capped(&mut e, MANIFEST_NAME, &mut total)?;
+        let buf = read_capped(&mut e, MANIFEST_NAME, &mut total, MAX_MANIFEST_BYTES, MAX_TOTAL_BYTES)?;
         let m: Manifest = serde_json::from_slice(&buf).map_err(anyhow::Error::from)?;
         (m, buf)
     };
     if !ACCEPTED_VERSIONS.contains(&manifest.version.as_str()) {
         return Err(VerifyFailure::new(
-            "unknown",
+            "not_evaluated",
             format!("unsupported backup version: {:?} (expected one of {:?})", manifest.version, ACCEPTED_VERSIONS),
         ));
     }
     let sig_bytes = match zip.by_name(MANIFEST_SIG_NAME) {
-        Ok(mut e) => Some(read_capped(&mut e, MANIFEST_SIG_NAME, &mut total)?),
+        Ok(mut e) => Some(read_capped(&mut e, MANIFEST_SIG_NAME, &mut total, MAX_MANIFEST_BYTES, MAX_TOTAL_BYTES)?),
         Err(_) => None,
     };
     let status = verify_signature(&manifest, &manifest_bytes, sig_bytes.as_deref(), signing, require)?;
@@ -780,7 +789,7 @@ fn parse_and_verify_backup(
         if name.ends_with('/') || name == MANIFEST_NAME || name == MANIFEST_SIG_NAME {
             continue;
         }
-        let buf = read_capped(&mut entry, &name, &mut total)?;
+        let buf = read_capped(&mut entry, &name, &mut total, MAX_ENTRY_BYTES, MAX_TOTAL_BYTES)?;
         digests.insert(name.clone(), integrity::sha512_hex(&buf));
         if let Some(rest) = name.strip_prefix("tables/") {
             if let Some(tname) = rest.strip_suffix(".jsonl") {
@@ -1234,6 +1243,21 @@ mod integrity_tests {
             }
         }
         bytes
+    }
+
+    #[test]
+    fn read_capped_rejects_an_over_cap_entry_and_an_over_cap_total() {
+        let mut total = 0;
+        assert!(read_capped(&mut &b"abcd"[..], "e", &mut total, 3, 100).is_err());
+        let mut total = 0;
+        assert!(read_capped(&mut &b"abc"[..], "e", &mut total, 3, 5).is_ok());
+        assert!(read_capped(&mut &b"abc"[..], "e", &mut total, 3, 5).is_err());
+    }
+
+    #[test]
+    fn refused_before_evaluation_is_not_confused_with_unknown_key() {
+        let f = parse_and_verify_backup(b"not a zip", None, false).unwrap_err();
+        assert_eq!(f.status, "not_evaluated");
     }
 
     #[test]
