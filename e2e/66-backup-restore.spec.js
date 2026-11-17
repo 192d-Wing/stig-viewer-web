@@ -152,7 +152,11 @@ test.describe("Backup + restore — API", () => {
     // Manifest is valid JSON with the expected keys.
     const manifestEntry = entries.find((e) => e.name === "manifest.json");
     const manifest = JSON.parse(readEntryText(body, manifestEntry));
-    expect(manifest.version).toBe("1");
+    expect(manifest.version).toBe("2");
+    expect(manifest.type).toBe("stig-viewer/backup");
+    // Every other entry is digested (SHA-512 hex).
+    expect(manifest.entries["tables/users.jsonl"]).toMatch(/^[0-9a-f]{128}$/);
+    expect(Array.isArray(manifest.signers)).toBe(true);
     expect(typeof manifest.takenAt).toBe("string");
     expect(typeof manifest.schemaMigration).toBe("number");
     expect(manifest.schemaMigration).toBeGreaterThan(0);
@@ -353,6 +357,11 @@ test.describe("Backup + restore — API", () => {
     const manifestEntry = entries.find((e) => e.name === "manifest.json");
     const manifest = JSON.parse(readEntryText(original, manifestEntry));
     manifest.schemaMigration = 9999;
+    // The repacked zip holds only the manifest, so drop the digest list and
+    // signers (an unsigned, digest-free manifest passes the integrity check
+    // and reaches the schema gate this test exercises).
+    manifest.entries = {};
+    manifest.signers = [];
 
     // Re-pack a minimal zip: we don't have a zip writer in the test, so
     // construct one by hand using node's built-in `zlib.deflateRawSync`.

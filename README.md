@@ -265,6 +265,89 @@ tables, give the application role only `SELECT` and `INSERT` on the audit
 tables (plus `UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and
 ship audit rows to an external append-only store.
 
+### Integrity of audit archives and backups
+
+With `AUDIT_ARCHIVE_ENABLED` (default on), each retention sweep writes
+immutable segments to `${DATA_DIR}/audit_archive/`:
+`rules-<UTC date>.<firstId>-<lastId>.jsonl` (`rule_audit`) and
+`events-<UTC date>.<firstId>-<lastId>.jsonl` (`audit_events`). A segment is
+written to a temp file, fsynced and renamed, then gets a sidecar
+`<segment>.manifest.json`. Archiving is idempotent by row id: ids already in
+that date's segments are skipped, so a retry after a failed delete adds no
+duplicates. Rows are archived before the delete runs, and a failed archive
+write deletes nothing.
+
+Files named `<date>.jsonl` and `events-<date>.jsonl` come from earlier
+versions (append mode). They are legacy: never rewritten, **unsigned**, with
+no manifest. Their ids are still skipped by new sweeps.
+
+**Formats.** The sidecar and a backup's `manifest.sig.json` are envelopes:
+
+```json
+{"version":1,"type":"stig-viewer/audit-archive","payload":"<base64url>",
+ "signatures":[{"algorithm":"ed25519","keyId":"…","signature":"<base64>"}],
+ "manifest":{…}}
+```
+
+`payload` is the exact signed bytes (the `manifest` copy is for humans and is
+not authenticated). For a segment it is `{type, version, stream, file, rows,
+firstId, lastId, digest:{algorithm:"sha-512",value}, signers:[{algorithm,
+keyId}]}`. A backup's `manifest.json` (format version 2; version 1 is still
+accepted) is the signed payload itself, and adds `type`, `entries`
+(`{entry name: sha512 hex}` for every other ZIP entry) and `signers`. Every
+listed signer must have a signature, and none may be extra.
+
+**Keys and domains.** The Ed25519 key is `SIGNING_KEY_HEX`, the same key that
+signs `/api/sign` exports. The signature input is a domain prefix followed by
+the payload, with a different prefix per purpose so one signature cannot be
+replayed as another: `stig-viewer/audit-archive/v1\0`,
+`stig-viewer/backup/v1\0` (and `stig-viewer/sign/v2\0` for exports). The
+signed payload also carries a `type`. Fetch the public key from
+`GET /api/signing/pubkey` and pin it offline; a key id alone proves nothing.
+
+**Without `SIGNING_KEY_HEX`**, manifests carry digests only. That detects
+corruption but not deliberate alteration: anyone who can edit a segment can
+recompute its digest.
+
+**Verify a segment** (needs Python `cryptography`; `PUB` is the pinned
+base64 public key):
+
+```sh
+sha512sum rules-2025-01-01.1-40.jsonl      # compare with manifest.digest.value
+python3 - <<'PY'
+import base64, json
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+env = json.load(open("rules-2025-01-01.1-40.jsonl.manifest.json"))
+pad = lambda s: s + "=" * (-len(s) % 4)
+payload = base64.urlsafe_b64decode(pad(env["payload"]))
+pub = Ed25519PublicKey.from_public_bytes(base64.b64decode("PUB"))
+for s in env["signatures"]:
+    pub.verify(base64.b64decode(s["signature"]), b"stig-viewer/audit-archive/v1\0" + payload)
+print("ok")   # raises InvalidSignature otherwise
+PY
+```
+
+For a backup, unzip it, run `sha512sum` on each entry and compare with
+`manifest.json`'s `entries`, then verify `manifest.sig.json` the same way
+against the bytes of `manifest.json` with the prefix
+`stig-viewer/backup/v1\0`.
+
+**Restore** checks the entry digests and the signature before it changes the
+database. A signature that is present and wrong is always rejected, as is an
+entry that is altered, added or missing (version 2). An unsigned backup, or one
+signed by a key this server does not hold, is accepted with a warning unless
+`BACKUP_REQUIRE_SIGNATURE=true`, which rejects anything but a verified
+signature (including version 1 backups). The result (`verified`, `unsigned` or
+`unknown_key`) is returned as `signatureStatus`, written to the pre-restore
+`audit` log line and recorded in the `backup.restore` event's detail.
+
+**Limits.** Deleting a whole segment (and its manifest) is not detectable:
+there is no chain between segments. Whoever can write the files and the
+backup can also strip the signature and the `signers` list from a backup;
+only `BACKUP_REQUIRE_SIGNATURE=true` turns that into a rejection. A segment
+whose sidecar is missing (for example, a crash between the two renames) is
+reported as unverifiable and is not re-signed.
+
 ## Repository layout
 
 ```
