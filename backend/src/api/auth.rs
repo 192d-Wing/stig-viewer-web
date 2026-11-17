@@ -71,7 +71,9 @@ pub struct OidcEnv {
 }
 
 impl OidcEnv {
-    pub fn from_env() -> Result<Self> {
+    /// `allow_test_auth_header` comes from the already-validated
+    /// [`crate::config::TestHooks`], so it can never be on in production.
+    pub fn from_env(allow_test_auth_header: bool) -> Result<Self> {
         Ok(Self {
             internal_issuer_url: std::env::var("OIDC_INTERNAL_URL")
                 .unwrap_or_else(|_| "http://keycloak:8081/realms/stig-viewer".into()),
@@ -85,9 +87,7 @@ impl OidcEnv {
                 .unwrap_or_else(|_| "http://localhost:8080/auth/callback".into()),
             frontend_url: std::env::var("FRONTEND_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".into()),
-            allow_test_auth_header: std::env::var("ALLOW_TEST_AUTH_HEADER")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            allow_test_auth_header,
         })
     }
 }
@@ -376,7 +376,9 @@ pub struct AppAuthState {
 
 /// Auth middleware:
 /// 1. Session cookie (primary path)
-/// 2. X-User-Id header (only if `ALLOW_TEST_AUTH_HEADER=true` AND not production)
+/// 2. X-User-Id header, only if `ALLOW_TEST_AUTH_HEADER=true`. Startup
+///    refuses that flag when `STIG_ENV=production`
+///    (`config::TestHooks::validate`), so the bypass cannot be on there.
 pub async fn auth_middleware(
     State(state): State<AppAuthState>,
     headers: HeaderMap,

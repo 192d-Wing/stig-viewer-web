@@ -526,7 +526,7 @@ pub async fn take_snapshot(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
 }
 
 /// POST /api/test/snapshot — manually take a snapshot. Only registered
-/// when STIG_ENV != "production"; used by E2E to populate trend data.
+/// when `STIG_ENABLE_TEST_ROUTES=true`; used by E2E to populate trend data.
 pub async fn snapshot_handler(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     take_snapshot(state.pool.as_ref()).await.map_err(map_db)?;
     Ok(StatusCode::NO_CONTENT)
