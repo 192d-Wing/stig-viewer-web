@@ -229,35 +229,10 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
 
     let body = match &*result {
         Some((system, r)) => {
-            let failed: Vec<&SaveRow> = r.results.iter().filter(|x| x.status == "error").collect();
-            let noted: Vec<&SaveRow> = r.results.iter().filter(|x| x.note.is_some()).collect();
             html! {
                 <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} testid="save-system-result">
                     {save_summary(system, r)}
-                    if !noted.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for noted.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.note.clone().unwrap_or_default()}
-                                </li>
-                            }) }
-                            if noted.len() > 10 {
-                                <li>{format!("…and {} more.", noted.len() - 10)}</li>
-                            }
-                        </ul>
-                    }
-                    if !failed.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for failed.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.error.clone().unwrap_or_default()}
-                                </li>
-                            }) }
-                            if failed.len() > 10 {
-                                <li>{format!("…and {} more.", failed.len() - 10)}</li>
-                            }
-                        </ul>
-                    }
+                    {result_issue_lists(r.results.iter().map(|x| (x.rule_id.as_str(), x.status.as_str(), x.error.as_deref(), x.note.as_deref())), "")}
                 </Alert>
             }
         }

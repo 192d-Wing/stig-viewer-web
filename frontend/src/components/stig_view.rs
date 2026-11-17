@@ -92,12 +92,20 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let show_poam_modal = use_state(|| false);
     let show_save_modal = use_state(|| false);
     let can_save = use_current_user().is_some_and(|u| u.role != "viewer");
-    // Rule ids ticked for a multi-rule status change. Per tab: cleared when
-    // the viewer switches to another open STIG.
-    let checked = use_state(Vec::<String>::new);
+    // Rule ids ticked for a multi-rule status change, tagged with the tab
+    // they were ticked in; ticks from another open STIG read as empty.
+    let checked = use_state(|| (String::new(), Vec::<String>::new()));
+    let checked_ids: &[String] = if checked.0 == p.tab.id { &checked.1 } else { &[] };
+    // Switching tabs discards the old tab's ticks. The read above is already
+    // empty on the switching render; this only drops the stash so the ticks
+    // do not come back when the viewer returns. No state is set on mount.
     {
         let checked = checked.clone();
-        use_effect_with(p.tab.id.clone(), move |_| checked.set(Vec::new()));
+        use_effect_with(p.tab.id.clone(), move |tab_id| {
+            if checked.0 != *tab_id && !checked.1.is_empty() {
+                checked.set((tab_id.clone(), Vec::new()));
+            }
+        });
     }
     let file_input_ref = use_node_ref();
 
@@ -192,18 +200,18 @@ pub fn StigView(p: &StigViewProps) -> Html {
 
     // Only ticked rules that pass the current filters are acted on, so a
     // status change never touches rules the user cannot see.
-    let checked_set: HashSet<&str> = checked.iter().map(String::as_str).collect();
-    let checked_visible: Vec<String> =
-        filtered_rules.iter().filter(|r| checked_set.contains(r.id.as_str())).map(|r| r.id.clone()).collect();
+    let filtered_ids: Vec<&str> = filtered_rules.iter().map(|r| r.id.as_str()).collect();
+    let checked_visible: Vec<String> = visible_selection(&filtered_ids, checked_ids);
     let on_check = {
-        let checked = checked.clone();
+        let (checked, tab_id) = (checked.clone(), p.tab.id.clone());
         Callback::from(move |(ids, on): (Vec<String>, bool)| {
             let changed: HashSet<&str> = ids.iter().map(String::as_str).collect();
-            let mut next: Vec<String> = checked.iter().filter(|id| !changed.contains(id.as_str())).cloned().collect();
+            let current: &[String] = if checked.0 == tab_id { &checked.1 } else { &[] };
+            let mut next: Vec<String> = current.iter().filter(|id| !changed.contains(id.as_str())).cloned().collect();
             if on {
                 next.extend(ids);
             }
-            checked.set(next);
+            checked.set((tab_id.clone(), next));
         })
     };
     let on_set_checked_status = {

@@ -14,6 +14,7 @@ use yew::prelude::*;
 
 use crate::api::{api_fetch, api_fetch_json, api_get, api_json, api_upload, api_upload_raw, BACKEND};
 use crate::auth::use_current_user;
+use crate::model::visible_selection;
 use crate::ui::*;
 use crate::util::{encode_uri_component, event_value, spawn_local, to_locale_string};
 
@@ -1131,9 +1132,8 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     // ── Multi-select "Set status" ───────────────────────────────────────────
     // Only rules that still exist in the checklist count as selected.
     // Rows hidden by the text filter are not acted on either.
-    let visible_ids: std::collections::HashSet<&str> = filtered_rules.iter().map(|r| r.id()).collect();
-    let selected_ids: Vec<String> =
-        selected.iter().filter(|id| visible_ids.contains(id.as_str())).cloned().collect();
+    let filtered_ids: Vec<&str> = filtered_rules.iter().map(|r| r.id()).collect();
+    let selected_ids: Vec<String> = visible_selection(&filtered_ids, &selected);
     let on_selection_change = {
         let selected = selected.clone();
         Callback::from(move |rows: Vec<Rc<RuleRow>>| selected.set(rows.iter().map(|r| r.id().to_string()).collect()))
@@ -1194,8 +1194,6 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let set_status_closing = CLOSING_STATUSES.contains(&set_status_value.as_str());
     let set_status_alert = match &*set_status_result {
         Some((status, r)) => {
-            let failed: Vec<&BulkStatusRow> = r.results.iter().filter(|x| x.status == "error").collect();
-            let noted: Vec<&BulkStatusRow> = r.results.iter().filter(|x| x.note.is_some()).collect();
             let dismiss = {
                 let result = set_status_result.clone();
                 Callback::from(move |_: ()| result.set(None))
@@ -1204,30 +1202,7 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                 <Alert kind={if r.error_count > 0 { "warning" } else { "success" }} dismissible=true
                        on_dismiss={dismiss} testid="set-status-result">
                     {bulk_status_summary(&status_label(status), r)}
-                    if !noted.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for noted.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.note.clone().unwrap_or_default()}
-                                </li>
-                            }) }
-                            if noted.len() > 10 {
-                                <li>{format!("…and {} more.", noted.len() - 10)}</li>
-                            }
-                        </ul>
-                    }
-                    if !failed.is_empty() {
-                        <ul style="margin:6px 0 0;padding-left:18px;">
-                            { for failed.iter().take(10).map(|x| html! {
-                                <li key={x.rule_id.clone()}>
-                                    <code>{x.rule_id.clone()}</code>{": "}{x.error.clone().unwrap_or_default()}
-                                </li>
-                            }) }
-                            if failed.len() > 10 {
-                                <li>{format!("…and {} more (still selected).", failed.len() - 10)}</li>
-                            }
-                        </ul>
-                    }
+                    {result_issue_lists(r.results.iter().map(|x| (x.rule_id.as_str(), x.status.as_str(), x.error.as_deref(), x.note.as_deref())), " (still selected)")}
                 </Alert>
             }
         }
