@@ -8,6 +8,8 @@ import { loginAs, loadDemoStig, resetDb, setUserRole, BACKEND } from "./helpers.
  */
 
 const ASSET_NAME = "save-host";
+const ensureUserViaMe = (request, user) =>
+  request.get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": user } });
 const JSON_HEADERS = (user) => ({ "X-User-Id": user, "Content-Type": "application/json" });
 
 async function seedAsset(request, owner = "alice") {
@@ -176,6 +178,41 @@ test.describe("Save to system — API", () => {
     expect(list.length).toBe(1);
   });
 
+  test("GET /api/assets?writable=true lists only systems the caller can write to", async ({ request }) => {
+    const mine = await seedAsset(request);
+    const theirs = await request
+      .post(`${BACKEND}/api/assets`, { headers: JSON_HEADERS("mallory"), data: { name: "mallory-host" } })
+      .then((r) => r.json());
+    const ids = async (query, user = "alice") =>
+      (await request.get(`${BACKEND}/api/assets${query}`, { headers: { "X-User-Id": user } }).then((r) => r.json())).map((a) => a.id);
+
+    // Unfiltered and writable=false are identical and hold exactly both systems.
+    const all = (await ids("")).sort();
+    expect(all).toEqual([mine.id, theirs.id].sort());
+    expect((await ids("?writable=false")).sort()).toEqual(all);
+    // Fail closed on a malformed value.
+    for (const bad of ["yes", "", "0"]) {
+      const res = await request.get(`${BACKEND}/api/assets?writable=${bad}`, { headers: { "X-User-Id": "alice" } });
+      expect(res.status()).toBe(400);
+    }
+    // A user with no writable systems gets [].
+    await ensureUserViaMe(request, "carol");
+    expect(await ids("?writable=true", "carol")).toEqual([]);
+    expect(await ids("?writable=true")).toEqual([mine.id]);
+
+    // A read grant does not make it writable; a write grant does.
+    const alice = await request.get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    const grant = (permission) =>
+      request.post(`${BACKEND}/api/assets/${theirs.id}/acl`, {
+        headers: JSON_HEADERS("mallory"),
+        data: { userId: alice.id, permission },
+      });
+    expect((await grant("read")).ok()).toBeTruthy();
+    expect(await ids("?writable=true")).toEqual([mine.id]);
+    expect((await grant("write")).ok()).toBeTruthy();
+    expect((await ids("?writable=true")).sort()).toEqual([mine.id, theirs.id].sort());
+  });
+
   test("validation and authorization", async ({ request }) => {
     const asset = await seedAsset(request);
     const ids = await edgeRuleIds(request);
@@ -256,6 +293,32 @@ test.describe("Save to system — UI", () => {
     await page.getByTestId("save-system-select").click();
     await page.getByRole("option", { name: new RegExp(ASSET_NAME) }).click();
     await expect(page.getByText(/already has a checklist for this STIG/)).toBeVisible();
+  });
+
+  test("the picker lists only systems the user can write to", async ({ page, request }) => {
+    await seedAsset(request);
+    await request.post(`${BACKEND}/api/assets`, { headers: JSON_HEADERS("mallory"), data: { name: "mallory-host" } });
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    const listbox = page.getByRole("listbox", { name: "Rules" });
+    await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId("save-to-system").click();
+    await page.getByTestId("save-system-select").click();
+    await expect(page.getByRole("option", { name: new RegExp(ASSET_NAME) })).toBeVisible();
+    await expect(page.getByRole("option", { name: /mallory-host/ })).toHaveCount(0);
+  });
+
+  test("a user with no writable systems sees the empty state", async ({ page, request }) => {
+    await seedAsset(request); // alice's system, not writable by carol
+    await loginAs(page, "carol");
+    await page.goto("/");
+    await page.getByText(/Microsoft Edge Security Technical/).first().click();
+    const listbox = page.getByRole("listbox", { name: "Rules" });
+    await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId("save-to-system").click();
+    await page.getByTestId("save-system-select").click();
+    await expect(page.getByText("No systems you can write to.")).toBeVisible();
   });
 
   test("the demo STIG cannot be saved to a system", async ({ page }) => {

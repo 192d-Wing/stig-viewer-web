@@ -34,6 +34,64 @@ pub async fn seed_asset(pool: &PgPool, id: &str, owner: &str, requires_approval:
         .expect("seed asset");
 }
 
+pub async fn seed_acl(pool: &PgPool, asset_id: &str, user_id: &str, permission: &str) {
+    sqlx::query("INSERT INTO asset_acl (asset_id, user_id, permission, granted_by) VALUES ($1, $2, $3, $2)")
+        .bind(asset_id)
+        .bind(user_id)
+        .bind(permission)
+        .execute(pool)
+        .await
+        .expect("seed acl");
+}
+
+pub async fn seed_tag(pool: &PgPool, asset_id: &str, tag: &str) {
+    sqlx::query("INSERT INTO asset_tags (asset_id, tag) VALUES ($1, $2)")
+        .bind(asset_id)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("seed tag");
+}
+
+pub async fn set_classification(pool: &PgPool, asset_id: &str, classification: &str) {
+    sqlx::query("UPDATE assets SET classification = $2 WHERE id = $1")
+        .bind(asset_id)
+        .bind(classification)
+        .execute(pool)
+        .await
+        .expect("set classification");
+}
+
+/// An ABAC policy created by `created_by` (must exist). `None` match = wildcard.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_policy(
+    pool: &PgPool,
+    name: &str,
+    effect: &str,
+    level: &str,
+    role_match: Option<&str>,
+    classification_match: Option<&str>,
+    tag_match: Option<&str>,
+    enabled: bool,
+    created_by: &str,
+) {
+    sqlx::query(
+        "INSERT INTO abac_policies (id, name, effect, level, role_match, classification_match, tag_match, enabled, created_by) \
+         VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(name)
+    .bind(effect)
+    .bind(level)
+    .bind(role_match)
+    .bind(classification_match)
+    .bind(tag_match)
+    .bind(enabled)
+    .bind(created_by)
+    .execute(pool)
+    .await
+    .expect("seed policy");
+}
+
 pub async fn seed_checklist(pool: &PgPool, id: &str, asset_id: &str, stig_id: &str) {
     sqlx::query("INSERT INTO checklists (id, asset_id, stig_id) VALUES ($1, $2, $3)")
         .bind(id)

@@ -119,19 +119,24 @@ fn map_sqlx(e: sqlx::Error) -> StatusCode {
 /// (user, asset) pair. A NULL column matches anything; a non-NULL
 /// column must equal the corresponding user.role / asset.classification
 /// / be present in asset.tags.
-fn policy_matches(policy: &PolicyRow, user: &AuthUser, asset: &AssetRow) -> bool {
+fn policy_matches(
+    policy: &PolicyRow,
+    user: &AuthUser,
+    classification: &str,
+    tags: &[String],
+) -> bool {
     if let Some(r) = &policy.role_match {
         if r != &user.role {
             return false;
         }
     }
     if let Some(c) = &policy.classification_match {
-        if c != &asset.classification {
+        if c != classification {
             return false;
         }
     }
     if let Some(t) = &policy.tag_match {
-        if !asset.tags.iter().any(|tag| tag == t) {
+        if !tags.iter().any(|tag| tag == t) {
             return false;
         }
     }
@@ -151,7 +156,19 @@ pub async fn evaluate(
     asset: &AssetRow,
     requested_level: &str,
 ) -> Decision {
-    let rows = sqlx::query_as::<_, PolicyRow>(
+    let rows = match load_policies(pool, requested_level).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("abac::evaluate lookup failed: {e:#}");
+            return Decision::NoOpinion;
+        }
+    };
+    decide(&rows, user, &asset.classification, &asset.tags)
+}
+
+/// Every enabled policy targeting `level`.
+pub async fn load_policies(pool: &PgPool, level: &str) -> Result<Vec<PolicyRow>, sqlx::Error> {
+    sqlx::query_as::<_, PolicyRow>(
         r#"
         SELECT id, name, effect, level,
                role_match, classification_match, tag_match,
@@ -161,20 +178,22 @@ pub async fn evaluate(
            AND level = $1
         "#,
     )
-    .bind(requested_level)
+    .bind(level)
     .fetch_all(pool)
-    .await;
-    let rows = match rows {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("abac::evaluate lookup failed: {e:#}");
-            return Decision::NoOpinion;
-        }
-    };
+    .await
+}
 
+/// The pure half of [`evaluate`]: Deny wins over Allow over NoOpinion across
+/// the already-loaded `policies` for an asset with this classification/tags.
+pub fn decide(
+    policies: &[PolicyRow],
+    user: &AuthUser,
+    classification: &str,
+    tags: &[String],
+) -> Decision {
     let mut allow_seen = false;
-    for p in &rows {
-        if !policy_matches(p, user, asset) {
+    for p in policies {
+        if !policy_matches(p, user, classification, tags) {
             continue;
         }
         if p.effect == "deny" {

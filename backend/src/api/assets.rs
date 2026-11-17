@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Extension, Json,
 };
@@ -69,12 +69,26 @@ pub fn normalize_tags(input: &[String]) -> Result<Vec<String>, StatusCode> {
     Ok(out)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListAssetsQuery {
+    /// `true` narrows the list to systems the caller can write to (the
+    /// "Save to system" picker). Advisory: write handlers re-check.
+    #[serde(default)]
+    pub writable: Option<bool>,
+}
+
 pub async fn list_assets_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(q): Query<ListAssetsQuery>,
 ) -> Result<Json<Vec<db_assets::AssetSummary>>, StatusCode> {
-    let rows = db_assets::list_assets(state.pool.as_ref())
+    let mut rows = db_assets::list_assets(state.pool.as_ref())
         .await
         .map_err(map_db)?;
+    if q.writable == Some(true) {
+        let ids = asset_acl::writable_asset_ids(state.pool.as_ref(), &user, &rows).await;
+        rows.retain(|a| ids.contains(&a.id));
+    }
     Ok(Json(rows))
 }
 

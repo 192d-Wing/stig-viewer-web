@@ -115,7 +115,7 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                 existing.set(None);
                 let my_gen = *generation.borrow();
                 spawn_local(async move {
-                    let loaded = api_get::<Vec<AssetOption>>("/api/assets").await;
+                    let loaded = api_get::<Vec<AssetOption>>("/api/assets?writable=true").await;
                     if *generation.borrow() != my_gen {
                         return;
                     }
@@ -271,7 +271,7 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                         disabled={*busy}
                         placeholder="Choose a system"
                         filtering=true
-                        empty={if error.is_some() { "Systems could not be loaded." } else { "No systems yet. Create one under Systems." }}
+                        empty={if error.is_some() { "Systems could not be loaded." } else { "No systems you can write to." }}
                         testid="save-system-select"
                     />
                 </FormField>
