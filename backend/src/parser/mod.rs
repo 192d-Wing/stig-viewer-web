@@ -640,9 +640,9 @@ mod tests {
     /// and hold real titles and CCI ids.
     #[test]
     fn seeded_catalog_has_real_titles_and_cci_ids() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/stigs");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed/stigs");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).expect("read data/stigs") {
+        for entry in std::fs::read_dir(&dir).expect("read seed/stigs") {
             let path = entry.expect("dir entry").path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -665,6 +665,81 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no catalog files found in {}", dir.display());
+    }
+
+    /// The seed is committed to a public repository, so it must not hold CUI:
+    /// no marking in any string, none of the withheld `CUI_` products, and no
+    /// repeated rule ids. The file-count floor makes a dropped directory fail
+    /// without pinning an exact count that every regeneration would change.
+    #[test]
+    fn seeded_catalog_holds_no_cui_and_has_unique_rule_ids() {
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+                serde_json::Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+                _ => {}
+            }
+        }
+        // Title patterns for the withheld products (lower-case).
+        const CUI_TITLES: &[&str] = &[
+            "trellix ens",
+            "ens 10",
+            "ess agent handler",
+            "ess epo",
+            "epo 5",
+            "policy auditor",
+            "ess remote console",
+            "rogue sensor",
+            "ess staging server",
+            "ess trellix agent",
+            "tie-dxl",
+            "tie dxl",
+            "joint regional security stack",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed/stigs");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read seed/stigs") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.display().to_string();
+            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+            let bytes = std::fs::read(&path).expect("read catalog file");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            let stig: StigData = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("{name} does not parse as StigData: {e}"));
+
+            let mut all = Vec::new();
+            strings(&value, &mut all);
+            for s in all {
+                let l = s.to_lowercase();
+                assert!(
+                    !l.contains("cui//") && !l.contains("controlled unclassified"),
+                    "{name}: a string carries a CUI marking"
+                );
+            }
+
+            let title = stig.title.to_lowercase();
+            let id_words: Vec<&str> = id.split('-').collect();
+            assert!(
+                !CUI_TITLES.iter().any(|p| title.contains(p))
+                    && !id.contains("trellix-ens")
+                    && !id.contains("tie-dxl")
+                    && !id.contains("joint-regional")
+                    && !id_words.contains(&"ess"),
+                "{name}: id or title matches a withheld CUI product ({:?})",
+                stig.title
+            );
+
+            let mut seen = std::collections::HashSet::new();
+            for r in &stig.rules {
+                assert!(seen.insert(r.id.as_str()), "{name}: duplicate rule id {}", r.id);
+            }
+            checked += 1;
+        }
+        assert!(checked >= 200, "only {checked} seed files in {}; expected at least 200", dir.display());
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
