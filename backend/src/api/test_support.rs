@@ -38,7 +38,8 @@ const VALID_SCHEDULERS: &[&str] = &[
 ];
 
 /// POST /api/test/reset — truncate all user-generated data for E2E test isolation.
-/// Only registered when STIG_ENV != "production".
+/// Only registered when `STIG_ENABLE_TEST_ROUTES=true` (which startup refuses
+/// under `STIG_ENV=production`).
 pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
     // catalog_archive has no FK linkage to user tables, so CASCADE doesn't
     // reach it from `users`. List it explicitly so per-test archive seeds
@@ -289,8 +290,8 @@ pub struct SamlLoginRequest {
 /// POST /api/test/saml-login — exercise the SAML "find or create user +
 /// mint session" path without a real IdP. Returns the session cookie via
 /// `Set-Cookie` so subsequent requests with the same cookie jar are
-/// authenticated. Gated by STIG_ENV != "production" like the other test
-/// helpers.
+/// authenticated. Only registered when `STIG_ENABLE_TEST_ROUTES=true`, like
+/// the other test helpers.
 pub async fn saml_login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -458,8 +459,8 @@ pub async fn run_scheduler_handler(
 /// POST /api/test/run-asset-email-schedules — synchronously run one
 /// tick of the per-asset scheduled-email loop and return the number of
 /// assets that were emailed. Used by E2E to drive the cadence path
-/// without waiting on the hourly scheduler. Gated by
-/// `STIG_ENV != "production"` at registration time.
+/// without waiting on the hourly scheduler. Only registered
+/// when `STIG_ENABLE_TEST_ROUTES=true`.
 pub async fn run_asset_email_schedules_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -475,8 +476,8 @@ pub async fn run_asset_email_schedules_handler(
 /// POST /api/test/reset-ratelimit — flush the in-memory token-bucket map
 /// used by the rate-limit middleware. The rate-limit E2E spec calls this
 /// in `beforeEach` so prior runs (and earlier mutation-heavy specs in the
-/// same process) don't contaminate alice's bucket. Gated by
-/// `STIG_ENV != "production"` at registration time.
+/// same process) don't contaminate alice's bucket. Only registered
+/// when `STIG_ENABLE_TEST_ROUTES=true`.
 pub async fn reset_ratelimit_handler() -> StatusCode {
     rate_limit::reset();
     StatusCode::NO_CONTENT

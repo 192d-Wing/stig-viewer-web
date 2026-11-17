@@ -68,9 +68,15 @@ services:
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-dev-only-not-a-real-secret}
       OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}
       FRONTEND_URL: ${VITE_API_URL_FRONTEND:-http://localhost:5173}
-      # Allow the X-User-Id test bypass. Production deployments MUST leave
-      # this unset (the backend additionally refuses it when STIG_ENV=production).
+      # Test-only hooks, both off unless set to "true"/"1". This dev stack
+      # turns them on because the Playwright suite needs them. Production
+      # deployments MUST leave both unset; the backend refuses to start if
+      # either is on while STIG_ENV=production.
+      #   ALLOW_TEST_AUTH_HEADER  — accept X-User-Id in place of a session.
+      #   STIG_ENABLE_TEST_ROUTES — mount the unauthenticated /api/test/*
+      #                             routes (DB reset, role changes, ...).
       ALLOW_TEST_AUTH_HEADER: ${ALLOW_TEST_AUTH_HEADER:-true}
+      STIG_ENABLE_TEST_ROUTES: ${STIG_ENABLE_TEST_ROUTES:-true}
       CARGO_TARGET_DIR: /target
     ports:
       - "8080:8080"
