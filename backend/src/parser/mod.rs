@@ -634,6 +634,39 @@ mod tests {
         assert_eq!(r.check_text, "first check");
     }
 
+    /// The seeded catalog is data, not code, so it can rot silently: files
+    /// written by an older parser carried "DPMS Target ..." as rule titles and
+    /// non-CCI idents in `cciIds`. Every tracked file must parse as `StigData`
+    /// and hold real titles and CCI ids.
+    #[test]
+    fn seeded_catalog_has_real_titles_and_cci_ids() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/stigs");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read data/stigs") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.display().to_string();
+            let bytes = std::fs::read(&path).expect("read catalog file");
+            let stig: StigData = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("{name} does not parse as StigData: {e}"));
+            for r in &stig.rules {
+                assert!(
+                    !r.title.starts_with("DPMS Target"),
+                    "{name}: rule {} has the DPMS Target title {:?}",
+                    r.id,
+                    r.title
+                );
+                for c in &r.cci_ids {
+                    assert!(c.starts_with("CCI-"), "{name}: rule {} has non-CCI id {c:?}", r.id);
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no catalog files found in {}", dir.display());
+    }
+
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write;
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
