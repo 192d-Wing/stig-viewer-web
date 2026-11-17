@@ -130,7 +130,7 @@ async fn archive_previous_catalog(
     tokio::fs::create_dir_all(&archive_dir).await?;
 
     let release_safe = sanitize_release(&old_release);
-    let archive_name = format!("{stig_id}-v{old_version}-r{release_safe}.json");
+    let archive_name = format!("{stig_id}-v{}-r{release_safe}.json", sanitize_release(&old_version));
     let archive_abs = archive_dir.join(&archive_name);
 
     // Copy the file regardless — if a previous archive run already
@@ -245,5 +245,6 @@ mod id_tests {
             assert!(validate_source(&src(bad)).is_err(), "{bad}");
         }
         assert!(validate_source(&src("windows-10")).is_ok());
+        assert!(validate_source(&src("a")).is_ok());
     }
 }

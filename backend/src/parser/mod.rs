@@ -551,6 +551,8 @@ pub fn extract_all_from_library(
                 id = format!("{base}-{n}");
             }
 
+            // Defensive: `filename_to_id` already yields lower-case ASCII, so
+            // in practice this only fires for an over-long id.
             if !crate::stig_id::is_valid_new(&id) {
                 errors.push((
                     id.chars().take(64).collect(),

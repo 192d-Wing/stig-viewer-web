@@ -205,7 +205,7 @@ async fn load_rule_meta_map(
     state: &AppState,
     stig_id: &str,
 ) -> HashMap<String, RuleMeta> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(stig_id) {
         return HashMap::new();
     }
     let path = state
@@ -254,4 +254,18 @@ async fn load_rule_meta_map(
 
 fn is_valid_status(s: &str) -> bool {
     matches!(s, "open" | "not_a_finding" | "not_applicable" | "not_reviewed")
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            assert!(load_rule_meta_map(&state, &id).await.is_empty(), "{id:?}");
+        }
+    }
 }

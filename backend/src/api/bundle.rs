@@ -634,3 +634,17 @@ fn map_db(e: anyhow::Error) -> StatusCode {
     tracing::error!("bundle db error: {e:#}");
     StatusCode::INTERNAL_SERVER_ERROR
 }
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            assert!(load_stig_json(&state, &id).await.is_none(), "{id:?}");
+        }
+    }
+}

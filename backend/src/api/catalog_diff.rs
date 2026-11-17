@@ -116,7 +116,7 @@ pub async fn diff_handler(
 ) -> Result<Json<DiffResponse>, StatusCode> {
     // Same id sanitization as `api::stig::get_stig` — alphanumerics +
     // hyphens. Prevents path traversal via crafted ids.
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(&stig_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -176,7 +176,7 @@ pub async fn list_archive_handler(
     State(state): State<AppState>,
     Path(stig_id): Path<String>,
 ) -> Result<Json<Vec<ArchiveRow>>, StatusCode> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(&stig_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let rows = sqlx::query_as::<_, (i64, String, String, String, DateTime<Utc>, String)>(
@@ -240,13 +240,14 @@ pub async fn seed_archive_handler(
     State(state): State<AppState>,
     Json(req): Json<SeedArchiveRequest>,
 ) -> Result<Json<SeedArchiveResponse>, StatusCode> {
-    if !req.stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid_new(&req.stig_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
     let release_safe = sanitize_release(&req.release_info);
+    let version_safe = sanitize_release(&req.version);
     let filename = format!(
         "{}-v{}-r{}.json",
-        req.stig_id, req.version, release_safe
+        req.stig_id, version_safe, release_safe
     );
     let rel_path = format!("stigs/archive/{filename}");
     let abs_path = state.config.data_dir.join(&rel_path);
@@ -415,5 +416,22 @@ fn sanitize_release(release_info: &str) -> String {
         "unknown".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            let d = diff_handler(State(state.clone()), Path(id.clone())).await;
+            assert!(matches!(d, Err(StatusCode::BAD_REQUEST)), "{id:?}");
+            let l = list_archive_handler(State(state.clone()), Path(id.clone())).await;
+            assert!(matches!(l, Err(StatusCode::BAD_REQUEST)), "{id:?}");
+        }
     }
 }

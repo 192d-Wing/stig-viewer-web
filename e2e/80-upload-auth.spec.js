@@ -60,6 +60,9 @@ test.describe("Catalog upload — authentication", () => {
     for (const id of ["", "a/b", "Upper-Case"]) {
       const res = await uploadStigAs("upload-admin", { ...bogus, id });
       expect(res.status).toBe(400);
+      if (id === "Upper-Case") expect(await res.text()).toContain("lower-case");
     }
+    const listed = await (await fetch(`${BACKEND}/api/stigs`)).json();
+    expect(listed.map((e) => e.id)).not.toContain("Upper-Case");
   });
 });

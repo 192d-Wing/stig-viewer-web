@@ -134,6 +134,10 @@ pub async fn fork_from_stig_handler(
     Extension(user): Extension<AuthUser>,
     Path(stig_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // The id becomes a path component and is stored in `based_on_stig`.
+    if !crate::stig_id::is_valid(&stig_id) {
+        return Err(err_400("invalid STIG id"));
+    }
     // Read the library STIG JSON
     let stig_path = state
         .config
@@ -564,3 +568,24 @@ pub async fn add_comment_handler(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            let r = fork_from_stig_handler(
+                State(state.clone()),
+                Extension(crate::test_fixtures::auth("u", "author")),
+                Path(id.clone()),
+            )
+            .await;
+            assert_eq!(r.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST), "{id:?}");
+        }
+        assert!(!state.config.data_dir.join("drafts").exists());
+    }
+}

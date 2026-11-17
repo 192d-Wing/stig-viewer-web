@@ -123,6 +123,9 @@ pub async fn search_handler(
         //    scan so a query that matches both title and a rule still
         //    surfaces individual rule hits — useful for "edge" where
         //    operators want to jump to specific rules.
+        if !crate::stig_id::is_valid(&entry.id) {
+            continue;
+        }
         let path = state
             .config
             .data_dir

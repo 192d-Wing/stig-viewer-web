@@ -17,9 +17,29 @@ pub fn is_valid_new(id: &str) -> bool {
     is_valid(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 
-/// Ids in `ids` that fail the read rule.
-pub fn non_conforming<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
-    ids.into_iter().filter(|i| !is_valid(i)).collect()
+/// How many offending ids the startup warning lists before "and N more".
+const WARN_LIST_CAP: usize = 50;
+
+/// Build the startup warning text from `(source, id)` rows, or `None` when
+/// every id conforms. Lists at most [`WARN_LIST_CAP`] ids, each truncated.
+pub fn warning_message(rows: &[(String, String)]) -> Option<String> {
+    let bad: Vec<String> = rows
+        .iter()
+        .filter(|(_, id)| !is_valid(id))
+        .map(|(src, id)| format!("{src}:{:?}", id.chars().take(64).collect::<String>()))
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    let mut list = bad.iter().take(WARN_LIST_CAP).cloned().collect::<Vec<_>>().join(", ");
+    if bad.len() > WARN_LIST_CAP {
+        list.push_str(&format!(" and {} more", bad.len() - WARN_LIST_CAP));
+    }
+    Some(format!(
+        "{} STIG id(s) do not match the id rule (ASCII alphanumerics and '-', 1-{MAX_BYTES} bytes) \
+         and cannot be read until re-uploaded: {list}",
+        bad.len()
+    ))
 }
 
 /// Log a startup warning listing catalog and checklist ids that fail the
@@ -28,27 +48,15 @@ pub async fn warn_non_conforming(pool: &sqlx::PgPool) {
     let rows: Result<Vec<(String, String)>, _> = sqlx::query_as(
         "SELECT 'catalog', id FROM stigs_catalog
          UNION
-         SELECT 'checklist', stig_id FROM checklists
+         SELECT DISTINCT 'checklist', stig_id FROM checklists
          ORDER BY 1, 2",
     )
     .fetch_all(pool)
     .await;
     match rows {
         Ok(rows) => {
-            let bad_ids = non_conforming(rows.iter().map(|(_, id)| id.as_str()));
-            let bad: Vec<String> = rows
-                .iter()
-                .filter(|(_, id)| bad_ids.contains(&id.as_str()))
-                .map(|(src, id)| format!("{src}:{:?}", id.chars().take(64).collect::<String>()))
-                .collect();
-            if !bad.is_empty() {
-                tracing::warn!(
-                    "{} STIG id(s) do not match the id rule (ASCII alphanumerics and '-', 1-{} bytes) \
-                     and cannot be read until re-uploaded: {}",
-                    bad.len(),
-                    MAX_BYTES,
-                    bad.join(", ")
-                );
+            if let Some(msg) = warning_message(&rows) {
+                tracing::warn!("{msg}");
             }
         }
         Err(e) => tracing::warn!("could not check STIG ids against the id rule: {e:#}"),
@@ -79,7 +87,17 @@ mod tests {
     }
 
     #[test]
-    fn non_conforming_lists_bad_ids() {
-        assert_eq!(non_conforming(["ok", "é", "", "Ok-1"]), ["é", ""]);
+    fn warning_message_is_none_when_all_conform() {
+        assert_eq!(warning_message(&[("catalog".into(), "ok".into())]), None);
+    }
+
+    #[test]
+    fn warning_message_lists_and_caps() {
+        let mut rows = vec![("checklist".to_string(), "\u{e9}".to_string()), ("catalog".into(), "fine".into())];
+        let m = warning_message(&rows).expect("message");
+        assert!(m.starts_with("1 STIG id(s)") && m.contains("checklist:") && !m.contains("fine"), "{m}");
+        rows.extend((0..59).map(|i| ("catalog".to_string(), format!("bad.{i}"))));
+        let m = warning_message(&rows).expect("message");
+        assert!(m.starts_with("60 STIG id(s)") && m.ends_with("and 10 more"), "{m}");
     }
 }

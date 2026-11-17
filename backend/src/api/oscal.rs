@@ -346,7 +346,7 @@ fn extract_cci_props(rule: &Value) -> Option<Vec<OscalProp>> {
 /// for unknown/invalid IDs or read errors — callers degrade gracefully
 /// (no rules → empty findings) rather than 500ing the whole export.
 async fn load_stig_json(data_dir: &StdPath, stig_id: &str) -> Option<Value> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(stig_id) {
         return None;
     }
     let path = data_dir.join("stigs").join(format!("{stig_id}.json"));
@@ -404,5 +404,19 @@ mod tests {
         assert_eq!(props.len(), 2);
         assert_eq!(props[0].name, "cci");
         assert_eq!(props[0].value, "CCI-001");
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            assert!(load_stig_json(&state.config.data_dir, &id).await.is_none(), "{id:?}");
+        }
     }
 }

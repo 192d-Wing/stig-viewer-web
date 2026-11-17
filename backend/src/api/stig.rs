@@ -38,3 +38,18 @@ pub async fn get_stig(
 
     Ok(Json(value))
 }
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            let r = get_stig(State(state.clone()), Path(id.clone())).await;
+            assert!(matches!(r, Err(StatusCode::BAD_REQUEST)), "{id:?}");
+        }
+    }
+}
