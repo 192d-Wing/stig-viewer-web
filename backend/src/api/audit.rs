@@ -174,19 +174,19 @@ fn parse_date_param(raw: &str, end: bool) -> Result<DateTime<Utc>, StatusCode> {
     Ok(Utc.from_utc_datetime(&ndt))
 }
 
-/// Record that an admin read an audit view. Fails open like every audit event.
-/// Filter values are bounded and sanitised; nothing else from the request is kept.
-#[allow(clippy::too_many_arguments)]
-async fn record_audit_read(
-    state: &AppState,
-    user: &AuthUser,
-    ctx: &RequestCtx,
+/// What one audit read returned, for its `audit.read` event.
+struct AuditRead<'a> {
     view: &'static str,
-    filters: &[(&'static str, &Option<String>)],
+    filters: &'a [(&'static str, &'a Option<String>)],
     page: i64,
     page_size: i64,
     returned: usize,
-) {
+}
+
+/// Record that an admin read an audit view. Fails open like every audit event.
+/// Filter values are bounded and sanitised; nothing else from the request is kept.
+async fn record_audit_read(state: &AppState, user: &AuthUser, ctx: &RequestCtx, read: AuditRead<'_>) {
+    let AuditRead { view, filters, page, page_size, returned } = read;
     let mut f = serde_json::Map::new();
     for (k, v) in filters {
         if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
@@ -367,17 +367,19 @@ pub async fn search_handler(
         &state,
         &user,
         &ctx,
-        "rules",
-        &[
+        AuditRead {
+            view: "rules",
+            filters: &[
             ("userId", &params.user_id),
             ("assetId", &params.asset_id),
             ("checklistId", &params.checklist_id),
             ("from", &params.from),
             ("to", &params.to),
         ],
-        page,
-        page_size,
-        rows.len(),
+            page,
+            page_size,
+            returned: rows.len(),
+        },
     )
     .await;
 
@@ -561,8 +563,9 @@ pub async fn events_handler(
         &state,
         &user,
         &ctx,
-        "events",
-        &[
+        AuditRead {
+            view: "events",
+            filters: &[
             ("userId", &params.user_id),
             ("assetId", &params.asset_id),
             ("checklistId", &params.checklist_id),
@@ -571,9 +574,10 @@ pub async fn events_handler(
             ("from", &params.from),
             ("to", &params.to),
         ],
-        page,
-        page_size,
-        rows.len(),
+            page,
+            page_size,
+            returned: rows.len(),
+        },
     )
     .await;
 
@@ -704,6 +708,23 @@ mod events_tests {
             assert_eq!(s.err(), Some(StatusCode::FORBIDDEN));
             assert_eq!(call(&state, role, query(None)).await.err(), Some(StatusCode::FORBIDDEN));
         }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_bad_request_writes_no_audit_read(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let ctx = crate::test_fixtures::ctx();
+        let mut sq = search_query();
+        sq.from = Some("not-a-date".into());
+        let s = search_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(sq)).await;
+        assert_eq!(s.err(), Some(StatusCode::BAD_REQUEST));
+        let mut eq = query(None);
+        eq.to = Some("nope".into());
+        assert_eq!(call(&state, "admin", eq).await.err(), Some(StatusCode::BAD_REQUEST));
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
     }

@@ -293,6 +293,7 @@ pub(crate) async fn record_ack_missing(pool: &PgPool, user_id: &str, session_id:
             asset_id: None,
             checklist_id: None,
             stig_id: None,
+            ctx: None,
             detail: json!({ "method": method, "sessionId": session_id }),
         },
     )
@@ -310,6 +311,7 @@ pub(crate) async fn record_ack_linked(pool: &PgPool, user_id: &str, session_id: 
             asset_id: None,
             checklist_id: None,
             stig_id: None,
+            ctx: None,
             detail: json!({
                 "noticeVersion": rec.notice_version,
                 "acknowledgedAt": rec.created_at.to_rfc3339(),

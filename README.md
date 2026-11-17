@@ -195,10 +195,13 @@ cd backend && cargo clippy -- -D warnings
   `failed to write audit event`, with the user, action, outcome and ids. Alert
   on that line, and ship the application logs to a retained store, since it is
   the only record of an event that missed the database (AU-5).
-- `source_ip` is taken from `X-Forwarded-For` / `X-Real-IP`, the same way
-  sessions record it. It is client-asserted unless the backend sits behind a
-  trusted proxy that overwrites those headers; do not expose the backend
-  directly if you rely on it.
+- `source_ip` is the same client IP the login notice uses: the socket peer
+  address, or, with `STIG_TRUST_PROXY_HEADERS=true`, the
+  `STIG_TRUSTED_PROXY_HOPS`-th hop from the right of `X-Forwarded-For`. It is
+  stored only as a canonical IP address (otherwise NULL). Behind a proxy
+  without that setting every row records the proxy's address; with it set, the
+  proxy must append to `X-Forwarded-For` as described above, since a value the
+  client supplied further left is never used.
 - IP addresses are retained with the audit rows, in the retention archive and
   in backups.
 

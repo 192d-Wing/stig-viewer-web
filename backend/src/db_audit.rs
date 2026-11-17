@@ -43,15 +43,6 @@ pub fn bound_id(id: &str) -> String {
     sanitize(id, MAX_ID_CHARS)
 }
 
-/// Longest `source_ip` kept.
-pub const MAX_SOURCE_IP_CHARS: usize = 64;
-
-/// A client-supplied address made safe to store and log (bounded, ASCII
-/// alphanumerics and `._:-` only).
-pub fn sanitize_source_ip(ip: &str) -> String {
-    sanitize(ip, MAX_SOURCE_IP_CHARS)
-}
-
 fn sanitize(id: &str, max: usize) -> String {
     id.chars()
         .take(max)
@@ -90,7 +81,7 @@ async fn insert(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail:
     .bind(detail.to_string())
     .bind(ev.ctx.and_then(|c| c.source_ip.as_deref()))
     .bind(ev.ctx.map(|c| c.request_id.as_str()))
-    .bind(ev.ctx.map(|c| c.role.as_str()))
+    .bind(ev.ctx.map(|c| bound_id(&c.role)))
     .execute(pool)
     .await?;
     Ok(())

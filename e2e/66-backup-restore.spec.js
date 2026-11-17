@@ -170,14 +170,22 @@ test.describe("Backup + restore — API", () => {
     const asset = await createAsset(request, "backup-host-events");
     await applyStig(request, asset.id);
 
-    const listEvents = async () =>
+    // Every read of /api/audit/events is itself audited (audit.read). Hide
+    // those rows from the comparisons, but count them where the backup counts them.
+    const fetchEvents = async (query = "") =>
       (
         await request
-          .get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } })
+          .get(`${BACKEND}/api/audit/events${query}`, { headers: { "X-User-Id": "alice" } })
           .then((r) => r.json())
       ).rows;
+    const listEvents = async () => (await fetchEvents()).filter((e) => e.action !== "audit.read");
     const before = await listEvents();
     expect(before.map((e) => e.action)).toContain("checklist.create");
+    // The backup holds the audit.read rows already written, plus the one this
+    // very call writes after its query.
+    const readsSeen = (await fetchEvents("?action=audit.read")).length;
+    expect(readsSeen).toBeGreaterThan(0);
+    const readsInBackup = readsSeen + 1;
 
     const backupBytes = await request
       .get(`${BACKEND}/api/admin/backup`, { headers: { "X-User-Id": "alice" } })
@@ -187,14 +195,18 @@ test.describe("Backup + restore — API", () => {
     await ensureUser(request, "alice");
     await setUserRole("alice", "admin");
     expect(await listEvents()).toHaveLength(0);
+    // (that call wrote one audit.read row into the freshly reset database)
 
     const restoreRes = await request.post(`${BACKEND}/api/admin/restore?force=true`, {
       headers: { "X-User-Id": "alice" },
       multipart: { file: { name: "backup.zip", mimeType: "application/zip", buffer: backupBytes } },
     });
     expect(restoreRes.status()).toBe(200);
-    expect((await restoreRes.json()).restored.audit_events).toBe(before.length);
+    expect((await restoreRes.json()).restored.audit_events).toBe(before.length + readsInBackup);
 
+    // The audit.read rows survive the round trip like any other event.
+    const restoredReads = await fetchEvents("?action=audit.read");
+    expect(restoredReads.length).toBeGreaterThanOrEqual(readsInBackup);
     const after = await listEvents();
     expect(after.map((e) => e.id)).toEqual(before.map((e) => e.id));
 

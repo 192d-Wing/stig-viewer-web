@@ -402,7 +402,10 @@ test.describe("Audit log search", () => {
     const body = await res.json();
     expect(body.totalCount).toBe(1);
     const row = body.rows[0];
-    expect(row).toMatchObject({ action: "audit.read", outcome: "ok", sourceIp: "203.0.113.9", userRole: "admin", requestId });
+    expect(row).toMatchObject({ action: "audit.read", outcome: "ok", userRole: "admin", requestId });
+    // Header text is never stored: the value is the socket peer (or a trusted hop), as a canonical IP.
+    expect(row.sourceIp).toMatch(/^[0-9a-f:.]+$/i);
+    expect(row.sourceIp).not.toBe("203.0.113.9");
     expect(row.detail).toMatchObject({ view: "rules", page: 1, filters: { from: "2020-01-01" } });
   });
 
