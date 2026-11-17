@@ -185,6 +185,120 @@ signed-in user with the `admin` role and accept bodies up to 500 MB. Other
 routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),
 `/api/sign` and the admin restore.
 
+### Signing envelope (v2)
+
+`POST /api/sign` returns:
+
+```json
+{
+  "document": { "...": "convenience copy, NOT authenticated" },
+  "payload": "<base64url, no padding, of the exact signed bytes>",
+  "signature": "<base64 Ed25519, legacy = signatures[0].signature>",
+  "keyId": "<legacy = signatures[0].keyId>",
+  "version": 2,
+  "signatures": [{ "algorithm": "ed25519", "keyId": "...", "signature": "<base64>" }]
+}
+```
+
+`GET /api/signing/pubkey` returns `{algorithm, keyId, publicKey, keys:
+[{algorithm, keyId, publicKey}]}`; pin the key from it out of band.
+
+**Only `payload` is authenticated.** It is the compact UTF-8 JSON of the
+signing document: `version`, `algorithm`, `keyId`, `signers`
+(`[{algorithm, keyId}]`), `sha256`, `signedAt`, `signedBy`, `signedByName`,
+and `resource` only when present. `algorithm` and `keyId` equal `signers[0]`.
+The top-level `document`, `signature`, `keyId` and `version` are ignored by
+verifiers. Verifiers never rebuild JSON: they decode `payload` and parse those
+same bytes.
+
+Domain separation: the signature input is
+`b"stig-viewer/sign/v2\0" || payload_bytes` (`SIGN_DOMAIN` in
+`backend/src/api/signing.rs`).
+
+Verification steps (implemented by `verify_bundle` in `signing.rs`):
+
+1. Base64url-decode `payload` and parse it as the signing document.
+2. Require the signed `version` to be exactly 2.
+3. Require `signers` to be non-empty and free of duplicates, with
+   `signers[0]` equal to the signed `algorithm`/`keyId`.
+4. If any signer uses an algorithm you do not support, reject (never skip).
+5. Require the envelope's `signatures[]` to match `signers` one to one (same
+   algorithm and keyId; no extras, none missing).
+6. Require every signer's `keyId` to be the fingerprint of the key you pinned
+   (first 8 bytes of SHA-256 of the raw public key, hex).
+7. Verify every signature over `SIGN_DOMAIN || payload`.
+8. Require the artifact's SHA-256 to equal `sha256` (hex, compared
+   case-insensitively). `verify_bundle` makes this mandatory;
+   `verify_bundle_document_only` skips it and binds no artifact.
+
+v1 is detected by the absence of `version` (and of `payload`); v1 verifiers,
+which checked a signature over a rebuilt document, break against v2 and must
+be updated. ML-DSA is not supported yet. Adding it means a new entry in both
+`signers` (inside the signed bytes) and `signatures`, and every signer must
+verify, so stripping a post-quantum signature is detected. Export bundles do
+not use this envelope.
+
+Worked example (Python, `cryptography` package). It uses explicit `raise`
+rather than `assert` (which `python -O` strips) and strict base64:
+
+```python
+import base64, hashlib, json
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+def no_dupes(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate JSON key: " + k)
+        d[k] = v
+    return d
+
+def verify(bundle_path, pinned_pub: Ed25519PublicKey, artifact_sha256_hex: str):
+    b = json.load(open(bundle_path), object_pairs_hook=no_dupes)
+    p = b["payload"]
+    if "=" in p:
+        raise ValueError("payload must be unpadded base64url")
+    # Strict: rejects characters outside the URL-safe alphabet.
+    payload = base64.b64decode(p + "=" * (-len(p) % 4), altchars=b"-_", validate=True)
+    doc = json.loads(payload, object_pairs_hook=no_dupes)
+
+    if doc.get("version") != 2:
+        raise ValueError("unsupported version")
+    signers = [(s["algorithm"], s["keyId"]) for s in doc["signers"]]
+    sigs = [(s["algorithm"], s["keyId"]) for s in b["signatures"]]
+    if not signers or len(signers) > 8 or len(set(signers)) != len(signers):
+        raise ValueError("bad signer list")
+    if signers[0] != (doc["algorithm"], doc["keyId"]):
+        raise ValueError("algorithm/keyId do not match signers[0]")
+    pub_raw = pinned_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    pinned_id = hashlib.sha256(pub_raw).digest()[:8].hex()
+    if signers != [("ed25519", pinned_id)]:   # reject unknown algorithms; never skip
+        raise ValueError("signers are not exactly the pinned ed25519 key")
+    if sorted(sigs) != sorted(signers):
+        raise ValueError("signatures do not match signers")
+
+    sig = base64.b64decode(b["signatures"][0]["signature"], validate=True)
+    pinned_pub.verify(sig, b"stig-viewer/sign/v2\0" + payload)  # raises on failure
+
+    if doc["sha256"].lower() != artifact_sha256_hex.lower():
+        raise ValueError("artifact hash mismatch")
+    return doc
+```
+
+The Rust verifier uses `verify_strict`, which rejects non-canonical
+signatures and small-order keys. OpenSSL's Ed25519 verify (used by
+`cryptography`) may be more permissive about non-canonical signatures; that is
+harmless for authenticity here but means the two verifiers can disagree on
+malformed input. Generalise the single-signer check above to a loop over
+`signers` once more algorithms exist.
+
+Rollout note: verifiers must support ML-DSA before the server starts emitting
+it, because unknown algorithms are rejected rather than skipped. When ML-DSA is
+added, derive key ids over `algorithm || pubkey` (so equal key bytes under two
+algorithms cannot share an id) and have `verify_bundle` take pinned keys keyed
+by `(algorithm, keyId)`.
+
 ### Database
 
 Postgres data lives in a named volume (`postgres_data`). Migrations apply on
