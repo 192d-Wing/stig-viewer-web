@@ -120,4 +120,23 @@ test.describe("SAML 2.0 SSO", () => {
     expect(user.display_name).toBe("SAML Bob (renamed)");
     await ctx2.dispose();
   });
+
+  test("POST /auth/saml/acs rejects an unsigned SAMLResponse and sets no session", async () => {
+    // Not configured with the dev skip flag in CI, so an unsigned (or
+    // garbage) response must be refused with exactly 401 (both processing
+    // and decode failures use the generic 401) and never set a
+    // stig_session cookie.
+    const ctx = await pwRequest.newContext();
+    const xml =
+      '<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="r"><saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="a"><saml:Subject><saml:NameID>admin@victim.example</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>';
+    for (const body of [Buffer.from(xml).toString("base64"), "!!not-base64!!"]) {
+      const res = await ctx.post(`${BACKEND}/auth/saml/acs`, {
+        form: { SAMLResponse: body },
+        maxRedirects: 0,
+      });
+      expect(res.status()).toBe(401);
+      expect(res.headers()["set-cookie"] || "").not.toContain("stig_session");
+    }
+    await ctx.dispose();
+  });
 });

@@ -201,6 +201,8 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
             data_dir: dir,
             sync_interval_hours: 100_000,
             backup_require_signature: None,
+            sync_on_start: false,
+            seed_dir: None,
         }),
         signing: None,
     };
@@ -215,4 +217,33 @@ pub fn ctx() -> crate::api::request_ctx::RequestCtx {
         role: "author".to_string(),
         audited: Default::default(),
     }
+}
+
+/// Ids every read point must reject (the 129-byte one is just over the cap).
+pub fn bad_ids() -> Vec<String> {
+    vec!["a.b".into(), "\u{e9}".into(), "../x".into(), "a b".into(), String::new(), "a".repeat(129)]
+}
+
+/// An `AppState` whose pool never connects, for handlers that must refuse
+/// before touching the database. The data dir is an unused unique path.
+pub fn lazy_state() -> (AppState, StigDir) {
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(dir.join("stigs")).expect("create stig dir");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+        .expect("lazy pool");
+    let state = AppState {
+        pool: Arc::new(pool),
+        config: Arc::new(Config {
+            port: 0,
+            database_url: String::new(),
+            data_dir: dir.clone(),
+            sync_interval_hours: 100_000,
+            backup_require_signature: None,
+            sync_on_start: false,
+            seed_dir: None,
+        }),
+        signing: None,
+    };
+    (state, StigDir(dir))
 }

@@ -37,6 +37,7 @@ pub mod rule_bulk_status;
 pub mod rule_comments;
 pub mod saml;
 pub mod saml_verify;
+pub mod saml_xml;
 pub mod saved_searches;
 pub mod scheduler_status;
 pub mod sessions;

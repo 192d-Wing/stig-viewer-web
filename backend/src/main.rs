@@ -11,7 +11,9 @@ mod db_checklists;
 mod db_drafts;
 mod parser;
 mod scheduler_log;
+mod seed;
 mod severity;
+mod stig_id;
 mod sync;
 #[cfg(test)]
 mod test_fixtures;
@@ -239,6 +241,10 @@ async fn main() -> Result<()> {
     }
 
     let config = Arc::new(Config::from_env()?);
+    config::validate_seed_dir(
+        std::env::var("STIG_ENV").ok().as_deref(),
+        config.seed_dir.as_deref(),
+    )?;
     let sources = Arc::new(load_sources()?);
 
     info!(
@@ -251,6 +257,12 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
+    let _ = stig_id::warn_non_conforming(&pool).await;
+
+    if let Some(seed_dir) = &config.seed_dir {
+        seed::seed(seed_dir, &config.data_dir.join("stigs"), &pool, &sources).await;
+    }
+    seed::warn_orphaned_ids(&pool, &sources, config.seed_dir.as_deref()).await;
 
     // ── Signing (optional) ──────────────────────────────────────────────────
     let signing = api::signing::SigningState::from_env()?;
@@ -315,7 +327,7 @@ async fn main() -> Result<()> {
     // SSO URL is configured the login route returns 503 with a helpful
     // message but /metadata still works (useful when handing the SP
     // metadata to an IdP admin to register us).
-    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin));
+    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin)?);
     info!(
         "SAML SP ready (configured={}, sp_entity_id={}, acs_url={})",
         saml_config.is_configured(),
@@ -328,7 +340,10 @@ async fn main() -> Result<()> {
     };
     let saml_routes: Router = Router::new()
         .route("/auth/saml/login", get(saml_login_handler))
-        .route("/auth/saml/acs", post(saml_acs_handler))
+        .route(
+            "/auth/saml/acs",
+            post(saml_acs_handler).layer(axum::extract::DefaultBodyLimit::max(api::saml::ACS_BODY_LIMIT)),
+        )
         .route("/auth/saml/metadata", get(saml_metadata_handler))
         .with_state(saml_state);
 
@@ -668,13 +683,20 @@ async fn main() -> Result<()> {
         let src = sources.clone();
         let db = pool.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(cfg.sync_interval_hours * 3600));
+            let period = Duration::from_secs(cfg.sync_interval_hours * 3600);
+            // `interval` fires its first tick immediately; with
+            // STIG_SYNC_ON_START=false start the schedule one period out.
+            let mut interval = if cfg.sync_on_start {
+                tokio::time::interval(period)
+            } else {
+                info!("STIG_SYNC_ON_START is off: first DISA sync in {} hour(s)", cfg.sync_interval_hours);
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period)
+            };
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "sync", || async {
-                    sync::run_sync(&cfg, &src, &db).await?;
-                    Ok::<String, anyhow::Error>(format!("synced {} source(s)", src.len()))
+                    let summary = sync::run_sync(&cfg, &src, &db).await?;
+                    Ok::<String, anyhow::Error>(summary.describe())
                 })
                 .await;
                 if let Err(e) = result {

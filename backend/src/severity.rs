@@ -84,7 +84,7 @@ pub fn weighted_score(
 /// This is the consolidated version of the previously-duplicated reader
 /// in dashboard.rs.
 pub async fn load_severity_map(state: &AppState, stig_id: &str) -> HashMap<String, String> {
-    if !stig_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !crate::stig_id::is_valid(stig_id) {
         return HashMap::new();
     }
     let path = state
@@ -183,5 +183,19 @@ mod tests {
             weighted_score("CAT III", "secret", "open", None, today),
             1.5
         );
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+    use crate::test_fixtures::{bad_ids, lazy_state};
+
+    #[tokio::test]
+    async fn invalid_ids_are_rejected_before_any_file_access() {
+        let (state, _dir) = lazy_state();
+        for id in bad_ids() {
+            assert!(load_severity_map(&state, &id).await.is_empty(), "{id:?}");
+        }
     }
 }

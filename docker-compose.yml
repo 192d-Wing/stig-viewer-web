@@ -5,7 +5,7 @@ services:
     #   https://quay.io/v2/keycloak/keycloak/manifests/26.0 (docker-content-digest),
     # confirm the patch version in the image label org.opencontainers.image.version,
     # then update this comment and the digest. Dependabot also proposes bumps.
-    image: quay.io/keycloak/keycloak:26.0@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858
+    image: quay.io/keycloak/keycloak:26.8@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
@@ -57,6 +57,16 @@ services:
       # Hours between DISA sync runs; set to a huge number to effectively disable
       # (used by CI to keep startup fast and avoid hitting external URLs).
       STIG_SYNC_INTERVAL_HOURS: ${STIG_SYNC_INTERVAL_HOURS:-24}
+      # Whether the first sync runs at boot (default) or one interval later.
+      # CI sets it to false so the e2e run never contacts DISA.
+      STIG_SYNC_ON_START: ${STIG_SYNC_ON_START:-true}
+      # Mutable data (synced/uploaded STIGs, drafts, attachments, archives)
+      # lives in the stig_data named volume, not in the git checkout. The
+      # tracked backend/data/stigs is a read-only seed: files missing from
+      # the volume are copied in at start and existing ones are never
+      # overwritten. Production leaves STIG_SEED_DIR unset.
+      DATA_DIR: /data
+      STIG_SEED_DIR: /app/data/stigs
       # OIDC config. Two URLs because the IdP is reached on two networks:
       #   OIDC_INTERNAL_URL — backend-to-Keycloak via the docker network.
       #                       Used for discovery, token exchange, JWKS fetch.
@@ -88,6 +98,7 @@ services:
     volumes:
       - ./backend:/app
       - backend_target:/target
+      - stig_data:/data
       - cargo_registry:/usr/local/cargo/registry
     depends_on:
       postgres:
@@ -120,6 +131,7 @@ services:
 
 volumes:
   postgres_data:
+  stig_data:
   backend_target:
   frontend_target:
   frontend_cargo:

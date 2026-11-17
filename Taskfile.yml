@@ -109,9 +109,9 @@ tasks:
       - '{{.COMPOSE}} down'
 
   reset:
-    desc: Stop the containers and drop the database volume
+    desc: Stop the containers and drop the volumes (Postgres and the STIG data volume; the seed is re-copied on next start)
     deps: [engine]
-    prompt: This deletes the local Postgres data. Continue?
+    prompt: This deletes the local Postgres data and the dev STIG data volume. Continue?
     cmds:
       - '{{.COMPOSE}} down -v'
 
@@ -127,24 +127,19 @@ tasks:
     cmds:
       - '{{.COMPOSE}} logs -f {{.CLI_ARGS}}'
 
-  data:restore:
-    desc: Discard the tracked STIG data files the backend's DISA sync rewrites on start
-    cmds:
-      - git checkout -- backend/data
-
   # ── Checks ─────────────────────────────────────────────────────────────────
 
   lint:
     desc: Clippy for frontend and backend
     cmds:
       - cd frontend && cargo clippy --target wasm32-unknown-unknown -- -D warnings
-      - cd backend && cargo clippy -- -D warnings
+      - cd backend && cargo clippy --locked -- -D warnings
 
   test:
     desc: Unit tests for frontend and backend
     cmds:
       - cd frontend && cargo test
-      - cd backend && cargo test
+      - cd backend && cargo test --locked
 
   test:db:
     desc: Backend tests including the database-backed ones, against a throwaway Postgres on 127.0.0.1:55432

@@ -747,14 +747,7 @@ async fn fire_assigned_event(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Longest accepted STIG id (bytes). Catalog ids come from file names
-/// (the longest checked in is 39 characters); this only stops absurd input
-/// from being stored, logged or echoed.
-pub(crate) const MAX_STIG_ID_BYTES: usize = 128;
-
-pub(crate) fn is_valid_stig_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= MAX_STIG_ID_BYTES && id.chars().all(|c| c.is_alphanumeric() || c == '-')
-}
+pub(crate) use crate::stig_id::is_valid as is_valid_stig_id;
 
 fn is_valid_status(status: &str) -> bool {
     matches!(
@@ -883,6 +876,14 @@ mod tests {
     use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
+    #[tokio::test]
+    async fn load_stig_json_rejects_invalid_ids() {
+        let (state, _dir) = crate::test_fixtures::lazy_state();
+        for id in crate::test_fixtures::bad_ids() {
+            assert_eq!(load_stig_json(&state, &id).await.err(), Some(StatusCode::BAD_REQUEST), "{id:?}");
+        }
+    }
+
     async fn create(state: &AppState, user: &str, stig_id: &str) -> Result<StatusCode, StatusCode> {
         create_handler(
             State(state.clone()),
@@ -990,8 +991,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ev, [("denied".to_string(), None), ("rejected".to_string(), None)]);
-        assert!(is_valid_stig_id(&"a".repeat(MAX_STIG_ID_BYTES)));
-        assert!(!is_valid_stig_id(&"a".repeat(MAX_STIG_ID_BYTES + 1)));
+        assert!(is_valid_stig_id(&"a".repeat(crate::stig_id::MAX_BYTES)));
+        assert!(!is_valid_stig_id(&"a".repeat(crate::stig_id::MAX_BYTES + 1)));
     }
 
     /// Relies on the current-thread runtime `#[sqlx::test]` uses: after one

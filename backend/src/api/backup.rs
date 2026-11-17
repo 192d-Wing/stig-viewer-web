@@ -753,7 +753,7 @@ fn parse_and_verify_backup(
     // be a matter of choice.
     let mut seen = std::collections::HashSet::new();
     for i in 0..zip.len() {
-        let name = zip.by_index_raw(i).map_err(anyhow::Error::from)?.name().to_string();
+        let name = zip.by_index_raw(i).map_err(anyhow::Error::from)?.name().map_err(anyhow::Error::from)?.into_owned();
         if !seen.insert(name.clone()) {
             return Err(VerifyFailure::new("not_evaluated", format!("duplicate entry {name:?}")));
         }
@@ -785,7 +785,7 @@ fn parse_and_verify_backup(
     let mut attachments: ParsedAttachments = Vec::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(anyhow::Error::from)?;
-        let name = entry.name().to_string();
+        let name = entry.name().map_err(anyhow::Error::from)?.into_owned();
         if name.ends_with('/') || name == MANIFEST_NAME || name == MANIFEST_SIG_NAME {
             continue;
         }
@@ -1032,7 +1032,7 @@ mod integrity_tests {
         let opts = SimpleFileOptions::default();
         for i in 0..src.len() {
             let mut e = src.by_index(i).unwrap();
-            let name = e.name().to_string();
+            let name = e.name().unwrap().into_owned();
             let mut buf = Vec::new();
             e.read_to_end(&mut buf).unwrap();
             if let Some(b) = f(&name, buf) {
@@ -1102,7 +1102,7 @@ mod integrity_tests {
             let mut e = src.by_index(i).unwrap();
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
-            w.start_file(e.name().to_string(), SimpleFileOptions::default()).unwrap();
+            w.start_file(e.name().unwrap().into_owned(), SimpleFileOptions::default()).unwrap();
             w.write_all(&b).unwrap();
         }
         w.start_file("attachments/extra", SimpleFileOptions::default()).unwrap();
@@ -1223,7 +1223,7 @@ mod integrity_tests {
             let mut e = src.by_index(i).unwrap();
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
-            let n = e.name().to_string();
+            let n = e.name().unwrap().into_owned();
             w.start_file(n.clone(), SimpleFileOptions::default()).unwrap();
             w.write_all(&b).unwrap();
             if n == name {
@@ -1337,7 +1337,7 @@ mod restore_integrity_db_tests {
         let mut w = ZipWriter::new(Cursor::new(Vec::new()));
         for i in 0..src.len() {
             let mut e = src.by_index(i).unwrap();
-            let name = e.name().to_string();
+            let name = e.name().unwrap().into_owned();
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
             if name == "tables/assets.jsonl" {
@@ -1430,5 +1430,117 @@ mod restore_integrity_db_tests {
             .await
             .unwrap();
         assert_eq!(d["requireSignature"], false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tests below predate integrity checking; they go through the full
+    /// parse-and-verify path with an unsigned, digest-free version 2 manifest.
+    fn parse_backup_zip(bytes: &[u8]) -> anyhow::Result<(Manifest, ParsedTables, ParsedAttachments)> {
+        parse_and_verify_backup(bytes, None, false)
+            .map(|(m, t, a, _)| (m, t, a))
+            .map_err(|f| anyhow::anyhow!(f.message))
+    }
+
+    fn manifest() -> Manifest {
+        Manifest {
+            kind: integrity::BACKUP_TYPE.into(),
+            entries: BTreeMap::new(),
+            entries_digest: "sha-512".into(),
+            signers: Vec::new(),
+            version: BACKUP_VERSION.to_string(),
+            taken_at: "2026-01-01T00:00:00Z".into(),
+            schema_migration: 7,
+            counts: HashMap::from([("users".to_string(), 1)]),
+        }
+    }
+
+    fn zip_with(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut w = ZipWriter::new(Cursor::new(Vec::new()));
+        w.start_file(name, SimpleFileOptions::default()).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn backup_round_trips_rows_and_attachment_blobs() {
+        let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(dir.join(&id), b"blob bytes \x00\x01\x02").unwrap();
+
+        let row = json!({"id": 1, "name": "alice"});
+        let built = build_backup_zip(
+            manifest(),
+            HashMap::from([("users".to_string(), vec![row.clone()])]),
+            vec![id.clone()],
+            dir.clone(),
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let (m, tables, atts) = parse_backup_zip(&built.unwrap()).unwrap();
+
+        assert_eq!(m.version, BACKUP_VERSION);
+        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m.schema_migration, 7);
+        assert_eq!(m.counts.get("users"), Some(&1));
+        assert_eq!(tables.get("users"), Some(&vec![row]));
+        assert_eq!(atts, vec![(id, b"blob bytes \x00\x01\x02".to_vec())]);
+    }
+
+    #[test]
+    fn restore_rejects_an_archive_without_a_manifest() {
+        assert!(parse_backup_zip(&zip_with("tables/users.jsonl", b"{}\n")).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_an_entry_whose_size_disagrees_with_its_data() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        // Central directory header: uncompressed size at offset 24.
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        let smaller = (data.len() as u32 - 5).to_le_bytes();
+        bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
+        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
+    }
+
+    #[test]
+    fn restore_rejects_an_unsupported_compression_method() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        for pos in 0..bytes.len() - 12 {
+            if &bytes[pos..pos + 4] == b"PK\x03\x04" {
+                bytes[pos + 8..pos + 10].copy_from_slice(&12u16.to_le_bytes());
+            } else if &bytes[pos..pos + 4] == b"PK\x01\x02" {
+                bytes[pos + 10..pos + 12].copy_from_slice(&12u16.to_le_bytes());
+            }
+        }
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string();
+        assert!(err.contains("compression method not supported: 12"), "{err}");
+    }
+
+    #[test]
+    fn restore_parses_an_entry_with_an_enormous_declared_size() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
+        let huge = u32::MAX.to_le_bytes();
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 24..cd + 28].copy_from_slice(&huge);
+        let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        bytes[lh + 22..lh + 26].copy_from_slice(&huge);
+        // The buffer is no longer sized from the declared size, so this parses
+        // the real data. (A with_capacity(u32::MAX) regression is not cheaply
+        // observable: allocation of ~4 GiB usually succeeds lazily here.)
+        let (m, tables, atts) = parse_backup_zip(&bytes).unwrap();
+        assert_eq!(m.version, BACKUP_VERSION);
+        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
+        assert_eq!(m.schema_migration, 7);
+        assert_eq!(m.counts.get("users"), Some(&1));
+        assert!(tables.is_empty());
+        assert!(atts.is_empty());
     }
 }

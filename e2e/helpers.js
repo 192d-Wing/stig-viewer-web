@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { expect } from "@playwright/test";
 const BACKEND = process.env.VITE_API_URL || "http://localhost:8080";
 
 /**
@@ -125,6 +126,27 @@ export async function loadDemoStig(page) {
   await page.goto("/");
   await page.getByRole("button", { name: "Open Local File" }).click();
   await page.getByRole("button", { name: "Load Demo STIG" }).click();
+}
+
+/**
+ * Show the seeded `edge` STIG (V2 R2) in the library. `ms-edge` has the same
+ * title with a newer release, so the library hides `edge` as "Superseded" by
+ * default, and the catalog is far larger than one 25-row page. The library
+ * keeps its filter in the URL (`q` = title filter, `super` = show superseded,
+ * `size` = page size; see `use_url_state` in stig_library.rs), so load it
+ * already filtered to Edge titles with superseded rows shown on one page.
+ * Idempotent: it navigates rather than toggling.
+ */
+export async function showEdgeInLibrary(page) {
+  await page.goto("/?q=Microsoft%20Edge&super=true&size=100");
+  await expect(page.getByTestId("diff-button-edge")).toBeVisible({ timeout: 15_000 });
+}
+
+/** Open `edge` (not `ms-edge`) from the library; the row is pinned by its Diff button. */
+export async function openEdgeFromLibrary(page) {
+  await showEdgeInLibrary(page);
+  const row = page.getByRole("row").filter({ has: page.getByTestId("diff-button-edge") });
+  await row.getByText(/Microsoft Edge Security Technical/).click();
 }
 
 export { BACKEND };

@@ -106,6 +106,11 @@ jobs:
       # Skip the DISA sync scheduler in CI — keeps backend startup fast and
       # avoids depending on the external network.
       STIG_SYNC_INTERVAL_HOURS: "999999"
+      # `interval` ticks once at start regardless of the period, so also turn
+      # the sync-at-start off. The suite reads `edge` and `windows-10` from
+      # the tracked seed (backend/data/stigs), which compose copies into the
+      # stig_data volume and indexes into the catalog at start.
+      STIG_SYNC_ON_START: "false"
       # The suite authenticates with X-User-Id and drives /api/test/*; both
       # are opt-in on the backend. Set explicitly rather than relying on the
       # compose defaults.

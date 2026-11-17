@@ -130,8 +130,13 @@ for local work. The ones you may want to change:
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
   how the browser does.
-- `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs. Set to a large
-  number to effectively disable the sync (CI does this to keep startup fast).
+- `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs.
+- `STIG_SYNC_ON_START` — run the first DISA sync at boot (default `true`).
+  `false` delays the first run by one interval; CI sets it to `false` so the
+  e2e run never contacts DISA. (A large interval alone does not skip the
+  boot sync.) A source URL that answers 404/410 is logged as a warning naming
+  the entry and counted as a stale URL in the scheduler summary; update
+  `backend/stig-sources.toml` when you see one.
 - `ALLOW_TEST_AUTH_HEADER` — enables the `X-User-Id` test bypass (any client
   can act as any user). Off unless set to `true`/`1`; the compose file turns it
   on for local dev and the E2E suite.
@@ -142,6 +147,38 @@ for local work. The ones you may want to change:
 Both test hooks must stay unset in production. The backend refuses to start if
 either is enabled while `STIG_ENV=production`, and with neither set
 `/api/test/*` returns 404 and `X-User-Id` is ignored.
+
+### STIG data directory
+
+The tracked `backend/data/stigs` is a read-only seed. It is never written by
+the running stack: compose sets `DATA_DIR=/data`, a named volume (`stig_data`)
+holding synced and uploaded STIGs, drafts, attachments and archives. A
+dev-only `STIG_SEED_DIR` (set to `/app/data/stigs` in compose) makes the
+backend copy seed files that are missing from `DATA_DIR/stigs` at start and
+add catalog rows for any STIG file that has none; it never overwrites an
+existing file. Production leaves `STIG_SEED_DIR` unset and points `DATA_DIR`
+at its own persistent storage. The sync skips writing (and archiving) a STIG
+whose serialised bytes are unchanged, so a no-op sync leaves files alone.
+
+`task reset` also drops the `stig_data` volume. Dev drafts and attachments
+created under the old `DATA_DIR` (inside the checkout, `backend/data`) are not
+migrated to the new volume; recreate them. `task data:restore` is gone
+because nothing rewrites the tracked files any more.
+
+`STIG_SEED_DIR` is dev-only: the backend refuses to start if it is set while
+`STIG_ENV=production`.
+
+Renamed sync ids. The DISA sync manifest now uses the ids library import
+derives: `windows-11` is `ms-windows-11`, `windows-server-2019` and
+`windows-server-2022` are `ms-windows-server-2019` / `-2022`, `ubuntu-2004` is
+`can-ubuntu-20-04-lts`, `ubuntu-2204` is `can-ubuntu-22-04-lts`,
+`chrome-windows` is `google-chrome`, `firefox` is `moz-firefox`,
+`active-directory` is `active-directory-domain` and `dns` is `bind-9-x`;
+`cisco-ios-xe` was dropped (no current download). Nothing is migrated.
+Checklists on an old id keep working against the old STIG file but are no
+longer refreshed by sync, and the backend logs a warning at start naming such
+ids. To move one forward, re-apply the STIG under the new id (or delete the
+old catalog entry once its checklists are gone).
 
 Catalog uploads (`POST /api/upload`, `POST /api/upload/library`) require a
 signed-in user with the `admin` role and accept bodies up to 500 MB. Other
@@ -523,6 +560,39 @@ wide) to speed up the first paint. To swap it, replace the file and adjust
 `LOGIN_EMBLEM_SRC` and `LOGIN_EMBLEM_ALT` in `frontend/src/auth.rs`. The
 background accent colour is the `--login-accent` variable in
 `frontend/styles/app.css`.
+
+## SAML service provider
+
+Env: `SAML_IDP_SSO_URL` (enables SAML), `SAML_IDP_CERT_PEM` (required to
+verify; pinned), `SAML_IDP_ENTITY_ID` (if set, the Assertion Issuer must equal
+it), `SAML_SP_ENTITY_ID` (Audience, default `{frontend}/saml/sp`),
+`SAML_SP_ACS_URL` (Recipient/Destination, default `{PUBLIC_BASE}/auth/saml/acs`),
+`SAML_CLOCK_SKEW_SECS` (default 120, clamped 0-300).
+
+The ACS accepts exactly one Assertion, a direct child of `samlp:Response`.
+Accepted signature layouts: Assertion signed, Response signed, or both; a
+`ds:Signature` must be a direct child of the Response or the Assertion, with one
+Reference to its parent's ID, RSA-SHA256 and SHA-256 only. Identity is read only
+from the signed scope. Required: Status Success, a bearer SubjectConfirmation
+with matching Recipient and unexpired NotOnOrAfter, Conditions, and an
+AudienceRestriction naming the SP; Destination is checked when present. DOCTYPE,
+comments, processing instructions and EncryptedAssertion are rejected. Failed
+ACS attempts return a generic 401 and log an `auth.saml_acs` audit line.
+
+Only RSA-SHA256 with keys of at least 2048 bits is accepted (a weaker
+`SAML_IDP_CERT_PEM` stops startup). `SignedInfo` and the signed element must
+declare every namespace they use themselves (the `ds` namespace included), since
+bindings outside the signed bytes are not authenticated. `POST /auth/saml/acs`
+shares the per-IP pre-auth rate limit (429 when exceeded) and answers every
+failure with a generic 401; reasons go to the audit log as fixed codes.
+
+Limitation: exclusive canonicalisation is not implemented yet. Signatures are
+verified over the bytes as sent, so IdPs that do not emit canonical XML will
+fail closed until c14n is added.
+
+`SAML_INSECURE_SKIP_VERIFY=true` skips only the signature check (all other
+checks still run) and is for local development. The backend **refuses to start**
+if it is set with `STIG_ENV=production`.
 
 ## System use notification (AC-8)
 
