@@ -174,30 +174,38 @@ enum DiffPhase {
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
-/// Strip everything except `<mark>` and `</mark>` tags from a server-
-/// generated snippet. The snippet is built server-side from STIG content (no
-/// user input flows in), but we still defang any stray tags before handing
-/// the string to the DOM as raw HTML.
+/// Neutralise a server-generated snippet before it is handed to the DOM as
+/// raw HTML. Only the exact `<mark>` and `</mark>` tags survive; every other
+/// `<` or `>` (including a dangling `<`) is escaped. Existing entities from
+/// the server's own escaping are left intact so they render as text.
 fn sanitize_snippet(raw: &str) -> String {
-    // Temporarily mark the allowed tags, drop everything else, restore.
-    const TOKEN_OPEN: &str = "MARK_OPEN";
-    const TOKEN_CLOSE: &str = "MARK_CLOSE";
-    let swapped = raw.replace("<mark>", TOKEN_OPEN).replace("</mark>", TOKEN_CLOSE);
-    // Drop any remaining tag-looking content (`<` up to the next `>`).
-    let mut stripped = String::with_capacity(swapped.len());
-    let mut rest = swapped.as_str();
-    while let Some(start) = rest.find('<') {
-        stripped.push_str(&rest[..start]);
-        match rest[start..].find('>') {
-            Some(end) => rest = &rest[start + end + 1..],
-            None => {
-                stripped.push_str(&rest[start..]);
-                rest = "";
+    fn escape_angles(s: &str, out: &mut String) {
+        for c in s.chars() {
+            match c {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                _ => out.push(c),
             }
         }
     }
-    stripped.push_str(rest);
-    stripped.replace(TOKEN_OPEN, "<mark>").replace(TOKEN_CLOSE, "</mark>")
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut rest = raw;
+    while let Some(i) = rest.find('<') {
+        escape_angles(&rest[..i], &mut out);
+        let tail = &rest[i..];
+        if let Some(r) = tail.strip_prefix("<mark>") {
+            out.push_str("<mark>");
+            rest = r;
+        } else if let Some(r) = tail.strip_prefix("</mark>") {
+            out.push_str("</mark>");
+            rest = r;
+        } else {
+            out.push_str("&lt;");
+            rest = &tail[1..];
+        }
+    }
+    escape_angles(rest, &mut out);
+    out
 }
 
 /// Trim long body fields for the diff table cells so a 4 KB description
@@ -1488,5 +1496,45 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                 }
             </SpaceBetween>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::sanitize_snippet;
+
+    fn only_mark_tags(out: &str) -> bool {
+        let rest = out.replace("<mark>", "").replace("</mark>", "");
+        !rest.contains('<') && !rest.contains('>')
+    }
+
+    #[test]
+    fn keeps_server_mark_tags() {
+        assert_eq!(
+            sanitize_snippet("a <mark>b</mark> c"),
+            "a <mark>b</mark> c"
+        );
+    }
+
+    #[test]
+    fn escapes_markup_and_dangling_angle() {
+        for input in [
+            "<script>alert(1)</script>",
+            "<img src=x onerror=alert(1)>",
+            "tail <",
+            "<mark",
+            "<<mark>x</mark>",
+            "MARK_OPEN MARK_CLOSE",
+            "a &amp; b &quot;q&quot;",
+            "<MARK>x</MARK>",
+        ] {
+            assert!(only_mark_tags(&sanitize_snippet(input)), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn sentinel_text_stays_literal() {
+        assert_eq!(sanitize_snippet("MARK_CLOSE"), "MARK_CLOSE");
+        assert_eq!(sanitize_snippet("x <"), "x &lt;");
     }
 }
