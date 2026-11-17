@@ -9,6 +9,8 @@
 //! Default `requires_approval = FALSE` preserves the legacy direct-close
 //! behavior that the bulk of the existing E2E suite depends on.
 
+use std::collections::HashSet;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -368,6 +370,116 @@ pub async fn has_pending(
     Ok(row.is_some())
 }
 
+/// One approval request for [`request_many`].
+#[derive(Debug, Clone, Copy)]
+pub struct ApprovalRequest<'a> {
+    pub rule_id: &'a str,
+    pub proposed_status: &'a str,
+    pub finding_details: &'a str,
+}
+
+/// Result of one item of [`request_many`].
+#[derive(Debug, PartialEq)]
+pub enum ApprovalOutcome {
+    /// A new pending row was filed.
+    Queued { id: String },
+    /// The rule already had a pending request (or an earlier item of this
+    /// call filed one); nothing was inserted.
+    AlreadyPending,
+    /// A database error rolled back the whole chunk this item was in.
+    Failed,
+}
+
+/// File approval requests for many rules of one checklist, skipping rules
+/// that already have a pending request. One transaction per
+/// `db_checklists::RULE_CHUNK` items; each takes the checklist lock, which is
+/// what makes the check-then-insert atomic against other writers. A database
+/// error rolls back and fails its chunk; after two failed chunks in a row
+/// the rest are failed without being tried. One entry per item, in order.
+pub async fn request_many(
+    pool: &PgPool,
+    checklist_id: &str,
+    requested_by: &str,
+    items: &[ApprovalRequest<'_>],
+) -> Vec<ApprovalOutcome> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut consecutive_failures = 0u8;
+    for (i, chunk) in items.chunks(db_checklists::RULE_CHUNK).enumerate() {
+        if consecutive_failures >= 2 {
+            out.extend(chunk.iter().map(|_| ApprovalOutcome::Failed));
+            continue;
+        }
+        match request_chunk(pool, checklist_id, requested_by, chunk).await {
+            Ok(results) => {
+                consecutive_failures = 0;
+                out.extend(results);
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                tracing::error!("approval batch failed (checklist {checklist_id}, chunk {i}): {e:#}");
+                out.extend(chunk.iter().map(|_| ApprovalOutcome::Failed));
+            }
+        }
+    }
+    out
+}
+
+async fn request_chunk(
+    pool: &PgPool,
+    checklist_id: &str,
+    requested_by: &str,
+    chunk: &[ApprovalRequest<'_>],
+) -> anyhow::Result<Vec<ApprovalOutcome>> {
+    let mut tx = pool.begin().await?;
+    db_checklists::lock_checklist(&mut tx, checklist_id).await?;
+    let wanted: Vec<&str> = chunk.iter().map(|r| r.rule_id).collect();
+    let pending: HashSet<String> = sqlx::query_scalar(
+        "SELECT DISTINCT rule_id FROM finding_approvals \
+         WHERE checklist_id = $1 AND status = 'pending' AND rule_id = ANY($2)",
+    )
+    .bind(checklist_id)
+    .bind(&wanted)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
+
+    let mut filed: HashSet<&str> = HashSet::new();
+    let mut results = Vec::with_capacity(chunk.len());
+    let (mut ids, mut rules, mut statuses, mut details) = (vec![], vec![], vec![], vec![]);
+    for item in chunk {
+        if pending.contains(item.rule_id) || !filed.insert(item.rule_id) {
+            results.push(ApprovalOutcome::AlreadyPending);
+            continue;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        results.push(ApprovalOutcome::Queued { id: id.clone() });
+        ids.push(id);
+        rules.push(item.rule_id);
+        statuses.push(item.proposed_status);
+        details.push(item.finding_details);
+    }
+    if !ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO finding_approvals \
+                 (id, checklist_id, rule_id, requested_by, proposed_status, finding_details, status) \
+             SELECT u.id, $1, u.rule_id, $2, u.proposed_status, u.finding_details, 'pending' \
+             FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[]) \
+                  AS u(id, rule_id, proposed_status, finding_details)",
+        )
+        .bind(checklist_id)
+        .bind(requested_by)
+        .bind(&ids)
+        .bind(&rules)
+        .bind(&statuses)
+        .bind(&details)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(results)
+}
+
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 fn is_reviewer(user: &AuthUser) -> bool {
@@ -437,4 +549,137 @@ pub async fn get_by_id(pool: &PgPool, id: &str) -> anyhow::Result<Option<Finding
 #[allow(dead_code)]
 pub fn parse_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{seed_asset, seed_checklist, seed_user};
+
+    async fn setup(pool: &PgPool) {
+        seed_user(pool, "u1").await;
+        seed_asset(pool, "a1", "u1", true).await;
+        seed_checklist(pool, "c1", "a1", "S").await;
+    }
+
+    fn reqs(ids: &[String]) -> Vec<ApprovalRequest<'_>> {
+        ids.iter()
+            .map(|id| ApprovalRequest { rule_id: id, proposed_status: "not_a_finding", finding_details: "why" })
+            .collect()
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("r{i:03}")).collect()
+    }
+
+    async fn pending_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_many_queues_missing_and_reports_already_pending(pool: PgPool) {
+        setup(&pool).await;
+        let ids = names(3);
+        let first = request_many(&pool, "c1", "u1", &reqs(&ids[..1])).await;
+        let ApprovalOutcome::Queued { id: first_id } = &first[0] else { panic!("{first:?}") };
+
+        // r000 is pending; r001 is new; the second r001 repeats within the call.
+        let batch = [ids[0].clone(), ids[1].clone(), ids[1].clone(), ids[2].clone()];
+        let out = request_many(&pool, "c1", "u1", &reqs(&batch)).await;
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], ApprovalOutcome::AlreadyPending);
+        assert!(matches!(out[1], ApprovalOutcome::Queued { .. }));
+        assert_eq!(out[2], ApprovalOutcome::AlreadyPending);
+        assert!(matches!(out[3], ApprovalOutcome::Queued { .. }));
+        assert_eq!(pending_rows(&pool).await, 3);
+
+        let (rule, status, details, by, state): (String, String, String, String, String) = sqlx::query_as(
+            "SELECT rule_id, proposed_status, finding_details, requested_by, status FROM finding_approvals WHERE id = $1",
+        )
+        .bind(first_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (rule.as_str(), status.as_str(), details.as_str(), by.as_str(), state.as_str()),
+            ("r000", "not_a_finding", "why", "u1", "pending")
+        );
+
+        // A decided request no longer blocks a new one.
+        sqlx::query("UPDATE finding_approvals SET status = 'rejected' WHERE rule_id = 'r000'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let out = request_many(&pool, "c1", "u1", &reqs(&ids[..1])).await;
+        assert!(matches!(out[0], ApprovalOutcome::Queued { .. }));
+    }
+
+    // Probabilistic: without the checklist lock both callers can pass the
+    // pending check before either inserts.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_request_many_leaves_one_pending_row_per_rule(pool: PgPool) {
+        setup(&pool).await;
+        let ids = names(30);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let (p, ids) = (pool.clone(), ids.clone());
+            tasks.spawn(async move { request_many(&p, "c1", "u1", &reqs(&ids)).await });
+        }
+        let mut queued = 0;
+        while let Some(res) = tasks.join_next().await {
+            queued += res.unwrap().iter().filter(|o| matches!(o, ApprovalOutcome::Queued { .. })).count();
+        }
+        assert_eq!(queued, 30);
+        assert_eq!(pending_rows(&pool).await, 30);
+        let distinct: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT rule_id) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(distinct, 30);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_many_failed_chunk_inserts_nothing(pool: PgPool) {
+        setup(&pool).await;
+        crate::test_fixtures::fail_writes_of(&pool, "finding_approvals", &["r150"]).await;
+        let ids = names(250);
+        let out = request_many(&pool, "c1", "u1", &reqs(&ids)).await;
+        for (i, o) in out.iter().enumerate() {
+            if (100..200).contains(&i) {
+                assert_eq!(*o, ApprovalOutcome::Failed, "item {i}");
+            } else {
+                assert!(matches!(o, ApprovalOutcome::Queued { .. }), "item {i}");
+            }
+        }
+        assert_eq!(pending_rows(&pool).await, 150);
+        let in_failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals WHERE rule_id >= 'r100' AND rule_id < 'r200'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(in_failed, 0);
+
+        // A missing checklist fails the chunk through the foreign key.
+        let out = request_many(&pool, "nope", "u1", &reqs(&ids[..2])).await;
+        assert_eq!(out, [ApprovalOutcome::Failed, ApprovalOutcome::Failed]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_many_handles_a_chunk_boundary(pool: PgPool) {
+        setup(&pool).await;
+        let n = db_checklists::RULE_CHUNK + 1;
+        let mut ids = names(n);
+        ids.push(ids[0].clone()); // repeat of a rule filed by the previous chunk
+        let out = request_many(&pool, "c1", "u1", &reqs(&ids)).await;
+        assert_eq!(out.len(), n + 1);
+        assert!(out[..n].iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
+        assert_eq!(out[n], ApprovalOutcome::AlreadyPending);
+        assert_eq!(pending_rows(&pool).await as usize, n);
+    }
 }

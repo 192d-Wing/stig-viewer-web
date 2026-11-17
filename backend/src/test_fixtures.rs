@@ -129,6 +129,27 @@ pub async fn seed_rule(
     .expect("seed rule");
 }
 
+/// Make any insert or update of the listed rule ids on `table`
+/// (`checklist_rules` or `finding_approvals`) raise, to fail one chunk of a
+/// batch deterministically.
+pub async fn fail_writes_of(pool: &PgPool, table: &str, rule_ids: &[&str]) {
+    sqlx::query(
+        "CREATE FUNCTION test_fail_rule() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF NEW.rule_id = ANY(TG_ARGV) THEN RAISE EXCEPTION 'injected failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create fail function");
+    let args = rule_ids.iter().map(|r| format!("'{r}'")).collect::<Vec<_>>().join(",");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_fail BEFORE INSERT OR UPDATE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION test_fail_rule({args})"
+    ))
+    .execute(pool)
+    .await
+    .expect("create fail trigger");
+}
+
 pub fn auth(id: &str, role: &str) -> AuthUser {
     AuthUser {
         id: id.into(),

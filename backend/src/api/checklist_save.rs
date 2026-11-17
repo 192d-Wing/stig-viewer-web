@@ -3,9 +3,12 @@
 //! checklist when it does not exist yet.
 //!
 //! Every rule goes through the same gates as the single-rule PATCH (via
-//! `rule_bulk_status::plan_rule` / `apply_plan`): known-rule check, the
+//! `rule_bulk_status::plan_rule` / `apply_plans`): known-rule check, the
 //! finding-details compliance gate and the per-asset approval workflow.
-//! Failures are reported per rule; one bad rule does not abort the batch.
+//! Entries are planned without touching the database ([`plan_entry`]), then
+//! written in chunks of `db_checklists::RULE_CHUNK` per transaction. A gate
+//! failure is reported per rule and does not abort the batch; a database
+//! error fails the chunk it hit.
 //!
 //! Merge policy (see [`merge_entry`]): untouched rules never downgrade the
 //! server, a `not_reviewed` status never changes the server status, blank
@@ -25,11 +28,11 @@ use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::api::checklists::{is_valid_stig_id, load_stig_json, take_rules};
 use crate::api::rule_bulk_status::{
-    apply_plan, expected_status, plan_rule, short_id, Plan, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
+    apply_plans, expected_status, plan_rule, short_id, Plan, RuleOp, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets;
 use crate::db_audit::{self, NewAuditEvent};
-use crate::db_checklists::{self, ChecklistRuleRow, RulePatch};
+use crate::db_checklists::{self, ChecklistRuleRow};
 use crate::AppState;
 
 /// Per-field cap (bytes) on each rule's finding details and comments. A rule
@@ -116,7 +119,7 @@ fn merge_entry(existing: Option<&ChecklistRuleRow>, e: &SaveRule) -> Option<Merg
 /// POST /api/assets/:id/checklists/save
 ///
 /// The work (access check through the final audit events) runs in a spawned
-/// task: each rule is committed on its own, so a client disconnect that drops
+/// task: each chunk is committed on its own, so a client disconnect that drops
 /// this future must not leave committed writes without their audit events.
 pub async fn save_handler(
     State(state): State<AppState>,
@@ -228,28 +231,8 @@ async fn save_work(
             .map(|r| (r.rule_id.clone(), r))
             .collect();
 
-    let mut results = Vec::with_capacity(req.rules.len());
-    let mut seen: HashSet<&str> = HashSet::new();
-    for entry in &req.rules {
-        if !seen.insert(entry.rule_id.as_str()) {
-            continue; // duplicate rule id: first one wins
-        }
-        let outcome = save_one(
-            pool,
-            &checklist.id,
-            &user.id,
-            asset.requires_approval,
-            known.contains(&entry.rule_id),
-            existing.get(&entry.rule_id),
-            entry,
-        )
-        .await;
-        let rule_id = short_id(&entry.rule_id);
-        results.push(match outcome {
-            Ok((status, note)) => SaveRowResult { rule_id, status: status.into(), error: None, note },
-            Err(error) => SaveRowResult { rule_id, status: "error".into(), error: Some(error), note: None },
-        });
-    }
+    let results =
+        apply_entries(pool, &checklist.id, &user.id, asset.requires_approval, &known, &existing, &req.rules).await;
 
     let count = |s: &str| results.iter().filter(|r| r.status == s).count();
     let all_rejected: Vec<(String, String)> = results
@@ -347,16 +330,23 @@ async fn find_or_create(
         .ok_or_else(|| anyhow::anyhow!("checklist vanished after concurrent create"))
 }
 
-/// Process one entry; returns the result status or a per-rule error message.
-async fn save_one(
-    pool: &sqlx::PgPool,
-    checklist_id: &str,
-    user_id: &str,
+/// An entry that has something to write: the merge, the revision guard and
+/// the gate decision.
+struct Planned {
+    merged: Merged,
+    /// Status the locked row must still have (see `expected_status`).
+    expect: Option<String>,
+    plan: Plan,
+}
+
+/// Validate and plan one entry without touching the database. `Ok(None)`
+/// means unchanged; `Err` is the per-rule error message.
+fn plan_entry(
     requires_approval: bool,
     known: bool,
     prev: Option<&ChecklistRuleRow>,
     e: &SaveRule,
-) -> Result<(&'static str, Option<String>), String> {
+) -> Result<Option<Planned>, String> {
     if e.rule_id.len() > MAX_RULE_ID_BYTES {
         return Err("rule id too long".into());
     }
@@ -371,7 +361,7 @@ async fn save_one(
         return Err("rule is not part of this checklist's STIG".into());
     }
     let Some(merged) = merge_entry(prev, e) else {
-        return Ok(("unchanged", None));
+        return Ok(None);
     };
     // A text-only update leaves the status alone, so the status gates do not apply.
     let plan = if merged.write_status {
@@ -380,38 +370,75 @@ async fn save_one(
         Plan::Apply { finding_details: e.finding_details.clone() }
     };
     let expect = expected_status(requires_approval, &merged.status, prev);
-    let applied = apply_plan(
-        pool,
-        checklist_id,
-        &e.rule_id,
-        user_id,
-        &merged.status,
-        merged.write_status,
-        expect.as_deref(),
-        merged.finding_details.as_deref(),
-        merged.comments.as_deref(),
-        plan,
-    )
-    .await?;
-    if applied.status == "pending_approval" {
-        if let Some(comments) = merged.comments.as_deref() {
-            // Status and finding details wait for approval; the comments are
-            // not gated, so keep them rather than dropping user input.
-            db_checklists::patch_rule(
-                pool,
-                checklist_id,
-                &e.rule_id,
-                RulePatch { comments: Some(comments), ..RulePatch::default() },
-                user_id,
-            )
-            .await
-            .map_err(|err| {
-                tracing::error!("save comments failed for {}: {err:#}", short_id(&e.rule_id));
-                "failed to save comments".to_string()
-            })?;
+    Ok(Some(Planned { merged, expect, plan }))
+}
+
+/// Plan every entry (first occurrence of a rule id wins), write them through
+/// `apply_plans`, and return the results in request order. `existing` is the
+/// caller's snapshot; the writes re-check against the locked rows.
+async fn apply_entries(
+    pool: &sqlx::PgPool,
+    checklist_id: &str,
+    user_id: &str,
+    requires_approval: bool,
+    known: &HashSet<String>,
+    existing: &HashMap<String, ChecklistRuleRow>,
+    rules: &[SaveRule],
+) -> Vec<SaveRowResult> {
+    enum Slot {
+        Done(SaveRowResult),
+        Op(usize),
+    }
+    let mut slots = Vec::with_capacity(rules.len());
+    let mut entries: Vec<&SaveRule> = Vec::new();
+    let mut planned: Vec<Planned> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in rules {
+        if !seen.insert(entry.rule_id.as_str()) {
+            continue; // duplicate rule id: first one wins
+        }
+        let rule_id = short_id(&entry.rule_id);
+        match plan_entry(requires_approval, known.contains(&entry.rule_id), existing.get(&entry.rule_id), entry) {
+            Err(error) => slots.push(Slot::Done(SaveRowResult { rule_id, status: "error".into(), error: Some(error), note: None })),
+            Ok(None) => slots.push(Slot::Done(SaveRowResult { rule_id, status: "unchanged".into(), error: None, note: None })),
+            Ok(Some(p)) => {
+                slots.push(Slot::Op(planned.len()));
+                entries.push(entry);
+                planned.push(p);
+            }
         }
     }
-    Ok((applied.status, applied.note.map(str::to_string)))
+    let (plans, rest): (Vec<Plan>, Vec<(Merged, Option<String>)>) =
+        planned.into_iter().map(|p| (p.plan, (p.merged, p.expect))).unzip();
+    let ops: Vec<RuleOp<'_>> = entries
+        .iter()
+        .zip(plans)
+        .zip(&rest)
+        .map(|((e, plan), (merged, expect))| RuleOp {
+            rule_id: &e.rule_id,
+            status: &merged.status,
+            write_status: merged.write_status,
+            expect_status: expect.as_deref(),
+            finding_details: merged.finding_details.as_deref(),
+            comments: merged.comments.as_deref(),
+            plan,
+        })
+        .collect();
+    let mut applied = apply_plans(pool, checklist_id, user_id, &ops).await.into_iter();
+    slots
+        .into_iter()
+        .map(|slot| match slot {
+            Slot::Done(r) => r,
+            Slot::Op(i) => {
+                let rule_id = short_id(&entries[i].rule_id);
+                match applied.next() {
+                    Some(Ok(a)) => SaveRowResult { rule_id, status: a.status.into(), error: None, note: a.note.map(str::to_string) },
+                    Some(Err(error)) => SaveRowResult { rule_id, status: "error".into(), error: Some(error), note: None },
+                    None => SaveRowResult { rule_id, status: "error".into(), error: Some("failed to save".into()), note: None },
+                }
+            }
+        })
+        .collect()
 }
 
 fn map_db(e: anyhow::Error) -> StatusCode {
@@ -506,9 +533,71 @@ mod tests {
         ));
     }
 
+    fn plan(requires_approval: bool, known: bool, prev: Option<&ChecklistRuleRow>, e: &SaveRule) -> Result<Option<Planned>, String> {
+        plan_entry(requires_approval, known, prev, e)
+    }
+
+    #[test]
+    fn plan_entry_reports_each_validation_in_order() {
+        let long_id = "x".repeat(MAX_RULE_ID_BYTES + 1);
+        let long_text = "y".repeat(MAX_TEXT_BYTES + 1);
+        let mut e = entry("bogus", &long_text, "");
+        e.rule_id = long_id;
+        // Every check fails at once: the id length is reported first.
+        assert_eq!(plan(false, false, None, &e).err().as_deref(), Some("rule id too long"));
+        e.rule_id = "r".into();
+        assert_eq!(plan(false, false, None, &e).err().as_deref(), Some("invalid status"));
+        e.status = "open".into();
+        assert_eq!(
+            plan(false, false, None, &e).err().as_deref(),
+            Some("finding details or comments too long")
+        );
+        let e = entry("open", "", &long_text);
+        assert_eq!(
+            plan(false, false, None, &e).err().as_deref(),
+            Some("finding details or comments too long")
+        );
+        // Unknown rules are reported even when there is nothing to write.
+        let e = entry("not_reviewed", "", "");
+        assert_eq!(
+            plan(false, false, None, &e).err().as_deref(),
+            Some("rule is not part of this checklist's STIG")
+        );
+    }
+
+    #[test]
+    fn plan_entry_unchanged_and_planned() {
+        assert!(matches!(plan(false, true, None, &entry("not_reviewed", "", "")), Ok(None)));
+        let open = row("open", "d", "c");
+        assert!(matches!(plan(false, true, Some(&open), &entry("open", "d", "c")), Ok(None)));
+
+        let p = plan(false, true, None, &entry("open", "", "")).unwrap().unwrap();
+        assert_eq!(p.plan, Plan::Apply { finding_details: String::new() });
+        assert_eq!((p.merged.status.as_str(), p.merged.write_status, p.expect), ("open", true, None));
+
+        // Text only: the status gates do not apply.
+        let p = plan(true, true, Some(&open), &entry("not_reviewed", "", "note")).unwrap().unwrap();
+        assert!(!p.merged.write_status);
+        assert_eq!(p.plan, Plan::Apply { finding_details: String::new() });
+        assert_eq!(p.expect, None);
+    }
+
+    #[test]
+    fn plan_entry_applies_the_approval_and_details_gates() {
+        let p = plan(true, true, None, &entry("not_a_finding", "why", "")).unwrap().unwrap();
+        assert_eq!(p.plan, Plan::RequestApproval { finding_details: "why".into() });
+        let p = plan(false, true, None, &entry("not_a_finding", "", "")).unwrap().unwrap();
+        assert!(matches!(p.plan, Plan::Reject(_)));
+        // Already at the target on a gated asset: write, guarded by the snapshot status.
+        let closed = row("not_a_finding", "why", "");
+        let p = plan(true, true, Some(&closed), &entry("not_a_finding", "why2", "")).unwrap().unwrap();
+        assert_eq!(p.plan, Plan::Apply { finding_details: "why2".into() });
+        assert_eq!(p.expect.as_deref(), Some("not_a_finding"));
+    }
+
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{app_state, app_state_with_rules, auth, fail_writes_of, rule_ids, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
     async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -546,29 +635,35 @@ mod tests {
         seed_asset(pool, "a1", "owner", requires_approval).await;
     }
 
+    fn known() -> HashSet<String> {
+        RULES.iter().map(|s| s.to_string()).collect()
+    }
+
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn save_one_rejects_when_the_live_row_was_reopened(pool: PgPool) {
+    async fn apply_entries_rejects_when_the_live_row_was_reopened(pool: PgPool) {
         base(&pool, true).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
         seed_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner").await;
         // The caller read the rule as closed...
         let prev = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        let snapshot = HashMap::from([(RULES[0].to_string(), prev)]);
         // ...then someone reopened it before the save wrote.
         seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
         let audit_before = count(&pool, "SELECT COUNT(*) FROM rule_audit").await;
 
-        let out = save_one(
+        let out = apply_entries(
             &pool,
             "c1",
             "owner",
             true,
-            true,
-            Some(&prev),
-            &rule(RULES[0], "not_a_finding", "d", "new comment"),
+            &known(),
+            &snapshot,
+            &[rule(RULES[0], "not_a_finding", "d", "new comment")],
         )
         .await;
-        assert_eq!(out, Err("rule changed while saving; try again".to_string()));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].error.as_deref(), Some("rule changed while saving; try again"));
 
         let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
         assert_eq!((live.status.as_str(), live.comments.as_str()), ("open", ""));
@@ -581,18 +676,17 @@ mod tests {
     async fn pending_path_keeps_comments_with_a_single_audit_row(pool: PgPool) {
         base(&pool, true).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
-        let out = save_one(
+        let out = apply_entries(
             &pool,
             "c1",
             "owner",
             true,
-            true,
-            None,
-            &rule(RULES[0], "not_a_finding", "because", "reviewer note"),
+            &known(),
+            &HashMap::new(),
+            &[rule(RULES[0], "not_a_finding", "because", "reviewer note")],
         )
-        .await
-        .unwrap();
-        assert_eq!(out.0, "pending_approval");
+        .await;
+        assert_eq!(out[0].status, "pending_approval");
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals WHERE status = 'pending'").await, 1);
         let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
         assert_eq!(live.status, "not_reviewed");
@@ -602,6 +696,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fields, ["comments"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_text_only_entries_keep_the_locked_status_in_a_batch(pool: PgPool) {
+        base(&pool, false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
+        let snapshot = HashMap::from([(
+            RULES[0].to_string(),
+            db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0),
+        )]);
+        // The status moves on after the snapshot; a text-only save must not revert it.
+        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner").await;
+        let out = apply_entries(
+            &pool,
+            "c1",
+            "owner",
+            false,
+            &known(),
+            &snapshot,
+            &[
+                rule(RULES[0], "not_reviewed", "", "reviewer note"),
+                rule(RULES[1], "open", "", ""),
+                rule(RULES[2], "not_reviewed", "", "note only"),
+            ],
+        )
+        .await;
+        let statuses: Vec<&str> = out.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, ["applied", "applied", "applied"]);
+        let rows = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap();
+        let by = |id: &str| rows.iter().find(|r| r.rule_id == id).unwrap();
+        assert_eq!((by(RULES[0]).status.as_str(), by(RULES[0]).comments.as_str()), ("not_a_finding", "reviewer note"));
+        assert_eq!(by(RULES[1]).status, "open");
+        assert_eq!((by(RULES[2]).status.as_str(), by(RULES[2]).comments.as_str()), ("not_reviewed", "note only"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_event_counts_survive_a_failed_chunk(pool: PgPool) {
+        base(&pool, false).await;
+        let ids = rule_ids(250);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        fail_writes_of(&pool, "checklist_rules", &[ids[150].as_str()]).await;
+        let rules: Vec<SaveRule> = ids.iter().map(|id| rule(id, "open", "", "")).collect();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        assert_eq!((out.applied_count, out.error_count, out.unchanged_count), (150, 100, 0));
+        assert!(out.results[100..200].iter().all(|r| r.error.as_deref() == Some("failed to save")));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 150);
+        let saves: Vec<_> = events(&pool).await.into_iter().filter(|e| e.0 == "checklist.save").collect();
+        assert_eq!(saves.len(), 1);
+        assert_eq!(saves[0].1, "partial");
+        let d: serde_json::Value = serde_json::from_str(&saves[0].4).unwrap();
+        assert_eq!((d["applied"].as_i64(), d["errors"].as_i64()), (Some(150), Some(100)));
+        assert_eq!(d["rejected"].as_array().unwrap().len(), 100);
+        assert_eq!(d["rejected"][0]["reason"], "failed to save");
+        assert_eq!(d["rejectedTruncated"], false);
     }
 
     #[sqlx::test]

@@ -146,14 +146,19 @@ pub async fn prune_orphan_rule_overrides(
     checklist_id: &str,
     keep: &[String],
 ) -> Result<u64> {
+    // Takes the checklist lock like every other rule writer, so this
+    // multi-row delete cannot interleave with a batch holding row locks.
+    let mut tx = pool.begin().await?;
+    lock_checklist(&mut tx, checklist_id).await?;
     let res = sqlx::query(
         "DELETE FROM checklist_rules \
          WHERE checklist_id = $1 AND rule_id <> ALL($2)",
     )
     .bind(checklist_id)
     .bind(keep)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -308,7 +313,7 @@ fn resolve_patch(
 /// and it serialises first writes to a rule row that does not exist yet.
 /// `FOR NO KEY UPDATE` is enough to conflict with other writers without
 /// blocking foreign-key `KEY SHARE` checks.
-async fn lock_checklist(
+pub(crate) async fn lock_checklist(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     checklist_id: &str,
 ) -> Result<()> {
@@ -324,6 +329,7 @@ async fn lock_checklist(
 /// edit of a column this call does not touch (comments, assignee, due date,
 /// ...) is never reverted by a stale snapshot. Audit rows and the checklist
 /// `updated_at` bump match `upsert_rule`.
+#[allow(dead_code)] // reference single-rule path; the endpoints batch through `patch_rules`
 pub async fn patch_rule(
     pool: &PgPool,
     checklist_id: &str,
@@ -356,6 +362,112 @@ pub async fn patch_rule(
     touch_checklist(&mut tx, checklist_id).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// Rules written per transaction by the batch writers.
+pub const RULE_CHUNK: usize = 100;
+
+/// Result of one item of [`patch_rules`].
+#[derive(Debug, PartialEq)]
+pub enum PatchOutcome {
+    Written,
+    /// A write-time gate refused this rule; nothing was written for it.
+    Rejected(PatchRejected),
+    /// A database error rolled back the whole chunk this rule was in.
+    Failed,
+}
+
+/// [`patch_rule`] for many rules of one checklist, one transaction per
+/// [`RULE_CHUNK`] items. Each chunk locks the checklist, locks and reads its
+/// rule rows, applies every patch through `resolve_patch` against the locked
+/// row, and writes through `write_rule` (so the audit rows are the same). A
+/// gate rejection skips only that rule. A database error rolls back and fails
+/// its whole chunk; after two failed chunks in a row the rest are failed
+/// without being tried. The result has one entry per item, in order.
+pub async fn patch_rules(
+    pool: &PgPool,
+    checklist_id: &str,
+    updated_by: &str,
+    items: &[(&str, RulePatch<'_>)],
+) -> Vec<PatchOutcome> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut consecutive_failures = 0u8;
+    for (i, chunk) in items.chunks(RULE_CHUNK).enumerate() {
+        if consecutive_failures >= 2 {
+            out.extend(chunk.iter().map(|_| PatchOutcome::Failed));
+            continue;
+        }
+        match patch_chunk(pool, checklist_id, updated_by, chunk).await {
+            Ok(results) => {
+                consecutive_failures = 0;
+                out.extend(results.into_iter().map(|r| match r {
+                    Ok(()) => PatchOutcome::Written,
+                    Err(rejected) => PatchOutcome::Rejected(rejected),
+                }));
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                tracing::error!("rule batch write failed (checklist {checklist_id}, chunk {i}): {e:#}");
+                out.extend(chunk.iter().map(|_| PatchOutcome::Failed));
+            }
+        }
+    }
+    out
+}
+
+async fn patch_chunk(
+    pool: &PgPool,
+    checklist_id: &str,
+    updated_by: &str,
+    chunk: &[(&str, RulePatch<'_>)],
+) -> Result<Vec<Result<(), PatchRejected>>> {
+    let mut tx = pool.begin().await?;
+    lock_checklist(&mut tx, checklist_id).await?;
+    let ids: Vec<&str> = chunk.iter().map(|(id, _)| *id).collect();
+    let mut rows: std::collections::HashMap<String, ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
+        "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = ANY($2) \
+         ORDER BY rule_id FOR UPDATE",
+    )
+    .bind(checklist_id)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|r| (r.rule_id.clone(), r))
+    .collect();
+
+    let mut results = Vec::with_capacity(chunk.len());
+    let mut wrote = false;
+    for (rule_id, patch) in chunk {
+        let existing = rows.get(*rule_id);
+        let r = match resolve_patch(existing, patch) {
+            Ok(r) => r,
+            Err(rejected) => {
+                results.push(Err(rejected));
+                continue;
+            }
+        };
+        let w = RuleWrite {
+            checklist_id,
+            rule_id,
+            status: &r.status,
+            finding_details: &r.finding_details,
+            comments: &r.comments,
+            updated_by,
+            assignee_id: r.assignee_id.as_deref(),
+            due_date: r.due_date,
+        };
+        let row = write_rule(&mut tx, existing, &w).await?;
+        // A later item for the same rule must see this write.
+        rows.insert((*rule_id).to_string(), row);
+        wrote = true;
+        results.push(Ok(()));
+    }
+    if wrote {
+        touch_checklist(&mut tx, checklist_id).await?;
+    }
+    tx.commit().await?;
+    Ok(results)
 }
 
 /// Upsert one rule and write its `rule_audit` rows inside the caller's
@@ -534,7 +646,7 @@ mod tests {
 
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{seed_asset, seed_checklist, seed_rule, seed_user};
+    use crate::test_fixtures::{fail_writes_of, seed_asset, seed_checklist, seed_rule, seed_user};
 
     async fn setup(pool: &PgPool) {
         seed_user(pool, "u1").await;
@@ -763,5 +875,249 @@ mod tests {
         assert_eq!(by_pair.created_by, None);
         let json = serde_json::to_value(&by_id).unwrap();
         assert_eq!(json["createdBy"], serde_json::Value::Null);
+    }
+
+    // ── patch_rules ────────────────────────────────────────────────────────
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("r{i:03}")).collect()
+    }
+
+    fn open_patch<'a>() -> RulePatch<'a> {
+        RulePatch { status: Some("open"), finding_details: Some("d"), ..RulePatch::default() }
+    }
+
+    fn items<'a>(ids: &'a [String], patch: RulePatch<'a>) -> Vec<(&'a str, RulePatch<'a>)> {
+        ids.iter().map(|id| (id.as_str(), patch)).collect()
+    }
+
+    async fn count(pool: &PgPool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_writes_across_a_chunk_boundary(pool: PgPool) {
+        setup(&pool).await;
+        let ids = names(RULE_CHUNK + 1);
+        let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
+        assert_eq!(out.len(), ids.len());
+        assert!(out.iter().all(|o| *o == PatchOutcome::Written));
+        assert_eq!(list_rule_overrides(&pool, "c1").await.unwrap().len(), RULE_CHUNK + 1);
+        // status + finding_details per rule.
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await as usize, 2 * (RULE_CHUNK + 1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_mixed_chunk_writes_the_good_and_rejects_the_rest(pool: PgPool) {
+        setup(&pool).await;
+        seed_rule(&pool, "c1", "r-closed", "not_a_finding", "d", "", "u1").await;
+        seed_rule(&pool, "c1", "r-open", "open", "", "", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        let close = RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() };
+        let guarded = RulePatch { expect_status: Some("not_a_finding"), comments: Some("x"), ..RulePatch::default() };
+        let batch = [
+            ("r-good", open_patch()),
+            ("r-open", close),     // stored details are blank
+            ("r-closed", RulePatch { expect_status: Some("open"), ..guarded }),
+            ("r-good2", RulePatch { status: Some("open"), ..RulePatch::default() }),
+        ];
+        let out = patch_rules(&pool, "c1", "u1", &batch).await;
+        assert_eq!(
+            out,
+            [
+                PatchOutcome::Written,
+                PatchOutcome::Rejected(PatchRejected::DetailsRequired),
+                PatchOutcome::Rejected(PatchRejected::StatusChanged),
+                PatchOutcome::Written,
+            ]
+        );
+        let rows = list_rule_overrides(&pool, "c1").await.unwrap();
+        assert_eq!(rows.len(), 4);
+        let open = rows.iter().find(|r| r.rule_id == "r-open").unwrap();
+        assert_eq!(open.status, "open");
+        let closed = rows.iter().find(|r| r.rule_id == "r-closed").unwrap();
+        assert_eq!(closed.comments, "");
+        // Only the two written rules added audit rows.
+        let touched: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT rule_id FROM rule_audit WHERE id > $1 ORDER BY 1")
+                .bind(mark)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(touched, ["r-good", "r-good2"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_bumps_updated_at_once_per_chunk_and_not_for_all_rejected(pool: PgPool) {
+        setup(&pool).await;
+        let t0 = checklist_updated_at(&pool).await;
+        let closing = RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() };
+        let ids = names(3);
+        let out = patch_rules(&pool, "c1", "u1", &items(&ids, closing)).await;
+        assert!(out.iter().all(|o| matches!(o, PatchOutcome::Rejected(_))));
+        assert_eq!(checklist_updated_at(&pool).await, t0);
+
+        // Two chunks: every rule row in a chunk shares one timestamp, the
+        // checklist ends at the last chunk's.
+        let ids = names(RULE_CHUNK + 1);
+        patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
+        let stamps: Vec<(String, DateTime<Utc>)> =
+            sqlx::query_as("SELECT rule_id, updated_at FROM checklist_rules ORDER BY rule_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let distinct: std::collections::HashSet<_> = stamps.iter().map(|(_, t)| *t).collect();
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(stamps[0].1, stamps[RULE_CHUNK - 1].1);
+        assert_eq!(checklist_updated_at(&pool).await, stamps[RULE_CHUNK].1);
+        assert!(checklist_updated_at(&pool).await > t0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_audit_rows_match_single_rule_writes(pool: PgPool) {
+        setup(&pool).await;
+        seed_rule(&pool, "c1", "r1", "open", "old", "oc", "u1").await;
+        seed_rule(&pool, "c1", "r2", "open", "old", "oc", "u1").await;
+        let patches = [
+            ("r1", RulePatch { status: Some("not_a_finding"), finding_details: Some("new"), ..RulePatch::default() }),
+            ("r2", RulePatch { comments: Some("nc"), ..RulePatch::default() }),
+            ("r3", open_patch()),
+        ];
+        type Audit = Vec<(String, String, Option<String>, Option<String>)>;
+        let audit = |pool: PgPool, from: i64| async move {
+            let a: Audit = sqlx::query_as(
+                "SELECT rule_id, field, from_value, to_value FROM rule_audit WHERE id > $1 ORDER BY rule_id, field",
+            )
+            .bind(from)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            a
+        };
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        for (id, patch) in patches {
+            patch_rule(&pool, "c1", id, patch, "u1").await.unwrap();
+        }
+        let single = audit(pool.clone(), mark).await;
+
+        // Reset to the same starting state and replay through the batch path.
+        sqlx::query("DELETE FROM checklist_rules").execute(&pool).await.unwrap();
+        seed_rule(&pool, "c1", "r1", "open", "old", "oc", "u1").await;
+        seed_rule(&pool, "c1", "r2", "open", "old", "oc", "u1").await;
+        let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
+        let out = patch_rules(&pool, "c1", "u1", &patches).await;
+        assert!(out.iter().all(|o| *o == PatchOutcome::Written));
+        let batch = audit(pool.clone(), mark).await;
+        assert!(!single.is_empty());
+        assert_eq!(single, batch);
+        let users: Vec<String> = sqlx::query_scalar("SELECT DISTINCT user_id FROM rule_audit")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, ["u1"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_failed_chunk_writes_nothing_and_other_chunks_commit(pool: PgPool) {
+        setup(&pool).await;
+        fail_writes_of(&pool, "checklist_rules", &["r150"]).await;
+        let ids = names(250);
+        let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
+        for (i, o) in out.iter().enumerate() {
+            let want = if (100..200).contains(&i) { PatchOutcome::Failed } else { PatchOutcome::Written };
+            assert_eq!(*o, want, "item {i}");
+        }
+        let written: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM checklist_rules ORDER BY rule_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let want: Vec<String> = ids.iter().enumerate().filter(|(i, _)| !(100..200).contains(i)).map(|(_, r)| r.clone()).collect();
+        assert_eq!(written, want);
+        let audited: i64 = count(&pool, "SELECT COUNT(DISTINCT rule_id) FROM rule_audit").await;
+        assert_eq!(audited, 150);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_stops_after_two_failed_chunks(pool: PgPool) {
+        setup(&pool).await;
+        fail_writes_of(&pool, "checklist_rules", &["r050", "r150"]).await;
+        let ids = names(400);
+        let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
+        assert_eq!(out.len(), 400);
+        assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
+        // Chunks 2 and 3 would have succeeded had they been tried.
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_duplicate_rule_id_sees_the_earlier_write(pool: PgPool) {
+        setup(&pool).await;
+        let batch = [
+            ("r1", open_patch()),
+            // Passes only if the first item's write is visible.
+            ("r1", RulePatch { expect_status: Some("open"), comments: Some("x"), ..RulePatch::default() }),
+        ];
+        let out = patch_rules(&pool, "c1", "u1", &batch).await;
+        assert_eq!(out, [PatchOutcome::Written, PatchOutcome::Written]);
+        let row = list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        assert_eq!((row.status.as_str(), row.finding_details.as_str(), row.comments.as_str()), ("open", "d", "x"));
+        // Second write diffed against the first: comments only.
+        let fields = audit_fields(&pool).await;
+        assert_eq!(fields, ["status", "finding_details", "comments"]);
+    }
+
+    // Probabilistic, like the twenty-writers test: a writer that took rule locks before the
+    // checklist lock (the old prune, or a batch) would surface as a deadlock error.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn batch_and_single_writers_do_not_deadlock(pool: PgPool) {
+        setup(&pool).await;
+        let ids = names(150);
+        let mut tasks = tokio::task::JoinSet::new();
+        for round in 0..4 {
+            let (p, mine) = (pool.clone(), ids.clone());
+            tasks.spawn(async move {
+                let out = patch_rules(&p, "c1", "u1", &items(&mine, open_patch())).await;
+                assert!(out.iter().all(|o| *o == PatchOutcome::Written), "round {round}");
+                Ok(())
+            });
+            let p = pool.clone();
+            tasks.spawn(async move {
+                patch_rule(&p, "c1", "r010", RulePatch { comments: Some("p"), ..RulePatch::default() }, "u1")
+                    .await
+                    .map(|_| ())
+            });
+            let p = pool.clone();
+            tasks.spawn(async move {
+                upsert_rule(
+                    &p,
+                    RuleWrite {
+                        checklist_id: "c1",
+                        rule_id: "r120",
+                        status: "open",
+                        finding_details: "d",
+                        comments: "u",
+                        updated_by: "u1",
+                        assignee_id: None,
+                        due_date: None,
+                    },
+                )
+                .await
+                .map(|_| ())
+            });
+            let (p, keep) = (pool.clone(), ids[..100].to_vec());
+            tasks.spawn(async move { prune_orphan_rule_overrides(&p, "c1", &keep).await.map(|_| ()) });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap().unwrap();
+        }
     }
 }
