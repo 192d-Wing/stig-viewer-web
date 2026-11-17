@@ -236,9 +236,8 @@ fn count_suffix(n: usize) -> String {
 
 const LOGO_SVG: &str = concat!(
     r##"<svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">"##,
-    r##"<rect width="40" height="40" rx="8" fill="#539fe5"/>"##,
-    r##"<path d="M12 10h16v4H12zM12 17h16v2H12zM12 22h16v2H12zM12 27h10v2H12z" fill="#0f1b2e"/>"##,
-    r##"<path d="M28 22l4 4-4 4" stroke="#0f1b2e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>"##,
+    r##"<path d="M20 3l14 5v10c0 9-5.6 15.6-14 19C11.600 33.600 6 27 6 18V8z" fill="#3ec6b3"/>"##,
+    r##"<path d="M13 20l5 5 9-10" stroke="#04211d" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>"##,
     "</svg>"
 );
 
@@ -682,7 +681,7 @@ pub fn App() -> Html {
                         <img src={format!("data:image/svg+xml,{}", crate::util::encode_uri_component(LOGO_SVG))} alt="STIG Tools" />
                         <span class="ui-topnav-title">{"STIG Tools"}</span>
                     </a>
-                    <div class="ui-topnav-utilities">
+                    <nav class="ui-topnav-primary" aria-label="Primary">
                         {nav_btn("Viewer", "viewer")}
                         {nav_btn("Writer", "writer")}
                         {nav_btn("Systems", "systems")}
@@ -690,6 +689,8 @@ pub fn App() -> Html {
                         {nav_btn("Dashboard", "dashboard")}
                         {nav_btn("My findings", "myfindings")}
                         if is_admin_user { {nav_btn("Admin", "admin")} }
+                    </nav>
+                    <div class="ui-topnav-utilities">
                         if is_library_mode && has_tabs {
                             <NavButton text="Open File" icon_name="upload" onclick={open_file} />
                             if tabs.len() >= 2 {

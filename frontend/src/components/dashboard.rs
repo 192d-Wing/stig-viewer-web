@@ -236,8 +236,9 @@ fn severity_options() -> Vec<SelectOption> {
 
 fn severity_badge(sev: &str) -> &'static str {
     match sev {
-        "CAT I" => "red",
-        "CAT II" => "blue",
+        "CAT I" => "severity-high",
+        "CAT II" => "severity-medium",
+        "CAT III" => "severity-low",
         _ => "grey",
     }
 }
@@ -1131,8 +1132,8 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     }}>
                         <LineChart
                             series={vec![
-                                ChartSeries::line("Open", series(|p| p.open)).color("#d13212"),
-                                ChartSeries::line("Reviewed", series(|p| p.reviewed)).color("#1d8102"),
+                                ChartSeries::line("Open", series(|p| p.open)).color(CHART_NEGATIVE),
+                                ChartSeries::line("Reviewed", series(|p| p.reviewed)).color(CHART_POSITIVE),
                             ]}
                             x_scale_type="time"
                             x_title="Time"
@@ -1148,7 +1149,7 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     }}>
                         <LineChart
                             series={vec![
-                                ChartSeries::line("Compliance", series(|p| p.compliance_score)).color("#1d8102"),
+                                ChartSeries::line("Compliance", series(|p| p.compliance_score)).color(CHART_POSITIVE),
                             ]}
                             x_scale_type="time"
                             x_title="Time"
@@ -2190,10 +2191,10 @@ struct HeatCell {
 fn cell_color(c: Option<&HeatCell>) -> (&'static str, &'static str, String) {
     match c {
         None => ("transparent", "var(--text-inactive)", "—".into()),
-        Some(c) if c.open_count > 0 => ("#7a1c1c", "#fff", c.open_count.to_string()),
-        Some(c) if c.reviewed_count == 0 => ("#444", "#ccc", "·".into()),
-        Some(c) if c.reviewed_count < c.rule_count => ("#7a5e1c", "#fff", "↻".into()),
-        Some(_) => ("#1c5e2d", "#fff", "✓".into()),
+        Some(c) if c.open_count > 0 => ("var(--heat-open)", "#fff", c.open_count.to_string()),
+        Some(c) if c.reviewed_count == 0 => ("var(--heat-none)", "var(--text)", "·".into()),
+        Some(c) if c.reviewed_count < c.rule_count => ("var(--heat-partial)", "#fff", "↻".into()),
+        Some(_) => ("var(--heat-done)", "#fff", "✓".into()),
     }
 }
 
@@ -2278,13 +2279,13 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
                 <table style="border-collapse:collapse;font-size:12px">
                     <thead>
                         <tr>
-                            <th style={format!("text-align:left;padding:6px 10px;border-bottom:1px solid #444;{sticky}")}>
+                            <th style={format!("text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);{sticky}")}>
                                 {"System"}
                             </th>
                             { for stigs.iter().map(|(id, title)| html! {
                                 <th
                                     key={id.to_string()}
-                                    style="padding:6px 10px;border-bottom:1px solid #444;font-weight:400;font-size:11px;writing-mode:vertical-rl;transform:rotate(180deg);white-space:nowrap;max-height:180px"
+                                    style="padding:6px 10px;border-bottom:1px solid var(--border);font-weight:400;font-size:11px;writing-mode:vertical-rl;transform:rotate(180deg);white-space:nowrap;max-height:180px"
                                     title={title.to_string()}
                                 >
                                     {truncate(title, 30)}
@@ -2295,7 +2296,7 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
                     <tbody>
                         { for rows.iter().map(|(name, assets)| html! {
                             <tr key={name.clone()}>
-                                <td style={format!("padding:6px 10px;border-bottom:1px solid #2b2b2b;{sticky}")}>
+                                <td style={format!("padding:6px 10px;border-bottom:1px solid var(--border);{sticky}")}>
                                     if group_by_tag {
                                         <Badge color="grey">{name.clone()}</Badge>
                                         <span style="margin-left:6px;color:var(--text-inactive);font-size:11px">
@@ -2316,7 +2317,7 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
                                         None => format!("{name} · {title} — not applied"),
                                     };
                                     html! {
-                                        <td key={id.to_string()} title={tip} style="padding:0;border-bottom:1px solid #2b2b2b">
+                                        <td key={id.to_string()} title={tip} style="padding:0;border-bottom:1px solid var(--border)">
                                             <div style={format!(
                                                 "width:32px;height:28px;margin:2px;background:{bg};color:{fg};display:flex;align-items:center;justify-content:center;font-weight:600;border-radius:3px"
                                             )}>
@@ -2331,5 +2332,18 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
                 </table>
             </div>
         </Container>
+    }
+}
+
+#[cfg(test)]
+mod severity_badge_tests {
+    use super::*;
+
+    #[test]
+    fn maps_cat_levels_to_severity_classes() {
+        assert_eq!(severity_badge("CAT I"), "severity-high");
+        assert_eq!(severity_badge("CAT II"), "severity-medium");
+        assert_eq!(severity_badge("CAT III"), "severity-low");
+        assert_eq!(severity_badge("bogus"), "grey");
     }
 }

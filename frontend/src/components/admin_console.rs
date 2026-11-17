@@ -1938,7 +1938,7 @@ fn SnippetBlock(props: &SnippetBlockProps) -> Html {
                 </Button>
             </UiBox>
             <pre data-testid={format!("verify-snippet-body-{}", props.language)}
-                 style="background:#1f2329;color:#e6edf3;padding:12px;border-radius:4px;overflow-x:auto;font-family:ui-monospace, SFMono-Regular, Menlo, monospace;font-size:13px;white-space:pre;margin:0;">
+                 style="background:var(--bg-input);color:var(--text-heading);padding:12px;border-radius:4px;overflow-x:auto;font-family:var(--mono);font-size:13px;white-space:pre;margin:0;">
                 {props.text.clone()}
             </pre>
         </SpaceBetween>

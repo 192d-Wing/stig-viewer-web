@@ -72,10 +72,13 @@ fn severity_label(sev: &str) -> String {
 fn severity_color(sev: &str) -> &'static str {
     let s = sev.to_lowercase();
     if s.contains('i') && !s.contains("ii") {
-        return "red"; // CAT I
+        return "severity-high"; // CAT I
     }
     if s.contains("ii") && !s.contains("iii") {
-        return "blue"; // CAT II
+        return "severity-medium"; // CAT II
+    }
+    if s.contains("iii") {
+        return "severity-low"; // CAT III
     }
     "grey"
 }
@@ -1342,5 +1345,18 @@ fn comment_item(s: &ViewState, rule_id: &str, c: &Comment, current_user_id: Opti
                 {content}
             </SpaceBetween>
         </UiBox>
+    }
+}
+
+#[cfg(test)]
+mod severity_badge_tests {
+    use super::*;
+
+    #[test]
+    fn maps_cat_levels_to_severity_classes() {
+        assert_eq!(severity_color("CAT I"), "severity-high");
+        assert_eq!(severity_color("CAT II"), "severity-medium");
+        assert_eq!(severity_color("CAT III"), "severity-low");
+        assert_eq!(severity_color("unknown"), "grey");
     }
 }

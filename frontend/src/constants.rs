@@ -15,8 +15,9 @@ pub const SEVERITY_ORDER: [&str; 3] = ["CAT I", "CAT II", "CAT III"];
 /// Severity → Badge colour.
 pub fn severity_badge_color(cat: &str) -> &'static str {
     match cat {
-        "CAT I" => "red",
-        "CAT II" => "blue",
+        "CAT I" => "severity-high",
+        "CAT II" => "severity-medium",
+        "CAT III" => "severity-low",
         _ => "grey",
     }
 }
@@ -67,3 +68,16 @@ pub fn status_indicator_kind(status: &str) -> &'static str {
 /// (rule field key, label) pairs for the free-text finding fields.
 pub const FINDING_DETAILS_FIELDS: [(&str, &str); 2] =
     [("findingDetails", "Finding Details"), ("comments", "Comments")];
+
+#[cfg(test)]
+mod severity_badge_tests {
+    use super::*;
+
+    #[test]
+    fn maps_cat_levels_to_severity_classes() {
+        assert_eq!(severity_badge_color("CAT I"), "severity-high");
+        assert_eq!(severity_badge_color("CAT II"), "severity-medium");
+        assert_eq!(severity_badge_color("CAT III"), "severity-low");
+        assert_eq!(severity_badge_color("bogus"), "grey");
+    }
+}
