@@ -205,14 +205,16 @@ pub async fn approve_handler(
 
     db_checklists::upsert_rule(
         pool,
-        &approval.checklist_id,
-        &approval.rule_id,
-        &approval.proposed_status,
-        &approval.finding_details,
-        &comments,
-        &user.id,
-        assignee.as_deref(),
-        due,
+        db_checklists::RuleWrite {
+            checklist_id: &approval.checklist_id,
+            rule_id: &approval.rule_id,
+            status: &approval.proposed_status,
+            finding_details: &approval.finding_details,
+            comments: &comments,
+            updated_by: &user.id,
+            assignee_id: assignee.as_deref(),
+            due_date: due,
+        },
     )
     .await
     .map_err(|e| {
@@ -318,7 +320,6 @@ pub async fn update_policy_handler(
 /// Create a `pending` `finding_approvals` row. Called from
 /// `checklists.rs::update_rule_handler` when an asset has
 /// `requires_approval = TRUE` and the proposed status is a closing one.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_pending(
     pool: &PgPool,
     checklist_id: &str,

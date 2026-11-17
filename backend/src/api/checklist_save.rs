@@ -508,7 +508,7 @@ mod tests {
 
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
     async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -551,15 +551,11 @@ mod tests {
     async fn save_one_rejects_when_the_live_row_was_reopened(pool: PgPool) {
         base(&pool, true).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
-        db_checklists::upsert_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner", None, None)
-            .await
-            .unwrap();
+        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner").await;
         // The caller read the rule as closed...
         let prev = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
         // ...then someone reopened it before the save wrote.
-        db_checklists::upsert_rule(&pool, "c1", RULES[0], "open", "d", "", "owner", None, None)
-            .await
-            .unwrap();
+        seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
         let audit_before = count(&pool, "SELECT COUNT(*) FROM rule_audit").await;
 
         let out = save_one(

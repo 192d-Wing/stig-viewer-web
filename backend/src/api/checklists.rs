@@ -600,14 +600,16 @@ pub async fn update_rule_handler(
 
     let row = db_checklists::upsert_rule(
         state.pool.as_ref(),
-        &id,
-        &rule_id,
-        &req.status,
-        &req.finding_details,
-        &req.comments,
-        &user.id,
-        req.assignee_id.as_deref(),
-        req.due_date,
+        db_checklists::RuleWrite {
+            checklist_id: &id,
+            rule_id: &rule_id,
+            status: &req.status,
+            finding_details: &req.finding_details,
+            comments: &req.comments,
+            updated_by: &user.id,
+            assignee_id: req.assignee_id.as_deref(),
+            due_date: req.due_date,
+        },
     )
     .await
     .map_err(map_db)

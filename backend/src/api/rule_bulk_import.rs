@@ -263,14 +263,16 @@ pub async fn bulk_import_handler(
 
             db_checklists::upsert_rule(
                 state.pool.as_ref(),
-                &checklist_id,
-                &row.rule_id,
-                &row.status,
-                &row.finding_details,
-                &comments,
-                &user.id,
-                assignee_id.as_deref(),
-                due_date,
+                db_checklists::RuleWrite {
+                    checklist_id: &checklist_id,
+                    rule_id: &row.rule_id,
+                    status: &row.status,
+                    finding_details: &row.finding_details,
+                    comments: &comments,
+                    updated_by: &user.id,
+                    assignee_id: assignee_id.as_deref(),
+                    due_date,
+                },
             )
             .await
             .map_err(|e| {

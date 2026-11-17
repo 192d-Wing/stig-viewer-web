@@ -102,6 +102,33 @@ pub async fn seed_checklist(pool: &PgPool, id: &str, asset_id: &str, stig_id: &s
         .expect("seed checklist");
 }
 
+/// Write one rule through `upsert_rule` (no assignee, no due date).
+pub async fn seed_rule(
+    pool: &PgPool,
+    checklist_id: &str,
+    rule_id: &str,
+    status: &str,
+    finding_details: &str,
+    comments: &str,
+    user: &str,
+) {
+    crate::db_checklists::upsert_rule(
+        pool,
+        crate::db_checklists::RuleWrite {
+            checklist_id,
+            rule_id,
+            status,
+            finding_details,
+            comments,
+            updated_by: user,
+            assignee_id: None,
+            due_date: None,
+        },
+    )
+    .await
+    .expect("seed rule");
+}
+
 pub fn auth(id: &str, role: &str) -> AuthUser {
     AuthUser {
         id: id.into(),
@@ -124,10 +151,21 @@ impl Drop for StigDir {
 /// An `AppState` over `pool` whose data dir holds a three-rule STIG named
 /// [`STIG_ID`] under a unique temp directory.
 pub fn app_state(pool: PgPool) -> (AppState, StigDir) {
+    let ids: Vec<String> = RULES.iter().map(|s| s.to_string()).collect();
+    app_state_with_rules(pool, &ids)
+}
+
+/// Rule ids `SV-{i}r1_rule` for `i` in `1..=n`.
+pub fn rule_ids(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("SV-{i}r1_rule")).collect()
+}
+
+/// Like [`app_state`] but the fixture STIG holds exactly `rule_ids`.
+pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, StigDir) {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
     let stigs = dir.join("stigs");
     std::fs::create_dir_all(&stigs).expect("create stig dir");
-    let rules: Vec<_> = RULES.iter().map(|id| serde_json::json!({ "id": id, "title": id })).collect();
+    let rules: Vec<_> = rule_ids.iter().map(|id| serde_json::json!({ "id": id, "title": id })).collect();
     std::fs::write(
         stigs.join(format!("{STIG_ID}.json")),
         serde_json::json!({ "id": STIG_ID, "rules": rules }).to_string(),

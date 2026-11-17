@@ -531,7 +531,7 @@ mod tests {
 
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{app_state, StigDir, seed_asset, seed_checklist, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{app_state, app_state_with_rules, rule_ids, StigDir, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
     async fn setup(pool: &PgPool) -> (AppState, StigDir) {
@@ -630,9 +630,7 @@ mod tests {
         // must change between its snapshot read and its write), so this is
         // the equivalent check one level down with a stale `expect_status`.
         let (_state, _dir) = setup(&pool).await;
-        db_checklists::upsert_rule(&pool, "c1", RULES[0], "open", "d", "", "owner", None, None)
-            .await
-            .unwrap();
+        seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
         let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
         let out = apply_plan(
             &pool,
@@ -817,5 +815,90 @@ mod tests {
         assert_eq!((ev[0].0.as_str(), ev[0].1.as_str()), ("rules.bulk_status", "rejected"));
         let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
         assert_eq!(d["reason"], "stig_unavailable");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_status_covers_more_rules_than_one_chunk(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let ids = rule_ids(101);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Json(out) = call(&state, "owner", "c1", &refs, "open", "").await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (101, 0));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 101);
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        assert_eq!(audit, 101);
+    }
+
+    /// Benchmark, not a test: returns at once unless `BENCH_RULES` is set.
+    /// Drives only the public handlers so the same code runs on any commit.
+    /// `BENCH_RULES=300 cargo test bench_300 -- --include-ignored --nocapture`
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bench_300_rule_batches(pool: PgPool) {
+        use crate::api::checklist_save::{save_handler, SaveRequest, SaveRule};
+        let Some(n) = std::env::var("BENCH_RULES").ok().and_then(|v| v.parse::<usize>().ok()) else {
+            return;
+        };
+        const RUNS: usize = 5;
+        seed_user(&pool, "owner").await;
+        let ids = rule_ids(n);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let mut report = Vec::new();
+        for (name, gated) in [("a bulk open, ungated", false), ("b bulk close, approval asset", true)] {
+            let mut times = Vec::new();
+            for run in 0..RUNS {
+                let asset = format!("bench-{}-{run}", &name[..1]);
+                let checklist = format!("bc-{}-{run}", &name[..1]);
+                seed_asset(&pool, &asset, "owner", gated).await;
+                seed_checklist(&pool, &checklist, &asset, STIG_ID).await;
+                let (status, details) = if gated { ("not_a_finding", "bench details") } else { ("open", "") };
+                let t = std::time::Instant::now();
+                let Json(out) = call(&state, "owner", &checklist, &refs, status, details).await.unwrap();
+                times.push(t.elapsed());
+                assert_eq!(out.error_count, 0);
+                assert_eq!(out.applied_count + out.pending_count, n);
+            }
+            report.push((name, median(times)));
+        }
+        let mut times = Vec::new();
+        for run in 0..RUNS {
+            let asset = format!("bench-c-{run}");
+            seed_asset(&pool, &asset, "owner", false).await;
+            let rules: Vec<SaveRule> = ids
+                .iter()
+                .map(|id| SaveRule {
+                    rule_id: id.clone(),
+                    status: "not_a_finding".into(),
+                    finding_details: "bench details".into(),
+                    comments: "bench comments".into(),
+                })
+                .collect();
+            let t = std::time::Instant::now();
+            let Json(out) = save_handler(
+                State(state.clone()),
+                Extension(crate::test_fixtures::auth("owner", "author")),
+                Path(asset),
+                Json(SaveRequest { stig_id: STIG_ID.into(), rules }),
+            )
+            .await
+            .unwrap();
+            times.push(t.elapsed());
+            assert_eq!((out.error_count, out.applied_count), (0, n));
+        }
+        report.push(("c save, status+details+comments", median(times)));
+        for (name, d) in report {
+            eprintln!("BENCH n={n} runs={RUNS} median {name}: {d:?}");
+        }
     }
 }
