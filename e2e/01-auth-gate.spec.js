@@ -1,5 +1,5 @@
-import { test, expect } from "@playwright/test";
-import { loginAs, resetDb } from "./helpers.js";
+import { test, expect, request as pwRequest } from "@playwright/test";
+import { acknowledgeNotice, BACKEND, FRONTEND, NOTICE_VERSION, loginAs, resetDb } from "./helpers.js";
 
 test.describe("Auth Gate", () => {
   test.beforeEach(async () => {
@@ -8,6 +8,7 @@ test.describe("Auth Gate", () => {
 
   test("unauthenticated visit shows Sign in screen", async ({ page }) => {
     await page.goto("/");
+    await acknowledgeNotice(page);
     // Both Keycloak and SAML sign-in buttons render; assert the primary
     // Keycloak path specifically rather than matching /sign in/.
     await expect(
@@ -18,6 +19,7 @@ test.describe("Auth Gate", () => {
 
   test("clicking Sign in redirects to the IdP login page", async ({ page }) => {
     await page.goto("/");
+    await acknowledgeNotice(page);
     await page
       .getByRole("button", { name: /sign in with keycloak/i })
       .click();
@@ -64,6 +66,7 @@ test.describe("Login screen", () => {
   test("fits a phone viewport", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 });
     await page.goto("/");
+    await acknowledgeNotice(page);
     await expect(
       page.getByRole("button", { name: /sign in with keycloak/i }),
     ).toBeVisible();
@@ -135,6 +138,7 @@ test.describe("Login screen", () => {
     // request to /auth/saml/login and that its response is a redirect.
     const respP = page.waitForResponse((r) => /\/auth\/saml\/login/.test(r.url()));
     await page.goto("/");
+    await acknowledgeNotice(page);
     const saml = page.getByRole("button", { name: /sign in with saml/i });
     await saml.focus();
     await page.keyboard.press("Enter");
@@ -145,6 +149,7 @@ test.describe("Login screen", () => {
 
   test("login buttons use the requested colours", async ({ page }) => {
     await page.goto("/");
+    await acknowledgeNotice(page);
     const bg = (name) =>
       page.getByRole("button", { name }).evaluate((el) => getComputedStyle(el).backgroundColor);
     expect(await bg(/sign in with keycloak/i)).toBe("rgb(21, 38, 59)");
@@ -157,6 +162,7 @@ test.describe("Login screen", () => {
     await page.goto("/");
     const kc = page.getByRole("button", { name: /sign in with keycloak/i });
     const saml = page.getByRole("button", { name: /sign in with saml/i });
+    await acknowledgeNotice(page);
     await expect(kc).toBeVisible();
     await page.keyboard.press("Tab");
     await expect(kc).toBeFocused();
@@ -167,5 +173,160 @@ test.describe("Login screen", () => {
     await expect(page).toHaveURL(/keycloak|realms\/stig-viewer/i, {
       timeout: 10_000,
     });
+  });
+});
+
+test.describe("System use notification (AC-8)", () => {
+  test.beforeEach(async () => {
+    await resetDb();
+  });
+
+  const signIn = (page) => page.getByRole("button", { name: /sign in/i });
+
+  test("banner present, sign-in absent", async ({ page }) => {
+    await page.goto("/");
+    const notice = page.getByTestId("login-notice");
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText("You are accessing a U.S. Government (USG) Information System (IS)");
+    await expect(notice).toContainText("See User Agreement for details.");
+    await expect(notice.locator("li")).toHaveCount(5);
+    await expect(signIn(page)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "I Agree" })).toBeVisible();
+  });
+
+  test("acknowledge reveals sign-in", async ({ page }) => {
+    await page.goto("/");
+    await acknowledgeNotice(page);
+    for (const n of [/sign in with keycloak/i, /sign in with saml/i]) {
+      const b = page.getByRole("button", { name: n });
+      await expect(b).toBeVisible();
+      await expect(b).toBeEnabled();
+    }
+    await expect(page.getByTestId("login-notice")).toHaveCount(0);
+  });
+
+  test("Escape and clicking away do not bypass", async ({ page }) => {
+    await page.goto("/");
+    await page.keyboard.press("Escape");
+    await page.locator(".login-emblem-panel").click({ position: { x: 5, y: 5 } });
+    await expect(signIn(page)).toHaveCount(0);
+    await expect(page.getByTestId("login-notice")).toBeVisible();
+  });
+
+  test("keyboard flow", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.getByTestId("login-notice")).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: "I Agree" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("group", { name: "Sign-in options" })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: /sign in with keycloak/i })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/keycloak|realms\/stig-viewer/i, { timeout: 10_000 });
+  });
+
+  test("re-required on reload, nothing persisted", async ({ page }) => {
+    await page.goto("/");
+    await acknowledgeNotice(page);
+    await expect(signIn(page)).toHaveCount(2);
+    const lens = await page.evaluate(() => [localStorage.length, sessionStorage.length]);
+    expect(lens).toEqual([0, 0]);
+    await page.reload();
+    await expect(page.getByTestId("login-notice")).toBeVisible();
+    await expect(signIn(page)).toHaveCount(0);
+  });
+
+  test("phone viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.goto("/");
+    await expect(page.getByTestId("login-notice")).toBeVisible();
+    const noOverflow = () =>
+      page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      );
+    expect(await noOverflow()).toBe(true);
+    const ack = page.getByTestId("login-notice-ack");
+    await ack.scrollIntoViewIfNeeded();
+    await ack.click();
+    for (const n of [/sign in with keycloak/i, /sign in with saml/i]) {
+      const b = page.getByRole("button", { name: n });
+      await b.scrollIntoViewIfNeeded();
+      await expect(b).toBeVisible();
+      const box = await b.boundingBox();
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width).toBeLessThanOrEqual(375);
+    }
+    expect(await noOverflow()).toBe(true);
+  });
+
+  test("reduced motion: animated layers are static after acknowledging", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/");
+    await acknowledgeNotice(page);
+    for (const sel of [".login-bg", ".login-binary span"]) {
+      expect(
+        await page.locator(sel).first().evaluate((el) => getComputedStyle(el).animationName),
+      ).toBe("none");
+    }
+    expect(
+      await page
+        .locator(".login-bg")
+        .evaluate((el) => getComputedStyle(el, "::after").animationName),
+    ).toBe("none");
+  });
+});
+
+test.describe("AC-8 server-side gate", () => {
+  test.beforeEach(async () => {
+    await resetDb();
+  });
+
+  const ack = (ctx, headers = {}, version = NOTICE_VERSION) =>
+    ctx.post(`${BACKEND}/auth/notice/ack`, {
+      headers: { Origin: FRONTEND, "Content-Type": "application/json", ...headers },
+      data: { noticeVersion: version },
+    });
+
+  test("direct GET /auth/login without proof redirects to the banner", async () => {
+    const ctx = await pwRequest.newContext();
+    const res = await ctx.get(`${BACKEND}/auth/login`, { maxRedirects: 0 });
+    expect(res.status()).toBe(303);
+    expect(new URL(res.headers()["location"]).origin).toBe(new URL(FRONTEND).origin);
+    await ctx.dispose();
+  });
+
+  test("browser hitting /auth/login directly lands on the banner", async ({ page }) => {
+    await page.goto(`${BACKEND}/auth/login`);
+    await expect(page.getByTestId("login-notice")).toBeVisible();
+    await expect(page.getByRole("button", { name: /sign in/i })).toHaveCount(0);
+  });
+
+  test("ack then login proceeds to the IdP once; reuse is denied", async () => {
+    const ctx = await pwRequest.newContext();
+    expect((await ack(ctx)).status()).toBe(204);
+    const first = await ctx.get(`${BACKEND}/auth/login`, { maxRedirects: 0 });
+    expect(first.status()).toBe(303);
+    expect(first.headers()["location"]).toMatch(/keycloak|realms\/stig-viewer/i);
+    const second = await ctx.get(`${BACKEND}/auth/login`, { maxRedirects: 0 });
+    expect(second.status()).toBe(303);
+    expect(new URL(second.headers()["location"]).origin).toBe(new URL(FRONTEND).origin);
+    await ctx.dispose();
+  });
+
+  test("ack rejects a foreign Origin (403) and a wrong version (409)", async () => {
+    const ctx = await pwRequest.newContext();
+    expect((await ack(ctx, { Origin: "http://evil.example" })).status()).toBe(403);
+    expect((await ack(ctx, {}, "wrong-version")).status()).toBe(409);
+    await ctx.dispose();
+  });
+
+  test("UI stays on the banner when the ack request fails", async ({ page }) => {
+    await page.route("**/auth/notice/ack", (route) => route.abort());
+    await page.goto("/");
+    await page.getByTestId("login-notice-ack").click();
+    await expect(page.getByTestId("login-notice-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: /sign in/i })).toHaveCount(0);
+    await expect(page.getByTestId("login-notice")).toBeVisible();
   });
 });

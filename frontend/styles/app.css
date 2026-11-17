@@ -723,7 +723,23 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); widt
 .login-emblem { width: min(60%, 360px); height: auto; aspect-ratio: 1; object-fit: contain; }
 .login-title { margin: 0; font-size: 28px; line-height: 34px; font-weight: 700; }
 .login-subtitle { margin: 0; color: var(--text-secondary); }
+.login-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--text);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.login-notice p { margin: 0; }
+.login-notice-version { font-size: 12px; color: var(--text-secondary); }
+.login-notice-title { margin: 0; font-size: 16px; font-weight: 600; }
+.login-notice ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
 .login-actions { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+/* Programmatic (tabindex=-1) focus target after acknowledgement only; not a control. */
+.login-actions:focus { outline: none; }
 .login-actions .ui-btn { width: 100%; min-height: 44px; }
 .login-actions .ui-btn { color: #fff; border: 1px solid transparent; }
 .login-actions .ui-btn-primary {

@@ -46,13 +46,17 @@ pub async fn reset_handler(State(state): State<AppState>) -> StatusCode {
     // don't leak between specs.
     let result = sqlx::query(
         "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
-                  email_deliveries CASCADE",
+                  email_deliveries, login_notice_acks CASCADE",
     )
         .execute(state.pool.as_ref())
         .await;
 
     match result {
-        Ok(_) => StatusCode::NO_CONTENT,
+        Ok(_) => {
+            // Also clear the pre-auth rate-limit buckets so specs start fresh.
+            crate::api::rate_limit::reset();
+            StatusCode::NO_CONTENT
+        }
         Err(e) => {
             tracing::error!("Test reset failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR

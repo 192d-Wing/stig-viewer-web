@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     Form,
 };
-use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use axum_extra::extract::cookie::{CookieJar, SameSite};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
 use flate2::{write::DeflateEncoder, Compression};
@@ -29,8 +29,52 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::api::auth::{
-    client_ip, create_session, upsert_user, user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
+    cookie_secure, create_session, session_cookie, upsert_user,
+    user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
 };
+use crate::api::notice::{link_ack_at_login, require_ack, AckLookup};
+
+/// Longest RelayState accepted as a redirect target.
+const MAX_RELAY_STATE_CHARS: usize = 512;
+
+/// A RelayState reduced to a same-origin relative path: starts with a single
+/// `/` (not `//`), no backslash or control characters, at most
+/// [`MAX_RELAY_STATE_CHARS`] characters.
+pub(crate) fn safe_relay_path(raw: &str) -> Option<&str> {
+    let mut chars = raw.chars();
+    if chars.next() != Some('/')
+        || matches!(chars.next(), Some('/') | Some('\\'))
+        || raw.chars().count() > MAX_RELAY_STATE_CHARS
+        || raw.chars().any(|c| c == '\\' || c.is_control())
+    {
+        return None;
+    }
+    Some(raw)
+}
+
+/// RelayState sent to the IdP: the validated relative path (ACS validates it
+/// again and resolves it), or `/`.
+pub(crate) fn relay_for_idp(raw: &str) -> String {
+    safe_relay_path(raw).unwrap_or("/").to_string()
+}
+
+/// Redirect target for a RelayState: only a same-origin relative path is
+/// resolved against `frontend_url` (and must stay on its origin); anything
+/// else yields `frontend_url`.
+pub(crate) fn safe_relay_target(raw: &str, frontend_url: &str) -> String {
+    let fallback = || frontend_url.to_string();
+    let Some(path) = safe_relay_path(raw) else { return fallback() };
+    let Ok(base) = url::Url::parse(frontend_url) else { return fallback() };
+    match base.join(path) {
+        Ok(u) if u.origin() == base.origin() => u.to_string(),
+        _ => fallback(),
+    }
+}
+
+/// Where the ACS redirects after login for the IdP-supplied RelayState.
+pub(crate) fn acs_redirect_target(relay_state: Option<&str>, frontend_url: &str) -> String {
+    safe_relay_target(relay_state.unwrap_or(""), frontend_url)
+}
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -93,8 +137,11 @@ pub struct LoginParams {
 /// AuthnRequest in the `SAMLRequest` query param.
 pub async fn login_handler(
     State(state): State<AppSamlState>,
+    headers: HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    jar: CookieJar,
     axum::extract::Query(params): axum::extract::Query<LoginParams>,
-) -> Result<Redirect, (StatusCode, String)> {
+) -> Result<(CookieJar, Redirect), (StatusCode, String)> {
     if !state.config.is_configured() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -102,6 +149,24 @@ pub async fn login_handler(
         ));
     }
     let req_id = format!("_{}", uuid::Uuid::new_v4().simple());
+    let ip = crate::api::notice::notice_ip(&headers, peer.map(|p| p.0));
+    if crate::api::notice::login_start_limited(&jar, &ip) {
+        return Ok(crate::api::notice::rate_limited_redirect(jar, &state.config.frontend_url, &ip));
+    }
+    // AC-8 gate: consumes the acknowledgement and binds it to this request id.
+    let (jar, _ack_id) = match require_ack(
+        state.pool.as_ref(),
+        jar,
+        &state.config.frontend_url,
+        "saml",
+        Some(&req_id),
+        &ip,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(deny) => return Ok(*deny),
+    };
     let issue_instant = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let authn_req = build_authn_request(
         &req_id,
@@ -121,16 +186,14 @@ pub async fn login_handler(
         .map_err(|e| internal(&format!("deflate finish failed: {e}")))?;
     let encoded = B64.encode(&deflated);
 
-    let relay = params
-        .relay_state
-        .unwrap_or_else(|| state.config.frontend_url.clone());
+    let relay = relay_for_idp(params.relay_state.as_deref().unwrap_or(""));
 
     let mut url = url::Url::parse(&state.config.idp_sso_url)
         .map_err(|e| internal(&format!("bad SAML_IDP_SSO_URL: {e}")))?;
     url.query_pairs_mut()
         .append_pair("SAMLRequest", &encoded)
         .append_pair("RelayState", &relay);
-    Ok(Redirect::to(url.as_str()))
+    Ok((jar, Redirect::to(url.as_str())))
 }
 
 // ── ACS: POST /auth/saml/acs ────────────────────────────────────────────────
@@ -149,10 +212,11 @@ pub struct AcsForm {
 pub async fn acs_handler(
     State(state): State<AppSamlState>,
     headers: HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     jar: CookieJar,
     Form(form): Form<AcsForm>,
 ) -> Result<(CookieJar, Redirect), (StatusCode, String)> {
-    let ip = client_ip(&headers);
+    let ip = crate::api::notice::notice_ip(&headers, peer.map(|p| p.0));
     let ua = user_agent(&headers);
     let xml_bytes = B64
         .decode(form.saml_response.as_bytes())
@@ -198,19 +262,39 @@ pub async fn acs_handler(
         .await
         .map_err(|e| internal(&format!("create_session failed: {e}")))?;
 
-    let cookie = Cookie::build((SESSION_COOKIE, session_id))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .max_age(time::Duration::hours(SESSION_LIFETIME_HOURS))
-        .build();
+    // Best-effort AU-2 link of the AC-8 acknowledgement; never fails the login.
+    finish_saml_login(state.pool.as_ref(), &assertion, &user.id, &session_id).await;
 
-    let redirect_to = form
-        .relay_state
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| state.config.frontend_url.clone());
+    let cookie = session_cookie(
+        SESSION_COOKIE,
+        session_id,
+        "/",
+        SameSite::Lax,
+        time::Duration::hours(SESSION_LIFETIME_HOURS),
+        cookie_secure(),
+    );
+
+    let redirect_to = acs_redirect_target(form.relay_state.as_deref(), &state.config.frontend_url);
 
     Ok((jar.add(cookie), Redirect::to(&redirect_to)))
+}
+
+/// Post-session step of the ACS: link the AC-8 acknowledgement whose AuthnRequest
+/// id matches the response's `InResponseTo` (best effort, never fails the login).
+pub(crate) async fn finish_saml_login(
+    pool: &PgPool,
+    assertion: &ParsedAssertion,
+    user_id: &str,
+    session_id: &str,
+) {
+    link_ack_at_login(
+        pool,
+        AckLookup::BySamlRequest(assertion.in_response_to.as_deref()),
+        user_id,
+        session_id,
+        "saml",
+    )
+    .await;
 }
 
 // ── Metadata: GET /auth/saml/metadata ───────────────────────────────────────
@@ -282,6 +366,8 @@ pub(crate) struct ParsedAssertion {
     pub name_id: Option<String>,
     pub email: Option<String>,
     pub display_name: Option<String>,
+    /// `InResponseTo` of the `Response` element (the AuthnRequest ID), bounded.
+    pub in_response_to: Option<String>,
 }
 
 /// Pull NameID and a handful of common attributes (`mail`/`email`, plus
@@ -300,11 +386,23 @@ pub(crate) fn parse_assertion(xml: &str) -> Result<ParsedAssertion> {
     let mut current_attr_name: Option<String> = None;
     // Text-accumulator for the current text run (handles entity refs).
     let mut text_buf = String::new();
+    let mut first_element = true;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let local = local_name(e.name().as_ref());
+                // InResponseTo is read only from the root element.
+                let is_root = std::mem::replace(&mut first_element, false);
+                if is_root && local == "Response" {
+                    for a in e.attributes().flatten() {
+                        if local_name(a.key.as_ref()) == "InResponseTo" {
+                            if let Ok(v) = a.unescape_value() {
+                                out.in_response_to = Some(v.chars().take(128).collect());
+                            }
+                        }
+                    }
+                }
                 match local.as_str() {
                     "NameID" => {
                         in_name_id = true;
@@ -477,6 +575,7 @@ impl IntoResponse for ParsedAssertion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum_extra::extract::cookie::Cookie;
 
     #[test]
     fn parse_minimal_response() {
@@ -495,6 +594,135 @@ mod tests {
         assert_eq!(a.name_id.as_deref(), Some("alice@example.com"));
         assert_eq!(a.email.as_deref(), Some("alice@example.com"));
         assert_eq!(a.display_name.as_deref(), Some("Alice Example"));
+    }
+
+    #[test]
+    fn parse_extracts_in_response_to() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" InResponseTo="_abc123"><saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">a@b.c</saml:NameID></samlp:Response>"#;
+        assert_eq!(parse_assertion(xml).unwrap().in_response_to.as_deref(), Some("_abc123"));
+    }
+
+    #[test]
+    fn in_response_to_only_from_root_response() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:NameID>a@b.c</saml:NameID><samlp:Response InResponseTo="_evil"/><samlp:Response InResponseTo="_evil2"></samlp:Response></samlp:Response>"#;
+        assert_eq!(parse_assertion(xml).unwrap().in_response_to, None);
+    }
+
+    const FE: &str = "http://localhost:5173";
+
+    #[test]
+    fn relay_state_accepts_only_same_origin_paths() {
+        assert_eq!(safe_relay_target("/", FE), "http://localhost:5173/");
+        assert_eq!(safe_relay_target("/checklists?x=1", FE), "http://localhost:5173/checklists?x=1");
+        for bad in [
+            "",
+            "//evil.com",
+            "/\\evil.com",
+            "https://evil.com",
+            "javascript:alert(1)",
+            "%2F%2Fevil.com",
+            "/a\r\nSet-Cookie: x=1",
+            "/a\nb",
+            "/a\\b",
+        ] {
+            assert_eq!(safe_relay_target(bad, FE), FE, "{bad:?}");
+        }
+        let long = format!("/{}", "a".repeat(MAX_RELAY_STATE_CHARS));
+        assert_eq!(safe_relay_target(&long, FE), FE);
+        let ok_len = format!("/{}", "a".repeat(MAX_RELAY_STATE_CHARS - 1));
+        assert_ne!(safe_relay_target(&ok_len, FE), FE);
+    }
+
+    #[test]
+    fn relay_round_trip_sends_a_relative_path_and_acs_resolves_it() {
+        let sent = relay_for_idp("/checklists?x=1");
+        assert_eq!(sent, "/checklists?x=1");
+        assert_eq!(acs_redirect_target(Some(&sent), FE), "http://localhost:5173/checklists?x=1");
+        assert_eq!(relay_for_idp(""), "/");
+        assert_eq!(relay_for_idp("https://evil.example"), "/");
+        assert_eq!(acs_redirect_target(None, FE), FE);
+    }
+
+    #[test]
+    fn acs_redirect_falls_back_for_hostile_relay_state() {
+        for bad in ["//evil.example", "https://evil.example", "/\\evil.example", "javascript:alert(1)"] {
+            assert_eq!(acs_redirect_target(Some(bad), FE), FE, "{bad}");
+        }
+    }
+
+    fn st(pool: PgPool, sso: &str) -> AppSamlState {
+        AppSamlState {
+            pool: Arc::new(pool),
+            config: Arc::new(SamlConfig {
+                idp_sso_url: sso.into(),
+                idp_entity_id: String::new(),
+                sp_entity_id: "sp".into(),
+                sp_acs_url: "http://localhost:8080/auth/saml/acs".into(),
+                idp_cert_pem: None,
+                frontend_url: FE.into(),
+                is_production: false,
+            }),
+        }
+    }
+
+    fn location(r: Redirect) -> String {
+        let resp = IntoResponse::into_response(r);
+        resp.headers().get("location").unwrap().to_str().unwrap().to_string()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn saml_login_links_matching_in_response_to_or_records_missing(pool: PgPool) {
+        sqlx::query("INSERT INTO users (id, display_name, email, sub, provider) VALUES ('u1','U','','s','test')")
+            .execute(&pool).await.unwrap();
+        let id = "00000000-0000-4000-8000-0000000000e1";
+        crate::db_notice::insert_ack(&pool, id, crate::api::notice::USE_NOTICE_VERSION, "", "", 300).await.unwrap();
+        crate::db_notice::consume_ack(&pool, id, crate::api::notice::USE_NOTICE_VERSION, "saml", Some("_req9")).await.unwrap();
+        let with = |r: Option<&str>| ParsedAssertion { in_response_to: r.map(String::from), ..Default::default() };
+        finish_saml_login(&pool, &with(Some("_req9")), "u1", "s1").await;
+        finish_saml_login(&pool, &with(None), "u1", "s2").await;
+        finish_saml_login(&pool, &with(Some("_other")), "u1", "s3").await;
+        let o: Vec<String> = sqlx::query_scalar("SELECT outcome FROM audit_events ORDER BY id")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(o, ["ok", "missing", "missing"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn saml_login_requires_ack_then_single_use(pool: PgPool) {
+        let state = st(pool.clone(), "https://idp.example/sso");
+        let q = || axum::extract::Query(LoginParams { relay_state: None });
+        let (_, r) = login_handler(State(state.clone()), HeaderMap::new(), None, CookieJar::new(), q())
+            .await.unwrap();
+        assert_eq!(location(r), FE);
+
+        crate::db_notice::insert_ack(&pool, "00000000-0000-4000-8000-000000000001",
+            crate::api::notice::USE_NOTICE_VERSION, "", "", 300).await.unwrap();
+        let jar = CookieJar::new().add(Cookie::new(crate::api::notice::ACK_COOKIE, "00000000-0000-4000-8000-000000000001"));
+        let (_, r) = login_handler(State(state.clone()), HeaderMap::new(), None, jar.clone(), q()).await.unwrap();
+        let loc = location(r);
+        assert!(loc.starts_with("https://idp.example/sso"));
+        assert!(loc.contains("SAMLRequest="));
+        let (req, consumed): (Option<String>, bool) = sqlx::query_as(
+            "SELECT saml_request_id, consumed_at IS NOT NULL FROM login_notice_acks")
+            .fetch_one(&pool).await.unwrap();
+        assert!(req.is_some() && consumed);
+        let (_, r) = login_handler(State(state), HeaderMap::new(), None, jar, q()).await.unwrap();
+        assert_eq!(location(r), FE);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn saml_login_unconfigured_is_503_and_keeps_proof(pool: PgPool) {
+        crate::db_notice::insert_ack(&pool, "00000000-0000-4000-8000-000000000002",
+            crate::api::notice::USE_NOTICE_VERSION, "", "", 300).await.unwrap();
+        let jar = CookieJar::new().add(Cookie::new(crate::api::notice::ACK_COOKIE, "00000000-0000-4000-8000-000000000002"));
+        let r = login_handler(State(st(pool.clone(), "")), HeaderMap::new(), None, jar,
+            axum::extract::Query(LoginParams { relay_state: None })).await;
+        assert_eq!(r.err().map(|e| e.0), Some(StatusCode::SERVICE_UNAVAILABLE));
+        let consumed: bool = sqlx::query_scalar("SELECT consumed_at IS NOT NULL FROM login_notice_acks")
+            .fetch_one(&pool).await.unwrap();
+        assert!(!consumed);
     }
 
     #[test]

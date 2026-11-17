@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 const BACKEND = process.env.VITE_API_URL || "http://localhost:8080";
 
 /**
@@ -127,3 +128,36 @@ export async function loadDemoStig(page) {
 }
 
 export { BACKEND };
+
+/** Frontend origin the specs run against (must match the backend's FRONTEND_URL). */
+export const FRONTEND = process.env.BASE_URL || "http://localhost:5173";
+
+/**
+ * Version of the AC-8 notice wording, read from the frontend constant so the
+ * specs cannot drift from it (the backend has a test pinning the same value).
+ */
+export const NOTICE_VERSION = (() => {
+  const src = readFileSync(
+    new URL("../frontend/src/constants.rs", import.meta.url),
+    "utf8",
+  );
+  const m = src.match(/USE_NOTICE_VERSION: &str = "([^"]+)"/);
+  if (!m) throw new Error("USE_NOTICE_VERSION not found in frontend constants");
+  return m[1];
+})();
+
+/**
+ * Acknowledge the AC-8 system use notification on the login screen. Waits for
+ * the server's 204 so the single-use proof cookie is set before sign-in.
+ */
+export async function acknowledgeNotice(page) {
+  const [res] = await Promise.all([
+    page.waitForResponse(
+      (r) => /\/auth\/notice\/ack$/.test(r.url()) && r.request().method() === "POST",
+    ),
+    page.getByTestId("login-notice-ack").click(),
+  ]);
+  if (res.status() !== 204) {
+    throw new Error(`notice ack failed: HTTP ${res.status()}`);
+  }
+}

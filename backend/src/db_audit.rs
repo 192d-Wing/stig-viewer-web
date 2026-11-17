@@ -4,7 +4,8 @@
 //! request that caused them, including requests that were rejected (400) or
 //! denied (403). `detail` holds only counts, status values, reason codes and
 //! (truncated) rule ids; never finding details, comments or other free text
-//! from the request.
+//! from the request. The one exception is `auth.notice_ack`, whose `detail`
+//! carries the sanitized, truncated User-Agent and client IP of the acknowledgement.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -15,7 +16,7 @@ pub const MAX_REJECTED_LISTED: usize = 100;
 
 pub struct NewAuditEvent<'a> {
     pub user_id: &'a str,
-    /// "rules.bulk_status" | "rules.bulk_import" | "checklist.save" | "checklist.create"
+    /// "rules.bulk_status" | "rules.bulk_import" | "checklist.save" | "checklist.create" | "auth.notice_ack"
     pub action: &'static str,
     /// "ok" | "partial" | "denied" | "rejected"
     pub outcome: &'static str,

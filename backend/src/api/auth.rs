@@ -150,6 +150,61 @@ struct AuthState {
     pkce_verifier: String,
     csrf_token: String,
     nonce: String,
+    /// AC-8 acknowledgement consumed at login start; linked into the audit log on completion.
+    #[serde(default)]
+    ack_id: Option<String>,
+}
+
+// ── Cookie helpers ──────────────────────────────────────────────────────────
+
+/// `Secure` is set on auth cookies when `STIG_ENV=production` (dev/test run over http).
+pub(crate) fn cookie_secure() -> bool {
+    secure_for(
+        std::env::var("STIG_ENV").ok().as_deref(),
+        std::env::var("FRONTEND_URL").ok().as_deref(),
+    )
+}
+
+/// Secure when running in production or when the frontend is served over https.
+pub(crate) fn secure_for(stig_env: Option<&str>, frontend_url: Option<&str>) -> bool {
+    crate::config::is_production(stig_env)
+        || frontend_url.is_some_and(|u| u.trim().to_ascii_lowercase().starts_with("https://"))
+}
+
+/// HttpOnly cookie with explicit path, SameSite, lifetime and Secure attribute.
+pub(crate) fn session_cookie(
+    name: &'static str,
+    value: String,
+    path: &'static str,
+    same_site: SameSite,
+    max_age: time::Duration,
+    secure: bool,
+) -> Cookie<'static> {
+    Cookie::build((name, value))
+        .path(path)
+        .http_only(true)
+        .secure(secure)
+        .same_site(same_site)
+        .max_age(max_age)
+        .build()
+}
+
+/// Removal cookie matching the attributes of [`session_cookie`].
+pub(crate) fn removal_cookie(name: &'static str, path: &'static str, secure: bool) -> Cookie<'static> {
+    Cookie::build(name).path(path).secure(secure).build()
+}
+
+/// Post-session step of the OIDC callback: link the AC-8 acknowledgement id carried
+/// in the state cookie into the audit log (best effort, never fails the login).
+async fn finish_oidc_login(pool: &PgPool, ack_id: Option<&str>, user_id: &str, session_id: &str) {
+    crate::api::notice::link_ack_at_login(
+        pool,
+        crate::api::notice::AckLookup::ById(ack_id),
+        user_id,
+        session_id,
+        "oidc",
+    )
+    .await;
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -157,9 +212,28 @@ struct AuthState {
 /// GET /auth/login — start the OIDC Authorization Code + PKCE flow.
 pub async fn login_handler(
     State(state): State<AppAuthState>,
+    headers: HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     jar: CookieJar,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
     let oidc = &state.oidc;
+    let ip = crate::api::notice::notice_ip(&headers, peer.map(|p| p.0));
+    if crate::api::notice::login_start_limited(&jar, &ip) {
+        return Ok(crate::api::notice::rate_limited_redirect(jar, &oidc.frontend_url, &ip));
+    }
+    let (jar, ack_id) = match crate::api::notice::require_ack(
+        state.pool.as_ref(),
+        jar,
+        &oidc.frontend_url,
+        "oidc",
+        None,
+        &ip,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(deny) => return Ok(*deny),
+    };
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
     let (mut auth_url, csrf_token, nonce) = oidc
@@ -183,15 +257,18 @@ pub async fn login_handler(
         pkce_verifier: pkce_verifier.secret().clone(),
         csrf_token: csrf_token.secret().clone(),
         nonce: nonce.secret().clone(),
+        ack_id: Some(ack_id),
     };
     let state_json = serde_json::to_string(&state).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let cookie = Cookie::build((STATE_COOKIE, state_json))
-        .path("/auth")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .max_age(time::Duration::minutes(10))
-        .build();
+    let cookie = session_cookie(
+        STATE_COOKIE,
+        state_json,
+        "/auth",
+        SameSite::Lax,
+        time::Duration::minutes(10),
+        cookie_secure(),
+    );
 
     Ok((jar.add(cookie), Redirect::to(auth_url.as_str())))
 }
@@ -208,9 +285,10 @@ pub async fn callback_handler(
     State(state): State<AppAuthState>,
     Query(params): Query<CallbackParams>,
     headers: HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     jar: CookieJar,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
-    let ip = client_ip(&headers);
+    let ip = crate::api::notice::notice_ip(&headers, peer.map(|p| p.0));
     let ua = user_agent(&headers);
     let oidc = &state.oidc;
 
@@ -222,7 +300,7 @@ pub async fn callback_handler(
         .to_string();
     let auth_state: AuthState =
         serde_json::from_str(&state_cookie).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let jar = jar.remove(Cookie::build(STATE_COOKIE).path("/auth").build());
+    let jar = jar.remove(removal_cookie(STATE_COOKIE, "/auth", cookie_secure()));
 
     // CSRF check (defense in depth — PKCE already binds the flow).
     if auth_state.csrf_token != params.state {
@@ -303,12 +381,17 @@ pub async fn callback_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let session_cookie = Cookie::build((SESSION_COOKIE, session_id))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .max_age(time::Duration::hours(SESSION_LIFETIME_HOURS))
-        .build();
+    // Best-effort AU-2 link of the AC-8 acknowledgement; never fails the login.
+    finish_oidc_login(&state.pool, auth_state.ack_id.as_deref(), &user.id, &session_id).await;
+
+    let session_cookie = session_cookie(
+        SESSION_COOKIE,
+        session_id,
+        "/",
+        SameSite::Lax,
+        time::Duration::hours(SESSION_LIFETIME_HOURS),
+        cookie_secure(),
+    );
 
     Ok((jar.add(session_cookie), Redirect::to(&oidc.frontend_url)))
 }
@@ -324,7 +407,7 @@ pub async fn logout_handler(
             .execute(state.pool.as_ref())
             .await;
     }
-    let jar = jar.remove(Cookie::build(SESSION_COOKIE).path("/").build());
+    let jar = jar.remove(removal_cookie(SESSION_COOKIE, "/", cookie_secure()));
     (jar, StatusCode::NO_CONTENT)
 }
 
@@ -493,27 +576,13 @@ pub(crate) async fn create_session(
     Ok(session_id)
 }
 
-/// Pull the client IP from `X-Forwarded-For` (first hop) or
-/// `X-Real-IP`, falling back to an empty string. We don't wire
-/// `axum::serve` with `ConnectInfo` today, so a header-derived value is
-/// the most reliable signal we have — typical deployments are behind a
-/// proxy that sets one of these anyway.
+/// Client IP from headers only (no socket peer): a validated canonical IP from
+/// the trusted `X-Forwarded-For` hop when `STIG_TRUST_PROXY_HEADERS` is on,
+/// else empty. Handlers that have `ConnectInfo` use `notice::notice_ip`.
 pub(crate) fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let trimmed = first.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        let trimmed = real.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    String::new()
+    // Validated and canonical, never the raw header text; no peer address is
+    // available here, so this is empty unless proxy headers are trusted.
+    crate::api::notice::notice_ip(headers, None)
 }
 
 /// Pull the `User-Agent` request header, defaulting to an empty
@@ -624,3 +693,53 @@ fn rewrite_origin(url: url::Url, from_origin: &str, to_origin: &str) -> url::Url
     new
 }
 
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    #[test]
+    fn secure_follows_production_or_https_frontend() {
+        assert!(secure_for(Some("production"), None));
+        assert!(secure_for(None, Some("https://stig.example")));
+        assert!(secure_for(Some("dev"), Some(" HTTPS://x")));
+        assert!(!secure_for(None, Some("http://localhost:5173")));
+        assert!(!secure_for(None, None));
+    }
+
+    #[test]
+    fn secure_attribute_follows_flag() {
+        let c = session_cookie("n", "v".into(), "/", SameSite::Lax, time::Duration::hours(1), true);
+        assert_eq!(c.secure(), Some(true));
+        assert_eq!(c.http_only(), Some(true));
+        let c = session_cookie("n", "v".into(), "/", SameSite::Lax, time::Duration::hours(1), false);
+        assert_eq!(c.secure(), Some(false));
+        assert_eq!(removal_cookie("n", "/auth", true).secure(), Some(true));
+        assert_eq!(removal_cookie("n", "/auth", true).path(), Some("/auth"));
+    }
+}
+
+#[cfg(test)]
+mod finish_login_tests {
+    use super::*;
+
+    async fn outcomes(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT outcome FROM audit_events WHERE action = 'auth.notice_ack' ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn oidc_login_links_a_consumed_ack_or_records_missing(pool: PgPool) {
+        sqlx::query("INSERT INTO users (id, display_name, email, sub, provider) VALUES ('u1','U','','s','test')")
+            .execute(&pool).await.unwrap();
+        let id = "00000000-0000-4000-8000-0000000000d1";
+        crate::db_notice::insert_ack(&pool, id, crate::api::notice::USE_NOTICE_VERSION, "", "", 300).await.unwrap();
+        crate::db_notice::consume_ack(&pool, id, crate::api::notice::USE_NOTICE_VERSION, "oidc", None).await.unwrap();
+        finish_oidc_login(&pool, Some(id), "u1", "s1").await;
+        finish_oidc_login(&pool, None, "u1", "s2").await;
+        assert_eq!(outcomes(&pool).await, ["ok", "missing"]);
+    }
+}

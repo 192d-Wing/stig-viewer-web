@@ -1,5 +1,5 @@
 import { test, expect, request as pwRequest } from "@playwright/test";
-import { resetDb, BACKEND } from "./helpers.js";
+import { resetDb, BACKEND, FRONTEND, NOTICE_VERSION } from "./helpers.js";
 
 /**
  * SAML SP endpoints. These specs exercise the API directly (no browser
@@ -37,11 +37,18 @@ test.describe("SAML 2.0 SSO", () => {
       const body = await res.text();
       expect(body.toLowerCase()).toContain("saml");
     } else {
-      expect(res.status()).toBe(302);
-      const location = res.headers()["location"];
-      expect(location).toBeTruthy();
+      // Without an AC-8 acknowledgement the login start bounces to the banner.
+      expect(res.status()).toBe(303);
+      expect(new URL(res.headers()["location"]).origin).toBe(new URL(FRONTEND).origin);
+      const ackRes = await ctx.post(`${BACKEND}/auth/notice/ack`, {
+        headers: { Origin: FRONTEND, "Content-Type": "application/json" },
+        data: { noticeVersion: NOTICE_VERSION },
+      });
+      expect(ackRes.status()).toBe(204);
+      const res2 = await ctx.get(`${BACKEND}/auth/saml/login`, { maxRedirects: 0 });
+      expect(res2.status()).toBe(303);
       // Should carry a SAMLRequest query param (per HTTP-Redirect binding).
-      expect(location).toContain("SAMLRequest=");
+      expect(res2.headers()["location"]).toContain("SAMLRequest=");
     }
     await ctx.dispose();
   });
