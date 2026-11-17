@@ -683,8 +683,8 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "sync", || async {
-                    sync::run_sync(&cfg, &src, &db).await?;
-                    Ok::<String, anyhow::Error>(format!("synced {} source(s)", src.len()))
+                    let summary = sync::run_sync(&cfg, &src, &db).await?;
+                    Ok::<String, anyhow::Error>(summary.describe())
                 })
                 .await;
                 if let Err(e) = result {

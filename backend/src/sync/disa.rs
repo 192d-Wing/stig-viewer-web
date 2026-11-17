@@ -22,13 +22,59 @@ fn validate_source(source: &StigSource) -> Result<()> {
     Ok(())
 }
 
+/// What happened to one source in a sync pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Downloaded, parsed and indexed (the file may or may not have changed).
+    Synced,
+    /// DISA answered 404 or 410: the URL in stig-sources.toml is out of date.
+    StaleUrl,
+}
+
+/// Totals for one sync pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub synced: usize,
+    pub stale: usize,
+    pub errors: usize,
+}
+
+impl SyncSummary {
+    /// One-line description for the scheduler log.
+    pub fn describe(&self) -> String {
+        format!(
+            "synced {}, {} stale URL(s), {} error(s)",
+            self.synced, self.stale, self.errors
+        )
+    }
+}
+
+/// A 404 or 410 means the manifest URL has gone stale (DISA publishes a new
+/// file name per release); every other non-success status is a real error.
+fn is_stale_status(status: u16) -> bool {
+    matches!(status, 404 | 410)
+}
+
+/// Write `bytes` to `path` unless the file already holds exactly them.
+/// Returns whether the file was written.
+async fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    match tokio::fs::read(path).await {
+        Ok(existing) if existing == bytes => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    tokio::fs::write(path, bytes).await?;
+    Ok(true)
+}
+
 /// Download, parse, and index one STIG from DISA.
 async fn sync_one(
     source: &StigSource,
     client: &reqwest::Client,
     pool: &PgPool,
     data_dir: &Path,
-) -> Result<()> {
+) -> Result<Outcome> {
     validate_source(source)?;
     info!("Syncing STIG '{}' from {}", source.id, source.url);
 
@@ -39,6 +85,14 @@ async fn sync_one(
         .await
         .context("HTTP request failed")?;
 
+    if is_stale_status(resp.status().as_u16()) {
+        warn!(
+            "source '{}' URL not found (HTTP {}); update stig-sources.toml",
+            source.id,
+            resp.status().as_u16()
+        );
+        return Ok(Outcome::StaleUrl);
+    }
     if !resp.status().is_success() {
         anyhow::bail!("DISA returned HTTP {}", resp.status());
     }
@@ -57,12 +111,21 @@ async fn sync_one(
     tokio::fs::create_dir_all(&stigs_dir).await?;
     let json_path = stigs_dir.join(format!("{}.json", source.id));
 
-    // 4a. If a previous JSON already exists for this STIG, archive it
+    let json_str = serde_json::to_string(&stig)?;
+
+    // 4a. Identical bytes: nothing to write and nothing to archive. (The
+    //     catalog row is still upserted below so a reset database re-indexes.)
+    let unchanged = matches!(
+        tokio::fs::read(&json_path).await,
+        Ok(existing) if existing == json_str.as_bytes()
+    );
+
+    // 4b. If a previous JSON already exists for this STIG, archive it
     //     under stigs/archive/ keyed by the OLD version + release so the
     //     diff endpoint can compare current vs prior. We look up the
     //     pre-sync catalog row to capture the about-to-be-replaced
     //     metadata.
-    if tokio::fs::try_exists(&json_path).await.unwrap_or(false) {
+    if !unchanged && tokio::fs::try_exists(&json_path).await.unwrap_or(false) {
         if let Err(e) =
             archive_previous_catalog(pool, data_dir, &source.id, &json_path).await
         {
@@ -73,8 +136,11 @@ async fn sync_one(
         }
     }
 
-    let json_str = serde_json::to_string(&stig)?;
-    tokio::fs::write(&json_path, json_str).await?;
+    if write_if_changed(&json_path, json_str.as_bytes()).await? {
+        info!("Wrote '{}'", json_path.display());
+    } else {
+        info!("'{}' unchanged; not rewritten", source.id);
+    }
 
     // 5. Upsert catalog row in Postgres
     let entry = CatalogEntry {
@@ -98,7 +164,7 @@ async fn sync_one(
         stig.rules.len(),
         json_path.display()
     );
-    Ok(())
+    Ok(Outcome::Synced)
 }
 
 /// Copy `${data_dir}/stigs/{id}.json` to
@@ -223,29 +289,34 @@ pub async fn run_sync(
     config: &Arc<Config>,
     sources: &Arc<Vec<StigSource>>,
     pool: &PgPool,
-) -> Result<()> {
+) -> Result<SyncSummary> {
     let client = reqwest::Client::builder()
         .user_agent("stig-viewer-backend/0.1")
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
-    let mut errors = 0usize;
+    let mut summary = SyncSummary::default();
     for source in sources.as_ref() {
-        if let Err(e) = sync_one(source, &client, pool, &config.data_dir).await {
-            error!("Failed to sync '{}': {e:#}", source.id);
-            errors += 1;
+        match sync_one(source, &client, pool, &config.data_dir).await {
+            Ok(Outcome::Synced) => summary.synced += 1,
+            Ok(Outcome::StaleUrl) => summary.stale += 1,
+            Err(e) => {
+                error!("Failed to sync '{}': {e:#}", source.id);
+                summary.errors += 1;
+            }
         }
     }
 
-    if errors == 0 {
-        info!("Sync complete — {} STIGs updated", sources.len());
+    if summary.errors == 0 && summary.stale == 0 {
+        info!("Sync complete — {}", summary.describe());
     } else {
         warn!(
-            "Sync finished with {errors} error(s) out of {} STIGs",
+            "Sync finished: {} (of {} sources)",
+            summary.describe(),
             sources.len()
         );
     }
-    Ok(())
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -265,6 +336,36 @@ mod id_tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_eq!(a, archive_file_name("x", "1.2", "R 1"));
+    }
+
+    #[test]
+    fn only_404_and_410_are_stale() {
+        assert!(is_stale_status(404));
+        assert!(is_stale_status(410));
+        for other in [200, 301, 403, 429, 500, 502, 503] {
+            assert!(!is_stale_status(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn summary_counts_stale_separately() {
+        let s = SyncSummary { synced: 5, stale: 2, errors: 1 };
+        assert_eq!(s.describe(), "synced 5, 2 stale URL(s), 1 error(s)");
+    }
+
+    #[tokio::test]
+    async fn write_if_changed_skips_identical_bytes() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.json");
+        assert!(write_if_changed(&p, b"one").await.unwrap(), "new file is written");
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!write_if_changed(&p, b"one").await.unwrap(), "same bytes skipped");
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), before);
+        assert!(write_if_changed(&p, b"two").await.unwrap(), "changed bytes written");
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
