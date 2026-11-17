@@ -146,10 +146,12 @@ test.describe("Audit retention", () => {
 
   test("API: request events are kept inside retain_days and pruned past it", async ({ request }) => {
     await seedAuditRows(request, "alice"); // the checklist create leaves one event
+    // Reads of /api/audit/events are audited (audit.read), so count only the
+    // checklist.create row the seeding left.
     const events = async () => {
       await setUserRole("audit-admin", "admin");
       return request
-        .get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "audit-admin" } })
+        .get(`${BACKEND}/api/audit/events?action=checklist.create`, { headers: { "X-User-Id": "audit-admin" } })
         .then((r) => r.json());
     };
     expect((await events()).totalCount).toBe(1);
@@ -160,7 +162,9 @@ test.describe("Audit retention", () => {
 
     // retain_days = 0 puts the cutoff at "now": everything written so far is expired.
     const swept = await runRetention(request, 0, false);
-    expect(swept.prunedEvents).toBe(1);
+    // The checklist.create row plus the two audit.read rows left by the two
+    // events() calls above (each read is itself audited); all are expired now.
+    expect(swept.prunedEvents).toBe(1 + 2);
     expect((await events()).totalCount).toBe(0);
   });
 });

@@ -22,6 +22,7 @@ use crate::api::rule_bulk_status::{
     apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_FINDING_DETAILS_BYTES, MAX_RULES,
     STATUS_PENDING_APPROVAL, VALID_STATUSES,
 };
+use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow};
 use crate::AppState;
@@ -131,9 +132,10 @@ pub(crate) fn plan_target(
 pub async fn bulk_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<BulkRequest>,
 ) -> Result<Json<BulkResponse>, StatusCode> {
-    tokio::spawn(bulk_work(state, user, req)).await.map_err(|e| {
+    tokio::spawn(bulk_work(state, user, ctx, req)).await.map_err(|e| {
         tracing::error!("findings bulk task failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?
@@ -167,13 +169,14 @@ struct Resolved {
     requires_approval: bool,
 }
 
-async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<Json<BulkResponse>, StatusCode> {
+async fn bulk_work(state: AppState, user: AuthUser, ctx: RequestCtx, req: BulkRequest) -> Result<Json<BulkResponse>, StatusCode> {
     let pool = state.pool.as_ref();
     let rejected_event = |reason: &'static str| {
         db_audit::record_or_log(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "findings.bulk_update",
                 outcome: "rejected",
                 asset_id: None,
@@ -254,6 +257,7 @@ async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<
                 pool,
                 NewAuditEvent {
                     user_id: &user.id,
+                    ctx: Some(&ctx),
                     action: "findings.bulk_update",
                     outcome: "denied",
                     asset_id: Some(&r.asset_id),
@@ -405,6 +409,7 @@ async fn bulk_work(state: AppState, user: AuthUser, req: BulkRequest) -> Result<
             pool,
             NewAuditEvent {
                 user_id: &user.id,
+                ctx: Some(&ctx),
                 action: "findings.bulk_update",
                 outcome: if errors > 0 { "partial" } else { "ok" },
                 asset_id: Some(&r.asset_id),
@@ -522,7 +527,7 @@ mod tests {
         patch: serde_json::Value,
     ) -> Result<BulkResponse, StatusCode> {
         let req: BulkRequest = serde_json::from_value(json!({ "targets": targets, "patch": patch })).unwrap();
-        bulk_handler(State(state.clone()), Extension(auth(user, role)), Json(req)).await.map(|j| j.0)
+        bulk_handler(State(state.clone()), Extension(auth(user, role)), Extension(crate::test_fixtures::ctx()), Json(req)).await.map(|j| j.0)
     }
 
     async fn call(state: &AppState, targets: serde_json::Value, patch: serde_json::Value) -> Result<BulkResponse, StatusCode> {

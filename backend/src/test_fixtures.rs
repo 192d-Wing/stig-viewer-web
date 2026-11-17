@@ -200,12 +200,23 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
             database_url: String::new(),
             data_dir: dir,
             sync_interval_hours: 100_000,
+            backup_require_signature: None,
             sync_on_start: false,
             seed_dir: None,
         }),
         signing: None,
     };
     (state, guard)
+}
+
+/// A request context as the `request_ctx` middleware would build it.
+pub fn ctx() -> crate::api::request_ctx::RequestCtx {
+    crate::api::request_ctx::RequestCtx {
+        request_id: "test-request".to_string(),
+        source_ip: Some("198.51.100.4".to_string()),
+        role: "author".to_string(),
+        audited: Default::default(),
+    }
 }
 
 /// Ids every read point must reject (the 129-byte one is just over the cap).
@@ -228,6 +239,7 @@ pub fn lazy_state() -> (AppState, StigDir) {
             database_url: String::new(),
             data_dir: dir.clone(),
             sync_interval_hours: 100_000,
+            backup_require_signature: None,
             sync_on_start: false,
             seed_dir: None,
         }),

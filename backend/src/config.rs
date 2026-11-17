@@ -28,6 +28,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// How often the sync scheduler runs (hours).
     pub sync_interval_hours: u64,
+    /// `BACKUP_REQUIRE_SIGNATURE`: `None` means the default, which is to
+    /// require a verified signature exactly when `SIGNING_KEY_HEX` is set.
+    pub backup_require_signature: Option<bool>,
     /// Run a DISA sync as soon as the server starts (`STIG_SYNC_ON_START`,
     /// default true). The periodic schedule is unaffected.
     pub sync_on_start: bool,
@@ -54,11 +57,28 @@ impl Config {
                 .unwrap_or_else(|_| "24".into())
                 .parse()
                 .context("STIG_SYNC_INTERVAL_HOURS must be a positive integer")?,
+            backup_require_signature: parse_require_signature(
+                std::env::var("BACKUP_REQUIRE_SIGNATURE").ok().as_deref(),
+            )?,
             sync_on_start: parse_flag_default_true(
                 std::env::var("STIG_SYNC_ON_START").ok().as_deref(),
             ),
             seed_dir: parse_seed_dir(std::env::var("STIG_SEED_DIR").ok().as_deref()),
         })
+    }
+}
+
+/// `BACKUP_REQUIRE_SIGNATURE`: `true`/`1`/`yes`, `false`/`0`/`no` (trimmed,
+/// case-insensitive); unset means the default (`None`). Anything else is an
+/// error, so a typo cannot silently weaken or change the policy.
+pub fn parse_require_signature(raw: Option<&str>) -> Result<Option<bool>> {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None => Ok(None),
+        Some("true" | "1" | "yes") => Ok(Some(true)),
+        Some("false" | "0" | "no") => Ok(Some(false)),
+        Some(other) => anyhow::bail!(
+            "BACKUP_REQUIRE_SIGNATURE must be true/1/yes or false/0/no (got {other:?})"
+        ),
     }
 }
 
@@ -177,6 +197,20 @@ pub fn load_sources() -> Result<Vec<StigSource>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_signature_accepts_only_explicit_booleans() {
+        assert_eq!(parse_require_signature(None).unwrap(), None);
+        for on in ["true", "1", "YES", " yes "] {
+            assert_eq!(parse_require_signature(Some(on)).unwrap(), Some(true), "{on:?}");
+        }
+        for off in ["false", "0", "No", " false "] {
+            assert_eq!(parse_require_signature(Some(off)).unwrap(), Some(false), "{off:?}");
+        }
+        for bad in ["", "on", "tru", "2", "enabled"] {
+            assert!(parse_require_signature(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn shipped_sources_manifest_is_valid_and_unique() {

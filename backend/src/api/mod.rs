@@ -29,6 +29,8 @@ pub mod notice;
 pub mod notifications;
 pub mod oscal;
 pub mod rate_limit;
+pub mod authz_audit;
+pub mod request_ctx;
 pub mod report;
 pub mod rule_bulk_import;
 pub mod rule_bulk_status;

@@ -152,7 +152,11 @@ test.describe("Backup + restore — API", () => {
     // Manifest is valid JSON with the expected keys.
     const manifestEntry = entries.find((e) => e.name === "manifest.json");
     const manifest = JSON.parse(readEntryText(body, manifestEntry));
-    expect(manifest.version).toBe("1");
+    expect(manifest.version).toBe("2");
+    expect(manifest.type).toBe("stig-viewer/backup");
+    // Every other entry is digested (SHA-512 hex).
+    expect(manifest.entries["tables/users.jsonl"]).toMatch(/^[0-9a-f]{128}$/);
+    expect(Array.isArray(manifest.signers)).toBe(true);
     expect(typeof manifest.takenAt).toBe("string");
     expect(typeof manifest.schemaMigration).toBe("number");
     expect(manifest.schemaMigration).toBeGreaterThan(0);
@@ -170,14 +174,24 @@ test.describe("Backup + restore — API", () => {
     const asset = await createAsset(request, "backup-host-events");
     await applyStig(request, asset.id);
 
-    const listEvents = async () =>
+    // Every read of /api/audit/events is itself audited (audit.read). Hide
+    // those rows from the comparisons, but count them where the backup counts them.
+    const fetchEvents = async (query = "") =>
       (
         await request
-          .get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } })
+          .get(`${BACKEND}/api/audit/events${query}`, { headers: { "X-User-Id": "alice" } })
           .then((r) => r.json())
       ).rows;
+    // A forced restore also records a backup.restore event inside the restore transaction.
+    const listEvents = async () =>
+      (await fetchEvents()).filter((e) => e.action !== "audit.read" && e.action !== "backup.restore");
     const before = await listEvents();
     expect(before.map((e) => e.action)).toContain("checklist.create");
+    // The backup holds the audit.read rows already written, plus the one this
+    // very call writes after its query.
+    const readsSeen = (await fetchEvents("?action=audit.read")).length;
+    expect(readsSeen).toBeGreaterThan(0);
+    const readsInBackup = readsSeen + 1;
 
     const backupBytes = await request
       .get(`${BACKEND}/api/admin/backup`, { headers: { "X-User-Id": "alice" } })
@@ -187,14 +201,21 @@ test.describe("Backup + restore — API", () => {
     await ensureUser(request, "alice");
     await setUserRole("alice", "admin");
     expect(await listEvents()).toHaveLength(0);
+    // (that call wrote one audit.read row into the freshly reset database)
 
     const restoreRes = await request.post(`${BACKEND}/api/admin/restore?force=true`, {
       headers: { "X-User-Id": "alice" },
       multipart: { file: { name: "backup.zip", mimeType: "application/zip", buffer: backupBytes } },
     });
     expect(restoreRes.status()).toBe(200);
-    expect((await restoreRes.json()).restored.audit_events).toBe(before.length);
+    expect((await restoreRes.json()).restored.audit_events).toBe(before.length + readsInBackup);
 
+    // The restore itself leaves a record in the replaced audit trail.
+    expect((await fetchEvents("?action=backup.restore")).length).toBe(1);
+
+    // The audit.read rows survive the round trip like any other event.
+    const restoredReads = await fetchEvents("?action=audit.read");
+    expect(restoredReads.length).toBeGreaterThanOrEqual(readsInBackup);
     const after = await listEvents();
     expect(after.map((e) => e.id)).toEqual(before.map((e) => e.id));
 
@@ -320,6 +341,55 @@ test.describe("Backup + restore — API", () => {
     expect(body.error).toMatch(/not empty|force=true/);
   });
 
+  test("restore of a backup with a corrupted entry returns 400", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+
+    const backupRes = await request.get(`${BACKEND}/api/admin/backup`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    const original = Buffer.from(await backupRes.body());
+    const usersBefore = await (
+      await request.get(`${BACKEND}/api/admin/users`, {
+        headers: { "X-User-Id": "alice" },
+      })
+    ).json();
+    const entry = listZipEntries(original).find(
+      (e) => e.name === "tables/users.jsonl",
+    );
+    // Flip one byte inside that entry's stored data. Whether the zip layer or
+    // the manifest digest catches it, the restore must be refused untouched.
+    const lh = entry.localHeaderOffset;
+    const dataStart =
+      lh + 30 + original.readUInt16LE(lh + 26) + original.readUInt16LE(lh + 28);
+    const corrupted = Buffer.from(original);
+    corrupted[dataStart + Math.floor(entry.compSize / 2)] ^= 0xff;
+
+    const restoreRes = await request.post(
+      `${BACKEND}/api/admin/restore?force=true`,
+      {
+        headers: { "X-User-Id": "alice" },
+        multipart: {
+          file: {
+            name: "corrupt-backup.zip",
+            mimeType: "application/zip",
+            buffer: corrupted,
+          },
+        },
+      },
+    );
+    expect(restoreRes.status()).toBe(400);
+
+    // The data is untouched: same users before and after.
+    const stillThere = await request.get(`${BACKEND}/api/admin/users`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    expect(stillThere.ok()).toBe(true);
+    expect(await stillThere.json()).toEqual(usersBefore);
+  });
+
   test("restore with mismatched schemaMigration returns 400", async ({
     request,
   }) => {
@@ -335,7 +405,19 @@ test.describe("Backup + restore — API", () => {
     const entries = listZipEntries(original);
     const manifestEntry = entries.find((e) => e.name === "manifest.json");
     const manifest = JSON.parse(readEntryText(original, manifestEntry));
+    // With SIGNING_KEY_HEX set, restore requires a verified signature by default
+    // and an unsigned repacked manifest is refused before the schema gate. The
+    // test API cannot change the backend's environment, so skip in that setup.
+    test.skip(
+      Array.isArray(manifest.signers) && manifest.signers.length > 0,
+      "backend has SIGNING_KEY_HEX set; this test assumes unsigned restores are allowed",
+    );
     manifest.schemaMigration = 9999;
+    // The repacked zip holds only the manifest, so drop the digest list and
+    // signers (an unsigned, digest-free manifest passes the integrity check
+    // and reaches the schema gate this test exercises).
+    manifest.entries = {};
+    manifest.signers = [];
 
     // Re-pack a minimal zip: we don't have a zip writer in the test, so
     // construct one by hand using node's built-in `zlib.deflateRawSync`.

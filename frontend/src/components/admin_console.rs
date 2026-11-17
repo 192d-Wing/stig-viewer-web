@@ -356,6 +356,12 @@ struct AuditEventRow {
     action: String,
     outcome: String,
     detail: Value,
+    source_ip: Option<String>,
+    request_id: Option<String>,
+    user_role: Option<String>,
+    /// How many identical denied/rejected requests this row stands for.
+    repeat_count: i64,
+    last_occurred_at: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
@@ -363,6 +369,18 @@ struct AuditEventRow {
 struct AuditEvents {
     total_count: i64,
     rows: Vec<AuditEventRow>,
+}
+
+/// The Count cell: "×N" for a collapsed row (with the last occurrence), else "1".
+fn repeat_label(e: &AuditEventRow) -> String {
+    if e.repeat_count > 1 {
+        match e.last_occurred_at.as_deref().filter(|s| !s.is_empty()) {
+            Some(last) => format!("\u{d7}{} (last {})", e.repeat_count, to_locale_string(last)),
+            None => format!("\u{d7}{}", e.repeat_count),
+        }
+    } else {
+        "1".into()
+    }
 }
 
 /// One-line summary of an event's `detail` (counts and reason codes only).
@@ -403,6 +421,32 @@ struct RestoreResult {
     restored: HashMap<String, i64>,
     attachments_written: i64,
     forced: Option<bool>,
+    /// `verified`, `unsigned` or `unknown_key`.
+    signature_status: String,
+}
+
+impl RestoreResult {
+    /// Alert kind and text for the outcome. Anything but a verified signature
+    /// is a warning that the backup's integrity was not verified.
+    fn summary(&self) -> (&'static str, String) {
+        let base = format!(
+            "Restored {} rows across {} tables and {} attachment blob(s){}.",
+            self.restored.values().sum::<i64>(),
+            self.restored.len(),
+            self.attachments_written,
+            if self.forced == Some(true) { " (force overwrite)" } else { "" },
+        );
+        match self.signature_status.as_str() {
+            "verified" => ("success", format!("{base} Signature verified.")),
+            other => (
+                "warning",
+                format!(
+                    "{base} Warning: this backup's integrity was not verified (signature status: {}).",
+                    if other.is_empty() { "not reported" } else { other }
+                ),
+            ),
+        }
+    }
 }
 
 // ── Shared console state ────────────────────────────────────────────────────
@@ -1283,6 +1327,12 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("stig", "STIG", |r: &AuditEventRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} }),
         Column::new("action", "Action", |r: &AuditEventRow| html! { {r.action.clone()} }),
         Column::new("outcome", "Outcome", |r: &AuditEventRow| html! { {r.outcome.clone()} }),
+        Column::new("role", "Role", |r: &AuditEventRow| html! { {r.user_role.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("ip", "Source IP", |r: &AuditEventRow| html! { {r.source_ip.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new("request", "Request ID", |r: &AuditEventRow| {
+            html! { <UiBox variant="code">{r.request_id.clone().unwrap_or_else(|| "—".into())}</UiBox> }
+        }),
+        Column::new("count", "Count", |r: &AuditEventRow| html! { {repeat_label(r)} }),
         Column::new("summary", "Summary", |r: &AuditEventRow| html! { {event_summary(r)} }),
     ];
     let requests_view = *view == "requests";
@@ -2305,15 +2355,12 @@ fn BackupSection(props: &SectionProps) -> Html {
                         <Alert kind="error" testid="restore-error">{e.clone()}</Alert>
                     }
                     if let Some(r) = &*restore_result {
-                        <Alert kind="success" testid="restore-success">
-                            {format!(
-                                "Restored {} rows across {} tables and {} attachment blob(s){}.",
-                                r.restored.values().sum::<i64>(),
-                                r.restored.len(),
-                                r.attachments_written,
-                                if r.forced == Some(true) { " (force overwrite)" } else { "" },
-                            )}
-                        </Alert>
+                        {{
+                            let (kind, text) = r.summary();
+                            html! {
+                                <Alert kind={kind} testid="restore-success">{text}</Alert>
+                            }
+                        }}
                     }
                 </SpaceBetween>
             </ColumnLayout>
@@ -2325,8 +2372,53 @@ fn BackupSection(props: &SectionProps) -> Html {
 mod audit_event_tests {
     use super::*;
 
+    #[test]
+    fn restore_summary_warns_unless_the_signature_was_verified() {
+        let ok: RestoreResult = serde_json::from_value(json!({
+            "restored": { "users": 2 }, "attachmentsWritten": 1, "signatureStatus": "verified"
+        }))
+        .unwrap();
+        let (kind, text) = ok.summary();
+        assert_eq!(kind, "success");
+        assert!(text.contains("Signature verified"), "{text}");
+        for status in ["unsigned", "unknown_key"] {
+            let r: RestoreResult =
+                serde_json::from_value(json!({ "signatureStatus": status })).unwrap();
+            let (kind, text) = r.summary();
+            assert_eq!(kind, "warning");
+            assert!(text.contains("integrity was not verified") && text.contains(status), "{text}");
+        }
+        // An older backend sends no status.
+        let (kind, _) = RestoreResult::default().summary();
+        assert_eq!(kind, "warning");
+    }
+
+
     fn event(detail: Value) -> AuditEventRow {
         AuditEventRow { detail, ..AuditEventRow::default() }
+    }
+
+    #[test]
+    fn event_rows_deserialize_the_request_context() {
+        let r: AuditEventRow =
+            serde_json::from_value(json!({ "sourceIp": "10.0.0.1", "requestId": "abc", "userRole": "admin" })).unwrap();
+        assert_eq!(
+            (r.source_ip.as_deref(), r.request_id.as_deref(), r.user_role.as_deref()),
+            (Some("10.0.0.1"), Some("abc"), Some("admin"))
+        );
+        // Rows written before the context columns existed have none.
+        let old: AuditEventRow = serde_json::from_value(json!({ "action": "checklist.save" })).unwrap();
+        assert!(old.source_ip.is_none() && old.request_id.is_none() && old.user_role.is_none());
+    }
+
+    #[test]
+    fn repeat_count_deserializes_and_labels_collapsed_rows() {
+        let r: AuditEventRow = serde_json::from_value(json!({ "repeatCount": 7 })).unwrap();
+        assert_eq!(r.repeat_count, 7);
+        assert_eq!(repeat_label(&r), "\u{d7}7");
+        let old: AuditEventRow = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(repeat_label(&old), "1");
+        assert!(old.last_occurred_at.is_none());
     }
 
     #[test]

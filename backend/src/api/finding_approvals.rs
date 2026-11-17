@@ -678,6 +678,23 @@ mod tests {
         assert!(out.iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
     }
 
+    // Timing-dependent (about 5s): the public entry point must bound the lock
+    // wait by CHUNK_LOCK_TIMEOUT.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn request_many_passes_the_chunk_lock_timeout(pool: PgPool) {
+        setup(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        let ids = names(2);
+        let t = std::time::Instant::now();
+        let out = request_many(&pool, "c1", "u1", &reqs(&ids)).await;
+        let took = t.elapsed();
+        assert!(out.iter().all(|o| *o == ApprovalOutcome::Failed));
+        assert!(took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15), "took {took:?}");
+        holder.rollback().await.unwrap();
+    }
+
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_batched_request_can_be_approved_or_rejected(pool: PgPool) {

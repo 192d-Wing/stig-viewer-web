@@ -1,5 +1,6 @@
 mod api;
 mod audit_retention;
+mod integrity;
 mod config;
 mod db;
 mod db_audit;
@@ -308,7 +309,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
-        signing,
+        signing: signing.clone(),
     };
 
     // Auth flow routes — public, do not require an existing session.
@@ -347,7 +348,7 @@ async fn main() -> Result<()> {
         .with_state(saml_state);
 
     // Draft + asset + /api/users/me routes — require an authenticated session.
-    let draft_routes = Router::new()
+    let draft_routes = api::authz_audit::protected_stack(Router::new()
         .route("/api/assets", get(list_assets_handler).post(create_asset_handler))
         .route("/api/assets/import", post(import_assets_handler))
         .route(
@@ -621,18 +622,9 @@ async fn main() -> Result<()> {
             "/api/upload/library",
             post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
-        // Viewer-role read-only gate. Sits inside the auth layer so the
-        // `AuthUser` extension is populated before it runs (outer layer runs
-        // first, so `auth_middleware` is added LAST below).
-        .route_layer(middleware::from_fn(api::viewer_guard::viewer_guard))
-        // Per-user token-bucket rate limiter. Also needs `AuthUser` in
-        // extensions, so it sits inside the auth layer too. Added AFTER
-        // `viewer_guard` so the layer ordering is:
-        //   auth_middleware -> rate_limit -> viewer_guard -> handler
-        // i.e. we throttle before we let a request reach the read-only
-        // gate (or any business logic), but only after we know who's
-        // calling so we can key the bucket on `user.id`.
-        .route_layer(middleware::from_fn(api::rate_limit::rate_limit))
+        // Viewer gate, central authz.denied recorder, request context and
+        // rate limiter (see `authz_audit::protected_stack` for the order).
+        , &state)
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -790,13 +782,14 @@ async fn main() -> Result<()> {
             .unwrap_or(true);
         let db = pool.clone();
         let cfg = config.clone();
+        let retention_signing = signing.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(retention_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "audit_retention", || async {
-                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled).await
+                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled, retention_signing.as_ref()).await
                 })
                 .await;
                 match result {

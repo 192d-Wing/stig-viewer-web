@@ -340,23 +340,35 @@ test.describe("Audit log search", () => {
     await ensureUser(request, "alice");
     const denied = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
     expect(denied.status()).toBe(403);
+    const deniedSearch = await request.get(`${BACKEND}/api/audit/search`, { headers: { "X-User-Id": "alice" } });
+    expect(deniedSearch.status()).toBe(403);
 
     await setUserRole("alice", "admin");
     await seedActivity(request, "alice", "events-host", []);
-    const res = await request.get(`${BACKEND}/api/audit/events`, { headers: { "X-User-Id": "alice" } });
+    // The 403 above is itself recorded centrally (authz.denied); look at the
+    // seeded event by action.
+    const res = await request.get(`${BACKEND}/api/audit/events?action=checklist.create`, { headers: { "X-User-Id": "alice" } });
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({ page: 1, pageSize: 50 });
     expect(body.totalCount).toBe(1);
     const row = body.rows[0];
+    for (const key of ["repeatCount", "lastOccurredAt"]) expect(row).toHaveProperty(key);
+    expect(row.repeatCount).toBe(1);
     for (const key of ["id", "occurredAt", "byName", "assetName", "stigTitle", "action", "outcome", "detail"]) {
       expect(row).toHaveProperty(key);
     }
     expect(row.action).toBe("checklist.create");
     expect(row.assetName).toBe("events-host");
 
-    const none = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
-    expect((await none.json()).totalCount).toBe(0);
+    const denials = await request.get(`${BACKEND}/api/audit/events?outcome=denied`, { headers: { "X-User-Id": "alice" } });
+    const denialBody = await denials.json();
+    expect(denialBody.totalCount).toBe(2);
+    expect(denialBody.rows.map((r) => r.detail.route).sort()).toEqual(["/api/audit/events", "/api/audit/search"]);
+    for (const r of denialBody.rows) {
+      expect(r).toMatchObject({ action: "authz.denied", outcome: "denied" });
+      expect(r.detail.method).toBe("GET");
+    }
     const bad = await request.get(`${BACKEND}/api/audit/events?from=nope`, { headers: { "X-User-Id": "alice" } });
     expect(bad.status()).toBe(400);
   });
@@ -376,9 +388,93 @@ test.describe("Audit log search", () => {
     await page.getByTestId("audit-search-button").click();
     await expect(table).toContainText("checklist.create", { timeout: 10_000 });
     await expect(table).toContainText("requests-ui-host");
+    // Collapsed denials show a count (column header and per-row value).
+    await expect(table).toContainText("Count");
+    // The seeded checklist.create row is not collapsed: its Count cell is "1".
+    const createRow = table.getByRole("row").filter({ hasText: "checklist.create" }).first();
+    await expect(createRow.getByRole("cell").nth(9)).toHaveText("1");
 
     // Switching back restores the rule-change view.
     await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();
     await expect(page.getByTestId("audit-search-table")).toBeVisible();
+  });
+
+  test("API: a search is audited as audit.read with request context, visible under Requests", async ({ request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "read-host", [{ status: "open", findingDetails: "x" }]);
+
+    const search = await request.get(`${BACKEND}/api/audit/search?from=2020-01-01`, {
+      headers: { "X-User-Id": "alice", "X-Forwarded-For": "203.0.113.9", "X-Request-Id": "attacker-chosen" },
+    });
+    expect(search.status()).toBe(200);
+    // The inbound id is never trusted; the generated one is echoed.
+    const requestId = search.headers()["x-request-id"];
+    expect(requestId).toBeTruthy();
+    expect(requestId).not.toBe("attacker-chosen");
+
+    const res = await request.get(`${BACKEND}/api/audit/events?action=audit.read`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    const body = await res.json();
+    expect(body.totalCount).toBe(1);
+    const row = body.rows[0];
+    expect(row).toMatchObject({ action: "audit.read", outcome: "ok", userRole: "admin", requestId });
+    // Header text is never stored: the value is the socket peer (or a trusted hop), as a canonical IP.
+    expect(row.sourceIp).toMatch(/^[0-9a-f:.]+$/i);
+    expect(row.sourceIp).not.toBe("203.0.113.9");
+    expect(row.detail).toMatchObject({ view: "rules", page: 1, filters: { from: "2020-01-01" } });
+  });
+
+  test("UI: a search shows up as audit.read under Requests", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "read-ui-host", [{ status: "open", findingDetails: "x" }]);
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-search-button").click();
+    await expect(page.getByTestId("audit-search-table")).toContainText("alice", { timeout: 10_000 });
+
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await page.getByTestId("audit-search-button").click();
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toContainText("audit.read", { timeout: 10_000 });
+  });
+
+  test("UI: a late rule-changes response never fills the Requests table", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "alice", "stale-host", [{ status: "open", findingDetails: "stale marker" }]);
+
+    // Hold the first /api/audit/search response until the view has switched.
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    let held = false;
+    await page.route("**/api/audit/search*", async (route) => {
+      if (held) return route.continue();
+      held = true;
+      const response = await route.fetch();
+      await gate;
+      await route.fulfill({ response });
+    });
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-search-button").click();
+    await expect.poll(() => held).toBe(true);
+
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await page.getByTestId("audit-search-button").click();
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toContainText("checklist.create", { timeout: 10_000 });
+
+    release();
+    // Let the stale response arrive and be ignored.
+    await page.waitForTimeout(500);
+    await expect(table).not.toContainText("stale marker");
+    await expect(table).toContainText("checklist.create");
   });
 });

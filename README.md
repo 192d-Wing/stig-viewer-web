@@ -334,6 +334,316 @@ cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
 ```
 
+## Operations: audit
+
+- Durable request events live in `audit_events` (see `/api/audit/events`).
+  Each row carries the user's role at the time, a server-generated request id
+  (also returned in the `X-Request-Id` response header; an inbound
+  `X-Request-Id` is ignored) and the source IP. Reading the audit log is itself
+  recorded, as `audit.read` (view, bounded filters, page and rows returned).
+- Audit writes fail open: if a row cannot be written, the request still
+  completes and the backend logs an error on the `audit` target containing
+  `failed to write audit event`, with the user, action, outcome and ids. Alert
+  on that line, and ship the application logs to a retained store, since it is
+  the only record of an event that missed the database (AU-5).
+- `source_ip` is the same client IP the login notice uses: the socket peer
+  address, or, with `STIG_TRUST_PROXY_HEADERS=true`, the
+  `STIG_TRUSTED_PROXY_HOPS`-th hop from the right of `X-Forwarded-For`. It is
+  stored only as a canonical IP address (otherwise NULL). Behind a proxy
+  without that setting every row records the proxy's address; with it set, the
+  proxy must append to `X-Forwarded-For` as described above, since a value the
+  client supplied further left is never used.
+- A 403 from the authenticated API that its handler did not record itself
+  (the viewer read-only gate, role checks, `/api/audit/*`) is recorded
+  centrally as `authz.denied` with `detail = {method, route}`, where `route` is
+  the route template, never the URL. 401 and 429 responses are not recorded.
+- Repeated `denied`/`rejected` events collapse. Only a true repeat does: the
+  same user, action, outcome, asset/checklist/STIG ids, `detail`
+  (for `authz.denied`, the method and route template), ignoring only the
+  client-derived counters `requested` and `distinct`, `source_ip` and
+  `user_role`. Such an event, arriving within 5 minutes of the row's first
+  occurrence, increments `repeat_count` and sets `last_occurred_at` on that row
+  instead of adding one, so a collapsed row covers
+  [`occurred_at`, `occurred_at` + 5 minutes]. Requests with different request
+  ids still merge; the row keeps the first request's `request_id`, `source_ip`
+  and `detail`, and later requests are represented only by the counter. The
+  `method` of `authz.denied` is one of the standard methods or `OTHER`. `ok`
+  and `partial` events are never collapsed. Retention prunes a row only when
+  both `occurred_at` and `last_occurred_at` are past the cutoff, and the
+  archive line carries both fields.
+- IP addresses are retained with the audit rows, in the retention archive and
+  in backups.
+
+
+### Database guard on the audit tables
+
+Migration `040_audit_guard.sql` makes `rule_audit` and `audit_events`
+append-only at the database level. Triggers on both tables (`BEFORE UPDATE OR
+DELETE` per row, `BEFORE TRUNCATE` per statement, one shared function) raise
+SQLSTATE `42501` unless the transaction declared a maintenance mode with
+`SELECT set_config('stig.audit_maintenance', '<mode>', true)`:
+
+- `retention`: DELETE (the audit retention sweep);
+- `restore`: TRUNCATE only (a forced backup restore);
+- `migration`: UPDATE only (a data migration that backfills audit rows);
+- `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
+  which exist only under `STIG_ENABLE_TEST_ROUTES`).
+
+The one update always allowed is the collapse of a repeated denial: on a
+`denied` or `rejected` `audit_events` row only `repeat_count` (exactly +1) and
+`last_occurred_at` (not before the row's last occurrence, not more than a
+minute in the future) may change. The triggers are `ENABLE ALWAYS`, so
+`session_replication_role = replica` does not skip them.
+
+A forced restore records `backup.restore` inside the restore transaction,
+re-inserting the acting admin's user row first if the backup lacks it. If the
+record cannot be written the whole restore rolls back. A structured `audit`
+log line is also written before the restore starts and after it commits
+(including how many attachment blobs were written).
+
+Migration authors: a migration that UPDATEs, backfills or DELETEs audit rows
+fails with 42501. A data migration must first run
+`SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
+transaction (UPDATE only). Never use `test` mode in production code.
+
+Limit: this is a guard, not a privilege boundary. Any code that can run SQL as
+the application role can set the mode, and a DBA or the table owner can
+disable the triggers. It stops accidents, stray queries and injected
+statements that do not know the mode; it does not stop a compromised
+application or database administrator. For production hardening, run
+migrations and the retention/restore jobs under a separate role that owns the
+tables, give the application role only `SELECT` and `INSERT` on the audit
+tables (plus `UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and
+ship audit rows to an external append-only store.
+
+### Integrity of audit archives and backups
+
+With `AUDIT_ARCHIVE_ENABLED` (default on), each retention sweep writes
+immutable segments to `${DATA_DIR}/audit_archive/`:
+`rules-<UTC date>.<firstId>-<lastId>.jsonl` (`rule_audit`) and
+`events-<UTC date>.<firstId>-<lastId>.jsonl` (`audit_events`). A segment is
+written to a temp file, fsynced and renamed, then gets a sidecar
+`<segment>.manifest.json`. Rows are archived before the delete runs, and a
+failed archive write deletes nothing.
+
+Archiving is idempotent by row id, without trusting the directory. A row is
+skipped only when a segment that verifies holds the IDENTICAL serialized line
+for it. "Verifies" means the sidecar exists and checks out (SHA-512, row count,
+ids inside the range in the file name) and, when `SIGNING_KEY_HEX` is set, that
+the signature is valid for the configured key. With a key, a planted segment
+cannot pass at all. Without a key the digest is not a secret, so a planted
+segment can be self-consistent; it still cannot hide a real row, because its
+line would have to equal the row's actual line. A segment that fails
+verification, or holds a different line, is logged on the `audit` target and its
+rows are archived again (a duplicate is harmless, a lost row is not). Only a definite
+verification failure (bad signature, digest, row-count or id-range mismatch, a
+missing or unparseable sidecar) renames the segment and its sidecar to
+`<name>.rejected-<UTC timestamp>`, keeping them as evidence; such files are
+never counted. An I/O error, or a segment that is `unsigned` or `unknown_key`
+while a key is configured, is logged and not counted but left untouched. A
+verified or left-in-place file is never replaced: new rows that would collide
+with an existing name go to `<stream>-<date>.<first>-<last>.r<n>.jsonl`. Each
+segment is read once, and the verified bytes are the bytes used. Without a key,
+a warning is logged if verified segments hold different lines for one id.
+
+After a key rotation, or when signing is switched on or off, older segments
+are `unknown_key` or `unsigned` under the new configuration: they stay where
+they are, the rows still in the database are archived again into new signed
+segments beside them, and nothing is renamed.
+
+Files named `<date>.jsonl` and `events-<date>.jsonl` come from earlier
+versions (append mode). They are legacy: never rewritten, **unsigned**, with no
+manifest, and never trusted to skip a row.
+
+**Formats.** The sidecar and a backup's `manifest.sig.json` are envelopes:
+
+```json
+{"version":1,"type":"stig-viewer/audit-archive","payload":"<base64url>",
+ "signatures":[{"algorithm":"ed25519","keyId":"...","signature":"<base64>"}]}
+```
+
+`payload` is the exact signed bytes and the only thing to trust; a verifier
+decodes it and reads everything from there. For a segment it is `{type,
+version, stream, file, rows, firstId, lastId, digest:{algorithm:"sha-512",
+value}, signers:[{algorithm, keyId}]}`. A backup's `manifest.json` (format
+version 2; version 1 is still accepted when policy allows) is the signed
+payload itself, and adds `type`, `entries` (`{entry name: sha512 hex}` for every
+other ZIP entry), `entriesDigest: "sha-512"` and `signers`. Every listed
+signer must have a signature, and none may be extra.
+
+**Keys and domains.** The Ed25519 key is `SIGNING_KEY_HEX`, the same key that
+signs `/api/sign` exports. The signature input is a domain prefix followed by
+the payload, with a different prefix per purpose so one signature cannot be
+replayed as another: `stig-viewer/audit-archive/v1\0`,
+`stig-viewer/backup/v1\0` (and `stig-viewer/sign/v2\0` for exports). The signed
+payload also carries a `type`. Fetch the public key from
+`GET /api/signing/pubkey` and pin it offline; a key id alone proves nothing.
+Verification uses strict Ed25519 (`verify_strict`).
+
+**Without `SIGNING_KEY_HEX`**, manifests carry digests only. That detects
+corruption but not deliberate alteration: anyone who can edit a segment can
+recompute its digest.
+
+**Verify a segment.** Needs Python 3 with `cryptography`; the third argument is
+the pinned base64 public key. The script trusts only `payload` and
+`signatures`, fails on an empty signer list, requires a valid signature for
+every signer (and no others), and recomputes the SHA-512 itself. Run it as
+`python3 -I verify_segment.py SEGMENT SEGMENT.manifest.json PUBKEY`:
+
+```python
+# usage: python3 -I verify_segment.py SEGMENT.jsonl SEGMENT.jsonl.manifest.json PINNED_PUBLIC_KEY_BASE64
+import base64, hashlib, json, os, sys
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+DOMAIN = b"stig-viewer/audit-archive/v1\0"
+seg_path, sidecar_path, pub_b64 = sys.argv[1:4]
+
+def fail(msg):
+    sys.exit("FAIL: " + msg)
+
+pub_raw = base64.b64decode(pub_b64)
+pub = Ed25519PublicKey.from_public_bytes(pub_raw)
+pinned_key_id = hashlib.sha256(pub_raw).hexdigest()[:16]
+
+env = json.load(open(sidecar_path))
+# Only `payload` and `signatures` are trusted inputs; everything else is ignored.
+payload = base64.urlsafe_b64decode(env["payload"] + "=" * (-len(env["payload"]) % 4))
+m = json.loads(payload)
+if m.get("type") != "stig-viewer/audit-archive":
+    fail("wrong type")
+signers = m.get("signers") or []
+if not signers:
+    fail("manifest names no signers (unsigned)")
+if pinned_key_id not in [s["keyId"] for s in signers]:
+    fail("pinned key is not a signer")
+sigs = {(s["algorithm"], s["keyId"]): s["signature"] for s in env["signatures"]}
+if len(sigs) != len(env["signatures"]) or set(sigs) != {(s["algorithm"], s["keyId"]) for s in signers}:
+    fail("signatures do not match the signer list")
+for s in signers:
+    if s["algorithm"] != "ed25519" or s["keyId"] != pinned_key_id:
+        fail("signer %r cannot be verified with the pinned key" % (s,))
+    try:
+        pub.verify(base64.b64decode(sigs[(s["algorithm"], s["keyId"])]), DOMAIN + payload)
+    except InvalidSignature:
+        fail("bad signature")
+
+body = open(seg_path, "rb").read()
+if m["file"] != os.path.basename(seg_path):
+    fail("manifest is for another file")
+if m["digest"]["algorithm"] != "sha-512" or hashlib.sha512(body).hexdigest() != m["digest"]["value"]:
+    fail("segment digest mismatch")
+print("ok:", m["file"], m["rows"], "rows")
+```
+
+**Verify a backup**: `python3 -I verify_backup.py backup.zip PUBKEY`.
+
+```python
+# usage: python3 -I verify_backup.py BACKUP.zip PINNED_PUBLIC_KEY_BASE64
+import base64, hashlib, json, sys, zipfile
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+DOMAIN = b"stig-viewer/backup/v1\0"
+zip_path, pub_b64 = sys.argv[1:3]
+
+def fail(msg):
+    sys.exit("FAIL: " + msg)
+
+pub_raw = base64.b64decode(pub_b64)
+pub = Ed25519PublicKey.from_public_bytes(pub_raw)
+pinned_key_id = hashlib.sha256(pub_raw).hexdigest()[:16]
+
+z = zipfile.ZipFile(zip_path)
+names = z.namelist()
+if len(names) != len(set(names)):
+    fail("duplicate entries")
+manifest_bytes = z.read("manifest.json")
+env = json.loads(z.read("manifest.sig.json"))
+payload = base64.urlsafe_b64decode(env["payload"] + "=" * (-len(env["payload"]) % 4))
+if payload != manifest_bytes:
+    fail("signed payload is not manifest.json")
+m = json.loads(payload)
+if m.get("type") != "stig-viewer/backup" or m.get("version") != "2":
+    fail("not a version 2 backup manifest")
+signers = m.get("signers") or []
+if not signers:
+    fail("manifest names no signers (unsigned)")
+if pinned_key_id not in [s["keyId"] for s in signers]:
+    fail("pinned key is not a signer")
+sigs = {(s["algorithm"], s["keyId"]): s["signature"] for s in env["signatures"]}
+if len(sigs) != len(env["signatures"]) or set(sigs) != {(s["algorithm"], s["keyId"]) for s in signers}:
+    fail("signatures do not match the signer list")
+for s in signers:
+    if s["algorithm"] != "ed25519" or s["keyId"] != pinned_key_id:
+        fail("signer %r cannot be verified with the pinned key" % (s,))
+    try:
+        pub.verify(base64.b64decode(sigs[(s["algorithm"], s["keyId"])]), DOMAIN + payload)
+    except InvalidSignature:
+        fail("bad signature")
+
+if m.get("entriesDigest") != "sha-512":
+    fail("unsupported entries digest")
+actual = {n: hashlib.sha512(z.read(n)).hexdigest() for n in names
+          if n not in ("manifest.json", "manifest.sig.json") and not n.endswith("/")}
+if actual != m["entries"]:
+    bad = sorted(n for n in set(actual) | set(m["entries"]) if actual.get(n) != m["entries"].get(n))
+    fail("entries differ from the manifest: %r" % bad)
+print("ok:", len(actual), "entries")
+```
+
+To check a digest by hand, use `sha512sum FILE` (Linux) or `shasum -a 512 FILE`
+(macOS) and compare it with the digest in the decoded payload, not with any
+other copy.
+
+**Restore policy.** Restore checks the entry digests and the signature before
+it changes the database. A signature that is present and wrong is always
+rejected, as is an entry that is altered, added, missing or duplicated, and a
+version 1 manifest carrying version 2 fields (a downgrade).
+
+- When `SIGNING_KEY_HEX` is set, a restore **requires a verified signature** by
+  default: unsigned, unknown-key and version 1 backups are rejected with a 400.
+  Set `BACKUP_REQUIRE_SIGNATURE=false` to opt out explicitly, for example to
+  migrate version 1 or unsigned backups.
+- Without a key, unsigned backups are accepted (with a warning) as before.
+  `BACKUP_REQUIRE_SIGNATURE=true` still requires a verified signature, which
+  without a key no backup can have.
+- `BACKUP_REQUIRE_SIGNATURE` accepts only `true/1/yes` or `false/0/no`, is read
+  once at startup, and the backend refuses to start on any other value.
+
+The outcome (`verified`, `unsigned` or `unknown_key`) is returned as
+`signatureStatus`, shown in the admin console (a warning when not verified),
+written to the pre-restore `audit` log line and recorded, with
+`requireSignature`, in the `backup.restore` event's detail. A rejected restore
+is also recorded, as a `backup.restore` event with `outcome = 'failure'` and
+`detail = {reason, signatureStatus, requireSignature}` (`signatureStatus` is
+`invalid` for a bad signature and `not_evaluated` when the backup was refused
+before its signature was evaluated). Entries are read with a per-entry (1 GiB) and a
+total (4 GiB) decompressed limit; `manifest.json` and `manifest.sig.json` are
+capped at 16 MiB.
+
+With `SIGNING_KEY_HEX` set (so the default policy requires a verified
+signature) a restore satisfies the intent of NIST SP 800-53 CP-9(8)
+(cryptographic protection of backups) and SI-7(6) (cryptographic integrity
+protection) for backups taken by this server. Without a key, or with
+`BACKUP_REQUIRE_SIGNATURE=false`, it does not: digests alone detect corruption
+only.
+
+**Limits.**
+
+- Deleting a whole segment (and its manifest) is not detectable: there is no
+  chain between segments.
+- Without a key, or with `BACKUP_REQUIRE_SIGNATURE=false`, whoever can modify a
+  backup can also strip its signature and `signers` list.
+- Key rotation: a signature made by a previous key verifies as `unknown_key`
+  once `SIGNING_KEY_HEX` changes, so old backups need
+  `BACKUP_REQUIRE_SIGNATURE=false` to restore. A list of trusted previous keys
+  is a follow-up.
+- Ed25519 is not quantum-safe, which matters for evidence that must stay
+  trustworthy for decades. The migration target is a hybrid with ML-DSA-87
+  (FIPS 204); because manifests carry a signer list in the signed bytes, that
+  means adding a signer, and verifiers must then require every signer.
+
 ## Repository layout
 
 ```

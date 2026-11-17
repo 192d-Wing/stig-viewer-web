@@ -1245,6 +1245,48 @@ mod tests {
         assert!(out.iter().all(|o| *o == PatchOutcome::Written));
     }
 
+    #[test]
+    fn chunk_lock_timeout_is_five_seconds() {
+        assert_eq!(CHUNK_LOCK_TIMEOUT, "5s");
+    }
+
+    #[test]
+    fn error_summary_for_non_database_errors() {
+        let sqlx_err = anyhow::Error::new(sqlx::Error::RowNotFound);
+        assert_eq!(error_summary(&sqlx_err), "non-database error");
+        assert_eq!(error_summary(&anyhow::anyhow!("secret value 42")), "unexpected error");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn error_summary_for_a_database_error_has_only_sqlstate_and_constraint(pool: PgPool) {
+        setup(&pool).await;
+        // Same primary key twice: unique_violation (23505) on the table's pkey.
+        let ins = "INSERT INTO checklist_rules (checklist_id, rule_id, status) VALUES ('c1', 'dup-secret', 'open')";
+        sqlx::query(ins).execute(&pool).await.unwrap();
+        let err = sqlx::query(ins).execute(&pool).await.unwrap_err();
+        let msg = error_summary(&anyhow::Error::new(err));
+        assert!(msg.starts_with("sqlstate 23505 constraint "), "{msg}");
+        assert!(!msg.contains("dup-secret"), "{msg}");
+    }
+
+    // Timing-dependent (about 5s): the public entry point must bound the lock
+    // wait by CHUNK_LOCK_TIMEOUT, not wait forever for the holder.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn patch_rules_passes_the_chunk_lock_timeout(pool: PgPool) {
+        setup(&pool).await;
+        let mut holder = pool.begin().await.unwrap();
+        lock_checklist(&mut holder, "c1").await.unwrap();
+        let ids = names(2);
+        let t = std::time::Instant::now();
+        let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
+        let took = t.elapsed();
+        assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
+        assert!(took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15), "took {took:?}");
+        holder.rollback().await.unwrap();
+    }
+
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn upsert_rule_expecting_rejects_a_changed_status_and_leaves_no_trace(pool: PgPool) {
