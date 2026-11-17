@@ -42,7 +42,7 @@ pub(crate) fn short_id(id: &str) -> String {
     id.chars().take(64).collect()
 }
 
-/// Outcome of [`apply_plan`] for one rule.
+/// Outcome of [`apply_plans`] for one rule.
 pub(crate) struct Applied {
     /// "applied" | "pending_approval"
     pub status: &'static str,
@@ -52,6 +52,11 @@ pub(crate) struct Applied {
 const MAX_FINDING_DETAILS_BYTES: usize = 32 * 1024;
 
 pub(crate) const VALID_STATUSES: &[&str] = &["not_reviewed", "open", "not_a_finding", "not_applicable"];
+
+/// Postgres `text` cannot hold NUL; such text would fail its whole chunk.
+pub(crate) fn has_nul(s: &str) -> bool {
+    s.contains('\0')
+}
 
 fn requires_finding_details(status: &str) -> bool {
     matches!(status, "not_a_finding" | "not_applicable")
@@ -131,7 +136,7 @@ pub(crate) fn plan_rule(
 /// POST /api/checklists/:id/rules/bulk-status
 ///
 /// The work (access check through the final audit event) runs in a spawned
-/// task: each rule is committed on its own, so a client disconnect that drops
+/// task: each chunk is committed on its own, so a client disconnect that drops
 /// this future must not leave committed writes without their audit event.
 pub async fn bulk_status_handler(
     State(state): State<AppState>,
@@ -189,6 +194,8 @@ async fn bulk_status_work(
         Some("too_many_rules")
     } else if req.finding_details.len() > MAX_FINDING_DETAILS_BYTES {
         Some("finding_details_too_long")
+    } else if has_nul(&req.finding_details) {
+        Some("finding_details_invalid")
     } else {
         None
     };
@@ -234,61 +241,7 @@ async fn bulk_status_work(
             .map(|r| (r.rule_id.clone(), r))
             .collect();
 
-    let mut results = Vec::with_capacity(req.rule_ids.len());
-    let mut seen: HashSet<&str> = HashSet::new();
-    for rule_id in &req.rule_ids {
-        if !seen.insert(rule_id.as_str()) {
-            continue; // duplicate id in the request
-        }
-        if rule_id.len() > MAX_RULE_ID_BYTES {
-            results.push(BulkStatusRowResult {
-                rule_id: short_id(rule_id),
-                status: "error".into(),
-                error: Some("rule id too long".into()),
-                note: None,
-            });
-            continue;
-        }
-        let prev = existing.get(rule_id);
-        let plan = plan_rule(
-            known.contains(rule_id),
-            prev,
-            &req.status,
-            &req.finding_details,
-            asset.requires_approval,
-        );
-        // Only a non-blank shared text overwrites; otherwise the write keeps
-        // whatever the row holds at write time.
-        let details = (!req.finding_details.trim().is_empty()).then_some(req.finding_details.as_str());
-        let expect = expected_status(asset.requires_approval, &req.status, prev);
-        let outcome = apply_plan(
-            pool,
-            &checklist_id,
-            rule_id,
-            &user.id,
-            &req.status,
-            true,
-            expect.as_deref(),
-            details,
-            None,
-            plan,
-        )
-        .await;
-        results.push(match outcome {
-            Ok(a) => BulkStatusRowResult {
-                rule_id: rule_id.clone(),
-                status: a.status.into(),
-                error: None,
-                note: a.note.map(str::to_string),
-            },
-            Err(error) => BulkStatusRowResult {
-                rule_id: rule_id.clone(),
-                status: "error".into(),
-                error: Some(error),
-                note: None,
-            },
-        });
-    }
+    let results = apply_bulk(pool, &checklist_id, &user.id, asset.requires_approval, &known, &existing, &req).await;
 
     let count = |s: &str| results.iter().filter(|r| r.status == s).count();
     let all_rejected: Vec<(String, String)> = results
@@ -367,69 +320,194 @@ fn build_patch<'a>(
     }
 }
 
-/// Carry out a [`Plan`] for one rule. `finding_details` / `comments` are
+/// One rule's work for [`apply_plans`]. `finding_details` / `comments` are
 /// `Some` only when the caller wants to overwrite that column; `None` keeps
 /// the value stored at write time. `write_status` false leaves the stored
 /// status alone (text-only update). A closing status is re-checked for
 /// finding details against the locked row at write time.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn apply_plan(
-    pool: &sqlx::PgPool,
-    checklist_id: &str,
-    rule_id: &str,
-    user_id: &str,
-    status: &str,
-    write_status: bool,
-    expect_status: Option<&str>,
-    finding_details: Option<&str>,
-    comments: Option<&str>,
-    plan: Plan,
-) -> Result<Applied, String> {
-    match plan {
-        Plan::Reject(msg) => Err(msg.to_string()),
-        Plan::RequestApproval { finding_details } => {
-            let already = request_approval(pool, checklist_id, rule_id, user_id, status, &finding_details).await?;
-            Ok(Applied { status: "pending_approval", note: already.then_some(ALREADY_PENDING) })
-        }
-        Plan::Apply { .. } => db_checklists::patch_rule(
-            pool,
-            checklist_id,
-            rule_id,
-            build_patch(status, write_status, expect_status, finding_details, comments),
-            user_id,
-        )
-        .await
-        .map(|_| Applied { status: "applied", note: None })
-        .map_err(|e| {
-            if let Some(rejected) = e.downcast_ref::<db_checklists::PatchRejected>() {
-                return rejected.to_string();
-            }
-            tracing::error!("rule write failed for {rule_id}: {e:#}");
-            "failed to save".to_string()
-        }),
-    }
+pub(crate) struct RuleOp<'a> {
+    pub rule_id: &'a str,
+    pub status: &'a str,
+    pub write_status: bool,
+    pub expect_status: Option<&'a str>,
+    pub finding_details: Option<&'a str>,
+    pub comments: Option<&'a str>,
+    pub plan: Plan,
 }
 
-/// File an approval request unless one is already pending for the rule.
-async fn request_approval(
+/// Carry out the [`Plan`] of every op against one checklist, in three
+/// phases: rule writes, approval requests, then the comments of rules whose
+/// status went to the approval queue (comments are not gated). Each phase
+/// is chunked by the db layer. Results are in `ops` order.
+pub(crate) async fn apply_plans(
     pool: &sqlx::PgPool,
     checklist_id: &str,
-    rule_id: &str,
     user_id: &str,
-    status: &str,
-    finding_details: &str,
-) -> Result<bool, String> {
-    let fail = |e: anyhow::Error| {
-        tracing::error!("bulk-status approval request failed for {rule_id}: {e:#}");
-        "failed to request approval".to_string()
-    };
-    if finding_approvals::has_pending(pool, checklist_id, rule_id).await.map_err(fail)? {
-        return Ok(true);
+    ops: &[RuleOp<'_>],
+) -> Vec<Result<Applied, String>> {
+    use db_checklists::PatchOutcome;
+    let mut out: Vec<Option<Result<Applied, String>>> = ops.iter().map(|_| None).collect();
+    let mut applies = Vec::new();
+    let mut approvals = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        match &op.plan {
+            Plan::Reject(msg) => out[i] = Some(Err(msg.to_string())),
+            Plan::Apply { .. } => applies.push(i),
+            Plan::RequestApproval { .. } => approvals.push(i),
+        }
     }
-    finding_approvals::create_pending(pool, checklist_id, rule_id, user_id, status, finding_details)
-        .await
-        .map(|_| false)
-        .map_err(fail)
+
+    // Phase 1: writes.
+    let patches: Vec<(&str, db_checklists::RulePatch<'_>)> = applies
+        .iter()
+        .map(|&i| {
+            let op = &ops[i];
+            (op.rule_id, build_patch(op.status, op.write_status, op.expect_status, op.finding_details, op.comments))
+        })
+        .collect();
+    let outcomes = db_checklists::patch_rules(pool, checklist_id, user_id, &patches).await;
+    for (&i, outcome) in applies.iter().zip(outcomes) {
+        out[i] = Some(match outcome {
+            PatchOutcome::Written => Ok(Applied { status: "applied", note: None }),
+            PatchOutcome::Rejected(r) => Err(r.to_string()),
+            PatchOutcome::Failed => Err("failed to save".to_string()),
+        });
+    }
+
+    // Phase 2: approval requests.
+    let requests: Vec<finding_approvals::ApprovalRequest<'_>> = approvals
+        .iter()
+        .map(|&i| {
+            let op = &ops[i];
+            let finding_details = match &op.plan {
+                Plan::RequestApproval { finding_details } => finding_details.as_str(),
+                _ => "",
+            };
+            finding_approvals::ApprovalRequest { rule_id: op.rule_id, proposed_status: op.status, finding_details }
+        })
+        .collect();
+    let queued = finding_approvals::request_many(pool, checklist_id, user_id, &requests).await;
+    let mut with_comments = Vec::new();
+    for (&i, outcome) in approvals.iter().zip(queued) {
+        out[i] = Some(match outcome {
+            finding_approvals::ApprovalOutcome::Queued { .. } => Ok(Applied { status: "pending_approval", note: None }),
+            finding_approvals::ApprovalOutcome::AlreadyPending => {
+                Ok(Applied { status: "pending_approval", note: Some(ALREADY_PENDING) })
+            }
+            finding_approvals::ApprovalOutcome::Failed => Err("failed to request approval".to_string()),
+        });
+        if matches!(out[i], Some(Ok(_))) && ops[i].comments.is_some() {
+            with_comments.push(i);
+        }
+    }
+
+    // Phase 3: comments for pending rules. Status and details wait for
+    // approval; the comments are kept rather than dropping user input.
+    let comment_patches: Vec<(&str, db_checklists::RulePatch<'_>)> = with_comments
+        .iter()
+        .map(|&i| {
+            (ops[i].rule_id, db_checklists::RulePatch { comments: ops[i].comments, ..Default::default() })
+        })
+        .collect();
+    let outcomes = db_checklists::patch_rules(pool, checklist_id, user_id, &comment_patches).await;
+    for (&i, outcome) in with_comments.iter().zip(outcomes) {
+        match outcome {
+            PatchOutcome::Written => {}
+            PatchOutcome::Rejected(r) => out[i] = Some(Err(r.to_string())),
+            PatchOutcome::Failed => out[i] = Some(Err("failed to save comments".to_string())),
+        }
+    }
+
+    out.into_iter()
+        .map(|o| o.unwrap_or_else(|| Err("failed to save".to_string())))
+        .collect()
+}
+
+/// Plan and apply the bulk request. `existing` is the caller's snapshot of
+/// the checklist's rule rows; the writes re-check against the locked rows.
+/// Duplicate ids collapse to the first; results are in request order.
+async fn apply_bulk(
+    pool: &sqlx::PgPool,
+    checklist_id: &str,
+    user_id: &str,
+    requires_approval: bool,
+    known: &HashSet<String>,
+    existing: &HashMap<String, ChecklistRuleRow>,
+    req: &BulkStatusRequest,
+) -> Vec<BulkStatusRowResult> {
+    enum Slot {
+        Done(BulkStatusRowResult),
+        Op(usize),
+    }
+    let mut slots = Vec::with_capacity(req.rule_ids.len());
+    let mut planned: Vec<(&str, Plan)> = Vec::new();
+    let mut expects: Vec<Option<String>> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    // Only a non-blank shared text overwrites; otherwise the write keeps
+    // whatever the row holds at write time.
+    let details = (!req.finding_details.trim().is_empty()).then_some(req.finding_details.as_str());
+    for rule_id in &req.rule_ids {
+        if !seen.insert(rule_id.as_str()) {
+            continue; // duplicate id in the request
+        }
+        if rule_id.len() > MAX_RULE_ID_BYTES {
+            slots.push(Slot::Done(BulkStatusRowResult {
+                rule_id: short_id(rule_id),
+                status: "error".into(),
+                error: Some("rule id too long".into()),
+                note: None,
+            }));
+            continue;
+        }
+        let prev = existing.get(rule_id);
+        let plan = plan_rule(known.contains(rule_id), prev, &req.status, &req.finding_details, requires_approval);
+        let expect = expected_status(requires_approval, &req.status, prev);
+        slots.push(Slot::Op(planned.len()));
+        planned.push((rule_id.as_str(), plan));
+        expects.push(expect);
+    }
+    let (rule_ids, plans): (Vec<&str>, Vec<Plan>) = planned.into_iter().unzip();
+    let ops: Vec<RuleOp<'_>> = rule_ids
+        .iter()
+        .zip(plans)
+        .zip(&expects)
+        .map(|((&rule_id, plan), expect)| RuleOp {
+            rule_id,
+            status: &req.status,
+            write_status: true,
+            expect_status: expect.as_deref(),
+            finding_details: details,
+            comments: None,
+            plan,
+        })
+        .collect();
+    let mut applied = apply_plans(pool, checklist_id, user_id, &ops).await.into_iter();
+    slots
+        .into_iter()
+        .map(|slot| match slot {
+            Slot::Done(r) => r,
+            Slot::Op(i) => {
+                let rule_id = rule_ids[i].to_string();
+                match applied.next() {
+                    Some(Ok(a)) => BulkStatusRowResult {
+                        rule_id,
+                        status: a.status.into(),
+                        error: None,
+                        note: a.note.map(str::to_string),
+                    },
+                    Some(Err(error)) => {
+                        BulkStatusRowResult { rule_id, status: "error".into(), error: Some(error), note: None }
+                    }
+                    None => BulkStatusRowResult {
+                        rule_id,
+                        status: "error".into(),
+                        error: Some("failed to save".into()),
+                        note: None,
+                    },
+                }
+            }
+        })
+        .collect()
 }
 
 fn map_db(e: anyhow::Error) -> StatusCode {
@@ -531,7 +609,7 @@ mod tests {
 
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{app_state, StigDir, seed_asset, seed_checklist, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{app_state, app_state_with_rules, fail_writes_of, rule_ids, StigDir, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
     async fn setup(pool: &PgPool) -> (AppState, StigDir) {
@@ -625,33 +703,34 @@ mod tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn apply_plan_rejects_a_stale_closed_snapshot(pool: PgPool) {
+    async fn apply_bulk_rejects_a_stale_closed_snapshot(pool: PgPool) {
         // The handler cannot be driven to this from one direct call (the row
         // must change between its snapshot read and its write), so this is
-        // the equivalent check one level down with a stale `expect_status`.
+        // the equivalent check one level down: a stale snapshot that still
+        // shows the rule closed while the live row was reopened.
         let (_state, _dir) = setup(&pool).await;
-        db_checklists::upsert_rule(&pool, "c1", RULES[0], "open", "d", "", "owner", None, None)
-            .await
-            .unwrap();
+        seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
+        let mut stale = row("not_a_finding", "d");
+        stale.checklist_id = "c1".into();
+        stale.rule_id = RULES[0].into();
+        let existing = HashMap::from([(RULES[0].to_string(), stale)]);
+        let known: HashSet<String> = RULES.iter().map(|s| s.to_string()).collect();
+        let req = BulkStatusRequest {
+            rule_ids: vec![RULES[0].into()],
+            status: "not_a_finding".into(),
+            finding_details: String::new(),
+        };
         let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
-        let out = apply_plan(
-            &pool,
-            "c1",
-            RULES[0],
-            "owner",
-            "not_a_finding",
-            true,
-            Some("not_a_finding"),
-            None,
-            None,
-            Plan::Apply { finding_details: "d".into() },
-        )
-        .await;
-        assert_eq!(out.err().as_deref(), Some("rule changed while saving; try again"));
+        let out = apply_bulk(&pool, "c1", "owner", true, &known, &existing, &req).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "error");
+        assert_eq!(out[0].error.as_deref(), Some("rule changed while saving; try again"));
         let status: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
         assert_eq!(status, "open");
         let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
         assert_eq!(audit_after, audit_before);
+        let approvals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(approvals, 0);
     }
 
     /// `(action, outcome, asset_id, checklist_id, detail text)` of every event, oldest first.
@@ -817,5 +896,177 @@ mod tests {
         assert_eq!((ev[0].0.as_str(), ev[0].1.as_str()), ("rules.bulk_status", "rejected"));
         let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
         assert_eq!(d["reason"], "stig_unavailable");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_status_covers_more_rules_than_one_chunk(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let ids = rule_ids(101);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Json(out) = call(&state, "owner", "c1", &refs, "open", "").await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (101, 0));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 101);
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        assert_eq!(audit, 101);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_event_lists_a_failed_chunk_as_partial(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let ids = rule_ids(250);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        fail_writes_of(&pool, "checklist_rules", &[ids[150].as_str()]).await;
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Json(out) = call(&state, "owner", "c1", &refs, "open", "").await.unwrap();
+        // Items 100..200 share the failed chunk.
+        assert_eq!((out.applied_count, out.error_count), (150, 100));
+        assert!(out.results[100..200].iter().all(|r| r.error.as_deref() == Some("failed to save")));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 150);
+        let ev = events(&pool).await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, "partial");
+        let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
+        assert_eq!((d["applied"].as_i64(), d["errors"].as_i64()), (Some(150), Some(100)));
+        let reasons: Vec<&str> = d["rejected"].as_array().unwrap().iter().map(|r| r["reason"].as_str().unwrap()).collect();
+        assert_eq!(reasons.len(), 100);
+        assert!(reasons.iter().all(|r| *r == "failed to save"));
+        assert_eq!(d["rejectedTruncated"], false);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_event_truncates_when_every_rule_fails(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let ids = rule_ids(300);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        // Chunks 0 and 1 fail, so chunk 2 is failed without being tried.
+        fail_writes_of(&pool, "checklist_rules", &[ids[50].as_str(), ids[150].as_str()]).await;
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Json(out) = call(&state, "owner", "c1", &refs, "open", "").await.unwrap();
+        assert_eq!((out.applied_count, out.error_count), (0, 300));
+        let ev = events(&pool).await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, "partial");
+        let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
+        assert_eq!(d["errors"].as_i64(), Some(300));
+        assert_eq!(d["rejected"].as_array().unwrap().len(), 100);
+        assert_eq!(d["rejectedTruncated"], true);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_on_a_gated_asset_queues_300_once(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let ids = rule_ids(300);
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Json(out) = call(&state, "owner", "c1", &refs, "not_a_finding", "why").await.unwrap();
+        assert_eq!((out.applied_count, out.pending_count, out.error_count), (0, 300, 0));
+        assert!(out.results.iter().all(|r| r.note.is_none()));
+        let Json(out) = call(&state, "owner", "c1", &refs, "not_a_finding", "why").await.unwrap();
+        assert_eq!(out.pending_count, 300);
+        assert!(out.results.iter().all(|r| r.note.as_deref() == Some(ALREADY_PENDING)));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 300);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// Benchmark, not a test: returns at once unless `BENCH_RULES` is set.
+    /// Drives only the public handlers so the same code runs on any commit.
+    /// `BENCH_RULES=300 cargo test bench_300 -- --include-ignored --nocapture`
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bench_300_rule_batches(pool: PgPool) {
+        use crate::api::checklist_save::{save_handler, SaveRequest, SaveRule};
+        let Some(n) = std::env::var("BENCH_RULES").ok().and_then(|v| v.parse::<usize>().ok()) else {
+            return;
+        };
+        const RUNS: usize = 5;
+        seed_user(&pool, "owner").await;
+        let ids = rule_ids(n);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
+
+        let median = |mut v: Vec<std::time::Duration>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        let mut report = Vec::new();
+        for (name, gated) in [("a bulk open, ungated", false), ("b bulk close, approval asset", true)] {
+            let mut times = Vec::new();
+            for run in 0..RUNS {
+                let asset = format!("bench-{}-{run}", &name[..1]);
+                let checklist = format!("bc-{}-{run}", &name[..1]);
+                seed_asset(&pool, &asset, "owner", gated).await;
+                seed_checklist(&pool, &checklist, &asset, STIG_ID).await;
+                let (status, details) = if gated { ("not_a_finding", "bench details") } else { ("open", "") };
+                let t = std::time::Instant::now();
+                let Json(out) = call(&state, "owner", &checklist, &refs, status, details).await.unwrap();
+                times.push(t.elapsed());
+                assert_eq!(out.error_count, 0);
+                assert_eq!(out.applied_count + out.pending_count, n);
+            }
+            report.push((name, median(times)));
+        }
+        let mut times = Vec::new();
+        for run in 0..RUNS {
+            let asset = format!("bench-c-{run}");
+            seed_asset(&pool, &asset, "owner", false).await;
+            let rules: Vec<SaveRule> = ids
+                .iter()
+                .map(|id| SaveRule {
+                    rule_id: id.clone(),
+                    status: "not_a_finding".into(),
+                    finding_details: "bench details".into(),
+                    comments: "bench comments".into(),
+                })
+                .collect();
+            let t = std::time::Instant::now();
+            let Json(out) = save_handler(
+                State(state.clone()),
+                Extension(crate::test_fixtures::auth("owner", "author")),
+                Path(asset),
+                Json(SaveRequest { stig_id: STIG_ID.into(), rules }),
+            )
+            .await
+            .unwrap();
+            times.push(t.elapsed());
+            assert_eq!((out.error_count, out.applied_count), (0, n));
+        }
+        report.push(("c save, status+details+comments", median(times)));
+        for (name, d) in report {
+            eprintln!("BENCH n={n} runs={RUNS} median {name}: {d:?}");
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bulk_rejects_nul_in_the_shared_details_and_records_it(pool: PgPool) {
+        let (state, _dir) = setup(&pool).await;
+        let err = call(&state, "owner", "c1", &RULES, "open", "bad\0text").await.err();
+        assert_eq!(err, Some(StatusCode::BAD_REQUEST));
+        let ev = events(&pool).await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, "rejected");
+        let d: serde_json::Value = serde_json::from_str(&ev[0].4).unwrap();
+        assert_eq!(d["reason"], "finding_details_invalid");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
     }
 }

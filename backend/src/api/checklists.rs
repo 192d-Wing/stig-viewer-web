@@ -536,49 +536,43 @@ pub async fn update_rule_handler(
         let already_closed = current_status.as_deref() == Some(req.status.as_str());
         if !already_closed {
             // Idempotency: if a pending request already exists for this
-            // rule, return 202 without filing a duplicate row.
-            let pending_exists = finding_approvals::has_pending(
+            // rule, return 202 without filing a duplicate row. `request_many`
+            // does the check and the insert under the checklist lock.
+            let request = finding_approvals::ApprovalRequest {
+                rule_id: &rule_id,
+                proposed_status: &req.status,
+                finding_details: &req.finding_details,
+            };
+            let outcome = finding_approvals::request_many(
                 state.pool.as_ref(),
                 &id,
-                &rule_id,
+                &user.id,
+                std::slice::from_ref(&request),
             )
             .await
-            .map_err(|e| {
-                tracing::error!("approval pending check: {e:#}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
-            if pending_exists {
-                return Ok((
+            .pop();
+            return match outcome {
+                Some(finding_approvals::ApprovalOutcome::AlreadyPending) => Ok((
                     StatusCode::ACCEPTED,
                     Json(json!({
                         "status": "pending_approval",
                         "message": "an approval request is already pending for this rule",
                     })),
                 )
-                    .into_response());
-            }
-            let row = finding_approvals::create_pending(
-                state.pool.as_ref(),
-                &id,
-                &rule_id,
-                &user.id,
-                &req.status,
-                &req.finding_details,
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("approval create_pending: {e:#}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
-            return Ok((
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "status": "pending_approval",
-                    "approvalId": row.id,
-                    "proposedStatus": row.proposed_status,
-                })),
-            )
-                .into_response());
+                    .into_response()),
+                Some(finding_approvals::ApprovalOutcome::Queued { id: approval_id }) => Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "status": "pending_approval",
+                        "approvalId": approval_id,
+                        "proposedStatus": req.status,
+                    })),
+                )
+                    .into_response()),
+                Some(finding_approvals::ApprovalOutcome::Failed) | None => {
+                    Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+            };
         }
     }
 
@@ -600,14 +594,16 @@ pub async fn update_rule_handler(
 
     let row = db_checklists::upsert_rule(
         state.pool.as_ref(),
-        &id,
-        &rule_id,
-        &req.status,
-        &req.finding_details,
-        &req.comments,
-        &user.id,
-        req.assignee_id.as_deref(),
-        req.due_date,
+        db_checklists::RuleWrite {
+            checklist_id: &id,
+            rule_id: &rule_id,
+            status: &req.status,
+            finding_details: &req.finding_details,
+            comments: &req.comments,
+            updated_by: &user.id,
+            assignee_id: req.assignee_id.as_deref(),
+            due_date: req.due_date,
+        },
     )
     .await
     .map_err(map_db)
@@ -854,7 +850,7 @@ fn map_unique_conflict(e: anyhow::Error) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{app_state, auth, seed_asset, seed_user, STIG_ID};
+    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
     use sqlx::PgPool;
 
     async fn create(state: &AppState, user: &str, stig_id: &str) -> Result<StatusCode, StatusCode> {
@@ -994,5 +990,96 @@ mod tests {
         assert_eq!(seen, 1);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklists").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+
+    async fn patch(
+        state: &AppState,
+        rule: &str,
+        status: &str,
+        details: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = update_rule_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Path(("c1".to_string(), rule.to_string())),
+            Json(UpdateRuleRequest {
+                status: status.into(),
+                finding_details: details.into(),
+                comments: String::new(),
+                assignee_id: None,
+                due_date: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|r| r);
+        let code = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_close_is_queued_once_and_a_repeat_reports_already_pending(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        seed_rule(&pool, "c1", RULES[0], "open", "", "", "owner").await;
+        let (state, _dir) = app_state(pool.clone());
+
+        let (code, body) = patch(&state, RULES[0], "not_a_finding", "because").await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "pending_approval");
+        assert_eq!(body["proposedStatus"], "not_a_finding");
+        let approval_id = body["approvalId"].as_str().expect("approvalId").to_string();
+        let (stored_id, details): (String, String) =
+            sqlx::query_as("SELECT id, finding_details FROM finding_approvals")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((stored_id, details.as_str()), (approval_id, "because"));
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(live, "open");
+
+        let (code, body) = patch(&state, RULES[0], "not_a_finding", "because").await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "pending_approval",
+                "message": "an approval request is already pending for this rule",
+            })
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_non_closing_status_still_writes_directly(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let (state, _dir) = app_state(pool.clone());
+        let (code, body) = patch(&state, RULES[0], "open", "").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "open");
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        assert_eq!(live, "open");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn gated_close_without_details_is_a_400_and_files_nothing(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_asset(&pool, "a1", "owner", true).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let (state, _dir) = app_state(pool.clone());
+        let (code, body) = patch(&state, RULES[0], "not_a_finding", "  ").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "finding_details required for status not_a_finding");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

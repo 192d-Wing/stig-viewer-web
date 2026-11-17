@@ -402,14 +402,16 @@ pub async fn bulk_handler(
 
         crate::db_checklists::upsert_rule(
             pool,
-            &t.checklist_id,
-            &t.rule_id,
-            &status,
-            &finding_details,
-            &comments,
-            &user.id,
-            assignee_id.as_deref(),
-            due_date,
+            crate::db_checklists::RuleWrite {
+                checklist_id: &t.checklist_id,
+                rule_id: &t.rule_id,
+                status: &status,
+                finding_details: &finding_details,
+                comments: &comments,
+                updated_by: &user.id,
+                assignee_id: assignee_id.as_deref(),
+                due_date,
+            },
         )
         .await
         .map_err(|e| {
