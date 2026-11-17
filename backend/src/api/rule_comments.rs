@@ -195,7 +195,7 @@ pub struct ReactionBody {
 const ALLOWED_REACTIONS: &[&str] = &["thumbs_up", "check", "question"];
 
 fn is_allowed_reaction(value: &str) -> bool {
-    ALLOWED_REACTIONS.iter().any(|r| *r == value)
+    ALLOWED_REACTIONS.contains(&value)
 }
 
 // ── List ───────────────────────────────────────────────────────────────────

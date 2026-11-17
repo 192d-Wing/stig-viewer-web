@@ -82,6 +82,7 @@ impl EmailConfig {
 
 /// Insert an `email_deliveries` row. Errors are logged, never returned —
 /// the audit log is best-effort.
+#[allow(clippy::too_many_arguments)]
 async fn insert_delivery(
     pool: &PgPool,
     kind: &str,

@@ -408,6 +408,7 @@ async fn reapply_one(
 /// has `requires_approval = TRUE` and the proposed status is a closing
 /// one, returns 202 Accepted with the new approval row's id (the rule
 /// row itself is NOT modified).
+#[allow(clippy::result_large_err)] // axum handler: Response is the error type
 pub async fn update_rule_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,

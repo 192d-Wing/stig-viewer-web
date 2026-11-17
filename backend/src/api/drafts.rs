@@ -100,12 +100,12 @@ pub async fn create_draft_handler(
     // Ensure drafts directory
     tokio::fs::create_dir_all(state.config.data_dir.join("drafts"))
         .await
-        .map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
 
     // Write empty rules JSON
     tokio::fs::write(&json_path, "[]")
         .await
-        .map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
 
     let draft = DraftRow {
         id: id.clone(),
@@ -144,7 +144,7 @@ pub async fn fork_from_stig_handler(
         .await
         .map_err(|_| err_404())?;
     let stig_value: serde_json::Value =
-        serde_json::from_str(&stig_json).map_err(|e| err_500(e))?;
+        serde_json::from_str(&stig_json).map_err(err_500)?;
 
     let draft_id = new_id();
     let json_path = state
@@ -156,14 +156,14 @@ pub async fn fork_from_stig_handler(
 
     tokio::fs::create_dir_all(state.config.data_dir.join("drafts"))
         .await
-        .map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
 
     // Copy rules to draft JSON
     let rules = stig_value.get("rules").cloned().unwrap_or(serde_json::json!([]));
     let rule_count = rules.as_array().map(|a| a.len()).unwrap_or(0) as i32;
     tokio::fs::write(&json_path, serde_json::to_string_pretty(&rules).unwrap_or_default())
         .await
-        .map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
 
     let title = stig_value.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let description = stig_value.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -289,7 +289,7 @@ pub async fn update_draft_handler(
             serde_json::to_string_pretty(rules).unwrap_or_default(),
         )
         .await
-        .map_err(|e| err_500(e))?;
+        .map_err(err_500)?;
     }
 
     update_draft_content(

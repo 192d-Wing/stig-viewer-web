@@ -103,7 +103,7 @@ fn clean_description(raw: &str) -> String {
 }
 
 /// Extract text content of the first child element with the given local name.
-fn child_text<'a>(parent_bytes: &'a [u8], tag: &str) -> Option<String> {
+fn child_text(parent_bytes: &[u8], tag: &str) -> Option<String> {
     // We use a simple substring search since quick-xml events are finer-grained;
     // this helper is used on already-extracted text buffers.
     let open = format!("<{tag}");

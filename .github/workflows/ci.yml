@@ -19,10 +19,33 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
+      - run: npm test
       - run: npm run build
 
+  backend:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable with clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
+
   e2e:
-    needs: lint-and-build
+    needs: [lint-and-build, backend]
     runs-on: ubuntu-latest
 
     env:

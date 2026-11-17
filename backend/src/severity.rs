@@ -28,9 +28,8 @@ pub fn severity_weight(sev: &str) -> i64 {
         10
     } else if s.contains("CAT II") && !s.contains("CAT III") {
         3
-    } else if s.contains("CAT III") {
-        1
     } else {
+        // CAT III and unknown severities both weigh 1.
         1
     }
 }

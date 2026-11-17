@@ -546,6 +546,7 @@ pub async fn run_asset_email_schedules(
 /// Same audit-row insert helper that `email.rs` uses; duplicated rather
 /// than re-exported to keep `email.rs` private to its module-level
 /// concerns (the fleet report).
+#[allow(clippy::too_many_arguments)]
 async fn insert_delivery(
     pool: &PgPool,
     kind: &str,
