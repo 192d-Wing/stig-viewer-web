@@ -1,5 +1,10 @@
 services:
   keycloak:
+    # Pinned to Keycloak 26.0.8 (multi-arch manifest-list digest, amd64 + arm64).
+    # Refresh: curl -sI -H "Accept: application/vnd.oci.image.index.v1+json" \
+    #   https://quay.io/v2/keycloak/keycloak/manifests/26.0 (docker-content-digest),
+    # confirm the patch version in the image label org.opencontainers.image.version,
+    # then update this comment and the digest. Dependabot also proposes bumps.
     image: quay.io/keycloak/keycloak:26.0@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
