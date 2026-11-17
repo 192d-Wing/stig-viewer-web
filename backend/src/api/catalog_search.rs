@@ -248,7 +248,7 @@ fn build_snippet(haystack: &str, q: &str) -> String {
     let h_lower = haystack.to_lowercase();
     let q_lower = q.to_lowercase();
     let Some(byte_idx) = h_lower.find(&q_lower) else {
-        return truncate_chars(haystack, MAX_SNIPPET_LEN);
+        return escape_truncated(haystack, MAX_SNIPPET_LEN);
     };
 
     // Find the matched substring in the original casing — same byte
@@ -259,7 +259,7 @@ fn build_snippet(haystack: &str, q: &str) -> String {
     let q_len = q_lower.len();
     let match_end = byte_idx + q_len;
     if !haystack.is_char_boundary(byte_idx) || !haystack.is_char_boundary(match_end) {
-        return truncate_chars(haystack, MAX_SNIPPET_LEN);
+        return escape_truncated(haystack, MAX_SNIPPET_LEN);
     }
     let matched_original = &haystack[byte_idx..match_end];
 
@@ -294,7 +294,7 @@ fn build_snippet(haystack: &str, q: &str) -> String {
         if bare.len() <= MAX_SNIPPET_LEN {
             return bare;
         }
-        return truncate_chars(haystack, MAX_SNIPPET_LEN);
+        return escape_truncated(haystack, MAX_SNIPPET_LEN);
     }
     snippet
 }
@@ -326,41 +326,45 @@ fn nearest_right_boundary(s: &str, mid: usize, chars: usize) -> usize {
     mid + taken_bytes
 }
 
-/// Truncate `s` to at most `max_bytes` while respecting char
-/// boundaries. Appends an ellipsis when truncation actually happens.
-fn truncate_chars(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    // Reserve a few bytes for the ellipsis.
-    let budget = max_bytes.saturating_sub(3);
-    let mut end = 0usize;
-    for (i, c) in s.char_indices() {
-        if i + c.len_utf8() > budget {
-            break;
+/// HTML-escape `s`, stopping before the escaped output would exceed
+/// `max_bytes` (an ellipsis is appended when truncated). Escaping happens
+/// per char, so an entity is never cut in half.
+fn escape_truncated(s: &str, max_bytes: usize) -> String {
+    let budget = max_bytes.saturating_sub('…'.len_utf8());
+    let mut out = String::with_capacity(s.len().min(max_bytes));
+    // Longest escaped prefix (in bytes) that still leaves room for the ellipsis.
+    let mut cut = 0usize;
+    for c in s.chars() {
+        push_escaped(&mut out, c);
+        if out.len() <= budget {
+            cut = out.len();
         }
-        end = i + c.len_utf8();
     }
-    let mut out = String::with_capacity(end + 3);
-    out.push_str(&s[..end]);
-    out.push('…');
+    if out.len() > max_bytes {
+        out.truncate(cut);
+        out.push('…');
+    }
     out
 }
 
-/// Escape the four HTML chars that could break the `<mark>` shell.
-/// We deliberately don't escape inside `<mark>` ourselves — we wrap a
-/// substring we know is safe (it came from the same `haystack` we just
-/// escaped). The wrapping `<mark>` tags are literal.
+fn push_escaped(out: &mut String, c: char) {
+    match c {
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '&' => out.push_str("&amp;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        _ => out.push(c),
+    }
+}
+
+/// Escape the five HTML-significant chars (`& < > " '`). Callers escape every
+/// text segment first and only then add the literal `<mark>`/`</mark>` tags
+/// around the escaped match, so text can never form a real tag.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
+        push_escaped(&mut out, c);
     }
     out
 }
@@ -368,6 +372,107 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remove the server's own mark tags, then assert no markup remains.
+    fn assert_only_mark_tags(out: &str) {
+        let rest = out.replace("<mark>", "").replace("</mark>", "");
+        assert!(!rest.contains('<') && !rest.contains('>'), "got: {out}");
+        assert!(!rest.contains('"'), "got: {out}");
+        assert!(!out.contains("<script"), "got: {out}");
+        // Every `&` must begin one of the complete entities we emit.
+        for (i, _) in out.match_indices('&') {
+            let t = &out[i..];
+            assert!(
+                ["&lt;", "&gt;", "&amp;", "&quot;", "&#39;"]
+                    .iter()
+                    .any(|e| t.starts_with(e)),
+                "partial entity in: {out}"
+            );
+        }
+    }
+
+    const HOSTILE: &[&str] = &[
+        "<script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>",
+        "dangling <",
+        "MARK_OPEN MARK_CLOSE \u{0}\u{1}",
+        "</mark><b>x",
+        "a & b \"q\" 'x'",
+    ];
+
+    #[test]
+    fn snippet_escapes_on_match_path() {
+        for h in HOSTILE {
+            let hay = format!("{h} needle {h}");
+            let out = build_snippet(&hay, "needle");
+            assert!(out.contains("<mark>needle</mark>"), "got: {out}");
+            assert_only_mark_tags(&out);
+            // Matching text that itself looks like markup.
+            let out = build_snippet(h, &h[..1.min(h.len())]);
+            assert_only_mark_tags(&out);
+        }
+    }
+
+    #[test]
+    fn snippet_escapes_on_fallback_paths() {
+        for h in HOSTILE {
+            // No match at all.
+            assert_only_mark_tags(&build_snippet(h, "zzz-no-match"));
+            // Oversized input forcing truncation.
+            let big = h.repeat(100);
+            let out = build_snippet(&big, "zzz-no-match");
+            assert!(out.len() <= MAX_SNIPPET_LEN, "len={}", out.len());
+            assert_only_mark_tags(&out);
+            let out = build_snippet(&big, &h[..1.min(h.len())]);
+            assert!(out.len() <= MAX_SNIPPET_LEN, "len={}", out.len());
+            assert_only_mark_tags(&out);
+        }
+        // Long matched text forces the "bare mark" / truncated fallbacks.
+        let long = "<".repeat(300);
+        let out = build_snippet(&long, &long);
+        assert!(out.len() <= MAX_SNIPPET_LEN);
+        assert_only_mark_tags(&out);
+    }
+
+    #[test]
+    fn snippet_non_char_boundary_fallback_is_escaped() {
+        let out = build_snippet("İé<script>alert(1)</script>", "é");
+        assert!(out.len() <= MAX_SNIPPET_LEN);
+        assert_only_mark_tags(&out);
+        assert!(out.contains("&lt;script&gt;"), "got: {out}");
+    }
+
+    #[test]
+    fn snippet_bare_mark_fallback_is_exact() {
+        let hay = format!("{}needle{}", "&".repeat(20), "&".repeat(20));
+        assert_eq!(build_snippet(&hay, "needle"), "<mark>needle</mark>");
+    }
+
+    #[test]
+    fn snippet_multibyte_inputs_stay_safe() {
+        let hay = "é<".repeat(100);
+        for q in ["zzz", "é", "<"] {
+            let out = build_snippet(&hay, q);
+            assert!(out.len() <= MAX_SNIPPET_LEN, "len={}", out.len());
+            assert_only_mark_tags(&out);
+        }
+        let kelvin = "\u{212A}<script>x</script>\u{212A}".repeat(20);
+        let out = build_snippet(&kelvin, "k");
+        assert!(out.len() <= MAX_SNIPPET_LEN, "len={}", out.len());
+        assert_only_mark_tags(&out);
+    }
+
+    #[test]
+    fn html_escape_covers_single_quote() {
+        assert_eq!(html_escape("'"), "&#39;");
+    }
+
+    #[test]
+    fn snippet_literal_mark_close_is_not_a_tag() {
+        let out = build_snippet("x </mark> y needle", "needle");
+        assert!(out.contains("&lt;/mark&gt;"), "got: {out}");
+        assert_eq!(out.matches("</mark>").count(), 1, "got: {out}");
+    }
 
     #[test]
     fn snippet_wraps_match_in_mark() {
