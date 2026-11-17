@@ -1,27 +1,48 @@
-//! Background prune of the `rule_audit` table.
+//! Background prune of the `rule_audit` and `audit_events` tables.
 //!
-//! `rule_audit` is append-only (one row per per-rule field change), so
-//! left unattended it grows unbounded. This module trims rows older
-//! than `retain_days` and, optionally, archives them as JSONL on disk
-//! before deletion. Mirrors the scheduler pattern used elsewhere
-//! (`sync`, dashboard snapshots, overdue digest) — a 4th `tokio::spawn`
-//! loop in `main.rs` drives it on a configurable interval.
+//! Both tables are append-only, so left unattended they grow unbounded. This
+//! module trims rows older than `retain_days` and, optionally, archives them
+//! on disk before deletion. Mirrors the scheduler pattern used elsewhere
+//! (`sync`, dashboard snapshots, overdue digest) — a `tokio::spawn` loop in
+//! `main.rs` drives it on a configurable interval.
 //!
-//! The archive layout is one file per UTC day of `occurred_at`, written
-//! in append mode at `${data_dir}/audit_archive/YYYY-MM-DD.jsonl`. This
-//! keeps individual files small enough to grep and lets ops compress /
-//! ship the directory wholesale without coordinating with the app.
+//! # Archive layout
+//!
+//! Each sweep writes immutable segments under `${data_dir}/audit_archive/`:
+//!
+//! - `rules-<UTC date>.<firstId>-<lastId>.jsonl` for `rule_audit`;
+//! - `events-<UTC date>.<firstId>-<lastId>.jsonl` for `audit_events`;
+//! - a sidecar `<segment>.manifest.json` per segment: an integrity envelope
+//!   (see [`crate::integrity`]) whose signed payload records the stream, file
+//!   name, row count, id range and the SHA-512 of the segment, plus the signer
+//!   list. With `SIGNING_KEY_HEX` unset the sidecar carries the digest only,
+//!   which detects corruption but not deliberate alteration.
+//!
+//! Segments are written to a temp file, fsynced and renamed; a failed write
+//! leaves no partial segment. Archiving is idempotent by row id: ids already
+//! present in that date's segments (or in a legacy file) are skipped, so a
+//! retry after a failed delete never duplicates a row.
+//!
+//! Files from earlier versions (`<date>.jsonl`, `events-<date>.jsonl`,
+//! append-mode) are legacy: they are never rewritten, never signed, and have
+//! no manifest. Their ids still count for idempotency.
+//!
+//! Ordering: rows are archived (fsynced) BEFORE the delete transaction runs,
+//! so a row is never deleted unarchived. If the archive write fails the sweep
+//! stops with an error and nothing is deleted; if the delete fails after a
+//! successful archive, the retry skips the already-archived ids.
 
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tokio::{
-    fs,
-    io::AsyncWriteExt,
-};
+
+use crate::api::signing::SigningState;
+use crate::integrity::{self, SignatureStatus, SignerId};
 
 /// One `rule_audit` row, shaped for JSONL archival. Matches the table
 /// columns 1:1 — we deliberately do not denormalize user/asset names
@@ -39,10 +60,233 @@ struct AuditRow {
     to_value: Option<String>,
 }
 
+// ── Archive segments ────────────────────────────────────────────────────────
+
+const STREAM_RULES: &str = "rules";
+const STREAM_EVENTS: &str = "events";
+
+/// One serialized row waiting to be archived.
+struct ArchiveLine {
+    id: i64,
+    occurred_at: DateTime<Utc>,
+    line: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Digest {
+    algorithm: String,
+    value: String,
+}
+
+/// Signed payload of a segment sidecar. Field order is the serialized order.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentManifest {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u32,
+    stream: String,
+    file: String,
+    rows: u64,
+    first_id: i64,
+    last_id: i64,
+    digest: Digest,
+    signers: Vec<SignerId>,
+}
+
+fn segment_prefix(stream: &str, date: &str) -> String {
+    format!("{stream}-{date}.")
+}
+
+/// Legacy append-mode file name for a stream and date.
+fn legacy_name(stream: &str, date: &str) -> String {
+    if stream == STREAM_RULES {
+        format!("{date}.jsonl")
+    } else {
+        format!("{stream}-{date}.jsonl")
+    }
+}
+
+fn ids_in(bytes: &[u8], strict: bool) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        match serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("id").and_then(serde_json::Value::as_i64))
+        {
+            Some(id) => ids.push(id),
+            None if strict => anyhow::bail!("archive segment has a line without an id"),
+            None => {} // legacy files may end in a torn line
+        }
+    }
+    Ok(ids)
+}
+
+/// Ids already archived for `stream` on `date`: every immutable segment, plus
+/// the legacy append-mode file.
+fn archived_ids(dir: &Path, stream: &str, date: &str) -> Result<HashSet<i64>> {
+    let mut seen = HashSet::new();
+    let prefix = segment_prefix(stream, date);
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_segment = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+            .and_then(|r| r.split_once('-'))
+            .is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            });
+        if is_segment {
+            let bytes = std::fs::read(entry.path()).with_context(|| format!("read {name}"))?;
+            seen.extend(ids_in(&bytes, true).with_context(|| name.clone())?);
+        }
+    }
+    if let Ok(bytes) = std::fs::read(dir.join(legacy_name(stream, date))) {
+        seen.extend(ids_in(&bytes, false)?);
+    }
+    Ok(seen)
+}
+
+/// Temp file, fsync, rename, fsync the directory.
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("write {name}"))?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+fn write_segment(
+    dir: &Path,
+    stream: &str,
+    date: &str,
+    group: &[&ArchiveLine],
+    key: Option<&SigningState>,
+) -> Result<()> {
+    let (Some(first), Some(last)) = (group.first(), group.last()) else {
+        return Ok(());
+    };
+    let mut body = Vec::new();
+    for l in group {
+        body.extend_from_slice(l.line.as_bytes());
+        body.push(b'\n');
+    }
+    let name = format!("{stream}-{date}.{}-{}.jsonl", first.id, last.id);
+    write_atomic(dir, &name, &body)?;
+    let manifest = SegmentManifest {
+        kind: integrity::ARCHIVE_TYPE.into(),
+        version: 1,
+        stream: stream.into(),
+        file: name.clone(),
+        rows: group.len() as u64,
+        first_id: first.id,
+        last_id: last.id,
+        digest: Digest { algorithm: "sha-512".into(), value: integrity::sha512_hex(&body) },
+        signers: integrity::signers_for(key),
+    };
+    let payload = serde_json::to_vec(&manifest)?;
+    let copy = serde_json::to_value(&manifest)?;
+    let envelope = integrity::seal(
+        integrity::ARCHIVE_DOMAIN,
+        integrity::ARCHIVE_TYPE,
+        &payload,
+        key,
+        Some(copy),
+    );
+    write_atomic(
+        dir,
+        &format!("{name}.manifest.json"),
+        &serde_json::to_vec_pretty(&envelope)?,
+    )
+}
+
+fn archive_blocking(
+    data_dir: &Path,
+    stream: &str,
+    rows: Vec<ArchiveLine>,
+    key: Option<&SigningState>,
+) -> Result<()> {
+    let dir = data_dir.join("audit_archive");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create archive dir {}", dir.display()))?;
+    // Group by UTC date; `occurred_at` can be out of order versus id.
+    let mut by_date: BTreeMap<String, Vec<&ArchiveLine>> = BTreeMap::new();
+    for row in &rows {
+        by_date.entry(row.occurred_at.format("%Y-%m-%d").to_string()).or_default().push(row);
+    }
+    for (date, mut group) in by_date {
+        let mut seen = archived_ids(&dir, stream, &date)?;
+        group.retain(|l| seen.insert(l.id));
+        group.sort_by_key(|l| l.id);
+        write_segment(&dir, stream, &date, &group, key)?;
+    }
+    Ok(())
+}
+
+async fn archive_rows(
+    data_dir: &Path,
+    stream: &'static str,
+    rows: Vec<ArchiveLine>,
+    key: Option<&SigningState>,
+) -> Result<()> {
+    let data_dir = data_dir.to_path_buf();
+    let key = key.cloned();
+    tokio::task::spawn_blocking(move || archive_blocking(&data_dir, stream, rows, key.as_ref()))
+        .await
+        .context("archive task")?
+}
+
+/// Verify one archive segment against its sidecar: the envelope (signature,
+/// when present), then the file name, row count, id range and SHA-512.
+/// Legacy files have no sidecar and cannot be verified.
+#[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
+pub fn verify_segment(
+    dir: &Path,
+    segment: &str,
+    key: Option<&SigningState>,
+) -> Result<SignatureStatus> {
+    let body = std::fs::read(dir.join(segment))?;
+    let sidecar = std::fs::read(dir.join(format!("{segment}.manifest.json")))?;
+    let v = integrity::verify_envelope(
+        integrity::ARCHIVE_DOMAIN,
+        integrity::ARCHIVE_TYPE,
+        &sidecar,
+        None,
+        key,
+    )?;
+    let m: SegmentManifest = serde_json::from_slice(&v.payload)?;
+    anyhow::ensure!(m.file == segment, "manifest is for another file");
+    anyhow::ensure!(m.digest.algorithm == "sha-512", "unsupported digest algorithm");
+    anyhow::ensure!(m.digest.value == integrity::sha512_hex(&body), "segment digest mismatch");
+    let ids = ids_in(&body, true)?;
+    anyhow::ensure!(ids.len() as u64 == m.rows, "row count mismatch");
+    anyhow::ensure!(
+        ids.iter().min() == Some(&m.first_id) && ids.iter().max() == Some(&m.last_id),
+        "id range mismatch"
+    );
+    Ok(v.status)
+}
+
+// ── rule_audit ──────────────────────────────────────────────────────────────
+
 /// Prune `rule_audit` rows older than `retain_days`. When `archive` is
-/// true, each pruned row is appended as a JSON line to a per-UTC-day
-/// file under `${data_dir}/audit_archive/`. Returns the number of rows
-/// deleted from the database.
+/// true, each pruned row is first written to an immutable, manifest-backed
+/// segment (see the module docs). Returns the number of rows deleted.
 ///
 /// The fetch + delete pair is not strictly transactional — between
 /// SELECT and DELETE a concurrent writer could insert a new row that
@@ -55,6 +299,7 @@ pub async fn run_prune(
     data_dir: &Path,
     retain_days: i64,
     archive: bool,
+    signing: Option<&SigningState>,
 ) -> Result<usize> {
     // Build the cutoff in Rust rather than embedding `retain_days` in
     // SQL — Postgres rejects negative INTERVAL composed via string
@@ -76,10 +321,21 @@ pub async fn run_prune(
         return Ok(0);
     }
 
+    // Archive first: an error here returns before any delete is attempted.
     if archive {
-        write_archive(data_dir, &rows)
+        let lines = rows
+            .iter()
+            .map(|r| {
+                Ok(ArchiveLine {
+                    id: r.id,
+                    occurred_at: r.occurred_at,
+                    line: serde_json::to_string(r).context("serialize audit row")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        archive_rows(data_dir, STREAM_RULES, lines, signing)
             .await
-            .context("write audit archive jsonl")?;
+            .context("write audit archive segment")?;
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
@@ -123,14 +379,15 @@ const EVENT_PRUNE_BATCH: i64 = 5_000;
 /// delete), but in bounded batches: any user with write access can create
 /// rows, so a sweep must not load them all at once. Each batch is archived
 /// before it is deleted. Archived to
-/// `${data_dir}/audit_archive/events-YYYY-MM-DD.jsonl`.
+/// `${data_dir}/audit_archive/events-<date>.<firstId>-<lastId>.jsonl`.
 pub async fn run_prune_events(
     pool: &PgPool,
     data_dir: &Path,
     retain_days: i64,
     archive: bool,
+    signing: Option<&SigningState>,
 ) -> Result<usize> {
-    run_prune_events_batched(pool, data_dir, retain_days, archive, EVENT_PRUNE_BATCH).await
+    run_prune_events_batched(pool, data_dir, retain_days, archive, EVENT_PRUNE_BATCH, signing).await
 }
 
 async fn run_prune_events_batched(
@@ -139,6 +396,7 @@ async fn run_prune_events_batched(
     retain_days: i64,
     archive: bool,
     batch: i64,
+    signing: Option<&SigningState>,
 ) -> Result<usize> {
     let mut total = 0usize;
     loop {
@@ -165,9 +423,10 @@ async fn run_prune_events_batched(
         }
 
         if archive {
-            write_event_archive(data_dir, &rows)
+            let lines = rows.iter().map(event_line).collect::<Result<Vec<_>>>()?;
+            archive_rows(data_dir, STREAM_EVENTS, lines, signing)
                 .await
-                .context("write audit events archive jsonl")?;
+                .context("write audit events archive segment")?;
         }
 
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
@@ -195,9 +454,10 @@ pub async fn run_scheduled(
     data_dir: &Path,
     retain_days: i64,
     archive: bool,
+    signing: Option<&SigningState>,
 ) -> Result<String> {
-    let rules = run_prune(pool, data_dir, retain_days, archive).await;
-    let events = run_prune_events(pool, data_dir, retain_days, archive).await;
+    let rules = run_prune(pool, data_dir, retain_days, archive, signing).await;
+    let events = run_prune_events(pool, data_dir, retain_days, archive, signing).await;
     match (rules, events) {
         (Ok(n), Ok(e)) => Ok(format!(
             "pruned {n} rows and {e} events (retain_days={retain_days}, archive={archive})"
@@ -212,101 +472,33 @@ pub async fn run_scheduled(
     }
 }
 
-async fn write_event_archive(data_dir: &Path, rows: &[EventRow]) -> Result<()> {
-    let dir = data_dir.join("audit_archive");
-    fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("create archive dir {}", dir.display()))?;
-
-    use std::collections::BTreeMap;
-    let mut by_date: BTreeMap<String, Vec<&EventRow>> = BTreeMap::new();
-    for row in rows {
-        by_date
-            .entry(row.occurred_at.format("%Y-%m-%d").to_string())
-            .or_default()
-            .push(row);
-    }
-
-    for (date, group) in by_date {
-        let path = dir.join(format!("events-{date}.jsonl"));
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("open archive file {}", path.display()))?;
-        for row in group {
-            let detail: serde_json::Value =
-                serde_json::from_str(&row.detail).unwrap_or(serde_json::Value::Null);
-            let line = serde_json::to_string(&serde_json::json!({
-                "id": row.id,
-                "occurred_at": row.occurred_at,
-                "user_id": row.user_id,
-                "action": row.action,
-                "outcome": row.outcome,
-                "asset_id": row.asset_id,
-                "checklist_id": row.checklist_id,
-                "stig_id": row.stig_id,
-                "source_ip": row.source_ip,
-                "request_id": row.request_id,
-                "user_role": row.user_role,
-                "repeat_count": row.repeat_count,
-                "last_occurred_at": row.last_occurred_at,
-                "detail": detail,
-            }))
-            .context("serialize audit event")?;
-            file.write_all(line.as_bytes()).await?;
-            file.write_all(b"\n").await?;
-        }
-        file.flush().await?;
-    }
-
-    Ok(())
-}
-
-/// Append each row to `${data_dir}/audit_archive/<UTC-date>.jsonl`.
-/// One file is opened per distinct date to keep handle count bounded
-/// even on a big sweep. Files are opened with create+append so reruns
-/// (or concurrent prunes for distinct date sets) append cleanly.
-async fn write_archive(data_dir: &Path, rows: &[AuditRow]) -> Result<()> {
-    let dir = data_dir.join("audit_archive");
-    fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("create archive dir {}", dir.display()))?;
-
-    // Group by UTC date so we open each file at most once per sweep.
-    // Rows are already ordered by id ASC, but `occurred_at` can be
-    // out-of-order vs id (backdate test endpoints, clock skew), so
-    // we group explicitly rather than rely on input ordering.
-    use std::collections::BTreeMap;
-    let mut by_date: BTreeMap<String, Vec<&AuditRow>> = BTreeMap::new();
-    for row in rows {
-        let date = row.occurred_at.format("%Y-%m-%d").to_string();
-        by_date.entry(date).or_default().push(row);
-    }
-
-    for (date, group) in by_date {
-        let path = dir.join(format!("{date}.jsonl"));
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("open archive file {}", path.display()))?;
-        for row in group {
-            let line = serde_json::to_string(row).context("serialize audit row")?;
-            file.write_all(line.as_bytes()).await?;
-            file.write_all(b"\n").await?;
-        }
-        file.flush().await?;
-    }
-
-    Ok(())
+fn event_line(row: &EventRow) -> Result<ArchiveLine> {
+    let detail: serde_json::Value =
+        serde_json::from_str(&row.detail).unwrap_or(serde_json::Value::Null);
+    let line = serde_json::to_string(&serde_json::json!({
+        "id": row.id,
+        "occurred_at": row.occurred_at,
+        "user_id": row.user_id,
+        "action": row.action,
+        "outcome": row.outcome,
+        "asset_id": row.asset_id,
+        "checklist_id": row.checklist_id,
+        "stig_id": row.stig_id,
+        "source_ip": row.source_ip,
+        "request_id": row.request_id,
+        "user_role": row.user_role,
+        "repeat_count": row.repeat_count,
+        "last_occurred_at": row.last_occurred_at,
+        "detail": detail,
+    }))
+    .context("serialize audit event")?;
+    Ok(ArchiveLine { id: row.id, occurred_at: row.occurred_at, line })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrity::test_key;
     use crate::test_fixtures::seed_user;
 
     #[sqlx::test]
@@ -324,7 +516,7 @@ mod tests {
             .unwrap();
         }
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        assert_eq!(run_prune(&pool, &dir, 5, true).await.unwrap(), 1);
+        assert_eq!(run_prune(&pool, &dir, 5, true, None).await.unwrap(), 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit").fetch_all(&pool).await.unwrap();
         assert_eq!(left, ["new"]);
         assert!(dir.join("audit_archive").exists());
@@ -346,7 +538,7 @@ mod tests {
             .unwrap();
         }
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let n = run_prune_events(&pool, &dir, 5, true).await.unwrap();
+        let n = run_prune_events(&pool, &dir, 5, true, None).await.unwrap();
         assert_eq!(n, 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT detail->>'reason' FROM audit_events")
             .fetch_all(&pool)
@@ -355,7 +547,10 @@ mod tests {
         assert_eq!(left, ["fresh"]);
         let mut archived = String::new();
         for entry in std::fs::read_dir(dir.join("audit_archive")).unwrap() {
-            archived.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "jsonl") {
+                archived.push_str(&std::fs::read_to_string(path).unwrap());
+            }
         }
         let line: serde_json::Value = serde_json::from_str(archived.trim()).unwrap();
         assert_eq!(line["repeat_count"], 4);
@@ -379,7 +574,7 @@ mod tests {
             .unwrap();
         }
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let n = run_prune_events(&pool, &dir, 365, true).await.unwrap();
+        let n = run_prune_events(&pool, &dir, 365, true, None).await.unwrap();
         assert_eq!(n, 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT outcome FROM audit_events")
             .fetch_all(&pool)
@@ -390,14 +585,16 @@ mod tests {
         for entry in std::fs::read_dir(dir.join("audit_archive")).unwrap() {
             let entry = entry.unwrap();
             assert!(entry.file_name().to_string_lossy().starts_with("events-"));
-            archived.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+            if entry.path().extension().is_some_and(|e| e == "jsonl") {
+                archived.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+            }
         }
         let line: serde_json::Value = serde_json::from_str(archived.trim()).unwrap();
         assert_eq!(line["outcome"], "ok");
         assert_eq!(line["detail"]["k"], 1);
         // Without the archive switch nothing is written.
         let dir2 = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        assert_eq!(run_prune_events(&pool, &dir2, 5, false).await.unwrap(), 1);
+        assert_eq!(run_prune_events(&pool, &dir2, 5, false, None).await.unwrap(), 1);
         assert!(!dir2.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -422,13 +619,13 @@ mod tests {
         }
         seed_expired_event(&pool, 1).await;
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let n = run_prune_events_batched(&pool, &dir, 365, true, 2).await.unwrap();
+        let n = run_prune_events_batched(&pool, &dir, 365, true, 2, None).await.unwrap();
         assert_eq!(n, 5);
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!(left, 1);
         let mut lines = 0;
-        for entry in std::fs::read_dir(dir.join("audit_archive")).unwrap() {
-            lines += std::fs::read_to_string(entry.unwrap().path()).unwrap().lines().count();
+        for seg in segments(&dir) {
+            lines += std::fs::read_to_string(dir.join("audit_archive").join(seg)).unwrap().lines().count();
         }
         assert_eq!(lines, 5);
         let _ = std::fs::remove_dir_all(&dir);
@@ -440,7 +637,7 @@ mod tests {
         seed_user(&pool, "u1").await;
         seed_expired_event(&pool, 400).await;
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let msg = run_scheduled(&pool, &dir, 365, false).await.unwrap();
+        let msg = run_scheduled(&pool, &dir, 365, false, None).await.unwrap();
         assert!(msg.contains("1 events"), "{msg}");
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!(left, 0);
@@ -453,10 +650,180 @@ mod tests {
         seed_expired_event(&pool, 400).await;
         sqlx::query("DROP TABLE rule_audit").execute(&pool).await.unwrap();
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let err = run_scheduled(&pool, &dir, 365, false).await.unwrap_err();
+        let err = run_scheduled(&pool, &dir, 365, false, None).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("rule_audit failed") && msg.contains("audit_events pruned 1"), "{msg}");
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!(left, 0);
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+    }
+
+    fn line(id: i64, date: &str) -> ArchiveLine {
+        ArchiveLine {
+            id,
+            occurred_at: format!("{date}T12:00:00Z").parse().unwrap(),
+            line: format!("{{\"id\":{id},\"v\":\"x\"}}"),
+        }
+    }
+
+    fn segments(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir.join("audit_archive"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn segment_manifest_verifies_and_any_flipped_byte_fails() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        archive_blocking(&dir, STREAM_RULES, vec![line(3, "2024-01-01"), line(1, "2024-01-01")], Some(&k)).unwrap();
+        let ad = dir.join("audit_archive");
+        assert_eq!(segments(&dir), ["rules-2024-01-01.1-3.jsonl"]);
+        let seg = "rules-2024-01-01.1-3.jsonl";
+        assert_eq!(verify_segment(&ad, seg, Some(&k)).unwrap(), SignatureStatus::Verified);
+        // Flip a byte in the segment.
+        let orig = std::fs::read(ad.join(seg)).unwrap();
+        let mut bad = orig.clone();
+        bad[2] ^= 1;
+        std::fs::write(ad.join(seg), &bad).unwrap();
+        assert!(verify_segment(&ad, seg, Some(&k)).is_err());
+        std::fs::write(ad.join(seg), &orig).unwrap();
+        // Rewrite the manifest's digest: the signature no longer covers it.
+        let mp = ad.join(format!("{seg}.manifest.json"));
+        let mut env: integrity::Envelope = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        let mut payload = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &env.payload).unwrap();
+        let i = payload.iter().position(|&b| b == b'3').unwrap();
+        payload[i] = b'4';
+        env.payload = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &payload);
+        std::fs::write(&mp, serde_json::to_vec(&env).unwrap()).unwrap();
+        assert!(verify_segment(&ad, seg, Some(&k)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_key_the_manifest_carries_a_digest_only() {
+        let dir = temp_dir();
+        archive_blocking(&dir, STREAM_EVENTS, vec![line(5, "2024-02-02")], None).unwrap();
+        let ad = dir.join("audit_archive");
+        let seg = "events-2024-02-02.5-5.jsonl";
+        assert_eq!(verify_segment(&ad, seg, None).unwrap(), SignatureStatus::Unsigned);
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ad.join(format!("{seg}.manifest.json"))).unwrap()).unwrap();
+        assert_eq!(sidecar["signatures"], serde_json::json!([]));
+        assert_eq!(sidecar["manifest"]["digest"]["algorithm"], "sha-512");
+        let mut bad = std::fs::read(ad.join(seg)).unwrap();
+        bad[2] ^= 1;
+        std::fs::write(ad.join(seg), bad).unwrap();
+        assert!(verify_segment(&ad, seg, None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_run_over_the_same_rows_writes_nothing() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let rows = || vec![line(1, "2024-01-01"), line(2, "2024-01-01"), line(9, "2024-01-02")];
+        archive_blocking(&dir, STREAM_RULES, rows(), Some(&k)).unwrap();
+        let before = std::fs::read_dir(dir.join("audit_archive")).unwrap().count();
+        archive_blocking(&dir, STREAM_RULES, rows(), Some(&k)).unwrap();
+        assert_eq!(std::fs::read_dir(dir.join("audit_archive")).unwrap().count(), before);
+        // A partial overlap writes only the new id, as its own segment.
+        archive_blocking(&dir, STREAM_RULES, vec![line(2, "2024-01-01"), line(7, "2024-01-01")], Some(&k)).unwrap();
+        assert_eq!(
+            segments(&dir),
+            ["rules-2024-01-01.1-2.jsonl", "rules-2024-01-01.7-7.jsonl", "rules-2024-01-02.9-9.jsonl"]
+        );
+        // No temp files linger.
+        assert!(std::fs::read_dir(dir.join("audit_archive")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_append_files_are_left_alone_and_their_ids_are_skipped() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let legacy = "{\"id\":1,\"v\":\"old\"}\n{\"id\":2,\"v\":\"old\"}\n";
+        std::fs::write(ad.join("2024-01-01.jsonl"), legacy).unwrap();
+        std::fs::write(ad.join("events-2024-01-01.jsonl"), legacy).unwrap();
+        archive_blocking(&dir, STREAM_RULES, vec![line(2, "2024-01-01"), line(3, "2024-01-01")], None).unwrap();
+        archive_blocking(&dir, STREAM_EVENTS, vec![line(1, "2024-01-01")], None).unwrap();
+        assert_eq!(std::fs::read_to_string(ad.join("2024-01-01.jsonl")).unwrap(), legacy);
+        assert_eq!(std::fs::read_to_string(ad.join("events-2024-01-01.jsonl")).unwrap(), legacy);
+        assert!(ad.join("rules-2024-01-01.3-3.jsonl").exists());
+        assert!(!ad.join("events-2024-01-01.1-1.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_delete_followed_by_a_retry_archives_each_id_once(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let k = test_key(1);
+        for rule in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+                 VALUES ('u1', 'c', $1, 'status', NOW() - INTERVAL '10 days')",
+            )
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM rule_audit ORDER BY id").fetch_all(&pool).await.unwrap();
+        let dir = temp_dir();
+        assert_eq!(run_prune(&pool, &dir, 5, true, Some(&k)).await.unwrap(), 2);
+        // Put the rows back under their ids: as if the delete had failed after the archive was written.
+        for (id, rule) in ids.iter().zip(["a", "b"]) {
+            sqlx::query(
+                "INSERT INTO rule_audit (id, user_id, checklist_id, rule_id, field, occurred_at) \
+                 VALUES ($1, 'u1', 'c', $2, 'status', NOW() - INTERVAL '10 days')",
+            )
+            .bind(id)
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(run_prune(&pool, &dir, 5, true, Some(&k)).await.unwrap(), 2);
+        let mut seen = Vec::new();
+        for seg in segments(&dir) {
+            assert_eq!(
+                verify_segment(&dir.join("audit_archive"), &seg, Some(&k)).unwrap(),
+                SignatureStatus::Verified
+            );
+            seen.extend(ids_in(&std::fs::read(dir.join("audit_archive").join(&seg)).unwrap(), true).unwrap());
+        }
+        seen.sort();
+        assert_eq!(seen, ids);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_archive_write_deletes_nothing(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'a', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // `audit_archive` is a file, so no segment can be written.
+        std::fs::write(dir.join("audit_archive"), b"not a directory").unwrap();
+        assert!(run_prune(&pool, &dir, 5, true, None).await.is_err());
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        assert_eq!(left, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

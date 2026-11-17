@@ -1,5 +1,6 @@
 mod api;
 mod audit_retention;
+mod integrity;
 mod config;
 mod db;
 mod db_audit;
@@ -296,7 +297,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool: pool.clone(),
         config: config.clone(),
-        signing,
+        signing: signing.clone(),
     };
 
     // Auth flow routes — public, do not require an existing session.
@@ -759,13 +760,14 @@ async fn main() -> Result<()> {
             .unwrap_or(true);
         let db = pool.clone();
         let cfg = config.clone();
+        let retention_signing = signing.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(retention_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "audit_retention", || async {
-                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled).await
+                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled, retention_signing.as_ref()).await
                 })
                 .await;
                 match result {
