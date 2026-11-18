@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { inflateRawSync } from "node:zlib";
-import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
+import { loginAs, resetDb, setUserRole, buildZip, breakCentralName, BACKEND } from "./helpers.js";
 
 // ── ZIP helpers (same shape as e2e/40-xccdf-export.spec.js) ─────────────────
 
@@ -438,6 +438,50 @@ test.describe("Backup + restore — API", () => {
     expect(withoutLastLogin(await stillThere.json())).toEqual(
       withoutLastLogin(usersBefore),
     );
+  });
+
+  test("restore refuses a backup whose headers disagree (400) and an oversized manifest (413)", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const original = await (
+      await request.get(`${BACKEND}/api/admin/backup`, { headers: { "X-User-Id": "alice" } })
+    ).body();
+    const usersBefore = await (
+      await request.get(`${BACKEND}/api/admin/users`, { headers: { "X-User-Id": "alice" } })
+    ).json();
+    const post = (name, buffer) =>
+      request.post(`${BACKEND}/api/admin/restore?force=true`, {
+        headers: { "X-User-Id": "alice" },
+        multipart: { file: { name, mimeType: "application/zip", buffer } },
+      });
+
+    const mismatched = await post("mismatch.zip", breakCentralName(original));
+    expect(mismatched.status()).toBe(400);
+    expect((await mismatched.json()).error).toMatch(/inconsistent ZIP headers/);
+
+    // manifest.json padded with 17 MiB of whitespace (deflates to ~17 KiB).
+    const padded = buildZip([
+      { name: "manifest.json", data: Buffer.concat([Buffer.from("{}"), Buffer.alloc(17 * 1024 * 1024, 0x20)]) },
+    ]);
+    const tooBig = await post("padded.zip", padded);
+    expect(tooBig.status()).toBe(413);
+
+    const events = await (
+      await request.get(`${BACKEND}/api/audit/events?action=backup.restore&outcome=failure`, {
+        headers: { "X-User-Id": "alice" },
+      })
+    ).json();
+    const codes = JSON.stringify(events);
+    expect(codes).toContain("header_inconsistency");
+    expect(codes).toContain("entry_too_large");
+
+    const after = await (
+      await request.get(`${BACKEND}/api/admin/users`, { headers: { "X-User-Id": "alice" } })
+    ).json();
+    const noLogin = (us) => us.map(({ lastLogin, ...rest }) => rest);
+    expect(noLogin(after)).toEqual(noLogin(usersBefore));
   });
 
   test("restore with mismatched schemaMigration returns 400", async ({

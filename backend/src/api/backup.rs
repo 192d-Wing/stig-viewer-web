@@ -36,8 +36,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
+
+use crate::zip_safe::{read_entry, ReadBudget, ZipReadError};
 
 use crate::api::auth::AuthUser;
 use crate::api::signing::SigningState;
@@ -395,7 +397,7 @@ pub async fn restore_handler(
     let (manifest, tables, attachments, signature_status) = match verified {
         Ok(v) => v,
         Err(f) => {
-            tracing::warn!(target: "audit", actor = %user.id, signature_status = f.status, "restore rejected: {}", f.message);
+            tracing::warn!(target: "audit", actor = %user.id, signature_status = f.status, reason_code = f.code, "restore rejected: {}", f.message);
             // Recorded outside any transaction: nothing was changed.
             let reason: String = f.message.chars().take(300).collect();
             crate::db_audit::record_or_log(
@@ -410,13 +412,15 @@ pub async fn restore_handler(
                     stig_id: None,
                     detail: json!({
                         "reason": reason,
+                        "reasonCode": f.code,
                         "signatureStatus": f.status,
                         "requireSignature": require_signature,
                     }),
                 },
             )
             .await;
-            return Err(err_response(StatusCode::BAD_REQUEST, format!("invalid backup: {}", f.message)));
+            let status = if f.too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::BAD_REQUEST };
+            return Err(err_response(status, format!("invalid backup: {}", f.message)));
         }
     };
 
@@ -696,17 +700,31 @@ struct VerifyFailure {
     /// signature; `not_evaluated` when the backup was refused before its
     /// signature was evaluated.
     status: &'static str,
+    /// Machine-readable reason, recorded in the audit event.
+    code: &'static str,
+    /// The archive exceeded a size cap (HTTP 413 rather than 400).
+    too_large: bool,
 }
 
 impl VerifyFailure {
     fn new(status: &'static str, message: impl Into<String>) -> Self {
-        Self { message: message.into(), status }
+        Self { message: message.into(), status, code: "invalid_backup", too_large: false }
     }
 }
 
 impl From<anyhow::Error> for VerifyFailure {
     fn from(e: anyhow::Error) -> Self {
-        Self::new("not_evaluated", format!("{e:#}"))
+        Self { code: "malformed", ..Self::new("not_evaluated", format!("{e:#}")) }
+    }
+}
+
+impl From<ZipReadError> for VerifyFailure {
+    fn from(e: ZipReadError) -> Self {
+        Self {
+            code: e.code(),
+            too_large: e.is_limit(),
+            ..Self::new("not_evaluated", e.to_string())
+        }
     }
 }
 
@@ -716,25 +734,6 @@ const MAX_ENTRY_BYTES: u64 = 1 << 30;
 const MAX_TOTAL_BYTES: u64 = 4 << 30;
 /// `manifest.json` and `manifest.sig.json` are small; read them under a tight cap.
 const MAX_MANIFEST_BYTES: u64 = 16 << 20;
-
-fn read_capped(
-    entry: &mut impl Read,
-    name: &str,
-    total: &mut u64,
-    entry_limit: u64,
-    total_limit: u64,
-) -> anyhow::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    entry.take(entry_limit + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > entry_limit {
-        anyhow::bail!("entry {name:?} is larger than {entry_limit} bytes");
-    }
-    *total += buf.len() as u64;
-    if *total > total_limit {
-        anyhow::bail!("backup is larger than {total_limit} bytes uncompressed");
-    }
-    Ok(buf)
-}
 
 type ParsedTables = HashMap<String, Vec<Value>>;
 type ParsedAttachments = Vec<(String, Vec<u8>)>;
@@ -749,8 +748,8 @@ fn parse_and_verify_backup(
     signing: Option<&SigningState>,
     require: bool,
 ) -> Result<(Manifest, ParsedTables, ParsedAttachments, SignatureStatus), VerifyFailure> {
-    let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(anyhow::Error::from)?;
-    let mut total = 0u64;
+    let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(ZipReadError::from)?;
+    let mut budget = ReadBudget::new(MAX_TOTAL_BYTES);
 
     // Duplicate names are refused outright: which copy a reader sees must not
     // be a matter of choice.
@@ -761,12 +760,16 @@ fn parse_and_verify_backup(
             return Err(VerifyFailure::new("not_evaluated", format!("duplicate entry {name:?}")));
         }
     }
+    // Local headers must agree with the central directory, before any entry
+    // (including the manifest) is read.
+    zip.validate_header_consistency()
+        .map_err(|e| ZipReadError::Inconsistent(e.to_string()))?;
 
     let (manifest, manifest_bytes) = {
         let mut e = zip
             .by_name(MANIFEST_NAME)
             .map_err(|_| anyhow::anyhow!("{MANIFEST_NAME} missing from backup"))?;
-        let buf = read_capped(&mut e, MANIFEST_NAME, &mut total, MAX_MANIFEST_BYTES, MAX_TOTAL_BYTES)?;
+        let buf = read_entry(&mut e, MAX_MANIFEST_BYTES, &mut budget)?;
         let m: Manifest = serde_json::from_slice(&buf).map_err(anyhow::Error::from)?;
         (m, buf)
     };
@@ -777,7 +780,7 @@ fn parse_and_verify_backup(
         ));
     }
     let sig_bytes = match zip.by_name(MANIFEST_SIG_NAME) {
-        Ok(mut e) => Some(read_capped(&mut e, MANIFEST_SIG_NAME, &mut total, MAX_MANIFEST_BYTES, MAX_TOTAL_BYTES)?),
+        Ok(mut e) => Some(read_entry(&mut e, MAX_MANIFEST_BYTES, &mut budget)?),
         Err(_) => None,
     };
     let status = verify_signature(&manifest, &manifest_bytes, sig_bytes.as_deref(), signing, require)?;
@@ -792,7 +795,7 @@ fn parse_and_verify_backup(
         if name.ends_with('/') || name == MANIFEST_NAME || name == MANIFEST_SIG_NAME {
             continue;
         }
-        let buf = read_capped(&mut entry, &name, &mut total, MAX_ENTRY_BYTES, MAX_TOTAL_BYTES)?;
+        let buf = read_entry(&mut entry, MAX_ENTRY_BYTES, &mut budget)?;
         digests.insert(name.clone(), integrity::sha512_hex(&buf));
         if let Some(rest) = name.strip_prefix("tables/") {
             if let Some(tname) = rest.strip_suffix(".jsonl") {
@@ -1002,6 +1005,7 @@ mod restore_record_tests {
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
+    use std::io::Read;
     use crate::integrity::test_key;
 
     fn manifest() -> Manifest {
@@ -1249,15 +1253,6 @@ mod integrity_tests {
     }
 
     #[test]
-    fn read_capped_rejects_an_over_cap_entry_and_an_over_cap_total() {
-        let mut total = 0;
-        assert!(read_capped(&mut &b"abcd"[..], "e", &mut total, 3, 100).is_err());
-        let mut total = 0;
-        assert!(read_capped(&mut &b"abc"[..], "e", &mut total, 3, 5).is_ok());
-        assert!(read_capped(&mut &b"abc"[..], "e", &mut total, 3, 5).is_err());
-    }
-
-    #[test]
     fn refused_before_evaluation_is_not_confused_with_unknown_key() {
         let f = parse_and_verify_backup(b"not a zip", None, false).unwrap_err();
         assert_eq!(f.status, "not_evaluated");
@@ -1279,6 +1274,7 @@ mod integrity_tests {
 #[cfg(test)]
 mod restore_integrity_db_tests {
     use super::*;
+    use std::io::Read;
     use crate::integrity::test_key;
     use crate::test_fixtures::{app_state, auth, ctx, seed_asset, seed_user};
     use axum::{extract::Request, middleware::{self, Next}, routing::post, Router};
@@ -1377,6 +1373,61 @@ mod restore_integrity_db_tests {
             .unwrap();
         assert_eq!(detail["signatureStatus"], "verified");
         assert_eq!(detail["requireSignature"], true);
+    }
+
+    async fn failure_rows(pool: &PgPool) -> Vec<Value> {
+        sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore' AND outcome = 'failure'")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_oversized_manifest_is_413_and_recorded_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        seed_asset(&pool, "a1", "admin1", false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let base = serve(state).await;
+
+        let mut w = ZipWriter::new(Cursor::new(Vec::new()));
+        w.start_file(MANIFEST_NAME, SimpleFileOptions::default()).unwrap();
+        w.write_all(b"{}").unwrap();
+        w.write_all(&vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
+        let zip = w.finish().unwrap().into_inner();
+
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 413, "{body}");
+        let rows = failure_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "entry_too_large");
+        assert_eq!(rows[0]["signatureStatus"], "not_evaluated");
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets").fetch_one(&pool).await.unwrap();
+        assert_eq!(assets, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_header_mismatch_is_400_and_recorded_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        seed_asset(&pool, "a1", "admin1", false).await;
+        let (state, _dir) = app_state(pool.clone());
+        let base = serve(state.clone()).await;
+        let mut zip = backup_of(&state).await;
+        // Rename the first central-directory entry; its local header keeps the old name.
+        let cd = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        zip[cd + 46] ^= 0x01;
+
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 400, "{body}");
+        let rows = failure_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "header_inconsistency");
+        assert_eq!(rows[0]["signatureStatus"], "not_evaluated");
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets").fetch_one(&pool).await.unwrap();
+        assert_eq!(assets, 1);
     }
 
     #[sqlx::test]
@@ -1499,16 +1550,47 @@ mod tests {
         assert!(parse_backup_zip(&zip_with("tables/users.jsonl", b"{}\n")).is_err());
     }
 
+    fn failure_of(bytes: &[u8]) -> VerifyFailure {
+        parse_and_verify_backup(bytes, None, false).unwrap_err()
+    }
+
     #[test]
     fn restore_rejects_an_entry_whose_size_disagrees_with_its_data() {
         let data = serde_json::to_vec(&manifest()).unwrap();
         let mut bytes = zip_with("manifest.json", &data);
-        // Central directory header: uncompressed size at offset 24.
+        // Patch both headers so they agree with each other but not the data.
+        // Central directory header: uncompressed size at offset 24; local
+        // header: offset 22.
+        let smaller = (data.len() as u32 - 5).to_le_bytes();
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
+        let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        bytes[lh + 22..lh + 26].copy_from_slice(&smaller);
+        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
+        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
+    }
+
+    #[test]
+    fn restore_rejects_a_central_only_size_mismatch_as_header_inconsistency() {
+        let data = serde_json::to_vec(&manifest()).unwrap();
+        let mut bytes = zip_with("manifest.json", &data);
         let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
         let smaller = (data.len() as u32 - 5).to_le_bytes();
         bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
-        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
-        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
+        let f = failure_of(&bytes);
+        assert_eq!(f.code, "header_inconsistency", "{}", f.message);
+        assert_eq!(f.status, "not_evaluated");
+        assert!(!f.too_large);
+    }
+
+    #[test]
+    fn restore_rejects_a_renamed_central_entry_before_reading_anything() {
+        let mut bytes = zip_with("tables/users.jsonl", b"{}\n");
+        let cd = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        bytes[cd + 46] = b'x'; // central name no longer matches the local header
+        let f = failure_of(&bytes);
+        assert_eq!(f.code, "header_inconsistency", "{}", f.message);
+        assert_eq!(f.status, "not_evaluated");
     }
 
     #[test]
@@ -1527,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_parses_an_entry_with_an_enormous_declared_size() {
+    fn restore_refuses_an_entry_with_an_enormous_declared_size() {
         let data = serde_json::to_vec(&manifest()).unwrap();
         let mut bytes = zip_with("manifest.json", &data);
         let huge = u32::MAX.to_le_bytes();
@@ -1535,15 +1617,37 @@ mod tests {
         bytes[cd + 24..cd + 28].copy_from_slice(&huge);
         let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
         bytes[lh + 22..lh + 26].copy_from_slice(&huge);
-        // The buffer is no longer sized from the declared size, so this parses
-        // the real data. (A with_capacity(u32::MAX) regression is not cheaply
-        // observable: allocation of ~4 GiB usually succeeds lazily here.)
-        let (m, tables, atts) = parse_backup_zip(&bytes).unwrap();
-        assert_eq!(m.version, BACKUP_VERSION);
-        assert_eq!(m.taken_at, "2026-01-01T00:00:00Z");
-        assert_eq!(m.schema_migration, 7);
-        assert_eq!(m.counts.get("users"), Some(&1));
-        assert!(tables.is_empty());
-        assert!(atts.is_empty());
+        // Declared size over the manifest cap: refused without decompressing.
+        let f = failure_of(&bytes);
+        assert_eq!(f.code, "entry_too_large", "{}", f.message);
+        assert!(f.too_large);
+    }
+
+    #[test]
+    fn restore_refuses_a_manifest_over_the_manifest_cap() {
+        let mut m = serde_json::to_vec(&manifest()).unwrap();
+        m.extend(std::iter::repeat_n(b' ', MAX_MANIFEST_BYTES as usize + 1));
+        let f = failure_of(&zip_with("manifest.json", &m));
+        assert_eq!(f.code, "entry_too_large", "{}", f.message);
+        assert!(f.too_large);
+    }
+
+    #[test]
+    fn built_backups_pass_header_validation_signed_and_unsigned() {
+        let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tables = || HashMap::from([("users".to_string(), vec![json!({"id": 1})])]);
+        let unsigned =
+            build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();
+        let (_, t, _, status) = parse_and_verify_backup(&unsigned, None, false).unwrap();
+        assert_eq!(t.get("users").map(Vec::len), Some(1));
+        assert_eq!(status.as_str(), "unsigned");
+
+        let key = crate::integrity::test_key(1);
+        let signed =
+            build_backup_zip(manifest(), tables(), vec![], dir.clone(), Some(&key)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, _, _, status) = parse_and_verify_backup(&signed, Some(&key), true).unwrap();
+        assert_eq!(status.as_str(), "verified");
     }
 }
