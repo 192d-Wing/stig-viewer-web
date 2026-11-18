@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use crate::zip_safe::{open_validated, read_entry, ReadBudget, ZipReadError};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
@@ -312,15 +313,51 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
     })
 }
 
-/// Find and return the text content of the XCCDF file within a ZIP archive.
-pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String> {
-    extract_xccdf_nested(zip_bytes, MAX_ZIP_DEPTH)
+/// Decompression limits for one ZIP read. Production values are
+/// `ZIP_LIMITS`; tests use tiny ones.
+pub struct ZipLimits {
+    /// Cap on each `*xccdf.xml` entry.
+    pub xccdf: u64,
+    /// Cap on each inner `.zip` entry.
+    pub nested_zip: u64,
 }
 
-fn extract_xccdf_nested(zip_bytes: &[u8], depth_left: u8) -> Result<String> {
-    use std::io::Read;
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)?;
+pub const ZIP_LIMITS: ZipLimits = ZipLimits { xccdf: 64 << 20, nested_zip: 128 << 20 };
+/// Cumulative decompressed bytes for one single-STIG upload or sync source.
+pub const SINGLE_STIG_BUDGET: u64 = 256 << 20;
+/// Cumulative decompressed bytes for one library import.
+pub const LIBRARY_BUDGET: u64 = 2 << 30;
+
+fn utf8_entry(bytes: Vec<u8>) -> Result<String, ZipReadError> {
+    String::from_utf8(bytes).map_err(|e| {
+        ZipReadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+    })
+}
+
+/// Find and return the text content of the XCCDF file within a ZIP archive.
+pub fn extract_xccdf_from_zip(zip_bytes: &[u8]) -> Result<String, ZipReadError> {
+    extract_xccdf_with(zip_bytes, &ZIP_LIMITS, SINGLE_STIG_BUDGET)
+}
+
+fn extract_xccdf_with(
+    zip_bytes: &[u8],
+    limits: &ZipLimits,
+    budget: u64,
+) -> Result<String, ZipReadError> {
+    let mut budget = ReadBudget::new(budget);
+    extract_xccdf_nested(zip_bytes, MAX_ZIP_DEPTH, limits, &mut budget)
+}
+
+fn extract_xccdf_nested(
+    zip_bytes: &[u8],
+    depth_left: u8,
+    limits: &ZipLimits,
+    budget: &mut ReadBudget,
+) -> Result<String, ZipReadError> {
+    let mut archive = open_validated(zip_bytes)?;
+    // First non-limit failure inside an inner ZIP; reported instead of
+    // "not found" when nothing else turns up. Limit errors are always fatal.
+    let mut first_err: Option<ZipReadError> = None;
 
     // STIGs may be double-zipped; follow nested ZIPs up to MAX_ZIP_DEPTH levels.
     for i in 0..archive.len() {
@@ -329,27 +366,25 @@ fn extract_xccdf_nested(zip_bytes: &[u8], depth_left: u8) -> Result<String> {
 
         // Direct XCCDF XML inside the outer ZIP
         if name.ends_with("_xccdf.xml") || name.ends_with("-xccdf.xml") {
-            let mut content = String::new();
-            file.read_to_string(&mut content)?;
-            return Ok(content);
+            return utf8_entry(read_entry(&mut file, limits.xccdf, budget)?);
         }
 
-        // Inner ZIP — extract it and recurse one level
-        if name.ends_with(".zip") {
-            // This error is swallowed by the `if let Ok` below by design: a too-deep
-            // inner ZIP is skipped and the caller reports "No *_xccdf.xml found".
-            if depth_left == 0 {
-                bail!("ZIP nesting exceeds {MAX_ZIP_DEPTH} levels");
-            }
-            let mut inner_bytes = Vec::new();
-            file.read_to_end(&mut inner_bytes)?;
-            if let Ok(xccdf) = extract_xccdf_nested(&inner_bytes, depth_left - 1) {
-                return Ok(xccdf);
+        // Inner ZIP: extract it and recurse one level. A too-deep inner ZIP
+        // is skipped and the caller reports "No *_xccdf.xml found".
+        if name.ends_with(".zip") && depth_left > 0 {
+            let inner_bytes = read_entry(&mut file, limits.nested_zip, budget)?;
+            match extract_xccdf_nested(&inner_bytes, depth_left - 1, limits, budget) {
+                Ok(xccdf) => return Ok(xccdf),
+                Err(e) if e.is_limit() => return Err(e),
+                Err(ZipReadError::NoXccdf) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
             }
         }
     }
 
-    bail!("No *_xccdf.xml found in ZIP archive")
+    Err(first_err.unwrap_or(ZipReadError::NoXccdf))
 }
 
 // ── Helpers re-used by child_text (kept for future use) ─────────────────────
@@ -435,33 +470,79 @@ const MAX_ZIP_DEPTH: u8 = 3;
 /// following nested ZIPs. Unlike `extract_xccdf_from_zip` this does not stop
 /// at the first hit: DISA product bundles (`U_Cisco_IOS-XE_Router_Y26M04_STIG.zip`)
 /// carry several STIGs (NDM, RTR, ...) as sibling inner ZIPs.
-pub fn extract_all_xccdf_from_zip(zip_bytes: &[u8]) -> Vec<(String, String)> {
+///
+/// Entries that cannot be read (over their cap, bad headers, bad data) are
+/// skipped and reported in `skipped` as `(label, reason)`. Only an exhausted
+/// budget is an `Err`: it aborts the whole request.
+fn extract_all_xccdf_from_zip(
+    zip_bytes: &[u8],
+    limits: &ZipLimits,
+    budget: &mut ReadBudget,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, ZipReadError> {
     let mut out = Vec::new();
-    collect_xccdf(zip_bytes, MAX_ZIP_DEPTH, &mut out);
-    out
+    collect_xccdf(zip_bytes, MAX_ZIP_DEPTH, "(inner zip)", limits, budget, &mut out, skipped)?;
+    Ok(out)
 }
 
-fn collect_xccdf(zip_bytes: &[u8], depth_left: u8, out: &mut Vec<(String, String)>) {
-    use std::io::Read;
-    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)) else {
-        return;
+fn short_label(name: &str) -> String {
+    name.chars().take(64).collect()
+}
+
+/// Skip a failed entry, or abort when the failure is an exhausted budget.
+fn skip_or_abort(
+    e: ZipReadError,
+    label: &str,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<(), ZipReadError> {
+    if matches!(e, ZipReadError::BudgetExceeded { .. }) {
+        return Err(e);
+    }
+    skipped.push((label.to_string(), e.to_string()));
+    Ok(())
+}
+
+fn collect_xccdf(
+    zip_bytes: &[u8],
+    depth_left: u8,
+    label: &str,
+    limits: &ZipLimits,
+    budget: &mut ReadBudget,
+    out: &mut Vec<(String, String)>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<(), ZipReadError> {
+    let mut archive = match open_validated(zip_bytes) {
+        Ok(a) => a,
+        Err(e) => return skip_or_abort(e, label, skipped),
     };
     for i in 0..archive.len() {
-        let Ok(mut file) = archive.by_index(i) else { continue };
+        let Ok(mut file) = archive.by_index(i) else {
+            skipped.push((label.to_string(), "failed to read ZIP entry".into()));
+            continue;
+        };
         let Ok(name) = file.name().map(|n| n.into_owned()) else { continue };
         let lower = name.to_lowercase();
         if lower.ends_with("_xccdf.xml") || lower.ends_with("-xccdf.xml") {
-            let mut content = String::new();
-            if file.read_to_string(&mut content).is_ok() {
-                out.push((name, content));
+            match read_entry(&mut file, limits.xccdf, budget).and_then(utf8_entry) {
+                Ok(content) => out.push((name, content)),
+                Err(e) => skip_or_abort(e, &short_label(&name), skipped)?,
             }
         } else if lower.ends_with(".zip") && depth_left > 0 {
-            let mut inner = Vec::new();
-            if file.read_to_end(&mut inner).is_ok() {
-                collect_xccdf(&inner, depth_left - 1, out);
+            match read_entry(&mut file, limits.nested_zip, budget) {
+                Ok(inner) => collect_xccdf(
+                    &inner,
+                    depth_left - 1,
+                    &short_label(&name),
+                    limits,
+                    budget,
+                    out,
+                    skipped,
+                )?,
+                Err(e) => skip_or_abort(e, &short_label(&name), skipped)?,
             }
         }
     }
+    Ok(())
 }
 
 /// Infer the catalog category from an XCCDF benchmark title.
@@ -500,15 +581,41 @@ pub fn infer_category(title: &str) -> &'static str {
 ///
 /// **Note:** this function is CPU-bound and should be called from
 /// `tokio::task::spawn_blocking`.
-pub fn extract_all_from_library(
-    library_bytes: &[u8],
-) -> (Vec<LibraryEntry>, Vec<(String, String)>) {
-    use std::io::Read;
+///
+/// An `Err` means the request-wide decompression budget was exhausted; nothing
+/// has been written at that point, so the caller can refuse the whole import.
+#[cfg(test)]
+pub fn extract_all_from_library(library_bytes: &[u8]) -> LibraryResult {
+    extract_all_from_library_with(library_bytes, &ZIP_LIMITS, LIBRARY_BUDGET)
+        .map(|(entries, errors, _)| (entries, errors))
+}
 
-    let cursor = std::io::Cursor::new(library_bytes);
-    let mut archive = match zip::ZipArchive::new(cursor) {
+/// Like `extract_all_from_library`, also returning the `code()` of the failure
+/// when the outer archive itself was refused (its message is then the single
+/// `"(outer zip)"` entry in the error list).
+pub fn extract_all_from_library_full(library_bytes: &[u8]) -> LibraryFullResult {
+    extract_all_from_library_with(library_bytes, &ZIP_LIMITS, LIBRARY_BUDGET)
+}
+
+pub type LibraryFullResult = Result<
+    (Vec<LibraryEntry>, Vec<(String, String)>, Option<&'static str>),
+    ZipReadError,
+>;
+
+#[cfg(test)]
+pub type LibraryResult = Result<(Vec<LibraryEntry>, Vec<(String, String)>), ZipReadError>;
+
+fn extract_all_from_library_with(
+    library_bytes: &[u8],
+    limits: &ZipLimits,
+    budget: u64,
+) -> LibraryFullResult {
+    let mut budget = ReadBudget::new(budget);
+    let mut archive = match open_validated(library_bytes) {
         Ok(a) => a,
-        Err(e) => return (vec![], vec![("(outer zip)".into(), e.to_string())]),
+        Err(e) => {
+            return Ok((vec![], vec![("(outer zip)".into(), e.to_string())], Some(e.code())))
+        }
     };
 
     let mut entries: Vec<LibraryEntry> = Vec::new();
@@ -529,19 +636,33 @@ pub fn extract_all_from_library(
                 continue;
             }
 
-            let mut bytes = Vec::new();
-            if file.read_to_end(&mut bytes).is_err() {
-                errors.push((filename_to_id(&raw_name), "failed to read ZIP entry".into()));
-                continue;
+            match read_entry(&mut file, limits.nested_zip, &mut budget) {
+                Ok(bytes) => (raw_name, bytes),
+                Err(e @ ZipReadError::BudgetExceeded { .. }) => return Err(e),
+                Err(e) => {
+                    errors.push((
+                        filename_to_id(&raw_name),
+                        format!("failed to read ZIP entry: {e}"),
+                    ));
+                    continue;
+                }
             }
-            (raw_name, bytes)
         };
 
         let outer_id = filename_to_id(&raw_name);
 
-        let docs = extract_all_xccdf_from_zip(&inner_bytes);
-        if docs.is_empty() {
-            errors.push((outer_id, "ZIP extraction failed: No *_xccdf.xml found in ZIP archive".into()));
+        let mut skipped = Vec::new();
+        let docs = extract_all_xccdf_from_zip(&inner_bytes, limits, &mut budget, &mut skipped)?;
+        let nothing_found = docs.is_empty();
+        let nothing_skipped = skipped.is_empty();
+        // Report under the library entry's id; the reason names the culprit.
+        errors.extend(skipped.into_iter().map(|(label, why)| {
+            (outer_id.clone(), format!("skipped {label}: {why}"))
+        }));
+        if nothing_found {
+            if nothing_skipped {
+                errors.push((outer_id, "ZIP extraction failed: No *_xccdf.xml found in ZIP archive".into()));
+            }
             continue;
         }
 
@@ -590,7 +711,7 @@ pub fn extract_all_from_library(
         }
     }
 
-    (entries, errors)
+    Ok((entries, errors, None))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -611,7 +732,7 @@ mod tests {
     fn library_import_skips_and_reports_empty_id() {
         let inner = zip_of(&[("x_xccdf.xml", &benchmark("T"))]);
         let outer = zip_of(&[("U_\u{e9}\u{e9}_V1R1_STIG.zip", &inner)]);
-        let (entries, errors) = extract_all_from_library(&outer);
+        let (entries, errors) = extract_all_from_library(&outer).unwrap();
         assert!(entries.is_empty());
         assert_eq!(errors.len(), 1);
     }
@@ -815,7 +936,7 @@ mod tests {
             ("U_MS_Windows_11_V2R3_STIG.zip", &single),
         ]);
 
-        let (entries, errors) = extract_all_from_library(&library);
+        let (entries, errors) = extract_all_from_library(&library).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         let mut got: Vec<(String, String)> =
             entries.into_iter().map(|e| (e.id, e.stig.title)).collect();
@@ -836,7 +957,7 @@ mod tests {
         let inner = zip_of(&[("x-xccdf.xml", &benchmark("Long"))]);
         let ok_inner = zip_of(&[("y-xccdf.xml", &benchmark("Short"))]);
         let library = zip_of(&[(long_name.as_str(), &inner), ("U_Short_V1R1_STIG.zip", &ok_inner)]);
-        let (entries, errors) = extract_all_from_library(&library);
+        let (entries, errors) = extract_all_from_library(&library).unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["short"]);
         assert_eq!(errors.len(), 1);
@@ -899,7 +1020,7 @@ mod tests {
         for (name_off, _) in hits {
             lib[name_off + 3] = 0xFF; // the 'X'
         }
-        let (entries, errors) = extract_all_from_library(&lib);
+        let (entries, errors) = extract_all_from_library(&lib).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "a-b");
@@ -950,7 +1071,7 @@ mod tests {
         for (_, method_off) in hits {
             lib[method_off..method_off + 2].copy_from_slice(&12u16.to_le_bytes());
         }
-        let (entries, errors) = extract_all_from_library(&lib);
+        let (entries, errors) = extract_all_from_library(&lib).unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["good"]);
         assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1091,5 +1212,232 @@ mod tests {
             assert_eq!(r.finding_details, "");
             assert_eq!(r.comments, "");
         }
+    }
+
+    // ── Decompression caps and header validation ──────────────────────────
+
+    const TINY: ZipLimits = ZipLimits { xccdf: 1024, nested_zip: 4096 };
+
+    fn big_xccdf(n: usize) -> Vec<u8> {
+        let mut v = benchmark("Big");
+        v.extend(std::iter::repeat_n(b' ', n));
+        v
+    }
+
+    #[test]
+    fn single_upload_refuses_an_over_cap_xccdf() {
+        let z = zip_of(&[("a-xccdf.xml", &big_xccdf(2000))]);
+        let e = extract_xccdf_with(&z, &TINY, 1 << 20).unwrap_err();
+        assert!(matches!(e, ZipReadError::EntryTooLarge { .. }), "{e}");
+        assert!(e.is_limit());
+    }
+
+    #[test]
+    fn a_deflated_bomb_over_the_production_cap_is_refused() {
+        // 64 MiB + 1 bytes of whitespace deflates to ~64 KiB.
+        let z = zip_of(&[("a-xccdf.xml", &big_xccdf((ZIP_LIMITS.xccdf + 1) as usize))]);
+        assert!(z.len() < 1 << 20, "bomb should compress well: {}", z.len());
+        let e = extract_xccdf_from_zip(&z).unwrap_err();
+        assert!(matches!(e, ZipReadError::EntryTooLarge { .. }), "{e}");
+    }
+
+    fn nest(inner: Vec<u8>, levels: usize) -> Vec<u8> {
+        let mut z = inner;
+        for _ in 0..levels {
+            z = zip_of(&[("inner.zip", &z)]);
+        }
+        z
+    }
+
+    #[test]
+    fn single_upload_budget_is_cumulative_across_nested_levels() {
+        // Each level charges its inner zip; the XCCDF is charged last.
+        let z = nest(zip_of(&[("a-xccdf.xml", &big_xccdf(800))]), 3);
+        // Generous budget: found.
+        assert!(extract_xccdf_with(&z, &TINY, 1 << 20).is_ok());
+        // Each part is under its own cap, but together they exceed the budget.
+        let e = extract_xccdf_with(&z, &TINY, 1500).unwrap_err();
+        assert!(matches!(e, ZipReadError::BudgetExceeded { limit: 1500 }), "{e}");
+    }
+
+    #[test]
+    fn library_budget_exhaustion_aborts_the_whole_import() {
+        let good = zip_of(&[("a-xccdf.xml", &benchmark("Good"))]);
+        let lib = zip_of(&[("U_Good_V1R1_STIG.zip", &nest(good, 2))]);
+        assert!(extract_all_from_library_with(&lib, &TINY, 1 << 20).is_ok());
+        let e = extract_all_from_library_with(&lib, &TINY, 400).err().unwrap();
+        assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
+    }
+
+    #[test]
+    fn library_skips_an_over_cap_stig_zip_and_reports_it() {
+        let good = zip_of(&[("g-xccdf.xml", &benchmark("Good"))]);
+        let bad = zip_of(&[("b-xccdf.xml", &big_xccdf(2000))]);
+        let lib = zip_of(&[("U_Bad_V1R1_STIG.zip", &bad), ("U_Good_V1R1_STIG.zip", &good)]);
+        let (entries, errors) = extract_all_from_library_with(&lib, &TINY, 1 << 20).map(|(a, b, _)| (a, b)).unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "bad");
+        assert!(errors[0].1.contains("larger than"), "{errors:?}");
+    }
+
+    /// Rename the entry `from` to `to` (same length) in the central directory
+    /// only, leaving the local header alone.
+    fn patch_central_name(z: &mut [u8], from: &str, to: &str) {
+        assert_eq!(from.len(), to.len());
+        let mut hit = false;
+        for pos in 0..z.len().saturating_sub(46) {
+            if &z[pos..pos + 4] == b"PK\x01\x02"
+                && z.get(pos + 46..pos + 46 + from.len()) == Some(from.as_bytes())
+            {
+                z[pos + 46..pos + 46 + from.len()].copy_from_slice(to.as_bytes());
+                hit = true;
+            }
+        }
+        assert!(hit);
+    }
+
+    #[test]
+    fn library_skips_an_inconsistent_inner_archive_and_reports_it() {
+        let mut bad = zip_of(&[("b-xccdf.xml", &benchmark("Bad"))]);
+        patch_central_name(&mut bad, "b-xccdf.xml", "c-xccdf.xml");
+        let good = zip_of(&[("g-xccdf.xml", &benchmark("Good"))]);
+        let lib = zip_of(&[("U_Bad_V1R1_STIG.zip", &bad), ("U_Good_V1R1_STIG.zip", &good)]);
+        let (entries, errors) = extract_all_from_library(&lib).unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "bad");
+        assert!(errors[0].1.contains("inconsistent ZIP headers"), "{errors:?}");
+    }
+
+    #[test]
+    fn library_reports_an_inconsistent_outer_archive() {
+        let inner = zip_of(&[("g-xccdf.xml", &benchmark("Good"))]);
+        let mut lib = zip_of(&[("U_Good_V1R1_STIG.zip", &inner)]);
+        patch_central_name(&mut lib, "U_Good_V1R1_STIG.zip", "U_Gold_V1R1_STIG.zip");
+        let (entries, errors) = extract_all_from_library(&lib).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "(outer zip)");
+        assert!(errors[0].1.contains("inconsistent ZIP headers"), "{errors:?}");
+        let (_, _, code) = extract_all_from_library_full(&lib).unwrap();
+        assert_eq!(code, Some("header_inconsistency"));
+    }
+
+    /// Rewrite the CRC-32 in both headers of the entry named `name` so it is
+    /// wrong identically in each: header validation passes, and the zip
+    /// crate only reports it at the end of the entry's data.
+    fn break_crc(z: &mut [u8], name: &str) {
+        let n = name.as_bytes();
+        for pos in 0..z.len().saturating_sub(46) {
+            let off = match &z[pos..pos + 4] {
+                b"PK\x03\x04" => (30, 14),
+                b"PK\x01\x02" => (46, 16),
+                _ => continue,
+            };
+            if z.get(pos + off.0..pos + off.0 + n.len()) == Some(n) {
+                z[pos + off.1] ^= 0xFF;
+            }
+        }
+    }
+
+    #[test]
+    fn bad_crc_entries_still_exhaust_the_budget() {
+        // Each entry reads fully (1500 bytes) and then fails its CRC check;
+        // the failures must still be charged to the shared budget.
+        let mut entries = Vec::new();
+        for i in 0..6 {
+            let name = format!("U_Bad{i}_V1R1_STIG.zip");
+            let mut inner = zip_of(&[("b-xccdf.xml", &big_xccdf(1500))]);
+            break_crc(&mut inner, "b-xccdf.xml");
+            entries.push((name, inner));
+        }
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let lib = zip_of(&refs);
+        // Without the charge nothing would add up and every entry would be skipped.
+        let e = extract_all_from_library_with(&lib, &ZipLimits { xccdf: 4096, nested_zip: 4096 }, 3000)
+            .err()
+            .expect("budget must be exhausted");
+        assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
+
+        // Single-STIG path: bad-CRC XCCDFs in sibling inner zips are skipped
+        // one by one, so the budget has to stop them.
+        let outer: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| {
+                let mut inner = zip_of(&[("b-xccdf.xml", &big_xccdf(1500))]);
+                break_crc(&mut inner, "b-xccdf.xml");
+                (format!("i{i}.zip"), inner)
+            })
+            .collect();
+        let refs: Vec<(&str, &[u8])> = outer.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let single = zip_of(&refs);
+        let e = extract_xccdf_with(&single, &ZipLimits { xccdf: 4096, nested_zip: 8192 }, 5000).unwrap_err();
+        assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
+    }
+
+    #[test]
+    fn single_upload_reports_an_inconsistent_inner_archive_not_not_found() {
+        let mut bad = zip_of(&[("b-xccdf.xml", &benchmark("Bad"))]);
+        patch_central_name(&mut bad, "b-xccdf.xml", "c-xccdf.xml");
+        let z = zip_of(&[("inner.zip", &bad)]);
+        let e = extract_xccdf_from_zip(&z).unwrap_err();
+        assert!(matches!(e, ZipReadError::Inconsistent(_)), "{e}");
+        assert!(!e.is_limit());
+    }
+
+    #[test]
+    fn single_upload_refuses_an_inconsistent_outer_archive() {
+        let mut z = zip_of(&[("b-xccdf.xml", &benchmark("Bad"))]);
+        patch_central_name(&mut z, "b-xccdf.xml", "c-xccdf.xml");
+        assert!(matches!(
+            extract_xccdf_from_zip(&z).unwrap_err(),
+            ZipReadError::Inconsistent(_)
+        ));
+    }
+
+    /// Reads every `*.zip` in `STIG_REAL_BUNDLES_DIR` with production limits.
+    /// Run: `STIG_REAL_BUNDLES_DIR=/path cargo test --locked -- --ignored real_bundles`
+    #[test]
+    #[ignore = "needs real DISA bundles (STIG_REAL_BUNDLES_DIR)"]
+    fn real_bundles_pass_production_limits_and_header_validation() {
+        let Ok(dir) = std::env::var("STIG_REAL_BUNDLES_DIR") else {
+            eprintln!("STIG_REAL_BUNDLES_DIR not set; skipping the real-bundle check");
+            return;
+        };
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("zip") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let name = path.display();
+            let is_library = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("Library"));
+            if is_library {
+                let (entries, errors) = extract_all_from_library(&bytes)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(errors.is_empty(), "{name}: {errors:?}");
+                assert!(!entries.is_empty(), "{name}");
+                assert!(entries.iter().all(|e| !e.stig.rules.is_empty()), "{name}");
+            } else {
+                let xccdf = extract_xccdf_from_zip(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let stig = parse_xccdf(&xccdf).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(!stig.rules.is_empty(), "{name}");
+                // Multi-STIG bundles must also pass the library path.
+                let mut budget = ReadBudget::new(LIBRARY_BUDGET);
+                let mut skipped = Vec::new();
+                let docs =
+                    extract_all_xccdf_from_zip(&bytes, &ZIP_LIMITS, &mut budget, &mut skipped)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(!docs.is_empty() && skipped.is_empty(), "{name}: {skipped:?}");
+            }
+            seen += 1;
+        }
+        assert!(seen > 0, "no *.zip in {dir}");
     }
 }

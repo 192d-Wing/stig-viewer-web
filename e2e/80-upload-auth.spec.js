@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { resetDb, setUserRole, uploadStigAs, BACKEND } from "./helpers.js";
+import { resetDb, setUserRole, uploadStigAs, buildZip, breakCentralName, BACKEND } from "./helpers.js";
 
 // Catalog uploads replace shared STIG content, so they sit behind the
 // session middleware and require the admin role.
@@ -65,5 +65,31 @@ test.describe("Catalog upload — authentication", () => {
     const listedRes = await request.get(`${BACKEND}/api/catalog`);
     expect(listedRes.ok()).toBeTruthy();
     expect((await listedRes.json()).map((e) => e.id)).not.toContain("Upper-Case");
+  });
+
+  test("a decompression bomb is refused with 413 and leaves the catalog empty", async ({ request }) => {
+    await setUserRole("upload-admin", "admin");
+    // 64 MiB + 1 of whitespace deflates to about 64 KiB.
+    const bomb = buildZip([
+      { name: "bomb-xccdf.xml", data: Buffer.concat([Buffer.from("<Benchmark/>"), Buffer.alloc(64 * 1024 * 1024 + 1, 0x20)]) },
+    ]);
+    expect(bomb.length).toBeLessThan(1024 * 1024);
+    const res = await uploadStigAs("upload-admin", { ...bogus, file: bomb, id: "upload-bomb" });
+    expect(res.status).toBe(413);
+    expect(await res.text()).toContain("larger than");
+
+    const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
+    expect(catalog.map((e) => e.id)).not.toContain("upload-bomb");
+  });
+
+  test("a ZIP whose headers disagree is refused with 422", async ({ request }) => {
+    await setUserRole("upload-admin", "admin");
+    const zip = breakCentralName(buildZip([{ name: "a-xccdf.xml", data: "<Benchmark/>" }]));
+    const res = await uploadStigAs("upload-admin", { ...bogus, file: zip, id: "upload-mismatch" });
+    expect(res.status).toBe(422);
+    expect(await res.text()).toContain("inconsistent ZIP headers");
+
+    const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
+    expect(catalog.map((e) => e.id)).not.toContain("upload-mismatch");
   });
 });

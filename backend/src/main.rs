@@ -16,6 +16,7 @@ mod seed;
 mod severity;
 mod stig_id;
 mod sync;
+mod zip_safe;
 #[cfg(test)]
 mod test_fixtures;
 

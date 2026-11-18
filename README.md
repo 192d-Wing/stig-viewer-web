@@ -185,6 +185,20 @@ signed-in user with the `admin` role and accept bodies up to 500 MB. Other
 routes cap request bodies at 10 MB, apart from evidence attachments (25 MB),
 `/api/sign` and the admin restore.
 
+Uploaded and synced ZIPs are bounded as they decompress, whatever their
+compressed size. Each `*xccdf.xml` entry may be at most 64 MiB and each nested
+ZIP 128 MiB; one `/api/upload` (or one sync source) may decompress at most
+256 MiB in total, nested ZIPs included, and one `/api/upload/library` at most
+2 GiB. A ZIP whose local headers disagree with its central directory (or with
+duplicate or overlapping entries) is refused too. Over a limit,
+`/api/upload` returns 413 (malformed or inconsistent: 422), and
+`/api/upload/library` returns 413 when the whole-request budget runs out; one
+over-limit or inconsistent entry inside a library is skipped and listed in
+`errorDetail`. Every rejection is recorded as a `catalog.upload` or
+`catalog.import_library` audit event with `outcome = 'rejected'` and
+`detail = {reasonCode, reason, bytesCompressed}`. A downloaded sync source is
+cut off at the 500 MB upload limit.
+
 ### Signing envelope (v2)
 
 `POST /api/sign` returns:
@@ -616,11 +630,15 @@ The outcome (`verified`, `unsigned` or `unknown_key`) is returned as
 written to the pre-restore `audit` log line and recorded, with
 `requireSignature`, in the `backup.restore` event's detail. A rejected restore
 is also recorded, as a `backup.restore` event with `outcome = 'failure'` and
-`detail = {reason, signatureStatus, requireSignature}` (`signatureStatus` is
+`detail = {reason, reasonCode, signatureStatus, requireSignature}` (`reasonCode` is
+`entry_too_large`, `budget_exceeded`, `header_inconsistency`, `malformed` or
+`invalid_backup`; `signatureStatus` is
 `invalid` for a bad signature and `not_evaluated` when the backup was refused
 before its signature was evaluated). Entries are read with a per-entry (1 GiB) and a
 total (4 GiB) decompressed limit; `manifest.json` and `manifest.sig.json` are
-capped at 16 MiB.
+capped at 16 MiB. A backup over a limit is refused with 413; one whose local
+headers disagree with its central directory (or that has duplicate or
+overlapping entries) is refused with 400 before the manifest is read.
 
 With `SIGNING_KEY_HEX` set (so the default policy requires a verified
 signature) a restore satisfies the intent of NIST SP 800-53 CP-9(8)

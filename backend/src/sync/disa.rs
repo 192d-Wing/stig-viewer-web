@@ -70,6 +70,47 @@ fn is_unchanged(existing: Option<&[u8]>, new: &[u8]) -> bool {
     existing == Some(new)
 }
 
+/// Largest STIG ZIP download accepted from DISA (matches the upload limit).
+const MAX_DISA_DOWNLOAD_BYTES: usize = 500 * 1024 * 1024;
+
+/// Read a response body, refusing more than `limit` bytes. A declared
+/// `Content-Length` over the limit is refused before any body is read; a
+/// body without one (or lying about it) is cut off as it streams.
+async fn read_capped_body(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let declared = resp.content_length();
+    read_capped_chunks(declared, limit, &mut resp).await
+}
+
+/// Where body chunks come from; a trait so the cap logic is testable.
+trait ChunkSource {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>>;
+}
+
+impl ChunkSource for reqwest::Response {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        let chunk = self.chunk().await.context("Failed to read response body")?;
+        Ok(chunk.map(|b| b.to_vec()))
+    }
+}
+
+async fn read_capped_chunks(
+    declared: Option<u64>,
+    limit: usize,
+    source: &mut impl ChunkSource,
+) -> Result<Vec<u8>> {
+    if declared.is_some_and(|n| n > limit as u64) {
+        anyhow::bail!("response body is larger than {limit} bytes");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = source.next_chunk().await? {
+        if body.len() + chunk.len() > limit {
+            anyhow::bail!("response body is larger than {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Download, parse, and index one STIG from DISA.
 async fn sync_one(
     source: &StigSource,
@@ -99,14 +140,18 @@ async fn sync_one(
         anyhow::bail!("DISA returned HTTP {}", resp.status());
     }
 
-    let zip_bytes = resp.bytes().await.context("Failed to read response body")?;
+    let zip_bytes = read_capped_body(resp, MAX_DISA_DOWNLOAD_BYTES).await?;
 
     // 2. Extract XCCDF XML from ZIP (handles double-zipped STIGs)
-    let xccdf =
-        extract_xccdf_from_zip(&zip_bytes).context("Failed to extract XCCDF from ZIP")?;
-
-    // 3. Parse XCCDF → StigData
-    let stig = parse_xccdf(&xccdf).context("Failed to parse XCCDF")?;
+    // Both steps are CPU-bound, so they run off the async workers.
+    let stig = tokio::task::spawn_blocking(move || -> Result<_> {
+        let xccdf =
+            extract_xccdf_from_zip(&zip_bytes).context("Failed to extract XCCDF from ZIP")?;
+        // 3. Parse XCCDF → StigData
+        parse_xccdf(&xccdf).context("Failed to parse XCCDF")
+    })
+    .await
+    .context("ZIP extraction task failed")??;
 
     // 4. Write JSON file
     let stigs_dir = data_dir.join("stigs");
@@ -381,5 +426,80 @@ mod id_tests {
         }
         assert!(validate_source(&src("windows-10")).is_ok());
         assert!(validate_source(&src("a")).is_ok());
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one HTTP response: `head` (status line + headers) then `body`.
+    /// Returns the URL. The connection closes after the body.
+    async fn serve_once(head: String, body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        });
+        url
+    }
+
+    async fn fetch(head: &str, body: Vec<u8>, limit: usize) -> Result<Vec<u8>> {
+        let url = serve_once(head.to_string(), body).await;
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        read_capped_body(resp, limit).await
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_content_length_is_refused_without_reading_the_body() {
+        // Headers promise 100 bytes, none follow: only a pre-check can refuse.
+        let e = fetch("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n", vec![], 10)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_over_the_cap_is_cut_off_without_a_content_length() {
+        let e = fetch("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", vec![b'x'; 50], 10)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_cut_off() {
+        let mut body = b"32\r\n".to_vec();
+        body.extend(vec![b'x'; 50]);
+        body.extend(b"\r\n0\r\n\r\n");
+        let e = fetch("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", body, 10)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_under_cap_body_comes_back_intact() {
+        let body: Vec<u8> = (0..200u8).collect();
+        let got = fetch("HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n", body.clone(), 200)
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[tokio::test]
+    async fn a_lying_content_length_cannot_beat_the_streaming_cap() {
+        // Declares 5 bytes (under the cap) but the chunk source yields 50.
+        struct Fake(std::vec::IntoIter<Vec<u8>>);
+        impl ChunkSource for Fake {
+            async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+                Ok(self.0.next())
+            }
+        }
+        let mut src = Fake(vec![vec![b'x'; 25], vec![b'x'; 25]].into_iter());
+        let e = read_capped_chunks(Some(5), 10, &mut src).await.unwrap_err();
+        assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
     }
 }

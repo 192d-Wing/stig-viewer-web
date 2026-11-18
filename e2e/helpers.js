@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { deflateRawSync } from "node:zlib";
 import { expect } from "@playwright/test";
 const BACKEND = process.env.VITE_API_URL || "http://localhost:8080";
 
@@ -182,4 +183,84 @@ export async function acknowledgeNotice(page) {
   if (res.status() !== 204) {
     throw new Error(`notice ack failed: HTTP ${res.status()}`);
   }
+}
+
+// ── ZIP builder ──────────────────────────────────────────────────────────────
+
+function crc32(buf) {
+  let table = crc32._t;
+  if (!table) {
+    table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    crc32._t = table;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ table[(crc ^ buf[i]) & 0xff];
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Build a ZIP from `[{ name, data }]` (data is a Buffer or string), deflating
+ * each entry with Node's zlib. Pass `{ store: true }` to store entries
+ * uncompressed. Local and central headers agree, so the archive passes the
+ * backend's header-consistency check; tests that want a mismatch patch bytes
+ * afterwards (the central-directory name starts 46 bytes after "PK\x01\x02").
+ */
+export function buildZip(entries, { store = false } = {}) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const { name, data } of entries) {
+    const raw = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const body = store ? raw : deflateRawSync(raw);
+    const method = store ? 0 : 8;
+    const nameBuf = Buffer.from(name, "utf-8");
+    const crc = crc32(raw);
+
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0);
+    lfh.writeUInt16LE(20, 4);
+    lfh.writeUInt16LE(0, 6);
+    lfh.writeUInt16LE(method, 8);
+    lfh.writeUInt32LE(crc, 14);
+    lfh.writeUInt32LE(body.length, 18);
+    lfh.writeUInt32LE(raw.length, 22);
+    lfh.writeUInt16LE(nameBuf.length, 26);
+    const local = Buffer.concat([lfh, nameBuf, body]);
+
+    const cdh = Buffer.alloc(46);
+    cdh.writeUInt32LE(0x02014b50, 0);
+    cdh.writeUInt16LE(20, 4);
+    cdh.writeUInt16LE(20, 6);
+    cdh.writeUInt16LE(method, 10);
+    cdh.writeUInt32LE(crc, 16);
+    cdh.writeUInt32LE(body.length, 20);
+    cdh.writeUInt32LE(raw.length, 24);
+    cdh.writeUInt16LE(nameBuf.length, 28);
+    cdh.writeUInt32LE(offset, 42);
+    centrals.push(Buffer.concat([cdh, nameBuf]));
+
+    locals.push(local);
+    offset += local.length;
+  }
+  const central = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(central.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, central, eocd]);
+}
+
+/** Flip a bit in the first central-directory entry name (local header keeps the old one). */
+export function breakCentralName(zip) {
+  const out = Buffer.from(zip);
+  const cd = out.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  out[cd + 46] ^= 0x01;
+  return out;
 }

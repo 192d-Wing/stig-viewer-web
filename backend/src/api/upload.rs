@@ -6,9 +6,10 @@ use axum::{
 use chrono::Utc;
 
 use crate::{
-    api::{auth::AuthUser, stig_validator::lint_stig},
+    api::{auth::AuthUser, request_ctx::RequestCtx, stig_validator::lint_stig},
     db::{upsert_catalog, CatalogEntry},
-    parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf},
+    parser::{extract_all_from_library_full, extract_xccdf_from_zip, parse_xccdf},
+    zip_safe::ZipReadError,
     AppState,
 };
 
@@ -23,6 +24,53 @@ fn ensure_admin(user: &AuthUser) -> Result<(), (StatusCode, String)> {
         Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "admin role required".into()))
+    }
+}
+
+/// Audit a ZIP that was refused (too large, inconsistent headers, malformed).
+/// Recorded outside any transaction: nothing was changed.
+async fn record_zip_rejection(
+    state: &AppState,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    action: &'static str,
+    stig_id: Option<&str>,
+    (reason_code, reason): (&'static str, &str),
+    bytes_compressed: usize,
+) {
+    let reason: String = reason.chars().take(300).collect();
+    tracing::warn!(
+        target: "audit",
+        actor = %user.id,
+        action,
+        reason_code,
+        "catalog upload rejected: {reason}"
+    );
+    crate::db_audit::record_or_log(
+        state.pool.as_ref(),
+        crate::db_audit::NewAuditEvent {
+            user_id: &user.id,
+            ctx: Some(ctx),
+            action,
+            outcome: "rejected",
+            asset_id: None,
+            checklist_id: None,
+            stig_id,
+            detail: serde_json::json!({
+                "reasonCode": reason_code,
+                "reason": reason,
+                "bytesCompressed": bytes_compressed,
+            }),
+        },
+    )
+    .await;
+}
+
+fn zip_status(err: &ZipReadError) -> StatusCode {
+    if err.is_limit() {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
     }
 }
 
@@ -44,6 +92,7 @@ fn ensure_admin(user: &AuthUser) -> Result<(), (StatusCode, String)> {
 pub async fn upload_stig(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     ensure_admin(&user)?;
@@ -93,13 +142,23 @@ pub async fn upload_stig(
     let category = category.ok_or((StatusCode::BAD_REQUEST, "Missing 'category' field".into()))?;
 
     // Extract and parse XCCDF
-    let xccdf = extract_xccdf_from_zip(&zip_bytes).map_err(|e| {
-        (StatusCode::UNPROCESSABLE_ENTITY, format!("ZIP extraction failed: {e}"))
-    })?;
-
-    let stig = parse_xccdf(&xccdf).map_err(|e| {
-        (StatusCode::UNPROCESSABLE_ENTITY, format!("XCCDF parse failed: {e}"))
-    })?;
+    // Both steps are CPU-bound (decompression and XML parsing).
+    let compressed = zip_bytes.len();
+    let extracted = tokio::task::spawn_blocking(move || {
+        extract_xccdf_from_zip(&zip_bytes).map(|xccdf| parse_xccdf(&xccdf))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {e}")))?;
+    let stig = match extracted {
+        Ok(parsed) => parsed.map_err(|e| {
+            (StatusCode::UNPROCESSABLE_ENTITY, format!("XCCDF parse failed: {e}"))
+        })?,
+        Err(e) => {
+            record_zip_rejection(&state, &user, &ctx, "catalog.upload", Some(&id), (e.code(), &e.to_string()), compressed)
+                .await;
+            return Err((zip_status(&e), format!("ZIP extraction failed: {e}")));
+        }
+    };
 
     // Lint the JSON shape *before* we write anything. We feed in the
     // multipart-supplied `id` + `category` alongside the parsed STIG so the
@@ -176,6 +235,7 @@ pub async fn upload_stig(
 pub async fn upload_library(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     ensure_admin(&user)?;
@@ -197,10 +257,25 @@ pub async fn upload_library(
     tracing::info!("Library bundle received ({} MB), processing…", zip_bytes.len() / 1_048_576);
 
     // Parsing is CPU-bound — run on blocking thread pool
-    let (lib_entries, parse_errors) =
-        tokio::task::spawn_blocking(move || extract_all_from_library(&zip_bytes))
+    let compressed = zip_bytes.len();
+    let (lib_entries, parse_errors, outer_failure) =
+        match tokio::task::spawn_blocking(move || extract_all_from_library_full(&zip_bytes))
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {e}")))?
+        {
+            Ok(v) => v,
+            Err(e) => {
+                record_zip_rejection(&state, &user, &ctx, "catalog.import_library", None, (e.code(), &e.to_string()), compressed)
+                    .await;
+                return Err((zip_status(&e), format!("ZIP extraction failed: {e}")));
+            }
+        };
+
+    // An unreadable outer archive is answered with 200 + errorDetail (below);
+    // it is still recorded as a rejection.
+    if let (Some(code), Some((_, why))) = (outer_failure, parse_errors.first()) {
+        record_zip_rejection(&state, &user, &ctx, "catalog.import_library", None, (code, why), compressed).await;
+    }
 
     // Write JSON files and upsert catalog rows
     let stigs_dir = state.config.data_dir.join("stigs");
@@ -291,5 +366,162 @@ mod tests {
             let (status, _) = ensure_admin(&user(role)).unwrap_err();
             assert_eq!(status, StatusCode::FORBIDDEN, "{role:?}");
         }
+    }
+
+    // ── Database-backed: rejected archives change nothing and are audited ──
+
+    use crate::test_fixtures::{app_state, auth, ctx, seed_user};
+    use axum::{
+        extract::{DefaultBodyLimit, Request},
+        middleware::{self, Next},
+        routing::post,
+        Router,
+    };
+    use sqlx::PgPool;
+    use std::io::Write;
+
+    async fn serve(state: AppState) -> String {
+        let app = Router::new()
+            .route("/api/upload", post(upload_stig))
+            .route("/api/upload/library", post(upload_library))
+            .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+            .route_layer(middleware::from_fn(|mut req: Request, next: Next| async move {
+                req.extensions_mut().insert(auth("admin1", "admin"));
+                req.extensions_mut().insert(ctx());
+                next.run(req).await
+            }))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        format!("http://{addr}")
+    }
+
+    fn zip_of(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    async fn post_zip(base: &str, path: &str, zip: &[u8]) -> (u16, String) {
+        let b = "XBOUNDARYX";
+        let mut body = Vec::new();
+        for (k, v) in [("id", "bomb-test"), ("category", "Linux")] {
+            body.extend_from_slice(
+                format!("--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.zip\"\r\nContent-Type: application/zip\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(zip);
+        body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+        let r = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header("content-type", format!("multipart/form-data; boundary={b}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), r.text().await.unwrap_or_default())
+    }
+
+    async fn rejected_rows(pool: &PgPool, action: &str) -> Vec<serde_json::Value> {
+        sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = $1 AND outcome = 'rejected'")
+            .bind(action)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_decompression_bomb_is_413_audited_and_writes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let base = serve(state).await;
+
+        let mut xml = b"<Benchmark/>".to_vec();
+        xml.resize(64 * 1024 * 1024 + 1, b' ');
+        let zip = zip_of("a-xccdf.xml", &xml);
+        assert!(zip.len() < 1 << 20);
+        let (status, body) = post_zip(&base, "/api/upload", &zip).await;
+        assert_eq!(status, 413, "{body}");
+
+        let rows = rejected_rows(&pool, "catalog.upload").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "entry_too_large");
+        assert_eq!(rows[0]["bytesCompressed"], zip.len());
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+        assert!(!data_dir.join("stigs/bomb-test.json").exists());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_library_over_the_budget_is_413_audited_and_writes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let base = serve(state).await;
+
+        // One 64 MiB (the per-entry cap) whitespace XCCDF, deflated to ~64 KiB,
+        // shared by 33 library entries: 33 x 64 MiB > the 2 GiB budget.
+        let inner = zip_of("a-xccdf.xml", &vec![b' '; 64 * 1024 * 1024]);
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for i in 0..33 {
+            w.start_file(format!("U_Big{i}_V1R1_STIG.zip"), zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(&inner).unwrap();
+        }
+        let lib = w.finish().unwrap().into_inner();
+
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 413, "{body}");
+        let rows = rejected_rows(&pool, "catalog.import_library").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "budget_exceeded");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+        // Nothing was written beyond the fixture STIG that `app_state` seeds.
+        let written: Vec<_> = std::fs::read_dir(data_dir.join("stigs"))
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".json") && n != &format!("{}.json", crate::test_fixtures::STIG_ID))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(written.is_empty(), "{written:?}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_header_mismatch_is_422_and_audited(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let base = serve(state).await;
+
+        let mut zip = zip_of("a-xccdf.xml", b"<Benchmark/>");
+        let cd = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        zip[cd + 46] = b'b';
+        let (status, body) = post_zip(&base, "/api/upload", &zip).await;
+        assert_eq!(status, 422, "{body}");
+        let rows = rejected_rows(&pool, "catalog.upload").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "header_inconsistency");
+
+        // The library route answers 200 with errorDetail but still audits.
+        let (status, body) = post_zip(&base, "/api/upload/library", &zip).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("(outer zip)"), "{body}");
+        let rows = rejected_rows(&pool, "catalog.import_library").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "header_inconsistency");
     }
 }
