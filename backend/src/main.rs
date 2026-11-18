@@ -1,15 +1,15 @@
 mod api;
 mod audit_retention;
-mod integrity;
 mod config;
 mod db;
-mod db_audit;
-mod db_notice;
 mod db_assets;
 mod db_attachments;
+mod db_audit;
 mod db_checklist_sets;
 mod db_checklists;
 mod db_drafts;
+mod db_notice;
+mod integrity;
 mod parser;
 mod pdf;
 mod scheduler_log;
@@ -17,25 +17,29 @@ mod seed;
 mod severity;
 mod stig_id;
 mod sync;
-mod zip_safe;
 #[cfg(test)]
 mod test_fixtures;
+mod zip_safe;
 
 use anyhow::Result;
-use axum::{extract::DefaultBodyLimit, handler::Handler, middleware, routing::{get, post}, Router};
+use axum::http::{header, HeaderValue, Method};
+use axum::{
+    extract::DefaultBodyLimit,
+    handler::Handler,
+    middleware,
+    routing::{get, post},
+    Router,
+};
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
-use axum::http::{header, HeaderValue, Method};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api::{
     abac::{
-        create_handler as create_abac_policy_handler,
-        delete_handler as delete_abac_policy_handler,
-        list_handler as list_abac_policies_handler,
-        update_handler as update_abac_policy_handler,
+        create_handler as create_abac_policy_handler, delete_handler as delete_abac_policy_handler,
+        list_handler as list_abac_policies_handler, update_handler as update_abac_policy_handler,
     },
     admin::{
         list_users_handler as admin_list_users_handler,
@@ -43,21 +47,18 @@ use api::{
         update_user_role_handler as admin_update_user_role_handler,
     },
     asset_acl::{
-        create_handler as create_asset_acl_handler,
-        delete_handler as delete_asset_acl_handler,
+        create_handler as create_asset_acl_handler, delete_handler as delete_asset_acl_handler,
         list_handler as list_asset_acl_handler,
     },
     asset_email_cc::{
         create_handler as create_asset_email_cc_handler,
         delete_handler as delete_asset_email_cc_handler,
-        list_handler as list_asset_email_cc_handler,
-        run_asset_email_schedules,
+        list_handler as list_asset_email_cc_handler, run_asset_email_schedules,
         send_handler as send_asset_email_report_handler,
     },
     asset_groups::{
         add_member_handler as add_asset_group_member_handler,
-        create_handler as create_asset_group_handler,
-        delete_handler as delete_asset_group_handler,
+        create_handler as create_asset_group_handler, delete_handler as delete_asset_group_handler,
         list_handler as list_asset_groups_handler,
         list_members_handler as list_asset_group_members_handler,
         remove_member_handler as remove_asset_group_member_handler,
@@ -79,52 +80,56 @@ use api::{
         activity_handler, events_handler as audit_events_handler, rule_history_handler,
         search_handler as audit_search_handler,
     },
-    backup::{download_handler as admin_backup_download_handler, restore_handler as admin_restore_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
     },
+    backup::{
+        download_handler as admin_backup_download_handler, restore_handler as admin_restore_handler,
+    },
     baselines::{
-        create_handler as create_baseline_handler,
-        delete_handler as delete_baseline_handler,
-        diff_handler as baseline_diff_handler,
-        list_handler as list_baselines_handler,
+        create_handler as create_baseline_handler, delete_handler as delete_baseline_handler,
+        diff_handler as baseline_diff_handler, list_handler as list_baselines_handler,
     },
     bundle::bundle_handler as asset_bundle_handler,
     catalog::get_catalog,
     catalog_diff::{
-        diff_handler as catalog_diff_handler,
-        list_archive_handler as list_catalog_archive_handler,
+        diff_handler as catalog_diff_handler, list_archive_handler as list_catalog_archive_handler,
         seed_archive_handler as seed_catalog_archive_handler,
     },
     catalog_search::search_handler as catalog_search_handler,
-    compliance_report::{
-        download_handler as download_compliance_report_handler,
-        list_handler as list_compliance_reports_handler,
-        run_report as run_compliance_report,
+    checklist_save::save_handler as checklist_save_handler,
+    checklist_sets::{
+        add_stig_handler as add_checklist_set_stig_handler,
+        autosave_handler as autosave_checklist_set_handler,
+        create_handler as create_checklist_set_handler,
+        delete_handler as delete_checklist_set_handler, get_handler as get_checklist_set_handler,
+        list_handler as list_checklist_sets_handler, patch_handler as patch_checklist_set_handler,
+        remove_stig_handler as remove_checklist_set_stig_handler,
+        save_to_system_handler as save_checklist_set_to_system_handler,
     },
     checklists::{
         bulk_reapply_handler as bulk_reapply_checklists_handler,
-        create_handler as create_checklist_handler,
-        delete_handler as delete_checklist_handler,
+        create_handler as create_checklist_handler, delete_handler as delete_checklist_handler,
         get_handler as get_checklist_handler,
         list_for_asset_handler as list_checklists_for_asset_handler,
         reapply_handler as reapply_checklist_handler,
         update_rule_handler as update_checklist_rule_handler,
     },
+    compliance_report::{
+        download_handler as download_compliance_report_handler,
+        list_handler as list_compliance_reports_handler, run_report as run_compliance_report,
+    },
     dashboard::{
-        asset_trend_handler,
-        get_handler as get_dashboard_handler,
-        snapshot_handler as snapshot_trigger_handler,
-        take_snapshot,
+        asset_trend_handler, get_handler as get_dashboard_handler,
+        snapshot_handler as snapshot_trigger_handler, take_snapshot,
         trend_handler as get_dashboard_trend_handler,
     },
     diff::diff_handler,
     drafts::*,
     email::list_deliveries_handler as list_email_deliveries_handler,
     finding_approvals::{
-        approve_handler as approve_finding_handler,
-        list_handler as list_approvals_handler,
+        approve_handler as approve_finding_handler, list_handler as list_approvals_handler,
         reject_handler as reject_finding_handler,
         update_policy_handler as update_asset_approval_policy_handler,
     },
@@ -140,38 +145,25 @@ use api::{
     oscal::export_handler as asset_oscal_handler,
     report::report_handler as asset_report_handler,
     rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
-    checklist_save::save_handler as checklist_save_handler,
-    checklist_sets::{
-        add_stig_handler as add_checklist_set_stig_handler, autosave_handler as autosave_checklist_set_handler,
-        create_handler as create_checklist_set_handler, delete_handler as delete_checklist_set_handler,
-        get_handler as get_checklist_set_handler, list_handler as list_checklist_sets_handler,
-        patch_handler as patch_checklist_set_handler, remove_stig_handler as remove_checklist_set_stig_handler,
-        save_to_system_handler as save_checklist_set_to_system_handler,
-    },
     rule_bulk_status::bulk_status_handler as rule_bulk_status_handler,
     rule_comments::{
         add_reaction_handler as add_comment_reaction_handler,
         create_handler as create_rule_comment_handler,
-        delete_handler as delete_rule_comment_handler,
-        list_handler as list_rule_comments_handler,
+        delete_handler as delete_rule_comment_handler, list_handler as list_rule_comments_handler,
         remove_reaction_handler as remove_comment_reaction_handler,
         update_handler as update_rule_comment_handler,
     },
     saml::{
-        acs_handler as saml_acs_handler,
-        login_handler as saml_login_handler,
-        metadata_handler as saml_metadata_handler,
-        AppSamlState, SamlConfig,
+        acs_handler as saml_acs_handler, login_handler as saml_login_handler,
+        metadata_handler as saml_metadata_handler, AppSamlState, SamlConfig,
     },
     saved_searches::{
         create_handler as create_saved_search_handler,
-        delete_handler as delete_saved_search_handler,
-        list_handler as list_saved_searches_handler,
+        delete_handler as delete_saved_search_handler, list_handler as list_saved_searches_handler,
     },
     scheduler_status::list_handler as list_scheduler_runs_handler,
     sessions::{
-        list_handler as list_active_sessions_handler,
-        revoke_handler as revoke_session_handler,
+        list_handler as list_active_sessions_handler, revoke_handler as revoke_session_handler,
     },
     stig::get_stig,
     stig_validator::lint_handler as stig_lint_handler,
@@ -184,13 +176,10 @@ use api::{
     },
     upload::{upload_library, upload_stig, MAX_UPLOAD_BYTES},
     webhooks::{
-        create_handler as create_webhook_handler,
-        delete_handler as delete_webhook_handler,
+        create_handler as create_webhook_handler, delete_handler as delete_webhook_handler,
         list_deliveries_handler as list_webhook_deliveries_handler,
-        list_handler as list_webhooks_handler,
-        run_overdue_digest,
-        test_handler as test_webhook_handler,
-        update_handler as update_webhook_handler,
+        list_handler as list_webhooks_handler, run_overdue_digest,
+        test_handler as test_webhook_handler, update_handler as update_webhook_handler,
         verify_recipe_handler as webhook_verify_recipe_handler,
     },
 };
@@ -233,9 +222,10 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "stig_viewer_backend=info,tower_http=info".into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -358,323 +348,338 @@ async fn main() -> Result<()> {
         .route("/auth/saml/login", get(saml_login_handler))
         .route(
             "/auth/saml/acs",
-            post(saml_acs_handler).layer(axum::extract::DefaultBodyLimit::max(api::saml::ACS_BODY_LIMIT)),
+            post(saml_acs_handler).layer(axum::extract::DefaultBodyLimit::max(
+                api::saml::ACS_BODY_LIMIT,
+            )),
         )
         .route("/auth/saml/metadata", get(saml_metadata_handler))
         .with_state(saml_state);
 
     // Draft + asset + /api/users/me routes — require an authenticated session.
-    let draft_routes = api::authz_audit::protected_stack(Router::new()
-        .route("/api/assets", get(list_assets_handler).post(create_asset_handler))
-        .route("/api/assets/import", post(import_assets_handler))
-        .route(
-            "/api/assets/:id",
-            get(get_asset_handler)
-                .put(update_asset_handler)
-                .patch(patch_asset_handler)
-                .delete(delete_asset_handler),
-        )
-        .route(
-            "/api/assets/:id/acl",
-            get(list_asset_acl_handler).post(create_asset_acl_handler),
-        )
-        .route(
-            "/api/assets/:id/acl/:user_id",
-            axum::routing::delete(delete_asset_acl_handler),
-        )
-        .route(
-            "/api/assets/:id/email-cc",
-            get(list_asset_email_cc_handler).post(create_asset_email_cc_handler),
-        )
-        .route(
-            "/api/assets/:id/email-cc/:email",
-            axum::routing::delete(delete_asset_email_cc_handler),
-        )
-        .route(
-            "/api/assets/:id/email-report",
-            post(send_asset_email_report_handler),
-        )
-        .route(
-            "/api/assets/:id/checklists/save",
-            post(checklist_save_handler.layer(DefaultBodyLimit::max(SAVE_TO_SYSTEM_BODY_LIMIT))),
-        )
-        .route(
-            "/api/checklist-sets",
-            get(list_checklist_sets_handler)
-                .post(create_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
-        )
-        .route(
-            "/api/checklist-sets/:id",
-            get(get_checklist_set_handler)
-                .patch(patch_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)))
-                .delete(delete_checklist_set_handler),
-        )
-        .route(
-            "/api/checklist-sets/:id/stigs",
-            post(add_checklist_set_stig_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
-        )
-        .route(
-            "/api/checklist-sets/:id/stigs/:stig_id",
-            axum::routing::delete(remove_checklist_set_stig_handler),
-        )
-        .route(
-            "/api/checklist-sets/:id/rules",
-            axum::routing::patch(
-                autosave_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_AUTOSAVE_BODY_LIMIT)),
-            ),
-        )
-        .route(
-            "/api/checklist-sets/:id/save-to-system",
-            post(save_checklist_set_to_system_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
-        )
-        .route(
-            "/api/asset-groups",
-            get(list_asset_groups_handler).post(create_asset_group_handler),
-        )
-        .route(
-            "/api/asset-groups/:id",
-            axum::routing::patch(update_asset_group_handler)
-                .delete(delete_asset_group_handler),
-        )
-        .route(
-            "/api/asset-groups/:id/members",
-            get(list_asset_group_members_handler).post(add_asset_group_member_handler),
-        )
-        .route(
-            "/api/asset-groups/:id/members/:asset_id",
-            axum::routing::delete(remove_asset_group_member_handler),
-        )
-        .route("/api/assets/:id/report.pdf", get(asset_report_handler))
-        .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))
-        .route("/api/assets/:id/oscal.json", get(asset_oscal_handler))
-        .route("/api/assets/:id/trend", get(asset_trend_handler))
-        .route(
-            "/api/assets/:left/diff/:right",
-            get(compare_assets_handler),
-        )
-        .route(
-            "/api/assets/:id/checklists",
-            get(list_checklists_for_asset_handler).post(create_checklist_handler),
-        )
-        .route(
-            "/api/checklists/:id",
-            get(get_checklist_handler).delete(delete_checklist_handler),
-        )
-        .route(
-            "/api/checklists/:id/reapply",
-            post(reapply_checklist_handler),
-        )
-        .route(
-            "/api/checklists/bulk-reapply",
-            post(bulk_reapply_checklists_handler),
-        )
-        .route(
-            "/api/checklists/:id/rules/:rule_id",
-            axum::routing::patch(update_checklist_rule_handler),
-        )
-        .route(
-            "/api/checklists/:id/rules/bulk-import",
-            post(rule_bulk_import_handler),
-        )
-        .route(
-            "/api/checklists/:id/rules/bulk-status",
-            post(rule_bulk_status_handler.layer(DefaultBodyLimit::max(BULK_STATUS_BODY_LIMIT))),
-        )
-        .route(
-            "/api/checklists/:id/rules/:rule_id/history",
-            get(rule_history_handler),
-        )
-        .route(
-            "/api/checklists/:id/rules/:rule_id/attachments",
-            get(list_attachments_for_rule_handler).post(
-                upload_attachment_handler
-                    .layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),
-            ),
-        )
-        .route(
-            "/api/checklists/:id/rules/:rule_id/comments",
-            get(list_rule_comments_handler).post(create_rule_comment_handler),
-        )
-        .route(
-            "/api/comments/:id",
-            axum::routing::patch(update_rule_comment_handler)
-                .delete(delete_rule_comment_handler),
-        )
-        .route(
-            "/api/comments/:id/reactions",
-            post(add_comment_reaction_handler),
-        )
-        .route(
-            "/api/comments/:id/reactions/:reaction",
-            axum::routing::delete(remove_comment_reaction_handler),
-        )
-        .route(
-            "/api/checklists/:id/attachments",
-            get(attachments_counts_for_checklist_handler),
-        )
-        .route(
-            "/api/attachments/:id",
-            get(download_attachment_handler)
-                .delete(delete_attachment_handler),
-        )
-        .route("/api/activity", get(activity_handler))
-        .route("/api/audit/search", get(audit_search_handler))
-        .route("/api/audit/events", get(audit_events_handler))
-        .route("/api/drafts", get(list_drafts_handler).post(create_draft_handler))
-        .route("/api/drafts/pending-for-me", get(pending_for_me_handler))
-        .route("/api/drafts/from-stig/:stig_id", post(fork_from_stig_handler))
-        .route(
-            "/api/drafts/:id",
-            get(get_draft_handler)
-                .put(update_draft_handler)
-                .delete(delete_draft_handler),
-        )
-        .route("/api/drafts/:id/next-vuln-id", post(next_vuln_id_handler))
-        .route("/api/drafts/:id/submit", post(submit_handler))
-        .route("/api/drafts/:id/review", post(review_handler))
-        .route("/api/drafts/:id/approve", post(approve_handler))
-        .route("/api/drafts/:id/reject", post(reject_handler))
-        .route("/api/drafts/:id/revise", post(revise_handler))
-        .route(
-            "/api/drafts/:id/comments",
-            get(list_comments_handler).post(add_comment_handler),
-        )
-        .route("/api/approvals", get(list_approvals_handler))
-        .route(
-            "/api/approvals/:id/approve",
-            post(approve_finding_handler),
-        )
-        .route(
-            "/api/approvals/:id/reject",
-            post(reject_finding_handler),
-        )
-        .route(
-            "/api/assets/:id/approval-policy",
-            axum::routing::patch(update_asset_approval_policy_handler),
-        )
-        .route("/api/notifications", get(get_notifications_handler))
-        .route(
-            "/api/notifications/mark-read",
-            post(mark_notifications_read_handler),
-        )
-        .route(
-            "/api/notifications/prefs",
-            get(get_notification_prefs_handler).put(put_notification_prefs_handler),
-        )
-        .route("/api/users", get(list_users_handler))
-        .route("/api/users/me", get(me_handler))
-        .route("/api/dashboard", get(get_dashboard_handler))
-        .route("/api/diff", get(diff_handler))
-        .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
-        .route("/api/findings", get(list_findings_handler))
-        .route(
-            "/api/findings/bulk",
-            axum::routing::patch(bulk_findings_handler),
-        )
-        .route(
-            "/api/baselines",
-            get(list_baselines_handler).post(create_baseline_handler),
-        )
-        .route("/api/baselines/:id", axum::routing::delete(delete_baseline_handler))
-        .route("/api/baselines/:id/diff", get(baseline_diff_handler))
-        .route("/api/reports", get(list_compliance_reports_handler))
-        .route(
-            "/api/reports/:id/report.pdf",
-            get(download_compliance_report_handler),
-        )
-        .route("/api/admin/users", get(admin_list_users_handler))
-        .route(
-            "/api/admin/users/:id/role",
-            axum::routing::patch(admin_update_user_role_handler),
-        )
-        .route(
-            "/api/admin/assets/:id/owner",
-            axum::routing::patch(admin_update_asset_owner_handler),
-        )
-        .route(
-            "/api/admin/email-deliveries",
-            get(list_email_deliveries_handler),
-        )
-        .route(
-            "/api/admin/scheduler-runs",
-            get(list_scheduler_runs_handler),
-        )
-        .route("/api/admin/backup", get(admin_backup_download_handler))
-        // Backup archives can be as large as the catalog uploads; the
-        // handler is admin-only.
-        .route(
-            "/api/admin/restore",
-            post(admin_restore_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-        )
-        .route(
-            "/api/admin/policies",
-            get(list_abac_policies_handler).post(create_abac_policy_handler),
-        )
-        .route(
-            "/api/admin/policies/:id",
-            axum::routing::patch(update_abac_policy_handler)
-                .delete(delete_abac_policy_handler),
-        )
-        .route("/api/admin/sessions", get(list_active_sessions_handler))
-        .route(
-            "/api/admin/sessions/:id",
-            axum::routing::delete(revoke_session_handler),
-        )
-        .route(
-            "/api/saved-searches",
-            get(list_saved_searches_handler).post(create_saved_search_handler),
-        )
-        .route(
-            "/api/saved-searches/:id",
-            axum::routing::delete(delete_saved_search_handler),
-        )
-        .route(
-            "/api/webhooks",
-            get(list_webhooks_handler).post(create_webhook_handler),
-        )
-        .route(
-            "/api/webhooks/:id",
-            axum::routing::patch(update_webhook_handler)
-                .delete(delete_webhook_handler),
-        )
-        .route(
-            "/api/webhooks/:id/deliveries",
-            get(list_webhook_deliveries_handler),
-        )
-        .route("/api/webhooks/:id/test", post(test_webhook_handler))
-        .route(
-            "/api/webhooks/:id/verify-recipe",
-            get(webhook_verify_recipe_handler),
-        )
-        .route("/api/stigs/lint", post(stig_lint_handler))
-        .route("/api/stigs/:id/diff", get(catalog_diff_handler))
-        .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
-        .route("/api/catalog/search", get(catalog_search_handler))
-        // Ed25519 detached signing for exported artifacts (.ckl bundles).
-        // Returns 503 when SIGNING_KEY_HEX isn't set.
-        .route(
-            "/api/sign",
-            post(api::signing::sign_handler).layer(DefaultBodyLimit::max(SIGN_BODY_LIMIT)),
-        )
-        // Catalog uploads — admin-only (checked in the handlers) and the
-        // only routes besides restore that accept bodies up to
-        // MAX_UPLOAD_BYTES.
-        .route(
-            "/api/upload",
-            post(upload_stig).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-        )
-        .route(
-            "/api/upload/library",
-            post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-        )
-        // Viewer gate, central authz.denied recorder, request context and
+    let draft_routes = api::authz_audit::protected_stack(
+        Router::new()
+            .route(
+                "/api/assets",
+                get(list_assets_handler).post(create_asset_handler),
+            )
+            .route("/api/assets/import", post(import_assets_handler))
+            .route(
+                "/api/assets/:id",
+                get(get_asset_handler)
+                    .put(update_asset_handler)
+                    .patch(patch_asset_handler)
+                    .delete(delete_asset_handler),
+            )
+            .route(
+                "/api/assets/:id/acl",
+                get(list_asset_acl_handler).post(create_asset_acl_handler),
+            )
+            .route(
+                "/api/assets/:id/acl/:user_id",
+                axum::routing::delete(delete_asset_acl_handler),
+            )
+            .route(
+                "/api/assets/:id/email-cc",
+                get(list_asset_email_cc_handler).post(create_asset_email_cc_handler),
+            )
+            .route(
+                "/api/assets/:id/email-cc/:email",
+                axum::routing::delete(delete_asset_email_cc_handler),
+            )
+            .route(
+                "/api/assets/:id/email-report",
+                post(send_asset_email_report_handler),
+            )
+            .route(
+                "/api/assets/:id/checklists/save",
+                post(
+                    checklist_save_handler.layer(DefaultBodyLimit::max(SAVE_TO_SYSTEM_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/checklist-sets",
+                get(list_checklist_sets_handler).post(
+                    create_checklist_set_handler
+                        .layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/checklist-sets/:id",
+                get(get_checklist_set_handler)
+                    .patch(
+                        patch_checklist_set_handler
+                            .layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)),
+                    )
+                    .delete(delete_checklist_set_handler),
+            )
+            .route(
+                "/api/checklist-sets/:id/stigs",
+                post(
+                    add_checklist_set_stig_handler
+                        .layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/checklist-sets/:id/stigs/:stig_id",
+                axum::routing::delete(remove_checklist_set_stig_handler),
+            )
+            .route(
+                "/api/checklist-sets/:id/rules",
+                axum::routing::patch(
+                    autosave_checklist_set_handler
+                        .layer(DefaultBodyLimit::max(CHECKLIST_SET_AUTOSAVE_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/checklist-sets/:id/save-to-system",
+                post(
+                    save_checklist_set_to_system_handler
+                        .layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/asset-groups",
+                get(list_asset_groups_handler).post(create_asset_group_handler),
+            )
+            .route(
+                "/api/asset-groups/:id",
+                axum::routing::patch(update_asset_group_handler).delete(delete_asset_group_handler),
+            )
+            .route(
+                "/api/asset-groups/:id/members",
+                get(list_asset_group_members_handler).post(add_asset_group_member_handler),
+            )
+            .route(
+                "/api/asset-groups/:id/members/:asset_id",
+                axum::routing::delete(remove_asset_group_member_handler),
+            )
+            .route("/api/assets/:id/report.pdf", get(asset_report_handler))
+            .route("/api/assets/:id/bundle.zip", get(asset_bundle_handler))
+            .route("/api/assets/:id/oscal.json", get(asset_oscal_handler))
+            .route("/api/assets/:id/trend", get(asset_trend_handler))
+            .route("/api/assets/:left/diff/:right", get(compare_assets_handler))
+            .route(
+                "/api/assets/:id/checklists",
+                get(list_checklists_for_asset_handler).post(create_checklist_handler),
+            )
+            .route(
+                "/api/checklists/:id",
+                get(get_checklist_handler).delete(delete_checklist_handler),
+            )
+            .route(
+                "/api/checklists/:id/reapply",
+                post(reapply_checklist_handler),
+            )
+            .route(
+                "/api/checklists/bulk-reapply",
+                post(bulk_reapply_checklists_handler),
+            )
+            .route(
+                "/api/checklists/:id/rules/:rule_id",
+                axum::routing::patch(update_checklist_rule_handler),
+            )
+            .route(
+                "/api/checklists/:id/rules/bulk-import",
+                post(rule_bulk_import_handler),
+            )
+            .route(
+                "/api/checklists/:id/rules/bulk-status",
+                post(rule_bulk_status_handler.layer(DefaultBodyLimit::max(BULK_STATUS_BODY_LIMIT))),
+            )
+            .route(
+                "/api/checklists/:id/rules/:rule_id/history",
+                get(rule_history_handler),
+            )
+            .route(
+                "/api/checklists/:id/rules/:rule_id/attachments",
+                get(list_attachments_for_rule_handler).post(
+                    upload_attachment_handler.layer(DefaultBodyLimit::max(ATTACHMENT_BODY_LIMIT)),
+                ),
+            )
+            .route(
+                "/api/checklists/:id/rules/:rule_id/comments",
+                get(list_rule_comments_handler).post(create_rule_comment_handler),
+            )
+            .route(
+                "/api/comments/:id",
+                axum::routing::patch(update_rule_comment_handler)
+                    .delete(delete_rule_comment_handler),
+            )
+            .route(
+                "/api/comments/:id/reactions",
+                post(add_comment_reaction_handler),
+            )
+            .route(
+                "/api/comments/:id/reactions/:reaction",
+                axum::routing::delete(remove_comment_reaction_handler),
+            )
+            .route(
+                "/api/checklists/:id/attachments",
+                get(attachments_counts_for_checklist_handler),
+            )
+            .route(
+                "/api/attachments/:id",
+                get(download_attachment_handler).delete(delete_attachment_handler),
+            )
+            .route("/api/activity", get(activity_handler))
+            .route("/api/audit/search", get(audit_search_handler))
+            .route("/api/audit/events", get(audit_events_handler))
+            .route(
+                "/api/drafts",
+                get(list_drafts_handler).post(create_draft_handler),
+            )
+            .route("/api/drafts/pending-for-me", get(pending_for_me_handler))
+            .route(
+                "/api/drafts/from-stig/:stig_id",
+                post(fork_from_stig_handler),
+            )
+            .route(
+                "/api/drafts/:id",
+                get(get_draft_handler)
+                    .put(update_draft_handler)
+                    .delete(delete_draft_handler),
+            )
+            .route("/api/drafts/:id/next-vuln-id", post(next_vuln_id_handler))
+            .route("/api/drafts/:id/submit", post(submit_handler))
+            .route("/api/drafts/:id/review", post(review_handler))
+            .route("/api/drafts/:id/approve", post(approve_handler))
+            .route("/api/drafts/:id/reject", post(reject_handler))
+            .route("/api/drafts/:id/revise", post(revise_handler))
+            .route(
+                "/api/drafts/:id/comments",
+                get(list_comments_handler).post(add_comment_handler),
+            )
+            .route("/api/approvals", get(list_approvals_handler))
+            .route("/api/approvals/:id/approve", post(approve_finding_handler))
+            .route("/api/approvals/:id/reject", post(reject_finding_handler))
+            .route(
+                "/api/assets/:id/approval-policy",
+                axum::routing::patch(update_asset_approval_policy_handler),
+            )
+            .route("/api/notifications", get(get_notifications_handler))
+            .route(
+                "/api/notifications/mark-read",
+                post(mark_notifications_read_handler),
+            )
+            .route(
+                "/api/notifications/prefs",
+                get(get_notification_prefs_handler).put(put_notification_prefs_handler),
+            )
+            .route("/api/users", get(list_users_handler))
+            .route("/api/users/me", get(me_handler))
+            .route("/api/dashboard", get(get_dashboard_handler))
+            .route("/api/diff", get(diff_handler))
+            .route("/api/dashboard/trend", get(get_dashboard_trend_handler))
+            .route("/api/findings", get(list_findings_handler))
+            .route(
+                "/api/findings/bulk",
+                axum::routing::patch(bulk_findings_handler),
+            )
+            .route(
+                "/api/baselines",
+                get(list_baselines_handler).post(create_baseline_handler),
+            )
+            .route(
+                "/api/baselines/:id",
+                axum::routing::delete(delete_baseline_handler),
+            )
+            .route("/api/baselines/:id/diff", get(baseline_diff_handler))
+            .route("/api/reports", get(list_compliance_reports_handler))
+            .route(
+                "/api/reports/:id/report.pdf",
+                get(download_compliance_report_handler),
+            )
+            .route("/api/admin/users", get(admin_list_users_handler))
+            .route(
+                "/api/admin/users/:id/role",
+                axum::routing::patch(admin_update_user_role_handler),
+            )
+            .route(
+                "/api/admin/assets/:id/owner",
+                axum::routing::patch(admin_update_asset_owner_handler),
+            )
+            .route(
+                "/api/admin/email-deliveries",
+                get(list_email_deliveries_handler),
+            )
+            .route(
+                "/api/admin/scheduler-runs",
+                get(list_scheduler_runs_handler),
+            )
+            .route("/api/admin/backup", get(admin_backup_download_handler))
+            // Backup archives can be as large as the catalog uploads; the
+            // handler is admin-only.
+            .route(
+                "/api/admin/restore",
+                post(admin_restore_handler).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            )
+            .route(
+                "/api/admin/policies",
+                get(list_abac_policies_handler).post(create_abac_policy_handler),
+            )
+            .route(
+                "/api/admin/policies/:id",
+                axum::routing::patch(update_abac_policy_handler).delete(delete_abac_policy_handler),
+            )
+            .route("/api/admin/sessions", get(list_active_sessions_handler))
+            .route(
+                "/api/admin/sessions/:id",
+                axum::routing::delete(revoke_session_handler),
+            )
+            .route(
+                "/api/saved-searches",
+                get(list_saved_searches_handler).post(create_saved_search_handler),
+            )
+            .route(
+                "/api/saved-searches/:id",
+                axum::routing::delete(delete_saved_search_handler),
+            )
+            .route(
+                "/api/webhooks",
+                get(list_webhooks_handler).post(create_webhook_handler),
+            )
+            .route(
+                "/api/webhooks/:id",
+                axum::routing::patch(update_webhook_handler).delete(delete_webhook_handler),
+            )
+            .route(
+                "/api/webhooks/:id/deliveries",
+                get(list_webhook_deliveries_handler),
+            )
+            .route("/api/webhooks/:id/test", post(test_webhook_handler))
+            .route(
+                "/api/webhooks/:id/verify-recipe",
+                get(webhook_verify_recipe_handler),
+            )
+            .route("/api/stigs/lint", post(stig_lint_handler))
+            .route("/api/stigs/:id/diff", get(catalog_diff_handler))
+            .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
+            .route("/api/catalog/search", get(catalog_search_handler))
+            // Ed25519 detached signing for exported artifacts (.ckl bundles).
+            // Returns 503 when SIGNING_KEY_HEX isn't set.
+            .route(
+                "/api/sign",
+                post(api::signing::sign_handler).layer(DefaultBodyLimit::max(SIGN_BODY_LIMIT)),
+            )
+            // Catalog uploads — admin-only (checked in the handlers) and the
+            // only routes besides restore that accept bodies up to
+            // MAX_UPLOAD_BYTES.
+            .route(
+                "/api/upload",
+                post(upload_stig).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            )
+            .route(
+                "/api/upload/library",
+                post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+            ), // Viewer gate, central authz.denied recorder, request context and
         // rate limiter (see `authz_audit::protected_stack` for the order).
-        , &state)
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
+        &state,
+    )
+    .route_layer(middleware::from_fn_with_state(
+        auth_state.clone(),
+        auth_middleware,
+    ))
+    .with_state(state.clone());
 
     let mut app = Router::new()
         .route("/api/health", get(get_health))
@@ -697,7 +702,10 @@ async fn main() -> Result<()> {
             .route("/api/test/set-role", post(set_role_handler))
             .route("/api/test/snapshot", post(snapshot_trigger_handler))
             .route("/api/test/backdate-rule", post(backdate_handler))
-            .route("/api/test/backdate-baseline", post(backdate_baseline_handler))
+            .route(
+                "/api/test/backdate-baseline",
+                post(backdate_baseline_handler),
+            )
             .route("/api/test/bump-stig", post(bump_stig_handler))
             .route("/api/test/run-digest", post(run_digest_handler))
             .route("/api/test/run-report", post(run_report_handler))
@@ -734,7 +742,10 @@ async fn main() -> Result<()> {
             let mut interval = if cfg.sync_on_start {
                 tokio::time::interval(period)
             } else {
-                info!("STIG_SYNC_ON_START is off: first DISA sync in {} hour(s)", cfg.sync_interval_hours);
+                info!(
+                    "STIG_SYNC_ON_START is off: first DISA sync in {} hour(s)",
+                    cfg.sync_interval_hours
+                );
                 tokio::time::interval_at(tokio::time::Instant::now() + period, period)
             };
             loop {
@@ -761,14 +772,11 @@ async fn main() -> Result<()> {
             .unwrap_or(24);
         let db = pool.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(snap_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(snap_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "snapshot", || async {
-                    let n = take_snapshot(&db)
-                        .await
-                        .map_err(anyhow::Error::from)?;
+                    let n = take_snapshot(&db).await.map_err(anyhow::Error::from)?;
                     Ok::<String, anyhow::Error>(format!("captured {n} checklists"))
                 })
                 .await;
@@ -791,8 +799,7 @@ async fn main() -> Result<()> {
             .unwrap_or(24);
         let db = pool.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(digest_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(digest_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "overdue_digest", || async {
@@ -829,12 +836,18 @@ async fn main() -> Result<()> {
         let cfg = config.clone();
         let retention_signing = signing.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(retention_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(retention_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "audit_retention", || async {
-                    audit_retention::run_scheduled(&db, &cfg.data_dir, retain_days, archive_enabled, retention_signing.as_ref()).await
+                    audit_retention::run_scheduled(
+                        &db,
+                        &cfg.data_dir,
+                        retain_days,
+                        archive_enabled,
+                        retention_signing.as_ref(),
+                    )
+                    .await
                 })
                 .await;
                 match result {
@@ -861,8 +874,7 @@ async fn main() -> Result<()> {
         let db = pool.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(report_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(report_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "compliance_report", || async {
@@ -895,8 +907,7 @@ async fn main() -> Result<()> {
         let db = pool.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(interval_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_hours * 3600));
             loop {
                 interval.tick().await;
                 let result = scheduler_log::record(&db, "asset_email_schedule", || async {
@@ -935,8 +946,8 @@ async fn main() -> Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

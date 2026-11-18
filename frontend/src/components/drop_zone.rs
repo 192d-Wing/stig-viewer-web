@@ -38,7 +38,9 @@ pub fn DropZone(p: &DropZoneProps) -> Html {
         Callback::from(move |e: DragEvent| {
             e.prevent_default();
             drag_over.set(false);
-            handle_files.emit(file_list_to_vec(e.data_transfer().and_then(|dt| dt.files())));
+            handle_files.emit(file_list_to_vec(
+                e.data_transfer().and_then(|dt| dt.files()),
+            ));
         })
     };
     let on_change = {
@@ -53,8 +55,16 @@ pub fn DropZone(p: &DropZoneProps) -> Html {
     let upload_area_style = format!(
         "border:2px dashed {};border-radius:12px;padding:48px 32px;background:{};\
          transition:border-color 0.2s, background 0.2s;",
-        if *drag_over { "var(--primary)" } else { "var(--border)" },
-        if *drag_over { "var(--bg-selected)" } else { "transparent" },
+        if *drag_over {
+            "var(--primary)"
+        } else {
+            "var(--border)"
+        },
+        if *drag_over {
+            "var(--bg-selected)"
+        } else {
+            "transparent"
+        },
     );
 
     html! {

@@ -95,8 +95,14 @@ pub fn diff_stigs(a: &Stig, b: &Stig) -> StigDiff {
             diff.changed.push(ChangedEntry {
                 stig_id: id.to_string(),
                 rule_id: rule_a.id.clone(),
-                a: fields.iter().map(|f| field(rule_a, f).to_string()).collect(),
-                b: fields.iter().map(|f| field(rule_b, f).to_string()).collect(),
+                a: fields
+                    .iter()
+                    .map(|f| field(rule_a, f).to_string())
+                    .collect(),
+                b: fields
+                    .iter()
+                    .map(|f| field(rule_b, f).to_string())
+                    .collect(),
                 fields,
             });
         }
@@ -124,7 +130,11 @@ mod tests {
     }
 
     fn stig(rules: Vec<Rule>) -> Stig {
-        Stig { title: "T".to_string(), rules, ..Stig::default() }
+        Stig {
+            title: "T".to_string(),
+            rules,
+            ..Stig::default()
+        }
     }
 
     #[test]
@@ -136,10 +146,26 @@ mod tests {
     #[test]
     fn detects_added_and_removed_rules() {
         let a = stig(vec![rule("V-1", "one"), rule("V-2", "two")]);
-        let b = stig(vec![rule("V-2", "two"), rule("V-3", "three"), rule("V-4", "four")]);
+        let b = stig(vec![
+            rule("V-2", "two"),
+            rule("V-3", "three"),
+            rule("V-4", "four"),
+        ]);
         let d = diff_stigs(&a, &b);
-        assert_eq!(d.added.iter().map(|r| r.stig_id.as_str()).collect::<Vec<_>>(), ["V-3", "V-4"]);
-        assert_eq!(d.removed.iter().map(|r| r.stig_id.as_str()).collect::<Vec<_>>(), ["V-1"]);
+        assert_eq!(
+            d.added
+                .iter()
+                .map(|r| r.stig_id.as_str())
+                .collect::<Vec<_>>(),
+            ["V-3", "V-4"]
+        );
+        assert_eq!(
+            d.removed
+                .iter()
+                .map(|r| r.stig_id.as_str())
+                .collect::<Vec<_>>(),
+            ["V-1"]
+        );
         assert!(d.changed.is_empty());
     }
 
@@ -158,8 +184,16 @@ mod tests {
                 stig_id: "V-1".to_string(),
                 rule_id: "SV-1r1_rule".to_string(),
                 fields: vec!["title", "severity", "fixText"],
-                a: vec!["old title".to_string(), "CAT II".to_string(), "fix".to_string()],
-                b: vec!["new title".to_string(), "CAT I".to_string(), "new fix".to_string()],
+                a: vec![
+                    "old title".to_string(),
+                    "CAT II".to_string(),
+                    "fix".to_string()
+                ],
+                b: vec![
+                    "new title".to_string(),
+                    "CAT I".to_string(),
+                    "new fix".to_string()
+                ],
             }]
         );
     }
@@ -177,12 +211,22 @@ mod tests {
 
     #[test]
     fn duplicate_stig_ids_keep_the_last_rule() {
-        let a = stig(vec![rule("V-1", "first"), rule("V-2", "two"), rule("V-1", "last")]);
+        let a = stig(vec![
+            rule("V-1", "first"),
+            rule("V-2", "two"),
+            rule("V-1", "last"),
+        ]);
         let b = stig(vec![rule("V-1", "last"), rule("V-2", "two")]);
         assert_eq!(diff_stigs(&a, &b), StigDiff::default());
 
         let d = diff_stigs(&a, &stig(vec![]));
-        assert_eq!(d.removed.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), ["last", "two"]);
+        assert_eq!(
+            d.removed
+                .iter()
+                .map(|r| r.title.as_str())
+                .collect::<Vec<_>>(),
+            ["last", "two"]
+        );
     }
 
     #[test]

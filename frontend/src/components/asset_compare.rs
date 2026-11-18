@@ -88,7 +88,11 @@ pub fn AssetCompare(props: &AssetCompareProps) -> Html {
         let assets = assets.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
-                assets.set(api_get::<Vec<AssetOption>>("/api/assets").await.unwrap_or_default());
+                assets.set(
+                    api_get::<Vec<AssetOption>>("/api/assets")
+                        .await
+                        .unwrap_or_default(),
+                );
             });
         });
     }
@@ -98,8 +102,9 @@ pub fn AssetCompare(props: &AssetCompareProps) -> Html {
         let diff = diff.clone();
         let loading = loading.clone();
         let error = error.clone();
-        use_effect_with(((*left_id).clone(), (*right_id).clone()), move |(left, right)| {
-            match (left, right) {
+        use_effect_with(
+            ((*left_id).clone(), (*right_id).clone()),
+            move |(left, right)| match (left, right) {
                 (Some(l), Some(r)) if l != r => {
                     let path = format!(
                         "/api/assets/{}/diff/{}",
@@ -120,12 +125,14 @@ pub fn AssetCompare(props: &AssetCompareProps) -> Html {
                     });
                 }
                 _ => diff.set(None),
-            }
-        });
+            },
+        );
     }
 
-    let options: Vec<SelectOption> =
-        assets.iter().map(|a| SelectOption::new(a.id.clone(), a.name.clone())).collect();
+    let options: Vec<SelectOption> = assets
+        .iter()
+        .map(|a| SelectOption::new(a.id.clone(), a.name.clone()))
+        .collect();
 
     let on_left = {
         let left_id = left_id.clone();

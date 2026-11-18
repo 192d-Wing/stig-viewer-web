@@ -56,23 +56,21 @@ pub async fn create_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    sqlx::query(
-        "INSERT INTO baselines (id, name, created_by) VALUES ($1, $2, $3)",
-    )
-    .bind(&id)
-    .bind(name)
-    .bind(&user.id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        let msg = format!("{e:#}");
-        if msg.contains("duplicate key") {
-            StatusCode::CONFLICT
-        } else {
-            tracing::error!("create baseline failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    })?;
+    sqlx::query("INSERT INTO baselines (id, name, created_by) VALUES ($1, $2, $3)")
+        .bind(&id)
+        .bind(name)
+        .bind(&user.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("duplicate key") {
+                StatusCode::CONFLICT
+            } else {
+                tracing::error!("create baseline failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
 
     sqlx::query(
         r#"
@@ -135,14 +133,15 @@ pub async fn delete_handler(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let owner: Option<String> = sqlx::query_scalar("SELECT created_by FROM baselines WHERE id = $1")
-        .bind(&id)
-        .fetch_optional(state.pool.as_ref())
-        .await
-        .map_err(|e| {
-            tracing::error!("delete baseline lookup failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT created_by FROM baselines WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(state.pool.as_ref())
+            .await
+            .map_err(|e| {
+                tracing::error!("delete baseline lookup failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let owner = owner.ok_or(StatusCode::NOT_FOUND)?;
     if owner != user.id {
@@ -314,4 +313,3 @@ async fn fetch_one(pool: &sqlx::PgPool, id: &str) -> Result<BaselineRow, StatusC
     })?
     .ok_or(StatusCode::NOT_FOUND)
 }
-

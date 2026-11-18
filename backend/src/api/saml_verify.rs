@@ -111,14 +111,19 @@ pub fn insecure_unverified_scope(is_production: bool) -> Result<VerifiedScope> {
     if is_production {
         bail!("signature verification cannot be skipped in production");
     }
-    Ok(VerifiedScope { kind: ScopeKind::Response, _private: () })
+    Ok(VerifiedScope {
+        kind: ScopeKind::Response,
+        _private: (),
+    })
 }
 
 /// Verify every Signature in `doc` against the configured PEM.
 pub fn verify_response(doc: &SamlDoc, idp_cert_pem: &str) -> Result<VerifiedScope> {
     let root = doc.root();
     let assertion = doc.assertion()?;
-    let sigs: Vec<usize> = (0..doc.len()).filter(|&i| doc.is(i, NS_DSIG, "Signature")).collect();
+    let sigs: Vec<usize> = (0..doc.len())
+        .filter(|&i| doc.is(i, NS_DSIG, "Signature"))
+        .collect();
     if sigs.is_empty() {
         bail!("no Signature element");
     }
@@ -144,13 +149,19 @@ pub fn verify_response(doc: &SamlDoc, idp_cert_pem: &str) -> Result<VerifiedScop
         verify_one(doc, s, parent, &key, &configured_b64)?;
         response_signed |= parent == root;
     }
-    let kind = if response_signed { ScopeKind::Response } else { ScopeKind::Assertion };
+    let kind = if response_signed {
+        ScopeKind::Response
+    } else {
+        ScopeKind::Assertion
+    };
     Ok(VerifiedScope { kind, _private: () })
 }
 
 /// Startup check for `SAML_IDP_CERT_PEM`: parses and enforces the key size.
 pub fn validate_idp_cert(pem: &str) -> Result<()> {
-    pinned_key(&strip_pem_armor(pem)).map(|_| ()).map_err(|e| tag("cert", e))
+    pinned_key(&strip_pem_armor(pem))
+        .map(|_| ())
+        .map_err(|e| tag("cert", e))
 }
 
 fn pinned_key(configured_b64: &str) -> Result<RsaPublicKey> {
@@ -166,7 +177,10 @@ fn pinned_key(configured_b64: &str) -> Result<RsaPublicKey> {
 
 fn check_key_size(key: &RsaPublicKey) -> Result<()> {
     if key.n().bits() < MIN_RSA_BITS {
-        return Err(reject("cert", format!("IdP RSA key is smaller than {MIN_RSA_BITS} bits")));
+        return Err(reject(
+            "cert",
+            format!("IdP RSA key is smaller than {MIN_RSA_BITS} bits"),
+        ));
     }
     Ok(())
 }
@@ -190,7 +204,10 @@ fn verify_one(
             .ok_or_else(|| anyhow!("{name} has no Algorithm"))
     };
     if alg_uri(signed_info, "CanonicalizationMethod")? != ALG_EXC_C14N {
-        return Err(reject("algorithm", "unsupported CanonicalizationMethod algorithm"));
+        return Err(reject(
+            "algorithm",
+            "unsupported CanonicalizationMethod algorithm",
+        ));
     }
     let sig_alg = SigAlg::from_uri(alg_uri(signed_info, "SignatureMethod")?)
         .ok_or_else(|| reject("algorithm", "unsupported SignatureMethod algorithm"))?;
@@ -223,7 +240,10 @@ fn verify_one(
     if let Some(&c) = certs.first() {
         let embedded: String = doc.leaf_text(c)?.split_whitespace().collect();
         if embedded != configured_b64 {
-            return Err(reject("cert", "embedded X509Certificate does not match SAML_IDP_CERT_PEM"));
+            return Err(reject(
+                "cert",
+                "embedded X509Certificate does not match SAML_IDP_CERT_PEM",
+            ));
         }
     }
 
@@ -241,7 +261,9 @@ fn verify_one(
     }
 
     let sig_b64: String = doc.leaf_text(sig_value)?.split_whitespace().collect();
-    let sig_bytes = B64.decode(sig_b64.as_bytes()).context("SignatureValue not base64")?;
+    let sig_bytes = B64
+        .decode(sig_b64.as_bytes())
+        .context("SignatureValue not base64")?;
     sig_alg.verify(key, doc.span(signed_info).as_bytes(), &sig_bytes)?;
     Ok(())
 }
@@ -285,11 +307,17 @@ pub(crate) mod fixtures {
 
     pub fn gen_cert_bits(bits: usize) -> (String, RsaPrivateKey) {
         let rsa = gen_rsa(bits);
-        let pem = rsa.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap().to_string();
-        let kp = rcgen::KeyPair::from_pkcs8_pem_and_sign_algo(&pem, &rcgen::PKCS_RSA_SHA256).unwrap();
+        let pem = rsa
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let kp =
+            rcgen::KeyPair::from_pkcs8_pem_and_sign_algo(&pem, &rcgen::PKCS_RSA_SHA256).unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, "test-idp");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "test-idp");
         (params.self_signed(&kp).unwrap().pem(), rsa)
     }
 
@@ -336,17 +364,34 @@ pub(crate) mod fixtures {
         }
 
         fn assertion(&self, sig: &str) -> String {
-            let irt = self.sub_irt.as_ref().map(|v| format!(r#" InResponseTo="{v}""#)).unwrap_or_default();
+            let irt = self
+                .sub_irt
+                .as_ref()
+                .map(|v| format!(r#" InResponseTo="{v}""#))
+                .unwrap_or_default();
             format!(
                 r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="AS1" Version="2.0" IssueInstant="2029-12-31T23:59:30Z"><saml:Issuer>{iss}</saml:Issuer>{sig}<saml:Subject><saml:NameID>{nm}</saml:NameID><saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="{rcp}" NotOnOrAfter="{bn}"{irt}/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{nb}" NotOnOrAfter="{na}"><saml:AudienceRestriction><saml:Audience>{aud}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:AttributeStatement><saml:Attribute Name="mail"><saml:AttributeValue>{nm}</saml:AttributeValue></saml:Attribute><saml:Attribute Name="displayName"><saml:AttributeValue>Alice Example</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>"#,
-                iss = self.issuer, nm = self.name_id, rcp = self.recipient, bn = self.bearer_nooa,
-                nb = self.cond_nb, na = self.cond_nooa, aud = self.audience,
+                iss = self.issuer,
+                nm = self.name_id,
+                rcp = self.recipient,
+                bn = self.bearer_nooa,
+                nb = self.cond_nb,
+                na = self.cond_nooa,
+                aud = self.audience,
             )
         }
 
         fn response(&self, sig: &str, assertion: &str) -> String {
-            let dest = self.destination.as_ref().map(|v| format!(r#" Destination="{v}""#)).unwrap_or_default();
-            let irt = self.resp_irt.as_ref().map(|v| format!(r#" InResponseTo="{v}""#)).unwrap_or_default();
+            let dest = self
+                .destination
+                .as_ref()
+                .map(|v| format!(r#" Destination="{v}""#))
+                .unwrap_or_default();
+            let irt = self
+                .resp_irt
+                .as_ref()
+                .map(|v| format!(r#" InResponseTo="{v}""#))
+                .unwrap_or_default();
             format!(
                 r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="RS1" Version="2.0"{dest}{irt}>{sig}<samlp:Status><samlp:StatusCode Value="{st}"/></samlp:Status>{assertion}</samlp:Response>"#,
                 st = self.status,
@@ -378,7 +423,11 @@ pub(crate) mod fixtures {
         let si = format!(
             r##"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#{id}"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{digest}</DigestValue></Reference></SignedInfo>"##
         );
-        let sv = B64.encode(SigningKey::<Sha256>::new(rsa.clone()).sign(si.as_bytes()).to_bytes());
+        let sv = B64.encode(
+            SigningKey::<Sha256>::new(rsa.clone())
+                .sign(si.as_bytes())
+                .to_bytes(),
+        );
         let cert = strip_pem_armor(cert_pem);
         format!(
             r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">{si}<SignatureValue>{sv}</SignatureValue><KeyInfo><X509Data><X509Certificate>{cert}</X509Certificate></X509Data></KeyInfo></Signature>"#
@@ -403,9 +452,18 @@ mod tests {
 
     #[test]
     fn verifies_each_layout_with_right_scope() {
-        assert_eq!(verify(&built(Layout::Assertion)).unwrap().kind, ScopeKind::Assertion);
-        assert_eq!(verify(&built(Layout::Response)).unwrap().kind, ScopeKind::Response);
-        assert_eq!(verify(&built(Layout::Both)).unwrap().kind, ScopeKind::Response);
+        assert_eq!(
+            verify(&built(Layout::Assertion)).unwrap().kind,
+            ScopeKind::Assertion
+        );
+        assert_eq!(
+            verify(&built(Layout::Response)).unwrap().kind,
+            ScopeKind::Response
+        );
+        assert_eq!(
+            verify(&built(Layout::Both)).unwrap().kind,
+            ScopeKind::Response
+        );
     }
 
     #[test]
@@ -464,7 +522,9 @@ mod tests {
         let s0 = good.find("<Signature").unwrap();
         let s1 = good.find("</Signature>").unwrap() + "</Signature>".len();
         let sig = good[s0..s1].to_string();
-        let moved = good.replace(&sig, "").replace("<samlp:Status>", &format!("<samlp:Status>{sig}"));
+        let moved = good
+            .replace(&sig, "")
+            .replace("<samlp:Status>", &format!("<samlp:Status>{sig}"));
         assert!(err(&moved).contains("not a direct child"));
     }
 
@@ -478,13 +538,17 @@ mod tests {
             assert!(err(&built(Layout::Assertion).replace(from, to)).contains("Reference URI"));
         }
         // Second Reference.
-        let xml = built(Layout::Assertion).replace("</SignedInfo>", r##"<Reference URI="#AS1"/></SignedInfo>"##);
+        let xml = built(Layout::Assertion)
+            .replace("</SignedInfo>", r##"<Reference URI="#AS1"/></SignedInfo>"##);
         assert!(err(&xml).contains("duplicate Reference"));
     }
 
     #[test]
     fn duplicate_ids_and_two_signatures_are_rejected() {
-        assert!(SamlDoc::parse(&built(Layout::Assertion).replace(r#"ID="RS1""#, r#"ID="AS1""#)).is_err());
+        assert!(
+            SamlDoc::parse(&built(Layout::Assertion).replace(r#"ID="RS1""#, r#"ID="AS1""#))
+                .is_err()
+        );
         let good = built(Layout::Assertion);
         let s0 = good.find("<Signature").unwrap();
         let s1 = good.find("</Signature>").unwrap() + "</Signature>".len();
@@ -498,33 +562,53 @@ mod tests {
         for (from, to, want) in [
             ("xmlenc#sha256", "xmlenc#sha512", "DigestMethod"),
             ("rsa-sha256", "rsa-sha1", "SignatureMethod"),
-            ("xml-exc-c14n#\"", "REC-xml-c14n-20010315\"", "CanonicalizationMethod"),
+            (
+                "xml-exc-c14n#\"",
+                "REC-xml-c14n-20010315\"",
+                "CanonicalizationMethod",
+            ),
             ("xmldsig#enveloped-signature", "xmldsig#base64", "Transform"),
         ] {
-            assert!(err(&built(Layout::Assertion).replace(from, to)).contains(want), "{from}");
+            assert!(
+                err(&built(Layout::Assertion).replace(from, to)).contains(want),
+                "{from}"
+            );
         }
     }
 
     #[test]
     fn tampering_and_pinning_are_rejected() {
-        let xml = built(Layout::Assertion).replace(">alice@example.com</saml:NameID>", ">evil@example.com</saml:NameID>");
+        let xml = built(Layout::Assertion).replace(
+            ">alice@example.com</saml:NameID>",
+            ">evil@example.com</saml:NameID>",
+        );
         assert!(err(&xml).contains("DigestValue"));
         let (other, _) = gen_cert();
-        let e = format!("{:#}", verify_response(&SamlDoc::parse(&built(Layout::Assertion)).unwrap(), &other).unwrap_err());
+        let e = format!(
+            "{:#}",
+            verify_response(&SamlDoc::parse(&built(Layout::Assertion)).unwrap(), &other)
+                .unwrap_err()
+        );
         assert!(e.contains("does not match SAML_IDP_CERT_PEM"), "{e}");
         assert!(err(&built(Layout::Unsigned)).contains("no Signature"));
     }
 
     #[test]
     fn comment_inside_nameid_is_rejected() {
-        let xml = built(Layout::Assertion).replace("alice@example.com</saml:NameID>", "a@b<!-- -->.evil</saml:NameID>");
+        let xml = built(Layout::Assertion).replace(
+            "alice@example.com</saml:NameID>",
+            "a@b<!-- -->.evil</saml:NameID>",
+        );
         assert!(SamlDoc::parse(&xml).is_err());
     }
 
     #[test]
     fn dev_bypass_refuses_in_production() {
         assert!(insecure_unverified_scope(true).is_err());
-        assert_eq!(insecure_unverified_scope(false).unwrap().kind, ScopeKind::Response);
+        assert_eq!(
+            insecure_unverified_scope(false).unwrap().kind,
+            ScopeKind::Response
+        );
     }
 
     const P: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
@@ -536,7 +620,9 @@ mod tests {
         let (pem, rsa) = key();
         let unsigned = format!("{open}{body}{close}");
         let sig = signature("AS1", &unsigned, pem, rsa);
-        format!(r#"<samlp:Response xmlns:samlp="{P}" {root_decls} ID="RS1">{open}{sig}{body}{close}</samlp:Response>"#)
+        format!(
+            r#"<samlp:Response xmlns:samlp="{P}" {root_decls} ID="RS1">{open}{sig}{body}{close}</samlp:Response>"#
+        )
     }
 
     #[test]
@@ -563,7 +649,9 @@ mod tests {
         let body = "<saml:Subject><saml:NameID>a@b.c</saml:NameID></saml:Subject>";
         let unsigned = format!("{open}{body}</saml:Assertion>");
         let sig = signature("AS1", &unsigned, pem, rsa);
-        let xml = format!(r#"<samlp:Response xmlns:samlp="{P}" ID="RS1">{open}{sig}{body}</saml:Assertion></samlp:Response>"#);
+        let xml = format!(
+            r#"<samlp:Response xmlns:samlp="{P}" ID="RS1">{open}{sig}{body}</saml:Assertion></samlp:Response>"#
+        );
         assert!(verify(&xml).is_ok());
     }
 
@@ -583,8 +671,13 @@ mod tests {
                 r#"<samlp:Response xmlns:samlp="{P}" ID="RS1" Version="2.0">{wrap}{signed}{close}</samlp:Response>"#
             );
             // Rejected at parse (Assertion not a direct child of Response) before any verification.
-            let e = SamlDoc::parse(&xml).and_then(|d| verify_response(&d, &key().0)).unwrap_err();
-            assert!(format!("{e:#}").contains("not a direct child of Response"), "{wrap}: {e:#}");
+            let e = SamlDoc::parse(&xml)
+                .and_then(|d| verify_response(&d, &key().0))
+                .unwrap_err();
+            assert!(
+                format!("{e:#}").contains("not a direct child of Response"),
+                "{wrap}: {e:#}"
+            );
         }
     }
 

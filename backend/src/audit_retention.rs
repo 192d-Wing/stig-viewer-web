@@ -159,11 +159,18 @@ fn preserve_rejected(dir: &Path, name: &str) {
         }
         let mut to = dir.join(format!("{file}.rejected-{ts}"));
         if to.exists() {
-            to = dir.join(format!("{file}.rejected-{ts}-{}", uuid::Uuid::new_v4().simple()));
+            to = dir.join(format!(
+                "{file}.rejected-{ts}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
         }
         match std::fs::rename(&from, &to) {
-            Ok(()) => tracing::warn!(target: "audit", from = ?file, to = ?to.file_name(), "audit archive file preserved as rejected"),
-            Err(e) => tracing::error!(target: "audit", file = ?file, "could not preserve rejected audit archive file: {e:#}"),
+            Ok(()) => {
+                tracing::warn!(target: "audit", from = ?file, to = ?to.file_name(), "audit archive file preserved as rejected")
+            }
+            Err(e) => {
+                tracing::error!(target: "audit", file = ?file, "could not preserve rejected audit archive file: {e:#}")
+            }
         }
     }
 }
@@ -231,7 +238,9 @@ fn archived_lines(
                     }
                 }
             }
-            Err(e) => tracing::warn!(target: "audit", segment = ?name, "audit archive segment unreadable, not counted: {e:#}"),
+            Err(e) => {
+                tracing::warn!(target: "audit", segment = ?name, "audit archive segment unreadable, not counted: {e:#}")
+            }
         }
     }
     Ok(seen)
@@ -289,7 +298,10 @@ fn write_segment(
         rows: group.len() as u64,
         first_id: first.id,
         last_id: last.id,
-        digest: Digest { algorithm: "sha-512".into(), value: integrity::sha512_hex(&body) },
+        digest: Digest {
+            algorithm: "sha-512".into(),
+            value: integrity::sha512_hex(&body),
+        },
         signers: integrity::signers_for(key),
     };
     let payload = serde_json::to_vec(&manifest)?;
@@ -322,7 +334,10 @@ fn archive_blocking(
     // Group by UTC date; `occurred_at` can be out of order versus id.
     let mut by_date: BTreeMap<String, Vec<&ArchiveLine>> = BTreeMap::new();
     for row in &rows {
-        by_date.entry(row.occurred_at.format("%Y-%m-%d").to_string()).or_default().push(row);
+        by_date
+            .entry(row.occurred_at.format("%Y-%m-%d").to_string())
+            .or_default()
+            .push(row);
     }
     for (date, mut group) in by_date {
         if !cache.contains_key(&date) {
@@ -330,12 +345,18 @@ fn archive_blocking(
         }
         let seen = cache.entry(date.clone()).or_default();
         // Skip a row only when a verified segment holds this exact line.
-        group.retain(|l| !seen.get(&l.id).is_some_and(|h| h.contains(&integrity::sha512_hex(l.line.as_bytes()))));
+        group.retain(|l| {
+            !seen
+                .get(&l.id)
+                .is_some_and(|h| h.contains(&integrity::sha512_hex(l.line.as_bytes())))
+        });
         group.sort_by_key(|l| l.id);
         group.dedup_by_key(|l| l.id);
         write_segment(&dir, stream, &date, &group, key)?;
         for l in &group {
-            seen.entry(l.id).or_default().insert(integrity::sha512_hex(l.line.as_bytes()));
+            seen.entry(l.id)
+                .or_default()
+                .insert(integrity::sha512_hex(l.line.as_bytes()));
         }
     }
     Ok(())
@@ -382,9 +403,15 @@ pub fn verify_segment(
     let sidecar = match std::fs::read(dir.join(format!("{segment}.manifest.json"))) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SegmentError::Definite(anyhow::anyhow!("sidecar manifest is missing")))
+            return Err(SegmentError::Definite(anyhow::anyhow!(
+                "sidecar manifest is missing"
+            )))
         }
-        Err(e) => return Err(SegmentError::Transient(anyhow::Error::from(e).context("read sidecar"))),
+        Err(e) => {
+            return Err(SegmentError::Transient(
+                anyhow::Error::from(e).context("read sidecar"),
+            ))
+        }
     };
     check_segment(segment, &body, &sidecar, key).map_err(SegmentError::Definite)
 }
@@ -404,8 +431,14 @@ fn check_segment(
     )?;
     let m: SegmentManifest = serde_json::from_slice(&v.payload)?;
     anyhow::ensure!(m.file == segment, "manifest is for another file");
-    anyhow::ensure!(m.digest.algorithm == "sha-512", "unsupported digest algorithm");
-    anyhow::ensure!(m.digest.value == integrity::sha512_hex(body), "segment digest mismatch");
+    anyhow::ensure!(
+        m.digest.algorithm == "sha-512",
+        "unsupported digest algorithm"
+    );
+    anyhow::ensure!(
+        m.digest.value == integrity::sha512_hex(body),
+        "segment digest mismatch"
+    );
     let ids: Vec<i64> = lines_in(body)?.into_iter().map(|(i, _)| i).collect();
     anyhow::ensure!(ids.len() as u64 == m.rows, "row count mismatch");
     let range = segment_range_any(segment).context("segment file name is not a segment name")?;
@@ -417,7 +450,10 @@ fn check_segment(
         ids.iter().min() == Some(&m.first_id) && ids.iter().max() == Some(&m.last_id),
         "id range mismatch"
     );
-    Ok(VerifiedSegment { status: v.status, body: body.to_vec() })
+    Ok(VerifiedSegment {
+        status: v.status,
+        body: body.to_vec(),
+    })
 }
 
 /// Why a segment did not verify. Only a `Definite` failure justifies
@@ -495,14 +531,22 @@ pub async fn run_prune(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        archive_rows(data_dir, STREAM_RULES, lines, signing, &mut SeenCache::new())
-            .await
-            .context("write audit archive segment")?;
+        archive_rows(
+            data_dir,
+            STREAM_RULES,
+            lines,
+            signing,
+            &mut SeenCache::new(),
+        )
+        .await
+        .context("write audit archive segment")?;
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let mut tx = pool.begin().await.context("begin rule_audit prune tx")?;
-    crate::db_audit::set_maintenance(&mut tx, "retention").await.context("set audit maintenance mode")?;
+    crate::db_audit::set_maintenance(&mut tx, "retention")
+        .await
+        .context("set audit maintenance mode")?;
     let deleted = sqlx::query("DELETE FROM rule_audit WHERE id = ANY($1::bigint[])")
         .bind(&ids)
         .execute(&mut *tx)
@@ -549,7 +593,15 @@ pub async fn run_prune_events(
     archive: bool,
     signing: Option<&SigningState>,
 ) -> Result<usize> {
-    run_prune_events_batched(pool, data_dir, retain_days, archive, EVENT_PRUNE_BATCH, signing).await
+    run_prune_events_batched(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        EVENT_PRUNE_BATCH,
+        signing,
+    )
+    .await
 }
 
 async fn run_prune_events_batched(
@@ -594,7 +646,9 @@ async fn run_prune_events_batched(
 
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         let mut tx = pool.begin().await.context("begin audit_events prune tx")?;
-        crate::db_audit::set_maintenance(&mut tx, "retention").await.context("set audit maintenance mode")?;
+        crate::db_audit::set_maintenance(&mut tx, "retention")
+            .await
+            .context("set audit maintenance mode")?;
         let deleted = sqlx::query("DELETE FROM audit_events WHERE id = ANY($1::bigint[])")
             .bind(&ids)
             .execute(&mut *tx)
@@ -630,7 +684,11 @@ pub async fn run_scheduled(
                 Ok(n) => format!("pruned {n}"),
                 Err(err) => format!("failed: {err:#}"),
             };
-            anyhow::bail!("audit retention: rule_audit {}; audit_events {}", show(r), show(e))
+            anyhow::bail!(
+                "audit retention: rule_audit {}; audit_events {}",
+                show(r),
+                show(e)
+            )
         }
     }
 }
@@ -655,7 +713,11 @@ fn event_line(row: &EventRow) -> Result<ArchiveLine> {
         "detail": detail,
     }))
     .context("serialize audit event")?;
-    Ok(ArchiveLine { id: row.id, occurred_at: row.occurred_at, line })
+    Ok(ArchiveLine {
+        id: row.id,
+        occurred_at: row.occurred_at,
+        line,
+    })
 }
 
 #[cfg(test)]
@@ -680,7 +742,10 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         assert_eq!(run_prune(&pool, &dir, 5, true, None).await.unwrap(), 1);
-        let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit").fetch_all(&pool).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, ["new"]);
         assert!(dir.join("audit_archive").exists());
     }
@@ -737,7 +802,9 @@ mod tests {
             .unwrap();
         }
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let n = run_prune_events(&pool, &dir, 365, true, None).await.unwrap();
+        let n = run_prune_events(&pool, &dir, 365, true, None)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT outcome FROM audit_events")
             .fetch_all(&pool)
@@ -757,7 +824,12 @@ mod tests {
         assert_eq!(line["detail"]["k"], 1);
         // Without the archive switch nothing is written.
         let dir2 = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        assert_eq!(run_prune_events(&pool, &dir2, 5, false, None).await.unwrap(), 1);
+        assert_eq!(
+            run_prune_events(&pool, &dir2, 5, false, None)
+                .await
+                .unwrap(),
+            1
+        );
         assert!(!dir2.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -782,13 +854,21 @@ mod tests {
         }
         seed_expired_event(&pool, 1).await;
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let n = run_prune_events_batched(&pool, &dir, 365, true, 2, None).await.unwrap();
+        let n = run_prune_events_batched(&pool, &dir, 365, true, 2, None)
+            .await
+            .unwrap();
         assert_eq!(n, 5);
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, 1);
         let mut lines = 0;
         for seg in segments(&dir) {
-            lines += std::fs::read_to_string(dir.join("audit_archive").join(seg)).unwrap().lines().count();
+            lines += std::fs::read_to_string(dir.join("audit_archive").join(seg))
+                .unwrap()
+                .lines()
+                .count();
         }
         assert_eq!(lines, 5);
         let _ = std::fs::remove_dir_all(&dir);
@@ -802,7 +882,10 @@ mod tests {
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let msg = run_scheduled(&pool, &dir, 365, false, None).await.unwrap();
         assert!(msg.contains("1 events"), "{msg}");
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, 0);
     }
 
@@ -811,12 +894,23 @@ mod tests {
     async fn a_failing_rule_audit_prune_does_not_skip_the_event_prune(pool: PgPool) {
         seed_user(&pool, "u1").await;
         seed_expired_event(&pool, 400).await;
-        sqlx::query("DROP TABLE rule_audit").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE rule_audit")
+            .execute(&pool)
+            .await
+            .unwrap();
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let err = run_scheduled(&pool, &dir, 365, false, None).await.unwrap_err();
+        let err = run_scheduled(&pool, &dir, 365, false, None)
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("rule_audit failed") && msg.contains("audit_events pruned 1"), "{msg}");
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert!(
+            msg.contains("rule_audit failed") && msg.contains("audit_events pruned 1"),
+            "{msg}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, 0);
     }
 
@@ -846,11 +940,21 @@ mod tests {
     fn segment_manifest_verifies_and_any_flipped_byte_fails() {
         let k = test_key(1);
         let dir = temp_dir();
-        archive_blocking(&dir, STREAM_RULES, vec![line(3, "2024-01-01"), line(1, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(3, "2024-01-01"), line(1, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let ad = dir.join("audit_archive");
         assert_eq!(segments(&dir), ["rules-2024-01-01.1-3.jsonl"]);
         let seg = "rules-2024-01-01.1-3.jsonl";
-        assert_eq!(verify_segment(&ad, seg, Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert_eq!(
+            verify_segment(&ad, seg, Some(&k)).unwrap().status,
+            SignatureStatus::Verified
+        );
         // Flip a byte in the segment.
         let orig = std::fs::read(ad.join(seg)).unwrap();
         let mut bad = orig.clone();
@@ -860,11 +964,17 @@ mod tests {
         std::fs::write(ad.join(seg), &orig).unwrap();
         // Rewrite the manifest's digest: the signature no longer covers it.
         let mp = ad.join(format!("{seg}.manifest.json"));
-        let mut env: integrity::Envelope = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
-        let mut payload = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &env.payload).unwrap();
+        let mut env: integrity::Envelope =
+            serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+        let mut payload = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &env.payload,
+        )
+        .unwrap();
         let i = payload.iter().position(|&b| b == b'3').unwrap();
         payload[i] = b'4';
-        env.payload = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &payload);
+        env.payload =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &payload);
         std::fs::write(&mp, serde_json::to_vec(&env).unwrap()).unwrap();
         assert!(verify_segment(&ad, seg, Some(&k)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -873,12 +983,24 @@ mod tests {
     #[test]
     fn without_a_key_the_manifest_carries_a_digest_only() {
         let dir = temp_dir();
-        archive_blocking(&dir, STREAM_EVENTS, vec![line(5, "2024-02-02")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_EVENTS,
+            vec![line(5, "2024-02-02")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let ad = dir.join("audit_archive");
         let seg = "events-2024-02-02.5-5.jsonl";
-        assert_eq!(verify_segment(&ad, seg, None).unwrap().status, SignatureStatus::Unsigned);
-        let sidecar: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(ad.join(format!("{seg}.manifest.json"))).unwrap()).unwrap();
+        assert_eq!(
+            verify_segment(&ad, seg, None).unwrap().status,
+            SignatureStatus::Unsigned
+        );
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(ad.join(format!("{seg}.manifest.json"))).unwrap(),
+        )
+        .unwrap();
         assert_eq!(sidecar["signatures"], serde_json::json!([]));
         // There is no unauthenticated copy of the manifest next to the payload.
         assert!(sidecar.get("manifest").is_none());
@@ -901,19 +1023,45 @@ mod tests {
     fn a_second_run_over_the_same_rows_writes_nothing() {
         let k = test_key(1);
         let dir = temp_dir();
-        let rows = || vec![line(1, "2024-01-01"), line(2, "2024-01-01"), line(9, "2024-01-02")];
+        let rows = || {
+            vec![
+                line(1, "2024-01-01"),
+                line(2, "2024-01-01"),
+                line(9, "2024-01-02"),
+            ]
+        };
         archive_blocking(&dir, STREAM_RULES, rows(), Some(&k), &mut SeenCache::new()).unwrap();
-        let before = std::fs::read_dir(dir.join("audit_archive")).unwrap().count();
+        let before = std::fs::read_dir(dir.join("audit_archive"))
+            .unwrap()
+            .count();
         archive_blocking(&dir, STREAM_RULES, rows(), Some(&k), &mut SeenCache::new()).unwrap();
-        assert_eq!(std::fs::read_dir(dir.join("audit_archive")).unwrap().count(), before);
+        assert_eq!(
+            std::fs::read_dir(dir.join("audit_archive"))
+                .unwrap()
+                .count(),
+            before
+        );
         // A partial overlap writes only the new id, as its own segment.
-        archive_blocking(&dir, STREAM_RULES, vec![line(2, "2024-01-01"), line(7, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(2, "2024-01-01"), line(7, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert_eq!(
             segments(&dir),
-            ["rules-2024-01-01.1-2.jsonl", "rules-2024-01-01.7-7.jsonl", "rules-2024-01-02.9-9.jsonl"]
+            [
+                "rules-2024-01-01.1-2.jsonl",
+                "rules-2024-01-01.7-7.jsonl",
+                "rules-2024-01-02.9-9.jsonl"
+            ]
         );
         // No temp files linger.
-        assert!(std::fs::read_dir(dir.join("audit_archive")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(std::fs::read_dir(dir.join("audit_archive"))
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -924,8 +1072,18 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         let legacy = "{\"id\":1,\"v\":\"old\"}\n{\"id\":2,\"v\":\"old\"}\n";
         std::fs::write(ad.join("2024-01-01.jsonl"), legacy).unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(2, "2024-01-01"), line(3, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
-        assert_eq!(std::fs::read_to_string(ad.join("2024-01-01.jsonl")).unwrap(), legacy);
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(2, "2024-01-01"), line(3, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ad.join("2024-01-01.jsonl")).unwrap(),
+            legacy
+        );
         assert!(ad.join("rules-2024-01-01.2-3.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -938,18 +1096,50 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         // Claims id 5, has no sidecar.
         std::fs::write(ad.join("rules-2024-01-01.1-1.jsonl"), "{\"id\":5}\n").unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let seg = "rules-2024-01-01.5-5.jsonl";
-        assert_eq!(verify_segment(&ad, seg, Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert_eq!(
+            verify_segment(&ad, seg, Some(&k)).unwrap().status,
+            SignatureStatus::Verified
+        );
         // A planted segment with a forged, digest-only sidecar is rejected too when a key is set.
         let forged = temp_dir();
-        archive_blocking(&forged, STREAM_RULES, vec![line(6, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
-        for f in ["rules-2024-01-01.6-6.jsonl", "rules-2024-01-01.6-6.jsonl.manifest.json"] {
+        archive_blocking(
+            &forged,
+            STREAM_RULES,
+            vec![line(6, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
+        for f in [
+            "rules-2024-01-01.6-6.jsonl",
+            "rules-2024-01-01.6-6.jsonl.manifest.json",
+        ] {
             std::fs::copy(forged.join("audit_archive").join(f), ad.join(f)).unwrap();
         }
-        archive_blocking(&dir, STREAM_RULES, vec![line(6, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(6, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         // The unsigned segment is left in place; a signed sibling holds the row.
-        assert_eq!(verify_segment(&ad, "rules-2024-01-01.6-6.r1.jsonl", Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert_eq!(
+            verify_segment(&ad, "rules-2024-01-01.6-6.r1.jsonl", Some(&k))
+                .unwrap()
+                .status,
+            SignatureStatus::Verified
+        );
         // Only the sidecar-less plant from the first step was quarantined.
         assert_eq!(rejected(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -960,20 +1150,51 @@ mod tests {
     fn a_segment_missing_its_sidecar_or_tampered_is_archived_again() {
         let dir = temp_dir();
         let ad = dir.join("audit_archive");
-        archive_blocking(&dir, STREAM_RULES, vec![line(1, "2024-01-01"), line(2, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let seg = "rules-2024-01-01.1-2.jsonl";
         let side = ad.join(format!("{seg}.manifest.json"));
         // No sidecar: rewritten (same name, replaced) with a sidecar.
         std::fs::remove_file(&side).unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(1, "2024-01-01"), line(2, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(verify_segment(&ad, seg, None).is_ok());
-        assert_eq!(rejected(&dir).len(), 1, "the sidecar-less segment is preserved");
+        assert_eq!(
+            rejected(&dir).len(),
+            1,
+            "the sidecar-less segment is preserved"
+        );
         // Tampered (drops id 2, keeps a valid line shape): re-archived from the rows.
-        std::fs::write(ad.join(seg), "{\"id\":1,\"v\":\"x\"}\n{\"id\":2,\"v\":\"evil\"}\n").unwrap();
+        std::fs::write(
+            ad.join(seg),
+            "{\"id\":1,\"v\":\"x\"}\n{\"id\":2,\"v\":\"evil\"}\n",
+        )
+        .unwrap();
         assert!(verify_segment(&ad, seg, None).is_err());
-        archive_blocking(&dir, STREAM_RULES, vec![line(1, "2024-01-01"), line(2, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(verify_segment(&ad, seg, None).is_ok());
-        assert!(!std::fs::read_to_string(ad.join(seg)).unwrap().contains("evil"));
+        assert!(!std::fs::read_to_string(ad.join(seg))
+            .unwrap()
+            .contains("evil"));
         // A segment whose ids fall outside its name's range is not trusted.
         std::fs::write(ad.join("rules-2024-01-01.9-9.jsonl"), "{\"id\":10}\n").unwrap();
         assert!(verify_segment(&ad, "rules-2024-01-01.9-9.jsonl", None).is_err());
@@ -1005,21 +1226,40 @@ mod tests {
     }
 
     fn forged_line(id: i64, date: &str) -> ArchiveLine {
-        ArchiveLine { line: format!("{{\"id\":{id},\"v\":\"FORGED\"}}"), ..line(id, date) }
+        ArchiveLine {
+            line: format!("{{\"id\":{id},\"v\":\"FORGED\"}}"),
+            ..line(id, date)
+        }
     }
 
     #[test]
     fn a_planted_self_consistent_segment_cannot_hide_a_real_row() {
         // No signing key: a forged line with a matching digest sidecar.
         let (dir, forged) = (temp_dir(), temp_dir());
-        archive_blocking(&forged, STREAM_RULES, vec![forged_line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &forged,
+            STREAM_RULES,
+            vec![forged_line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         plant(&forged, &dir);
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let ad = dir.join("audit_archive");
         // The forged segment is left untouched and still verifies; the real
         // line is in a non-colliding sibling.
         let forged_seg = verify_segment(&ad, "rules-2024-01-01.5-5.jsonl", None).unwrap();
-        assert!(String::from_utf8(forged_seg.body).unwrap().contains("FORGED"));
+        assert!(String::from_utf8(forged_seg.body)
+            .unwrap()
+            .contains("FORGED"));
         let real = verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", None).unwrap();
         assert!(String::from_utf8(real.body).unwrap().contains("\"x\""));
         assert!(rejected(&dir).is_empty());
@@ -1030,9 +1270,23 @@ mod tests {
     #[test]
     fn a_planted_segment_holding_the_genuine_line_is_skipped() {
         let (dir, genuine) = (temp_dir(), temp_dir());
-        archive_blocking(&genuine, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &genuine,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         plant(&genuine, &dir);
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
         assert!(rejected(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1043,23 +1297,64 @@ mod tests {
     fn an_unknown_key_segment_is_rearchived_with_a_key_and_matched_by_line_without_one() {
         let (a, b) = (test_key(1), test_key(2));
         let (dir, other) = (temp_dir(), temp_dir());
-        archive_blocking(&other, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&a), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &other,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&a),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         plant(&other, &dir);
         // No key here: signed by another key, so it cannot be checked, but the line matches.
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(rejected(&dir).is_empty());
         // No key, different line: archived.
-        archive_blocking(&dir, STREAM_RULES, vec![forged_line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![forged_line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(ad_has(&dir, "rules-2024-01-01.5-5.r1.jsonl"));
         // With key B the key-A segment is unknown_key: rejected and rewritten, verified.
         let (dir2, other2) = (temp_dir(), temp_dir());
-        archive_blocking(&other2, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&a), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &other2,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&a),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         plant(&other2, &dir2);
-        archive_blocking(&dir2, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&b), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir2,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&b),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         // Nothing is renamed; the key-A segment stays, and the row lands in a sibling.
         assert!(rejected(&dir2).is_empty());
         assert_eq!(
-            verify_segment(&dir2.join("audit_archive"), "rules-2024-01-01.5-5.r1.jsonl", Some(&b)).unwrap().status,
+            verify_segment(
+                &dir2.join("audit_archive"),
+                "rules-2024-01-01.5-5.r1.jsonl",
+                Some(&b)
+            )
+            .unwrap()
+            .status,
             SignatureStatus::Verified
         );
         assert!(ad_has(&dir2, "rules-2024-01-01.5-5.jsonl"));
@@ -1073,8 +1368,19 @@ mod tests {
         let dir = temp_dir();
         let ad = dir.join("audit_archive");
         std::fs::create_dir_all(&ad).unwrap();
-        std::fs::write(ad.join("rules-2024-01-01.5-5.jsonl.rejected-20240101T000000.000Z"), "{\"id\":5}\n").unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        std::fs::write(
+            ad.join("rules-2024-01-01.5-5.jsonl.rejected-20240101T000000.000Z"),
+            "{\"id\":5}\n",
+        )
+        .unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
     }
 
@@ -1084,7 +1390,14 @@ mod tests {
         let ad = dir.join("audit_archive");
         // A directory under the segment's name: reading it is an I/O error.
         std::fs::create_dir_all(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(ad.join("rules-2024-01-01.5-5.jsonl").is_dir());
         assert!(rejected(&dir).is_empty());
         assert!(verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", None).is_ok());
@@ -1096,17 +1409,43 @@ mod tests {
         let k = test_key(1);
         let dir = temp_dir();
         let ad = dir.join("audit_archive");
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], None, &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let before = std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap();
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert!(rejected(&dir).is_empty());
-        assert_eq!(std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap(), before);
         assert_eq!(
-            verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", Some(&k)).unwrap().status,
+            std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap(),
+            before
+        );
+        assert_eq!(
+            verify_segment(&ad, "rules-2024-01-01.5-5.r1.jsonl", Some(&k))
+                .unwrap()
+                .status,
             SignatureStatus::Verified
         );
         // A further sweep under the key finds the signed sibling and writes nothing.
-        archive_blocking(&dir, STREAM_RULES, vec![line(5, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert_eq!(segments(&dir).len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1116,18 +1455,46 @@ mod tests {
         let k = test_key(1);
         let dir = temp_dir();
         let ad = dir.join("audit_archive");
-        archive_blocking(&dir, STREAM_RULES, vec![line(1, "2024-01-01"), line(3, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(1, "2024-01-01"), line(3, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         let orig = "rules-2024-01-01.1-3.jsonl";
         let before = std::fs::read(ad.join(orig)).unwrap();
         // Rows 1 and 3 now have different lines: same first and last id.
-        archive_blocking(&dir, STREAM_RULES, vec![forged_line(1, "2024-01-01"), forged_line(3, "2024-01-01")], Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![forged_line(1, "2024-01-01"), forged_line(3, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(ad.join(orig)).unwrap(), before);
-        assert_eq!(verify_segment(&ad, orig, Some(&k)).unwrap().status, SignatureStatus::Verified);
-        assert_eq!(verify_segment(&ad, "rules-2024-01-01.1-3.r1.jsonl", Some(&k)).unwrap().status, SignatureStatus::Verified);
+        assert_eq!(
+            verify_segment(&ad, orig, Some(&k)).unwrap().status,
+            SignatureStatus::Verified
+        );
+        assert_eq!(
+            verify_segment(&ad, "rules-2024-01-01.1-3.r1.jsonl", Some(&k))
+                .unwrap()
+                .status,
+            SignatureStatus::Verified
+        );
         assert!(rejected(&dir).is_empty());
         // The `.rN` form parses, and a bad suffix does not.
-        assert_eq!(segment_range("rules-2024-01-01.1-3.r12.jsonl", "rules", "2024-01-01"), Some((1, 3)));
-        assert_eq!(segment_range("rules-2024-01-01.1-3.x1.jsonl", "rules", "2024-01-01"), None);
+        assert_eq!(
+            segment_range("rules-2024-01-01.1-3.r12.jsonl", "rules", "2024-01-01"),
+            Some((1, 3))
+        );
+        assert_eq!(
+            segment_range("rules-2024-01-01.1-3.x1.jsonl", "rules", "2024-01-01"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1146,7 +1513,11 @@ mod tests {
             .await
             .unwrap();
         }
-        let rows: Vec<(i64, DateTime<Utc>)> = sqlx::query_as("SELECT id, occurred_at FROM rule_audit ORDER BY id").fetch_all(&pool).await.unwrap();
+        let rows: Vec<(i64, DateTime<Utc>)> =
+            sqlx::query_as("SELECT id, occurred_at FROM rule_audit ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
         let dir = temp_dir();
         assert_eq!(run_prune(&pool, &dir, 5, true, Some(&k)).await.unwrap(), 2);
@@ -1167,10 +1538,17 @@ mod tests {
         let mut seen = Vec::new();
         for seg in segments(&dir) {
             assert_eq!(
-                verify_segment(&dir.join("audit_archive"), &seg, Some(&k)).unwrap().status,
+                verify_segment(&dir.join("audit_archive"), &seg, Some(&k))
+                    .unwrap()
+                    .status,
                 SignatureStatus::Verified
             );
-            seen.extend(lines_in(&std::fs::read(dir.join("audit_archive").join(&seg)).unwrap()).unwrap().into_iter().map(|(i, _)| i));
+            seen.extend(
+                lines_in(&std::fs::read(dir.join("audit_archive").join(&seg)).unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .map(|(i, _)| i),
+            );
         }
         seen.sort();
         assert_eq!(seen, ids);
@@ -1193,7 +1571,10 @@ mod tests {
         // `audit_archive` is a file, so no segment can be written.
         std::fs::write(dir.join("audit_archive"), b"not a directory").unwrap();
         assert!(run_prune(&pool, &dir, 5, true, None).await.is_err());
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -103,9 +103,7 @@ pub async fn create_draft_handler(
         .map_err(err_500)?;
 
     // Write empty rules JSON
-    tokio::fs::write(&json_path, "[]")
-        .await
-        .map_err(err_500)?;
+    tokio::fs::write(&json_path, "[]").await.map_err(err_500)?;
 
     let draft = DraftRow {
         id: id.clone(),
@@ -147,8 +145,7 @@ pub async fn fork_from_stig_handler(
     let stig_json = tokio::fs::read_to_string(&stig_path)
         .await
         .map_err(|_| err_404())?;
-    let stig_value: serde_json::Value =
-        serde_json::from_str(&stig_json).map_err(err_500)?;
+    let stig_value: serde_json::Value = serde_json::from_str(&stig_json).map_err(err_500)?;
 
     let draft_id = new_id();
     let json_path = state
@@ -163,16 +160,38 @@ pub async fn fork_from_stig_handler(
         .map_err(err_500)?;
 
     // Copy rules to draft JSON
-    let rules = stig_value.get("rules").cloned().unwrap_or(serde_json::json!([]));
+    let rules = stig_value
+        .get("rules")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
     let rule_count = rules.as_array().map(|a| a.len()).unwrap_or(0) as i32;
-    tokio::fs::write(&json_path, serde_json::to_string_pretty(&rules).unwrap_or_default())
-        .await
-        .map_err(err_500)?;
+    tokio::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&rules).unwrap_or_default(),
+    )
+    .await
+    .map_err(err_500)?;
 
-    let title = stig_value.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let description = stig_value.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let version = stig_value.get("version").and_then(|v| v.as_str()).unwrap_or("1").to_string();
-    let release_info = stig_value.get("releaseInfo").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let title = stig_value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = stig_value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = stig_value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1")
+        .to_string();
+    let release_info = stig_value
+        .get("releaseInfo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // next_vuln_id: find max existing V-ID and add 1
     let next_id = rules
@@ -278,7 +297,9 @@ pub async fn update_draft_handler(
         return Err(err_403("Only the author or admin can edit this draft"));
     }
     if draft.status != "draft" && draft.status != "rejected" {
-        return Err(err_400("Draft can only be edited in 'draft' or 'rejected' status"));
+        return Err(err_400(
+            "Draft can only be edited in 'draft' or 'rejected' status",
+        ));
     }
 
     let title = body.title.as_deref().unwrap_or(&draft.title);
@@ -377,12 +398,11 @@ pub async fn submit_handler(
     // whose role is `reviewer` or `admin`. Anything else is a 400.
     let assigned: Option<String> = body.and_then(|Json(b)| b.assigned_reviewer_id);
     if let Some(reviewer_id) = &assigned {
-        let role: Option<String> =
-            sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-                .bind(reviewer_id)
-                .fetch_optional(state.pool.as_ref())
-                .await
-                .map_err(err_500)?;
+        let role: Option<String> = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+            .bind(reviewer_id)
+            .fetch_optional(state.pool.as_ref())
+            .await
+            .map_err(err_500)?;
         match role.as_deref() {
             Some("reviewer") | Some("admin") => {}
             _ => {
@@ -413,10 +433,7 @@ pub async fn submit_handler(
 /// Common guard: if the draft has an `assigned_reviewer_id` set, only
 /// that user (or an admin) may act on it. Returns Ok if the caller is
 /// allowed, Err(403 JSON) otherwise.
-fn check_assignment_guard(
-    draft: &DraftRow,
-    user: &AuthUser,
-) -> Result<(), (StatusCode, String)> {
+fn check_assignment_guard(draft: &DraftRow, user: &AuthUser) -> Result<(), (StatusCode, String)> {
     if let Some(target) = &draft.assigned_reviewer_id {
         if user.id != *target && user.role != "admin" {
             return Err(err_403_json(
@@ -485,9 +502,16 @@ pub async fn approve_handler(
         .map_err(|e| err_400(&e.to_string()))?;
 
     if let Some(comment) = &body.comment {
-        insert_comment(&state.pool, &new_id(), &id, &user.id, comment, Some("approve"))
-            .await
-            .map_err(err_500)?;
+        insert_comment(
+            &state.pool,
+            &new_id(),
+            &id,
+            &user.id,
+            comment,
+            Some("approve"),
+        )
+        .await
+        .map_err(err_500)?;
     }
     Ok(Json(serde_json::json!({"status": "approved"})))
 }
@@ -516,9 +540,16 @@ pub async fn reject_handler(
         .map_err(|e| err_400(&e.to_string()))?;
 
     let comment = body.comment.as_deref().unwrap_or("Rejected");
-    insert_comment(&state.pool, &new_id(), &id, &user.id, comment, Some("reject"))
-        .await
-        .map_err(err_500)?;
+    insert_comment(
+        &state.pool,
+        &new_id(),
+        &id,
+        &user.id,
+        comment,
+        Some("reject"),
+    )
+    .await
+    .map_err(err_500)?;
     Ok(Json(serde_json::json!({"status": "rejected"})))
 }
 
@@ -568,7 +599,6 @@ pub async fn add_comment_handler(
     Ok(Json(serde_json::json!({"ok": true})))
 }
 
-
 #[cfg(test)]
 mod id_tests {
     use super::*;
@@ -584,7 +614,11 @@ mod id_tests {
                 Path(id.clone()),
             )
             .await;
-            assert_eq!(r.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST), "{id:?}");
+            assert_eq!(
+                r.err().map(|e| e.0),
+                Some(StatusCode::BAD_REQUEST),
+                "{id:?}"
+            );
         }
         assert!(!state.config.data_dir.join("drafts").exists());
     }

@@ -40,10 +40,7 @@ pub struct ChecklistRuleRow {
     pub due_date: Option<NaiveDate>,
 }
 
-pub async fn list_checklists_for_asset(
-    pool: &PgPool,
-    asset_id: &str,
-) -> Result<Vec<ChecklistRow>> {
+pub async fn list_checklists_for_asset(pool: &PgPool, asset_id: &str) -> Result<Vec<ChecklistRow>> {
     let rows = sqlx::query_as::<_, ChecklistRow>(
         "SELECT * FROM checklists WHERE asset_id = $1 ORDER BY created_at DESC",
     )
@@ -166,12 +163,11 @@ pub async fn prune_orphan_rule_overrides(
 /// Returns ("", "") if not in the catalog so create_handler can still
 /// proceed for user-uploaded STIGs that don't sit in stigs_catalog.
 pub async fn catalog_version(pool: &PgPool, stig_id: &str) -> Result<(String, String)> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT version, release_info FROM stigs_catalog WHERE id = $1",
-    )
-    .bind(stig_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT version, release_info FROM stigs_catalog WHERE id = $1")
+            .bind(stig_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.unwrap_or_default())
 }
 
@@ -239,7 +235,10 @@ pub async fn upsert_rule_expecting(
     .await?;
 
     if let Some(expected) = expect_status {
-        let cur = existing.as_ref().map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+        let cur = existing
+            .as_ref()
+            .map(|e| e.status.as_str())
+            .unwrap_or("not_reviewed");
         if cur != expected {
             tx.rollback().await?;
             return Ok(Err(PatchRejected::StatusChanged));
@@ -307,7 +306,9 @@ fn resolve_patch(
     existing: Option<&ChecklistRuleRow>,
     patch: &RulePatch<'_>,
 ) -> Result<Resolved, PatchRejected> {
-    let cur_status = existing.map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+    let cur_status = existing
+        .map(|e| e.status.as_str())
+        .unwrap_or("not_reviewed");
     if let Some(expected) = patch.expect_status {
         if expected != cur_status {
             return Err(PatchRejected::StatusChanged);
@@ -505,17 +506,18 @@ async fn patch_chunk(
     set_lock_timeout(&mut tx, lock_timeout).await?;
     lock_checklist(&mut tx, checklist_id).await?;
     let ids: Vec<&str> = chunk.iter().map(|(id, _)| *id).collect();
-    let mut rows: std::collections::HashMap<String, ChecklistRuleRow> = sqlx::query_as::<_, ChecklistRuleRow>(
-        "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = ANY($2) \
+    let mut rows: std::collections::HashMap<String, ChecklistRuleRow> =
+        sqlx::query_as::<_, ChecklistRuleRow>(
+            "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = ANY($2) \
          ORDER BY rule_id FOR UPDATE",
-    )
-    .bind(checklist_id)
-    .bind(&ids)
-    .fetch_all(&mut *tx)
-    .await?
-    .into_iter()
-    .map(|r| (r.rule_id.clone(), r))
-    .collect();
+        )
+        .bind(checklist_id)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|r| (r.rule_id.clone(), r))
+        .collect();
 
     let mut results = Vec::with_capacity(chunk.len());
     let mut wrote = false;
@@ -599,7 +601,9 @@ async fn write_rule(
     // Audit: write one row per field that actually changed. For a brand-new
     // row, treat "from" as the implicit defaults (status='not_reviewed',
     // empty strings, NULLs) so the audit log shows the initial assignment.
-    let prev_status = existing.map(|e| e.status.as_str()).unwrap_or("not_reviewed");
+    let prev_status = existing
+        .map(|e| e.status.as_str())
+        .unwrap_or("not_reviewed");
     let prev_finding = existing.map(|e| e.finding_details.as_str()).unwrap_or("");
     let prev_comments = existing.map(|e| e.comments.as_str()).unwrap_or("");
     let prev_assignee: Option<&str> = existing.and_then(|e| e.assignee_id.as_deref());
@@ -615,7 +619,11 @@ async fn write_rule(
             Some(prev_finding.into()),
             Some(finding_details.into()),
         ),
-        ("comments", Some(prev_comments.into()), Some(comments.into())),
+        (
+            "comments",
+            Some(prev_comments.into()),
+            Some(comments.into()),
+        ),
         (
             "assignee_id",
             prev_assignee.map(|s| s.into()),
@@ -676,40 +684,74 @@ mod tests {
     }
 
     fn closing<'a>() -> RulePatch<'a> {
-        RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() }
+        RulePatch {
+            status: Some("not_a_finding"),
+            require_details: true,
+            ..RulePatch::default()
+        }
     }
 
     #[test]
     fn closing_with_blank_stored_details_is_rejected() {
         let existing = row("open", "  ");
-        assert_eq!(resolve_patch(Some(&existing), &closing()), Err(PatchRejected::DetailsRequired));
-        assert_eq!(resolve_patch(None, &closing()), Err(PatchRejected::DetailsRequired));
+        assert_eq!(
+            resolve_patch(Some(&existing), &closing()),
+            Err(PatchRejected::DetailsRequired)
+        );
+        assert_eq!(
+            resolve_patch(None, &closing()),
+            Err(PatchRejected::DetailsRequired)
+        );
     }
 
     #[test]
     fn closing_is_accepted_with_details_in_patch_or_stored() {
         let existing = row("open", "");
-        let patch = RulePatch { finding_details: Some("because"), ..closing() };
-        assert_eq!(resolve_patch(Some(&existing), &patch).unwrap().finding_details, "because");
+        let patch = RulePatch {
+            finding_details: Some("because"),
+            ..closing()
+        };
+        assert_eq!(
+            resolve_patch(Some(&existing), &patch)
+                .unwrap()
+                .finding_details,
+            "because"
+        );
         let documented = row("open", "already");
-        assert_eq!(resolve_patch(Some(&documented), &closing()).unwrap().finding_details, "already");
+        assert_eq!(
+            resolve_patch(Some(&documented), &closing())
+                .unwrap()
+                .finding_details,
+            "already"
+        );
     }
 
     #[test]
     fn assignee_and_due_date_are_tri_state() {
         let existing = row("open", "");
         let keep = resolve_patch(Some(&existing), &RulePatch::default()).unwrap();
-        assert_eq!((keep.assignee_id.as_deref(), keep.due_date), (Some("u"), existing.due_date));
+        assert_eq!(
+            (keep.assignee_id.as_deref(), keep.due_date),
+            (Some("u"), existing.due_date)
+        );
         let clear = resolve_patch(
             Some(&existing),
-            &RulePatch { assignee_id: Some(None), due_date: Some(None), ..RulePatch::default() },
+            &RulePatch {
+                assignee_id: Some(None),
+                due_date: Some(None),
+                ..RulePatch::default()
+            },
         )
         .unwrap();
         assert_eq!((clear.assignee_id, clear.due_date), (None, None));
         let d = NaiveDate::from_ymd_opt(2031, 5, 6);
         let set = resolve_patch(
             Some(&existing),
-            &RulePatch { assignee_id: Some(Some("new")), due_date: Some(d), ..RulePatch::default() },
+            &RulePatch {
+                assignee_id: Some(Some("new")),
+                due_date: Some(d),
+                ..RulePatch::default()
+            },
         )
         .unwrap();
         assert_eq!((set.assignee_id.as_deref(), set.due_date), (Some("new"), d));
@@ -721,7 +763,10 @@ mod tests {
     #[test]
     fn guard_is_off_when_not_required() {
         let existing = row("open", "");
-        let patch = RulePatch { require_details: false, ..closing() };
+        let patch = RulePatch {
+            require_details: false,
+            ..closing()
+        };
         assert!(resolve_patch(Some(&existing), &patch).is_ok());
     }
 
@@ -735,17 +780,29 @@ mod tests {
         assert_eq!(r.assignee_id.as_deref(), Some("u"));
         assert_eq!(r.due_date, NaiveDate::from_ymd_opt(2026, 12, 31));
         let fresh = resolve_patch(None, &RulePatch::default()).unwrap();
-        assert_eq!((fresh.status.as_str(), fresh.finding_details.as_str()), ("not_reviewed", ""));
+        assert_eq!(
+            (fresh.status.as_str(), fresh.finding_details.as_str()),
+            ("not_reviewed", "")
+        );
     }
 
     #[test]
     fn expect_status_must_match_the_locked_row() {
         let closed = row("not_a_finding", "d");
-        let patch = RulePatch { expect_status: Some("not_a_finding"), ..closing() };
+        let patch = RulePatch {
+            expect_status: Some("not_a_finding"),
+            ..closing()
+        };
         assert!(resolve_patch(Some(&closed), &patch).is_ok());
         let reopened = row("open", "d");
-        assert_eq!(resolve_patch(Some(&reopened), &patch), Err(PatchRejected::StatusChanged));
-        assert_eq!(resolve_patch(None, &patch), Err(PatchRejected::StatusChanged));
+        assert_eq!(
+            resolve_patch(Some(&reopened), &patch),
+            Err(PatchRejected::StatusChanged)
+        );
+        assert_eq!(
+            resolve_patch(None, &patch),
+            Err(PatchRejected::StatusChanged)
+        );
     }
 
     // ── Database-backed tests ──────────────────────────────────────────────
@@ -790,13 +847,16 @@ mod tests {
                 due_date: due,
             },
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let out = patch_rule(
             &pool,
             "c1",
             "r1",
-            RulePatch { status: Some("not_a_finding"), ..RulePatch::default() },
+            RulePatch {
+                status: Some("not_a_finding"),
+                ..RulePatch::default()
+            },
             "u1",
         )
         .await
@@ -826,13 +886,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(audit_fields(&pool).await, ["status", "finding_details", "comments"]);
+        assert_eq!(
+            audit_fields(&pool).await,
+            ["status", "finding_details", "comments"]
+        );
         // Re-applying the same values changes nothing, so adds no audit rows.
         patch_rule(
             &pool,
             "c1",
             "r1",
-            RulePatch { status: Some("open"), ..RulePatch::default() },
+            RulePatch {
+                status: Some("open"),
+                ..RulePatch::default()
+            },
             "u1",
         )
         .await
@@ -840,11 +906,18 @@ mod tests {
         assert_eq!(audit_fields(&pool).await.len(), 3);
     }
 
-    async fn assert_rejected_writes_nothing(pool: &PgPool, patch: RulePatch<'_>, want: PatchRejected) {
+    async fn assert_rejected_writes_nothing(
+        pool: &PgPool,
+        patch: RulePatch<'_>,
+        want: PatchRejected,
+    ) {
         let before = checklist_updated_at(pool).await;
         let err = patch_rule(pool, "c1", "r1", patch, "u1").await.unwrap_err();
         assert_eq!(err.downcast_ref::<PatchRejected>(), Some(&want));
-        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules").fetch_one(pool).await.unwrap();
+        let rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         assert_eq!(rules, 0);
         assert!(audit_fields(pool).await.is_empty());
         assert_eq!(checklist_updated_at(pool).await, before);
@@ -862,7 +935,11 @@ mod tests {
     async fn status_changed_rejection_leaves_no_trace(pool: PgPool) {
         setup(&pool).await;
         // No row exists, so the live status is not_reviewed.
-        let patch = RulePatch { status: Some("open"), expect_status: Some("not_a_finding"), ..RulePatch::default() };
+        let patch = RulePatch {
+            status: Some("open"),
+            expect_status: Some("not_a_finding"),
+            ..RulePatch::default()
+        };
         assert_rejected_writes_nothing(&pool, patch, PatchRejected::StatusChanged).await;
     }
 
@@ -871,12 +948,21 @@ mod tests {
     async fn expect_status_is_checked_against_the_live_row(pool: PgPool) {
         setup(&pool).await;
         seed_rule(&pool, "c1", "r1", "not_a_finding", "d", "", "u1").await;
-        let patch = RulePatch { comments: Some("x"), expect_status: Some("not_a_finding"), ..RulePatch::default() };
+        let patch = RulePatch {
+            comments: Some("x"),
+            expect_status: Some("not_a_finding"),
+            ..RulePatch::default()
+        };
         assert!(patch_rule(&pool, "c1", "r1", patch, "u1").await.is_ok());
         // The row is reopened behind the caller's back.
         seed_rule(&pool, "c1", "r1", "open", "d", "x", "u1").await;
-        let err = patch_rule(&pool, "c1", "r1", patch, "u1").await.unwrap_err();
-        assert_eq!(err.downcast_ref::<PatchRejected>(), Some(&PatchRejected::StatusChanged));
+        let err = patch_rule(&pool, "c1", "r1", patch, "u1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<PatchRejected>(),
+            Some(&PatchRejected::StatusChanged)
+        );
     }
 
     // Probabilistic: tasks interleave only at I/O awaits on the default runtime. A lost
@@ -887,14 +973,35 @@ mod tests {
         setup(&pool).await;
         seed_rule(&pool, "c1", "r1", "open", "", "", "u1").await;
         let (a, b) = tokio::join!(
-            patch_rule(&pool, "c1", "r1", RulePatch { comments: Some("c"), ..RulePatch::default() }, "u1"),
-            patch_rule(&pool, "c1", "r1", RulePatch { finding_details: Some("d"), ..RulePatch::default() }, "u1"),
+            patch_rule(
+                &pool,
+                "c1",
+                "r1",
+                RulePatch {
+                    comments: Some("c"),
+                    ..RulePatch::default()
+                },
+                "u1"
+            ),
+            patch_rule(
+                &pool,
+                "c1",
+                "r1",
+                RulePatch {
+                    finding_details: Some("d"),
+                    ..RulePatch::default()
+                },
+                "u1"
+            ),
         );
         a.unwrap();
         b.unwrap();
         let rows = list_rule_overrides(&pool, "c1").await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].comments.as_str(), rows[0].finding_details.as_str()), ("c", "d"));
+        assert_eq!(
+            (rows[0].comments.as_str(), rows[0].finding_details.as_str()),
+            ("c", "d")
+        );
     }
 
     // Probabilistic: interleaving is not forced. A lock-order regression (rule row
@@ -913,7 +1020,10 @@ mod tests {
                         &pool,
                         "c1",
                         &rule,
-                        RulePatch { comments: Some("p"), ..RulePatch::default() },
+                        RulePatch {
+                            comments: Some("p"),
+                            ..RulePatch::default()
+                        },
                         "u1",
                     )
                     .await
@@ -959,8 +1069,12 @@ mod tests {
             applied_release: String::new(),
             created_by: Some("u1".into()),
         };
-        assert!(insert_checklist_if_absent(&pool, &mk("first")).await.unwrap());
-        assert!(!insert_checklist_if_absent(&pool, &mk("second")).await.unwrap());
+        assert!(insert_checklist_if_absent(&pool, &mk("first"))
+            .await
+            .unwrap());
+        assert!(!insert_checklist_if_absent(&pool, &mk("second"))
+            .await
+            .unwrap());
         let found = find_checklist(&pool, "a1", "S").await.unwrap().unwrap();
         assert_eq!(found.id, "first");
         assert_eq!(found.created_by.as_deref(), Some("u1"));
@@ -988,7 +1102,11 @@ mod tests {
     }
 
     fn open_patch<'a>() -> RulePatch<'a> {
-        RulePatch { status: Some("open"), finding_details: Some("d"), ..RulePatch::default() }
+        RulePatch {
+            status: Some("open"),
+            finding_details: Some("d"),
+            ..RulePatch::default()
+        }
     }
 
     fn items<'a>(ids: &'a [String], patch: RulePatch<'a>) -> Vec<(&'a str, RulePatch<'a>)> {
@@ -1007,9 +1125,15 @@ mod tests {
         let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
         assert_eq!(out.len(), ids.len());
         assert!(out.iter().all(|o| *o == PatchOutcome::Written));
-        assert_eq!(list_rule_overrides(&pool, "c1").await.unwrap().len(), RULE_CHUNK + 1);
+        assert_eq!(
+            list_rule_overrides(&pool, "c1").await.unwrap().len(),
+            RULE_CHUNK + 1
+        );
         // status + finding_details per rule.
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await as usize, 2 * (RULE_CHUNK + 1));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM rule_audit").await as usize,
+            2 * (RULE_CHUNK + 1)
+        );
     }
 
     #[sqlx::test]
@@ -1019,13 +1143,33 @@ mod tests {
         seed_rule(&pool, "c1", "r-closed", "not_a_finding", "d", "", "u1").await;
         seed_rule(&pool, "c1", "r-open", "open", "", "", "u1").await;
         let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
-        let close = RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() };
-        let guarded = RulePatch { expect_status: Some("not_a_finding"), comments: Some("x"), ..RulePatch::default() };
+        let close = RulePatch {
+            status: Some("not_a_finding"),
+            require_details: true,
+            ..RulePatch::default()
+        };
+        let guarded = RulePatch {
+            expect_status: Some("not_a_finding"),
+            comments: Some("x"),
+            ..RulePatch::default()
+        };
         let batch = [
             ("r-good", open_patch()),
-            ("r-open", close),     // stored details are blank
-            ("r-closed", RulePatch { expect_status: Some("open"), ..guarded }),
-            ("r-good2", RulePatch { status: Some("open"), ..RulePatch::default() }),
+            ("r-open", close), // stored details are blank
+            (
+                "r-closed",
+                RulePatch {
+                    expect_status: Some("open"),
+                    ..guarded
+                },
+            ),
+            (
+                "r-good2",
+                RulePatch {
+                    status: Some("open"),
+                    ..RulePatch::default()
+                },
+            ),
         ];
         let out = patch_rules(&pool, "c1", "u1", &batch).await;
         assert_eq!(
@@ -1058,7 +1202,11 @@ mod tests {
     async fn patch_rules_bumps_updated_at_once_per_chunk_and_not_for_all_rejected(pool: PgPool) {
         setup(&pool).await;
         let t0 = checklist_updated_at(&pool).await;
-        let closing = RulePatch { status: Some("not_a_finding"), require_details: true, ..RulePatch::default() };
+        let closing = RulePatch {
+            status: Some("not_a_finding"),
+            require_details: true,
+            ..RulePatch::default()
+        };
         let ids = names(3);
         let out = patch_rules(&pool, "c1", "u1", &items(&ids, closing)).await;
         assert!(out.iter().all(|o| matches!(o, PatchOutcome::Rejected(_))));
@@ -1087,8 +1235,21 @@ mod tests {
         seed_rule(&pool, "c1", "r1", "open", "old", "oc", "u1").await;
         seed_rule(&pool, "c1", "r2", "open", "old", "oc", "u1").await;
         let patches = [
-            ("r1", RulePatch { status: Some("not_a_finding"), finding_details: Some("new"), ..RulePatch::default() }),
-            ("r2", RulePatch { comments: Some("nc"), ..RulePatch::default() }),
+            (
+                "r1",
+                RulePatch {
+                    status: Some("not_a_finding"),
+                    finding_details: Some("new"),
+                    ..RulePatch::default()
+                },
+            ),
+            (
+                "r2",
+                RulePatch {
+                    comments: Some("nc"),
+                    ..RulePatch::default()
+                },
+            ),
             ("r3", open_patch()),
         ];
         type Audit = Vec<(String, String, Option<String>, Option<String>)>;
@@ -1109,7 +1270,10 @@ mod tests {
         let single = audit(pool.clone(), mark).await;
 
         // Reset to the same starting state and replay through the batch path.
-        sqlx::query("DELETE FROM checklist_rules").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM checklist_rules")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_rule(&pool, "c1", "r1", "open", "old", "oc", "u1").await;
         seed_rule(&pool, "c1", "r2", "open", "old", "oc", "u1").await;
         let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
@@ -1133,14 +1297,24 @@ mod tests {
         let ids = names(250);
         let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
         for (i, o) in out.iter().enumerate() {
-            let want = if (100..200).contains(&i) { PatchOutcome::Failed } else { PatchOutcome::Written };
+            let want = if (100..200).contains(&i) {
+                PatchOutcome::Failed
+            } else {
+                PatchOutcome::Written
+            };
             assert_eq!(*o, want, "item {i}");
         }
-        let written: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM checklist_rules ORDER BY rule_id")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let want: Vec<String> = ids.iter().enumerate().filter(|(i, _)| !(100..200).contains(i)).map(|(_, r)| r.clone()).collect();
+        let written: Vec<String> =
+            sqlx::query_scalar("SELECT rule_id FROM checklist_rules ORDER BY rule_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let want: Vec<String> = ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !(100..200).contains(i))
+            .map(|(_, r)| r.clone())
+            .collect();
         assert_eq!(written, want);
         let audited: i64 = count(&pool, "SELECT COUNT(DISTINCT rule_id) FROM rule_audit").await;
         assert_eq!(audited, 150);
@@ -1156,7 +1330,10 @@ mod tests {
         assert_eq!(out.len(), 400);
         assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
         // Chunks 2 and 3 would have succeeded had they been tried.
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            0
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
     }
 
@@ -1167,12 +1344,26 @@ mod tests {
         let batch = [
             ("r1", open_patch()),
             // Passes only if the first item's write is visible.
-            ("r1", RulePatch { expect_status: Some("open"), comments: Some("x"), ..RulePatch::default() }),
+            (
+                "r1",
+                RulePatch {
+                    expect_status: Some("open"),
+                    comments: Some("x"),
+                    ..RulePatch::default()
+                },
+            ),
         ];
         let out = patch_rules(&pool, "c1", "u1", &batch).await;
         assert_eq!(out, [PatchOutcome::Written, PatchOutcome::Written]);
         let row = list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
-        assert_eq!((row.status.as_str(), row.finding_details.as_str(), row.comments.as_str()), ("open", "d", "x"));
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.finding_details.as_str(),
+                row.comments.as_str()
+            ),
+            ("open", "d", "x")
+        );
         // Second write diffed against the first: comments only.
         let fields = audit_fields(&pool).await;
         assert_eq!(fields, ["status", "finding_details", "comments"]);
@@ -1190,14 +1381,26 @@ mod tests {
             let (p, mine) = (pool.clone(), ids.clone());
             tasks.spawn(async move {
                 let out = patch_rules(&p, "c1", "u1", &items(&mine, open_patch())).await;
-                assert!(out.iter().all(|o| *o == PatchOutcome::Written), "round {round}");
+                assert!(
+                    out.iter().all(|o| *o == PatchOutcome::Written),
+                    "round {round}"
+                );
                 Ok(())
             });
             let p = pool.clone();
             tasks.spawn(async move {
-                patch_rule(&p, "c1", "r010", RulePatch { comments: Some("p"), ..RulePatch::default() }, "u1")
-                    .await
-                    .map(|_| ())
+                patch_rule(
+                    &p,
+                    "c1",
+                    "r010",
+                    RulePatch {
+                        comments: Some("p"),
+                        ..RulePatch::default()
+                    },
+                    "u1",
+                )
+                .await
+                .map(|_| ())
             });
             let p = pool.clone();
             tasks.spawn(async move {
@@ -1218,7 +1421,11 @@ mod tests {
                 .map(|_| ())
             });
             let (p, keep) = (pool.clone(), ids[..100].to_vec());
-            tasks.spawn(async move { prune_orphan_rule_overrides(&p, "c1", &keep).await.map(|_| ()) });
+            tasks.spawn(async move {
+                prune_orphan_rule_overrides(&p, "c1", &keep)
+                    .await
+                    .map(|_| ())
+            });
         }
         while let Some(res) = tasks.join_next().await {
             res.unwrap().unwrap();
@@ -1236,10 +1443,17 @@ mod tests {
         let ids = names(3);
         let t = std::time::Instant::now();
         let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
-        assert!(t.elapsed() < std::time::Duration::from_secs(4), "took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(4),
+            "took {:?}",
+            t.elapsed()
+        );
         assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
         holder.rollback().await.unwrap();
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            0
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
         let out = patch_rules_with(&pool, "c1", "u1", &items(&ids, open_patch()), "300ms").await;
         assert!(out.iter().all(|o| *o == PatchOutcome::Written));
@@ -1254,7 +1468,10 @@ mod tests {
     fn error_summary_for_non_database_errors() {
         let sqlx_err = anyhow::Error::new(sqlx::Error::RowNotFound);
         assert_eq!(error_summary(&sqlx_err), "non-database error");
-        assert_eq!(error_summary(&anyhow::anyhow!("secret value 42")), "unexpected error");
+        assert_eq!(
+            error_summary(&anyhow::anyhow!("secret value 42")),
+            "unexpected error"
+        );
     }
 
     #[sqlx::test]
@@ -1283,7 +1500,10 @@ mod tests {
         let out = patch_rules(&pool, "c1", "u1", &items(&ids, open_patch())).await;
         let took = t.elapsed();
         assert!(out.iter().all(|o| *o == PatchOutcome::Failed));
-        assert!(took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15), "took {took:?}");
+        assert!(
+            took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15),
+            "took {took:?}"
+        );
         holder.rollback().await.unwrap();
     }
 
@@ -1308,10 +1528,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.unwrap_err(), PatchRejected::StatusChanged);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, audit);
-        let st: String = sqlx::query_scalar("SELECT status FROM checklist_rules WHERE rule_id = 'r1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let st: String =
+            sqlx::query_scalar("SELECT status FROM checklist_rules WHERE rule_id = 'r1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(st, "open");
     }
 
@@ -1330,10 +1551,18 @@ mod tests {
             due_date: None,
         };
         let a = upsert_rule(&pool, w("r1")).await.unwrap();
-        let b = upsert_rule_expecting(&pool, w("r2"), None).await.unwrap().unwrap();
-        assert_eq!((a.status, a.finding_details, a.comments), (b.status, b.finding_details, b.comments));
+        let b = upsert_rule_expecting(&pool, w("r2"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (a.status, a.finding_details, a.comments),
+            (b.status, b.finding_details, b.comments)
+        );
         // An expectation that holds writes through.
-        let c = upsert_rule_expecting(&pool, w("r2"), Some("open")).await.unwrap();
+        let c = upsert_rule_expecting(&pool, w("r2"), Some("open"))
+            .await
+            .unwrap();
         assert!(c.is_ok());
     }
 
@@ -1373,10 +1602,17 @@ mod tests {
         .unwrap();
         let single = audit(pool.clone(), mark).await;
 
-        sqlx::query("DELETE FROM checklist_rules").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM checklist_rules")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_rule(&pool, "c1", "r1", "open", "d", "c", "u1").await;
         let mark = count(&pool, "SELECT COALESCE(MAX(id), 0) FROM rule_audit").await;
-        let patch = RulePatch { assignee_id: Some(Some("u2")), due_date: Some(due), ..RulePatch::default() };
+        let patch = RulePatch {
+            assignee_id: Some(Some("u2")),
+            due_date: Some(due),
+            ..RulePatch::default()
+        };
         let out = patch_rules(&pool, "c1", "u1", &[("r1", patch)]).await;
         assert_eq!(out, [PatchOutcome::Written]);
         let batch = audit(pool.clone(), mark).await;
@@ -1398,9 +1634,17 @@ mod tests {
             assignee_id: None,
             due_date: None,
         };
-        let rejected = upsert_rule_expecting(&pool, w, Some("not_a_finding")).await.unwrap();
+        let rejected = upsert_rule_expecting(&pool, w, Some("not_a_finding"))
+            .await
+            .unwrap();
         assert_eq!(rejected.unwrap_err(), PatchRejected::StatusChanged);
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
-        assert!(upsert_rule_expecting(&pool, w, Some("not_reviewed")).await.unwrap().is_ok());
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            0
+        );
+        assert!(upsert_rule_expecting(&pool, w, Some("not_reviewed"))
+            .await
+            .unwrap()
+            .is_ok());
     }
 }

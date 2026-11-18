@@ -29,8 +29,8 @@ use crate::hooks::{use_interval, use_online};
 use crate::model::{AssetInfo, ChecklistSet, RuleUpdate, ServerRule, Stig, StigTab};
 use crate::ui::*;
 use crate::util::{
-    console_error, download_text, file_list_to_vec, file_text, now_ms, spawn_local, to_locale_string,
-    url_param, window,
+    console_error, download_text, file_list_to_vec, file_text, now_ms, spawn_local,
+    to_locale_string, url_param, window,
 };
 use crate::utils::export_ckl::export_ckl;
 use crate::utils::parse_ckl::parse_ckl;
@@ -55,7 +55,11 @@ enum TabsAction {
     /// Close a tab and move focus to the nearest remaining tab.
     Remove(String),
     SetActive(String),
-    UpdateRule { tab_id: String, rule_id: String, update: RuleUpdate },
+    UpdateRule {
+        tab_id: String,
+        rule_id: String,
+        update: RuleUpdate,
+    },
     SetAssetInfo(String, AssetInfo),
     SetSelectedRule(String, Option<String>),
     SetAllStatus(String, String),
@@ -63,12 +67,27 @@ enum TabsAction {
     SetStatusFor(String, Vec<String>, String),
     SetDiffPair(Option<DiffPair>),
     /// The first edit of a catalog tab created its set.
-    SetCreated { tab_id: String, set: ChecklistSet },
-    SetSaved { set_id: String, revision: i64 },
+    SetCreated {
+        tab_id: String,
+        set: ChecklistSet,
+    },
+    SetSaved {
+        set_id: String,
+        revision: i64,
+    },
     /// Open a set's STIGs as tabs (a tab already open for a STIG is only focused).
-    OpenSet { set: ChecklistSet, stigs: Vec<(String, Stig)> },
-    SetRenamed { set_id: String, name: String },
-    SetLinked { set_id: String, asset: Option<(String, String)> },
+    OpenSet {
+        set: ChecklistSet,
+        stigs: Vec<(String, Stig)>,
+    },
+    SetRenamed {
+        set_id: String,
+        name: String,
+    },
+    SetLinked {
+        set_id: String,
+        asset: Option<(String, String)>,
+    },
     SetDeleted(String),
     /// Server state for a set; rules in `keep` (tab id, rule id) stay as the user has them.
     ReplaceFromServer {
@@ -113,7 +132,9 @@ impl Reducible for TabsState {
                 s.tabs.retain(|t| t.id != id);
                 if s.active_tab_id.as_deref() == Some(id.as_str()) {
                     s.active_tab_id = match closed_idx {
-                        Some(i) if !s.tabs.is_empty() => Some(s.tabs[i.min(s.tabs.len() - 1)].id.clone()),
+                        Some(i) if !s.tabs.is_empty() => {
+                            Some(s.tabs[i.min(s.tabs.len() - 1)].id.clone())
+                        }
                         _ => None,
                     };
                 }
@@ -124,7 +145,11 @@ impl Reducible for TabsState {
                 }
             }
             TabsAction::SetActive(id) => s.active_tab_id = Some(id),
-            TabsAction::UpdateRule { tab_id, rule_id, update } => {
+            TabsAction::UpdateRule {
+                tab_id,
+                rule_id,
+                update,
+            } => {
                 if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab_id) {
                     let stig = Rc::make_mut(&mut t.stig);
                     if let Some(r) = stig.rules.iter_mut().find(|r| r.id == rule_id) {
@@ -171,7 +196,10 @@ impl Reducible for TabsState {
             TabsAction::OpenSet { set, stigs } => {
                 let mut first = None;
                 for (catalog_id, stig) in stigs {
-                    let open = s.tabs.iter().find(|t| t.set_id.as_deref() == Some(set.id.as_str()) && t.catalog_id.as_deref() == Some(catalog_id.as_str()));
+                    let open = s.tabs.iter().find(|t| {
+                        t.set_id.as_deref() == Some(set.id.as_str())
+                            && t.catalog_id.as_deref() == Some(catalog_id.as_str())
+                    });
                     if let Some(t) = open {
                         first.get_or_insert_with(|| t.id.clone());
                         continue;
@@ -209,22 +237,47 @@ impl Reducible for TabsState {
                 }
             }
             TabsAction::SetDeleted(set_id) => {
-                let gone: Vec<String> =
-                    s.tabs.iter().filter(|t| t.set_id.as_deref() == Some(set_id.as_str())).map(|t| t.id.clone()).collect();
+                let gone: Vec<String> = s
+                    .tabs
+                    .iter()
+                    .filter(|t| t.set_id.as_deref() == Some(set_id.as_str()))
+                    .map(|t| t.id.clone())
+                    .collect();
                 s.tabs.retain(|t| !gone.contains(&t.id));
                 s.sets.retain(|x| x.id != set_id);
                 if s.active_tab_id.as_ref().is_some_and(|a| gone.contains(a)) {
                     s.active_tab_id = s.tabs.last().map(|t| t.id.clone());
                 }
-                if s.diff_pair.as_ref().is_some_and(|(a, b)| [a, b].iter().any(|x| x.as_ref().is_some_and(|x| gone.contains(x)))) {
+                if s.diff_pair.as_ref().is_some_and(|(a, b)| {
+                    [a, b]
+                        .iter()
+                        .any(|x| x.as_ref().is_some_and(|x| gone.contains(x)))
+                }) {
                     s.diff_pair = None;
                 }
             }
-            TabsAction::ReplaceFromServer { set_id, revision, stigs, keep } => {
-                for t in s.tabs.iter_mut().filter(|t| t.set_id.as_deref() == Some(set_id.as_str())) {
-                    let Some((_, rules)) = stigs.iter().find(|(id, _)| Some(id) == t.catalog_id.as_ref()) else { continue };
-                    let keep_ids: HashSet<String> =
-                        keep.iter().filter(|(tab, _)| *tab == t.id).map(|(_, rule)| rule.clone()).collect();
+            TabsAction::ReplaceFromServer {
+                set_id,
+                revision,
+                stigs,
+                keep,
+            } => {
+                for t in s
+                    .tabs
+                    .iter_mut()
+                    .filter(|t| t.set_id.as_deref() == Some(set_id.as_str()))
+                {
+                    let Some((_, rules)) = stigs
+                        .iter()
+                        .find(|(id, _)| Some(id) == t.catalog_id.as_ref())
+                    else {
+                        continue;
+                    };
+                    let keep_ids: HashSet<String> = keep
+                        .iter()
+                        .filter(|(tab, _)| *tab == t.id)
+                        .map(|(_, rule)| rule.clone())
+                        .collect();
                     Rc::make_mut(&mut t.stig).overlay_server_state(rules, &keep_ids);
                 }
                 if let Some(x) = s.sets.iter_mut().find(|x| x.id == set_id) {
@@ -261,7 +314,15 @@ fn add_files(tabs: UseReducerDispatcher<TabsState>, files: Vec<web_sys::File>) {
 
 // ── Top-level view routing (`?view=`) ───────────────────────────────────────
 
-const VIEWS: [&str; 7] = ["viewer", "writer", "systems", "groups", "dashboard", "myfindings", "admin"];
+const VIEWS: [&str; 7] = [
+    "viewer",
+    "writer",
+    "systems",
+    "groups",
+    "dashboard",
+    "myfindings",
+    "admin",
+];
 
 fn view_from_url() -> &'static str {
     let v = url_param("view").unwrap_or_default();
@@ -327,7 +388,14 @@ impl Default for NotifPrefs {
     /// The backend treats missing rows as enabled, so first-open shows
     /// every toggle on.
     fn default() -> Self {
-        Self { assigned: true, overdue: true, mentions: true, approvals: true, decisions: true, assigned_drafts: true }
+        Self {
+            assigned: true,
+            overdue: true,
+            mentions: true,
+            approvals: true,
+            decisions: true,
+            assigned_drafts: true,
+        }
     }
 }
 
@@ -443,11 +511,23 @@ pub fn App() -> Html {
     let autosave = use_autosave({
         let dispatch = dispatch.clone();
         Callback::from(move |e: SetEvent| match e {
-            SetEvent::Created { tab_id, set } => dispatch.dispatch(TabsAction::SetCreated { tab_id, set }),
-            SetEvent::Saved { set_id, revision } => dispatch.dispatch(TabsAction::SetSaved { set_id, revision }),
-            SetEvent::Replace { set_id, revision, stigs, keep } => {
-                dispatch.dispatch(TabsAction::ReplaceFromServer { set_id, revision, stigs, keep })
+            SetEvent::Created { tab_id, set } => {
+                dispatch.dispatch(TabsAction::SetCreated { tab_id, set })
             }
+            SetEvent::Saved { set_id, revision } => {
+                dispatch.dispatch(TabsAction::SetSaved { set_id, revision })
+            }
+            SetEvent::Replace {
+                set_id,
+                revision,
+                stigs,
+                keep,
+            } => dispatch.dispatch(TabsAction::ReplaceFromServer {
+                set_id,
+                revision,
+                stigs,
+                keep,
+            }),
         })
     });
     let show_my_checklists = use_state(|| false);
@@ -462,7 +542,11 @@ pub fn App() -> Html {
         Callback::from(move |mode: &'static str| {
             app_mode.set(mode);
             let path = window().location().pathname().unwrap_or_default();
-            let url = if mode == "viewer" { path } else { format!("{path}?view={mode}") };
+            let url = if mode == "viewer" {
+                path
+            } else {
+                format!("{path}?view={mode}")
+            };
             if let Ok(h) = window().history() {
                 let _ = h.push_state_with_url(&JsValue::NULL, "", Some(&url));
             }
@@ -472,7 +556,9 @@ pub fn App() -> Html {
         // Pick up browser back/forward.
         let app_mode = app_mode.clone();
         use_effect_with((), move |_| {
-            let l = EventListener::new(&window(), "popstate", move |_| app_mode.set(view_from_url()));
+            let l = EventListener::new(&window(), "popstate", move |_| {
+                app_mode.set(view_from_url())
+            });
             move || drop(l)
         });
     }
@@ -489,7 +575,10 @@ pub fn App() -> Html {
 
     let tabs = &tabs_state.tabs;
     let active_tab_id = tabs_state.active_tab_id.clone();
-    let active_tab = tabs.iter().find(|t| Some(&t.id) == active_tab_id.as_ref()).cloned();
+    let active_tab = tabs
+        .iter()
+        .find(|t| Some(&t.id) == active_tab_id.as_ref())
+        .cloned();
     let diff_pair = tabs_state.diff_pair.clone();
     let is_diff_mode = diff_pair.is_some();
     let has_tabs = !tabs.is_empty();
@@ -501,7 +590,11 @@ pub fn App() -> Html {
         .cloned();
 
     let selected_rule = active_tab.as_ref().and_then(|t| {
-        t.stig.rules.iter().find(|r| Some(&r.id) == t.selected_rule_id.as_ref()).cloned()
+        t.stig
+            .rules
+            .iter()
+            .find(|r| Some(&r.id) == t.selected_rule_id.as_ref())
+            .cloned()
     });
 
     let on_add_files = {
@@ -510,7 +603,9 @@ pub fn App() -> Html {
     };
     let on_load_sample = {
         let dispatch = dispatch.clone();
-        Callback::from(move |_| dispatch.dispatch(TabsAction::Add(vec![(None, generate_sample_stig())])))
+        Callback::from(move |_| {
+            dispatch.dispatch(TabsAction::Add(vec![(None, generate_sample_stig())]))
+        })
     };
 
     let handle_diff_toggle = {
@@ -529,7 +624,10 @@ pub fn App() -> Html {
     let handle_file_input = {
         let on_add_files = on_add_files.clone();
         Callback::from(move |e: Event| {
-            if let Some(input) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) {
+            if let Some(input) = e
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            {
                 let files = file_list_to_vec(input.files());
                 if !files.is_empty() {
                     on_add_files.emit(files);
@@ -609,7 +707,10 @@ pub fn App() -> Html {
             spawn_local(async move {
                 // On failure the toggles stay where the user left them and
                 // the modal stays open so they can retry.
-                if api_send("/api/notifications/prefs", "PUT", Some(&prefs)).await.is_ok() {
+                if api_send("/api/notifications/prefs", "PUT", Some(&prefs))
+                    .await
+                    .is_ok()
+                {
                     notif_prefs_open.set(false);
                     // Refresh the bell so disabled buckets clear immediately.
                     refresh.emit(());
@@ -699,17 +800,32 @@ pub fn App() -> Html {
         _ => match &active_tab {
             Some(tab) => {
                 let id = tab.id.clone();
-                let (d1, d2, d3, d4, d5) = (dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone(), dispatch.clone());
-                let (i1, i2, i3, i4, i5) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+                let (d1, d2, d3, d4, d5) = (
+                    dispatch.clone(),
+                    dispatch.clone(),
+                    dispatch.clone(),
+                    dispatch.clone(),
+                    dispatch.clone(),
+                );
+                let (i1, i2, i3, i4, i5) =
+                    (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
                 let (a1, a4, a5) = (autosave.clone(), autosave.clone(), autosave.clone());
                 let all_stig = tab.stig.clone();
                 let set_tabs: Vec<StigTab> = match &tab.set_id {
-                    Some(sid) => tabs.iter().filter(|t| t.set_id.as_ref() == Some(sid)).cloned().collect(),
+                    Some(sid) => tabs
+                        .iter()
+                        .filter(|t| t.set_id.as_ref() == Some(sid))
+                        .cloned()
+                        .collect(),
                     None => Vec::new(),
                 };
-                let (rename_dispatch, link_dispatch, add_dispatch) = (dispatch.clone(), dispatch.clone(), dispatch.clone());
-                let (rename_id, link_id, add_set) =
-                    (active_set.as_ref().map(|s| s.id.clone()), active_set.as_ref().map(|s| s.id.clone()), active_set.clone());
+                let (rename_dispatch, link_dispatch, add_dispatch) =
+                    (dispatch.clone(), dispatch.clone(), dispatch.clone());
+                let (rename_id, link_id, add_set) = (
+                    active_set.as_ref().map(|s| s.id.clone()),
+                    active_set.as_ref().map(|s| s.id.clone()),
+                    active_set.clone(),
+                );
                 html! {
                     <StigView tab={tab.clone()}
                         set={active_set.clone()}
@@ -763,8 +879,14 @@ pub fn App() -> Html {
         let navigate_to = navigate_to.clone();
         html! { <NavButton {text} active={mode == target} onclick={Callback::from(move |_| navigate_to.emit(target))} /> }
     };
-    let is_admin_user = current_user.as_ref().map(|u| u.role == "admin").unwrap_or(false);
-    let is_viewer_user = current_user.as_ref().map(|u| u.role == "viewer").unwrap_or(false);
+    let is_admin_user = current_user
+        .as_ref()
+        .map(|u| u.role == "admin")
+        .unwrap_or(false);
+    let is_viewer_user = current_user
+        .as_ref()
+        .map(|u| u.role == "viewer")
+        .unwrap_or(false);
     let open_file = {
         let file_input = file_input.clone();
         Callback::from(move |_: MouseEvent| {
@@ -782,9 +904,17 @@ pub fn App() -> Html {
     // ── Side navigation / split panel ───────────────────────────────────────
     let navigation_hide = !is_library_mode || !has_tabs || is_diff_mode;
     let navigation_open = *nav_open && !navigation_hide;
-    let active_href = if *show_library { None } else { active_tab_id.clone() };
+    let active_href = if *show_library {
+        None
+    } else {
+        active_tab_id.clone()
+    };
     let split_panel = match (&selected_rule, &active_tab) {
-        (Some(rule), Some(tab)) if !is_diff_mode && is_library_mode && !*show_library && *split_panel_open => Some((rule.clone(), tab.id.clone())),
+        (Some(rule), Some(tab))
+            if !is_diff_mode && is_library_mode && !*show_library && *split_panel_open =>
+        {
+            Some((rule.clone(), tab.id.clone()))
+        }
         _ => None,
     };
     {
@@ -798,7 +928,9 @@ pub fn App() -> Html {
         });
     }
 
-    let closing_tab = closing_tab_id.as_ref().and_then(|id| tabs.iter().find(|t| &t.id == id).cloned());
+    let closing_tab = closing_tab_id
+        .as_ref()
+        .and_then(|id| tabs.iter().find(|t| &t.id == id).cloned());
     let dismiss_close = {
         let closing_tab_id = closing_tab_id.clone();
         Callback::from(move |_: ()| closing_tab_id.set(None))
@@ -834,11 +966,16 @@ pub fn App() -> Html {
         })
     };
 
-    let inactive = |text: &'static str| html! {
-        <UiBox color="text-status-inactive" padding_top="xs">{text}</UiBox>
+    let inactive = |text: &'static str| {
+        html! {
+            <UiBox color="text-status-inactive" padding_top="xs">{text}</UiBox>
+        }
     };
     let when = |s: String| html! { <UiBox variant="span" color="text-status-inactive">{s}</UiBox> };
-    let pref_toggle = |label: &'static str, testid: &'static str, checked: bool, set: fn(&mut NotifPrefs, bool)| {
+    let pref_toggle = |label: &'static str,
+                       testid: &'static str,
+                       checked: bool,
+                       set: fn(&mut NotifPrefs, bool)| {
         let notif_prefs = notif_prefs.clone();
         let on_change = Callback::from(move |v: bool| {
             let mut p = (*notif_prefs).clone();

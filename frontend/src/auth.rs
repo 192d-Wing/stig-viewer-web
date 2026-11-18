@@ -2,8 +2,8 @@
 
 use crate::api::{api_fetch, api_send, BACKEND};
 use crate::constants::{
-    USE_NOTICE_ACK_LABEL, USE_NOTICE_CONDITIONS, USE_NOTICE_INTRO, USE_NOTICE_LEAD, USE_NOTICE_TITLE,
-    USE_NOTICE_VERSION,
+    USE_NOTICE_ACK_LABEL, USE_NOTICE_CONDITIONS, USE_NOTICE_INTRO, USE_NOTICE_LEAD,
+    USE_NOTICE_TITLE, USE_NOTICE_VERSION,
 };
 use crate::ui::*;
 use serde::Deserialize;

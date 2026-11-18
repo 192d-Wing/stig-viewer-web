@@ -23,7 +23,10 @@ pub fn parse_ckl(xml: &str) -> Result<Stig, String> {
     // The browser DOMParser never throws: malformed XML yields an error
     // document with no CKL elements, which imports as an empty checklist.
     let Some(doc) = parse_document(xml) else {
-        return Ok(Stig { title: DEFAULT_TITLE.to_string(), ..Stig::default() });
+        return Ok(Stig {
+            title: DEFAULT_TITLE.to_string(),
+            ..Stig::default()
+        });
     };
     let root = doc.root();
 
@@ -69,16 +72,22 @@ pub fn parse_ckl(xml: &str) -> Result<Stig, String> {
             _ => "not_reviewed",
         };
 
-        let severity_raw = attr("Severity").unwrap_or_else(|| "medium".to_string()).to_lowercase();
+        let severity_raw = attr("Severity")
+            .unwrap_or_else(|| "medium".to_string())
+            .to_lowercase();
 
         rules.push(Rule {
             id: attr("Rule_ID").unwrap_or_else(|| format!("rule-{i}")),
             stig_id: attr("Vuln_Num").unwrap_or_else(|| format!("V-{}", 100_000 + i)),
             group_id: attr("Group_Title").unwrap_or_default(),
             title: attr("Rule_Title").unwrap_or_default(),
-            severity: severity_label(&severity_raw).unwrap_or("CAT II").to_string(),
+            severity: severity_label(&severity_raw)
+                .unwrap_or("CAT II")
+                .to_string(),
             description: clean_description(&attr("Vuln_Discuss").unwrap_or_default()),
-            fix_text: attr("Fix_Text").or_else(|| attr("STIGRef")).unwrap_or_default(),
+            fix_text: attr("Fix_Text")
+                .or_else(|| attr("STIGRef"))
+                .unwrap_or_default(),
             check_text: attr("Check_Content").unwrap_or_default(),
             cci_ids,
             status: status.to_string(),
@@ -89,7 +98,11 @@ pub fn parse_ckl(xml: &str) -> Result<Stig, String> {
     }
 
     Ok(Stig {
-        title: if title.is_empty() { DEFAULT_TITLE.to_string() } else { title },
+        title: if title.is_empty() {
+            DEFAULT_TITLE.to_string()
+        } else {
+            title
+        },
         description: String::new(),
         version,
         release_info,
@@ -112,7 +125,10 @@ mod tests {
         // CKL carries no benchmark description; everything else survives.
         // (check_text keeps its inner newlines; the sample has no leading /
         // trailing whitespace or markup that trimming / cleaning would alter.)
-        let expected = Stig { description: String::new(), ..original };
+        let expected = Stig {
+            description: String::new(),
+            ..original
+        };
         assert_eq!(parsed, expected);
     }
 

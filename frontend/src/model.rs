@@ -103,7 +103,11 @@ pub const BATCH_MAX_BYTES: usize = 768 * 1024;
 
 /// Split changes into requests of at most `max_count` changes and roughly
 /// `max_bytes` of JSON. A single change over the byte cap goes alone.
-pub fn split_batches(changes: Vec<SetRuleChange>, max_count: usize, max_bytes: usize) -> Vec<Vec<SetRuleChange>> {
+pub fn split_batches(
+    changes: Vec<SetRuleChange>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Vec<Vec<SetRuleChange>> {
     let mut out: Vec<Vec<SetRuleChange>> = Vec::new();
     let mut cur: Vec<SetRuleChange> = Vec::new();
     let mut cur_bytes = 0usize;
@@ -134,7 +138,8 @@ pub struct DirtyTracker {
 impl DirtyTracker {
     pub fn mark(&mut self, tab_id: &str, rule_id: &str) {
         self.seq += 1;
-        self.entries.insert((tab_id.to_string(), rule_id.to_string()), self.seq);
+        self.entries
+            .insert((tab_id.to_string(), rule_id.to_string()), self.seq);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -148,7 +153,8 @@ impl DirtyTracker {
 
     #[cfg(test)]
     pub fn is_dirty(&self, tab_id: &str, rule_id: &str) -> bool {
-        self.entries.contains_key(&(tab_id.to_string(), rule_id.to_string()))
+        self.entries
+            .contains_key(&(tab_id.to_string(), rule_id.to_string()))
     }
 
     /// Tab ids that have at least one dirty rule.
@@ -162,16 +168,23 @@ impl DirtyTracker {
     /// Dirty `(tab id, rule id)` pairs of the given tabs (oldest edit first)
     /// and the highest sequence number among them.
     pub fn take_batch(&self, tab_ids: &[&str]) -> (Vec<(String, String)>, u64) {
-        let mut hits: Vec<(&(String, String), &u64)> =
-            self.entries.iter().filter(|((t, _), _)| tab_ids.contains(&t.as_str())).collect();
+        let mut hits: Vec<(&(String, String), &u64)> = self
+            .entries
+            .iter()
+            .filter(|((t, _), _)| tab_ids.contains(&t.as_str()))
+            .collect();
         hits.sort_by_key(|(k, seq)| (**seq, (*k).clone()));
         let high_water = hits.iter().map(|(_, s)| **s).max().unwrap_or(0);
-        (hits.into_iter().map(|(k, _)| k.clone()).collect(), high_water)
+        (
+            hits.into_iter().map(|(k, _)| k.clone()).collect(),
+            high_water,
+        )
     }
 
     /// Clear the given tabs' entries not edited again since `high_water`.
     pub fn ack(&mut self, tab_ids: &[&str], high_water: u64) {
-        self.entries.retain(|(t, _), seq| !(tab_ids.contains(&t.as_str()) && *seq <= high_water));
+        self.entries
+            .retain(|(t, _), seq| !(tab_ids.contains(&t.as_str()) && *seq <= high_water));
     }
 
     /// Forget everything about a tab (closed, or replaced from the server).
@@ -205,13 +218,22 @@ impl Stig {
             r.finding_details.clear();
             r.comments.clear();
         }
-        let index: HashMap<String, usize> = self.rules.iter().enumerate().map(|(i, r)| (r.id.clone(), i)).collect();
+        let index: HashMap<String, usize> = self
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id.clone(), i))
+            .collect();
         let mut unknown = 0;
         for s in server {
             match index.get(&s.rule_id) {
                 Some(&i) if !keep.contains(&s.rule_id) => {
                     let r = &mut self.rules[i];
-                    r.status = if s.status.is_empty() { default_status() } else { s.status.clone() };
+                    r.status = if s.status.is_empty() {
+                        default_status()
+                    } else {
+                        s.status.clone()
+                    };
                     r.finding_details = s.finding_details.clone();
                     r.comments = s.comments.clone();
                 }
@@ -227,7 +249,11 @@ impl Stig {
     pub fn set_status_for(&mut self, rule_ids: &[String], status: &str) -> usize {
         let wanted: HashSet<&str> = rule_ids.iter().map(String::as_str).collect();
         let mut changed = 0;
-        for r in self.rules.iter_mut().filter(|r| wanted.contains(r.id.as_str())) {
+        for r in self
+            .rules
+            .iter_mut()
+            .filter(|r| wanted.contains(r.id.as_str()))
+        {
             if r.status != status {
                 r.status = status.to_string();
                 changed += 1;
@@ -274,7 +300,12 @@ impl RuleUpdate {
 pub fn visible_selection(filtered_ids: &[&str], selected: &[String]) -> Vec<String> {
     let sel: HashSet<&str> = selected.iter().map(String::as_str).collect();
     let mut seen = HashSet::new();
-    filtered_ids.iter().copied().filter(|id| sel.contains(id) && seen.insert(*id)).map(str::to_string).collect()
+    filtered_ids
+        .iter()
+        .copied()
+        .filter(|id| sel.contains(id) && seen.insert(*id))
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -282,7 +313,17 @@ mod tests {
     use super::*;
 
     fn stig(ids: &[&str]) -> Stig {
-        Stig { rules: ids.iter().map(|id| Rule { id: id.to_string(), status: default_status(), ..Rule::default() }).collect(), ..Stig::default() }
+        Stig {
+            rules: ids
+                .iter()
+                .map(|id| Rule {
+                    id: id.to_string(),
+                    status: default_status(),
+                    ..Rule::default()
+                })
+                .collect(),
+            ..Stig::default()
+        }
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
@@ -306,7 +347,13 @@ mod tests {
         t.mark("t1", "b");
         t.mark("t2", "z");
         let (keys, hw) = t.take_batch(&["t1"]);
-        assert_eq!(keys, vec![("t1".to_string(), "a".to_string()), ("t1".to_string(), "b".to_string())]);
+        assert_eq!(
+            keys,
+            vec![
+                ("t1".to_string(), "a".to_string()),
+                ("t1".to_string(), "b".to_string())
+            ]
+        );
         // "a" is edited again before the response arrives.
         t.mark("t1", "a");
         t.ack(&["t1"], hw);
@@ -334,9 +381,14 @@ mod tests {
     #[test]
     fn batches_split_by_count_and_by_bytes() {
         let many: Vec<SetRuleChange> = (0..7).map(|i| change(&format!("r{i}"), "")).collect();
-        let sizes: Vec<usize> = split_batches(many, 3, usize::MAX).iter().map(Vec::len).collect();
+        let sizes: Vec<usize> = split_batches(many, 3, usize::MAX)
+            .iter()
+            .map(Vec::len)
+            .collect();
         assert_eq!(sizes, [3, 3, 1]);
-        let big: Vec<SetRuleChange> = (0..4).map(|i| change(&format!("r{i}"), &"x".repeat(1000))).collect();
+        let big: Vec<SetRuleChange> = (0..4)
+            .map(|i| change(&format!("r{i}"), &"x".repeat(1000)))
+            .collect();
         let sizes: Vec<usize> = split_batches(big, 500, 2500).iter().map(Vec::len).collect();
         assert_eq!(sizes, [2, 2]);
         // An oversize single change still goes out, alone.
@@ -351,14 +403,33 @@ mod tests {
         let mut s = stig(&["a", "b", "c"]);
         s.rules[2].status = "open".into();
         let server = vec![
-            ServerRule { rule_id: "a".into(), status: "open".into(), finding_details: "d".into(), comments: "c".into() },
-            ServerRule { rule_id: "gone".into(), status: "open".into(), ..ServerRule::default() },
-            ServerRule { rule_id: "x".into(), status: "open".into(), ..ServerRule::default() },
+            ServerRule {
+                rule_id: "a".into(),
+                status: "open".into(),
+                finding_details: "d".into(),
+                comments: "c".into(),
+            },
+            ServerRule {
+                rule_id: "gone".into(),
+                status: "open".into(),
+                ..ServerRule::default()
+            },
+            ServerRule {
+                rule_id: "x".into(),
+                status: "open".into(),
+                ..ServerRule::default()
+            },
         ];
         assert_eq!(s.overlay_server_state(&server, &HashSet::new()), 2);
         let st: Vec<&str> = s.rules.iter().map(|r| r.status.as_str()).collect();
         assert_eq!(st, ["open", "not_reviewed", "not_reviewed"]);
-        assert_eq!((s.rules[0].finding_details.as_str(), s.rules[0].comments.as_str()), ("d", "c"));
+        assert_eq!(
+            (
+                s.rules[0].finding_details.as_str(),
+                s.rules[0].comments.as_str()
+            ),
+            ("d", "c")
+        );
     }
 
     #[test]
@@ -367,12 +438,23 @@ mod tests {
         s.rules[0].status = "open".into();
         s.rules[0].comments = "mine".into();
         let server = vec![
-            ServerRule { rule_id: "a".into(), status: "not_applicable".into(), ..ServerRule::default() },
-            ServerRule { rule_id: "b".into(), status: "open".into(), ..ServerRule::default() },
+            ServerRule {
+                rule_id: "a".into(),
+                status: "not_applicable".into(),
+                ..ServerRule::default()
+            },
+            ServerRule {
+                rule_id: "b".into(),
+                status: "open".into(),
+                ..ServerRule::default()
+            },
         ];
         let keep: HashSet<String> = ["a".to_string()].into();
         assert_eq!(s.overlay_server_state(&server, &keep), 0);
-        assert_eq!((s.rules[0].status.as_str(), s.rules[0].comments.as_str()), ("open", "mine"));
+        assert_eq!(
+            (s.rules[0].status.as_str(), s.rules[0].comments.as_str()),
+            ("open", "mine")
+        );
         assert_eq!(s.rules[1].status, "open");
     }
 
@@ -412,10 +494,16 @@ mod tests {
     #[test]
     fn visible_selection_is_in_filtered_order_and_drops_hidden() {
         let selected = ids(&["c", "gone", "a", "hidden"]);
-        assert_eq!(visible_selection(&["a", "b", "c"], &selected), ids(&["a", "c"]));
+        assert_eq!(
+            visible_selection(&["a", "b", "c"], &selected),
+            ids(&["a", "c"])
+        );
         assert!(visible_selection(&[], &selected).is_empty());
         assert!(visible_selection(&["a"], &[]).is_empty());
         // Duplicate ids in the filtered rows are acted on once.
-        assert_eq!(visible_selection(&["a", "b", "a"], &ids(&["a", "b"])), ids(&["a", "b"]));
+        assert_eq!(
+            visible_selection(&["a", "b", "a"], &ids(&["a", "b"])),
+            ids(&["a", "b"])
+        );
     }
 }

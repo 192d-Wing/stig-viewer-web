@@ -52,7 +52,10 @@ fn copy_one(src: &Path, stigs_dir: &Path, name: &str) -> std::io::Result<bool> {
     }
     let tmp = stigs_dir.join(format!(".seed-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         let mut input = std::fs::File::open(src)?;
         std::io::copy(&mut input, &mut out)?;
         out.sync_all()?;
@@ -115,8 +118,9 @@ async fn index_missing_capped(
         .collect();
     // Directory walking, file reads and JSON parsing are blocking work.
     let (dir, srcs) = (stigs_dir.to_path_buf(), sources.to_vec());
-    let found = tokio::task::spawn_blocking(move || scan_missing(&dir, &srcs, &existing, max_bytes))
-        .await??;
+    let found =
+        tokio::task::spawn_blocking(move || scan_missing(&dir, &srcs, &existing, max_bytes))
+            .await??;
     let added = found.len();
     for catalog in &found {
         upsert_catalog(pool, catalog).await?;
@@ -142,7 +146,10 @@ fn scan_missing(
         let name = entry.file_name();
         // New rows need the create rule (lower case); existing mixed-case
         // files stay readable but are not indexed here.
-        let Some(id) = name.to_str().and_then(seed_id).filter(|i| crate::stig_id::is_valid_new(i))
+        let Some(id) = name
+            .to_str()
+            .and_then(seed_id)
+            .filter(|i| crate::stig_id::is_valid_new(i))
         else {
             continue;
         };
@@ -150,7 +157,10 @@ fn scan_missing(
             continue;
         }
         if meta.len() > max_bytes {
-            warn!("seed: '{id}' is {} bytes, over the {max_bytes} cap; not indexed", meta.len());
+            warn!(
+                "seed: '{id}' is {} bytes, over the {max_bytes} cap; not indexed",
+                meta.len()
+            );
             continue;
         }
         let bytes = match std::fs::read(entry.path()) {
@@ -173,7 +183,12 @@ fn scan_missing(
             .get("category")
             .and_then(|c| c.as_str())
             .and_then(clean_category)
-            .or_else(|| sources.iter().find(|s| s.id == id).map(|s| s.category.clone()))
+            .or_else(|| {
+                sources
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.category.clone())
+            })
             .unwrap_or_else(|| "Other".to_string());
         let stig: StigData = match serde_json::from_value(value) {
             Ok(s) => s,
@@ -184,7 +199,11 @@ fn scan_missing(
         };
         let catalog = CatalogEntry {
             id: id.to_string(),
-            title: if stig.title.is_empty() { id.to_string() } else { stig.title.clone() },
+            title: if stig.title.is_empty() {
+                id.to_string()
+            } else {
+                stig.title.clone()
+            },
             category,
             version: stig.version.clone(),
             release_info: stig.release_info.clone(),
@@ -248,7 +267,10 @@ pub async fn seed(seed_dir: &Path, stigs_dir: &Path, pool: &PgPool, sources: &[S
         .await
         .unwrap_or_else(|e| Err(e.into()));
     match copied {
-        Ok(n) => info!("seed: copied {n} missing file(s) from {}", seed_dir.display()),
+        Ok(n) => info!(
+            "seed: copied {n} missing file(s) from {}",
+            seed_dir.display()
+        ),
         Err(e) => warn!("seed: copy from {} failed: {e:#}", seed_dir.display()),
     }
     match index_missing(pool, stigs_dir, sources).await {
@@ -287,8 +309,14 @@ mod tests {
         std::fs::write(dest.0.join("edge.json"), "synced-edge").unwrap();
 
         assert_eq!(copy_missing(&seed.0, &dest.0).unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(dest.0.join("edge.json")).unwrap(), "synced-edge");
-        assert_eq!(std::fs::read_to_string(dest.0.join("new.json")).unwrap(), "seed-new");
+        assert_eq!(
+            std::fs::read_to_string(dest.0.join("edge.json")).unwrap(),
+            "synced-edge"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.0.join("new.json")).unwrap(),
+            "seed-new"
+        );
         assert!(!dest.0.join("bad name.json").exists());
         assert!(!dest.0.join("notes.txt").exists());
         assert!(!dest.0.join("archive").exists());
@@ -314,12 +342,20 @@ mod tests {
     #[test]
     fn orphans_are_ids_missing_from_manifest_and_seed() {
         let src = |id: &str| StigSource {
-            id: id.into(), title: "t".into(), category: "c".into(), url: "u".into(),
+            id: id.into(),
+            title: "t".into(),
+            category: "c".into(),
+            url: "u".into(),
         };
         let seed: HashSet<String> = ["from-seed".to_string()].into();
-        let ids: Vec<String> =
-            ["in-manifest", "from-seed", "windows-11"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(orphaned(&ids, &[src("in-manifest")], &seed), vec!["windows-11".to_string()]);
+        let ids: Vec<String> = ["in-manifest", "from-seed", "windows-11"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            orphaned(&ids, &[src("in-manifest")], &seed),
+            vec!["windows-11".to_string()]
+        );
     }
 
     fn stig_json(extra: &str) -> String {
@@ -333,10 +369,16 @@ mod tests {
     async fn index_missing_adds_valid_files_only_and_keeps_existing_rows(pool: PgPool) {
         let dir = Tmp::new();
         let w = |n: &str, c: &str| std::fs::write(dir.0.join(n), c).unwrap();
-        w("with-json-cat.json", &stig_json(r#","category":"FromJson""#));
+        w(
+            "with-json-cat.json",
+            &stig_json(r#","category":"FromJson""#),
+        );
         w("with-manifest-cat.json", &stig_json(""));
         w("with-other-cat.json", &stig_json(""));
-        w("bad-json-cat.json", &stig_json(&format!(r#","category":"{}""#, "x".repeat(80))));
+        w(
+            "bad-json-cat.json",
+            &stig_json(&format!(r#","category":"{}""#, "x".repeat(80))),
+        );
         w("already-there.json", &stig_json(""));
         w("bad name.json", &stig_json(""));
         w("Upper.json", &stig_json(""));
@@ -349,8 +391,18 @@ mod tests {
         .await
         .unwrap();
         let sources = vec![
-            StigSource { id: "with-manifest-cat".into(), title: "t".into(), category: "Browser".into(), url: "u".into() },
-            StigSource { id: "bad-json-cat".into(), title: "t".into(), category: "Network".into(), url: "u".into() },
+            StigSource {
+                id: "with-manifest-cat".into(),
+                title: "t".into(),
+                category: "Browser".into(),
+                url: "u".into(),
+            },
+            StigSource {
+                id: "bad-json-cat".into(),
+                title: "t".into(),
+                category: "Network".into(),
+                url: "u".into(),
+            },
         ];
 
         assert_eq!(index_missing(&pool, &dir.0, &sources).await.unwrap(), 4);
@@ -363,7 +415,13 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             ids,
-            ["already-there", "bad-json-cat", "with-json-cat", "with-manifest-cat", "with-other-cat"]
+            [
+                "already-there",
+                "bad-json-cat",
+                "with-json-cat",
+                "with-manifest-cat",
+                "with-other-cat"
+            ]
         );
         let cat = |id: &str| rows.iter().find(|r| r.0 == id).unwrap().1.clone();
         assert_eq!(cat("with-json-cat"), "FromJson");
@@ -380,9 +438,16 @@ mod tests {
         let dir = Tmp::new();
         let small = stig_json("");
         std::fs::write(dir.0.join("small.json"), &small).unwrap();
-        std::fs::write(dir.0.join("big.json"), stig_json(&format!(r#","pad":"{}""#, "x".repeat(500)))).unwrap();
+        std::fs::write(
+            dir.0.join("big.json"),
+            stig_json(&format!(r#","pad":"{}""#, "x".repeat(500))),
+        )
+        .unwrap();
         let cap = small.len() as u64 + 10;
-        assert_eq!(index_missing_capped(&pool, &dir.0, &[], cap).await.unwrap(), 1);
+        assert_eq!(
+            index_missing_capped(&pool, &dir.0, &[], cap).await.unwrap(),
+            1
+        );
         let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM stigs_catalog")
             .fetch_all(&pool)
             .await

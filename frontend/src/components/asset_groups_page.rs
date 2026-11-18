@@ -45,7 +45,8 @@ enum GroupModal {
 
 /// Only the owner or a global admin may mutate a group.
 fn can_edit(user: &Option<User>, group: &Group) -> bool {
-    user.as_ref().is_some_and(|u| u.id == group.owner_id || u.role == "admin")
+    user.as_ref()
+        .is_some_and(|u| u.id == group.owner_id || u.role == "admin")
 }
 
 #[derive(Properties, PartialEq)]
@@ -159,7 +160,8 @@ pub fn AssetGroupsPage(_props: &AssetGroupsPageProps) -> Html {
             spawn_local(async move {
                 let result = match mode {
                     GroupModal::Create => {
-                        api_json::<serde_json::Value, _>("/api/asset-groups", "POST", Some(&body)).await
+                        api_json::<serde_json::Value, _>("/api/asset-groups", "POST", Some(&body))
+                            .await
                     }
                     GroupModal::Edit(group) => {
                         let path = format!("/api/asset-groups/{}", group.id);
@@ -208,7 +210,10 @@ pub fn AssetGroupsPage(_props: &AssetGroupsPageProps) -> Html {
     };
 
     if let Some((id, name)) = &*view {
-        let editable = groups.iter().find(|g| &g.id == id).is_some_and(|g| can_edit(&current_user, g));
+        let editable = groups
+            .iter()
+            .find(|g| &g.id == id)
+            .is_some_and(|g| can_edit(&current_user, g));
         let on_back = {
             let view = view.clone();
             let refresh = refresh.clone();
@@ -248,9 +253,17 @@ pub fn AssetGroupsPage(_props: &AssetGroupsPageProps) -> Html {
             Column::new("description", "Description", |g: &Group| {
                 html! { {if g.description.is_empty() { "—".to_string() } else { g.description.clone() }} }
             }),
-            Column::new("owner", "Owner", |g: &Group| html! { {g.owner_name.clone()} }),
+            Column::new(
+                "owner",
+                "Owner",
+                |g: &Group| html! { {g.owner_name.clone()} },
+            ),
             Column::new("members", "Members", |g: &Group| html! { {g.member_count} }),
-            Column::new("updated", "Created", |g: &Group| html! { {to_locale_string(&g.created_at)} }),
+            Column::new(
+                "updated",
+                "Created",
+                |g: &Group| html! { {to_locale_string(&g.created_at)} },
+            ),
             Column::new("actions", "", move |g: &Group| {
                 let editable = can_edit(&current_user, g);
                 let on_view = {
@@ -278,7 +291,10 @@ pub fn AssetGroupsPage(_props: &AssetGroupsPageProps) -> Html {
     };
 
     let is_edit = matches!(&*modal, Some(GroupModal::Edit(_)));
-    let delete_name = delete_target.as_ref().map(|g| g.name.clone()).unwrap_or_default();
+    let delete_name = delete_target
+        .as_ref()
+        .map(|g| g.name.clone())
+        .unwrap_or_default();
 
     html! {
         <>
@@ -416,7 +432,8 @@ fn GroupMembersView(p: &GroupMembersViewProps) -> Html {
             loading.set(true);
             error.set(None);
             spawn_local(async move {
-                let m = api_get::<Vec<Member>>(&format!("/api/asset-groups/{group_id}/members")).await;
+                let m =
+                    api_get::<Vec<Member>>(&format!("/api/asset-groups/{group_id}/members")).await;
                 let a = api_get::<Vec<AssetLite>>("/api/assets").await;
                 match (m, a) {
                     (Ok(m), Ok(a)) => {
@@ -479,7 +496,11 @@ fn GroupMembersView(p: &GroupMembersViewProps) -> Html {
                         Ok(res) => {
                             let status = res.status();
                             let text = res.text().await.unwrap_or_else(|_| res.status_text());
-                            failure = Some(if text.is_empty() { status.to_string() } else { text });
+                            failure = Some(if text.is_empty() {
+                                status.to_string()
+                            } else {
+                                text
+                            });
                             break;
                         }
                         Err(e) => {
@@ -524,7 +545,11 @@ fn GroupMembersView(p: &GroupMembersViewProps) -> Html {
         Column::new("hostname", "Hostname", |m: &Member| {
             html! { {if m.hostname.is_empty() { "—".to_string() } else { m.hostname.clone() }} }
         }),
-        Column::new("added", "Added", |m: &Member| html! { {to_locale_string(&m.added_at)} }),
+        Column::new(
+            "added",
+            "Added",
+            |m: &Member| html! { {to_locale_string(&m.added_at)} },
+        ),
         Column::new("actions", "", move |m: &Member| {
             let onclick = {
                 let id = m.asset_id.clone();

@@ -57,7 +57,12 @@ pub(crate) struct PreAuthLimiter {
 impl PreAuthLimiter {
     pub(crate) fn new(capacity: f64, refill_per_sec: f64, max_keys: usize) -> Self {
         Self {
-            inner: Mutex::new(LimiterInner { map: HashMap::new(), last_prune: Instant::now(), last_overflow_warn: None, prunes: 0 }),
+            inner: Mutex::new(LimiterInner {
+                map: HashMap::new(),
+                last_prune: Instant::now(),
+                last_overflow_warn: None,
+                prunes: 0,
+            }),
             capacity,
             refill_per_sec,
             max_keys: max_keys.max(2),
@@ -67,9 +72,15 @@ impl PreAuthLimiter {
     /// From the raw `AUTH_RATE_LIMIT_BURST` / `AUTH_RATE_LIMIT_PER_MINUTE` values.
     pub(crate) fn from_vars(burst: Option<&str>, per_minute: Option<&str>) -> Self {
         let parse = |v: Option<&str>, d: f64| {
-            v.and_then(|s| s.parse::<f64>().ok()).filter(|x| *x > 0.0).unwrap_or(d)
+            v.and_then(|s| s.parse::<f64>().ok())
+                .filter(|x| *x > 0.0)
+                .unwrap_or(d)
         };
-        Self::new(parse(burst, 30.0), parse(per_minute, 60.0) / 60.0, PRE_AUTH_MAX_KEYS)
+        Self::new(
+            parse(burst, 30.0),
+            parse(per_minute, 60.0) / 60.0,
+            PRE_AUTH_MAX_KEYS,
+        )
     }
 
     fn from_env() -> Self {
@@ -90,7 +101,10 @@ impl PreAuthLimiter {
         };
         let inner = &mut *g;
         let mut key = key;
-        if !inner.map.contains_key(key) && key != OVERFLOW_KEY && inner.map.len() + 1 >= self.max_keys {
+        if !inner.map.contains_key(key)
+            && key != OVERFLOW_KEY
+            && inner.map.len() + 1 >= self.max_keys
+        {
             if now.saturating_duration_since(inner.last_prune) >= PRUNE_INTERVAL {
                 inner.last_prune = now;
                 inner.prunes += 1;
@@ -103,21 +117,25 @@ impl PreAuthLimiter {
             }
             if inner.map.len() + 1 >= self.max_keys {
                 key = OVERFLOW_KEY;
-                let due = inner
-                    .last_overflow_warn
-                    .is_none_or(|t| now.saturating_duration_since(t) >= std::time::Duration::from_secs(60));
+                let due = inner.last_overflow_warn.is_none_or(|t| {
+                    now.saturating_duration_since(t) >= std::time::Duration::from_secs(60)
+                });
                 if due {
                     inner.last_overflow_warn = Some(now);
-                    tracing::warn!("pre-auth rate limiter is full; new clients share the overflow bucket");
+                    tracing::warn!(
+                        "pre-auth rate limiter is full; new clients share the overflow bucket"
+                    );
                 }
             }
         }
         let capacity = self.capacity;
-        let bucket = inner
-            .map
-            .entry(key.to_string())
-            .or_insert(BucketState { tokens: capacity, last_refill: now });
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let bucket = inner.map.entry(key.to_string()).or_insert(BucketState {
+            tokens: capacity,
+            last_refill: now,
+        });
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(capacity);
         bucket.last_refill = now;
         if bucket.tokens >= 1.0 {
@@ -151,7 +169,10 @@ pub(crate) fn limiter_key(ip: &str) -> String {
             Some(v4) => v4.to_string(),
             None => {
                 let s = v6.segments();
-                format!("{}/64", std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+                format!(
+                    "{}/64",
+                    std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)
+                )
             }
         },
         Err(_) => "unknown".to_string(),
@@ -252,7 +273,9 @@ pub async fn rate_limit(
 
         // Refill based on elapsed time since the last touch. Cap at capacity
         // so a long-idle user can't accumulate an unbounded burst.
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         if elapsed > 0.0 {
             bucket.tokens = (bucket.tokens + elapsed * refill).min(capacity);
             bucket.last_refill = now;
@@ -303,7 +326,9 @@ mod pre_auth_tests {
             assert!(l.len() <= 50);
         }
         // Keys past the cap share the overflow budget (2 tokens), so most are denied.
-        let denied = (500..520).filter(|i| !l.allow_at(&format!("10.9.0.{i}"), t0)).count();
+        let denied = (500..520)
+            .filter(|i| !l.allow_at(&format!("10.9.0.{i}"), t0))
+            .count();
         assert!(denied >= 18);
     }
 
@@ -335,8 +360,14 @@ mod pre_auth_tests {
 
     #[test]
     fn ipv6_shares_a_bucket_per_64_and_ipv4_is_exact() {
-        assert_eq!(limiter_key("2001:db8:1:2::1"), limiter_key("2001:db8:1:2:ffff::9"));
-        assert_ne!(limiter_key("2001:db8:1:2::1"), limiter_key("2001:db8:1:3::1"));
+        assert_eq!(
+            limiter_key("2001:db8:1:2::1"),
+            limiter_key("2001:db8:1:2:ffff::9")
+        );
+        assert_ne!(
+            limiter_key("2001:db8:1:2::1"),
+            limiter_key("2001:db8:1:3::1")
+        );
         assert_eq!(limiter_key("::ffff:1.2.3.4"), "1.2.3.4");
         assert_eq!(limiter_key("1.2.3.4"), "1.2.3.4");
         assert_ne!(limiter_key("1.2.3.4"), limiter_key("1.2.3.5"));

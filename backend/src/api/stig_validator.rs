@@ -77,10 +77,7 @@ pub fn lint_stig(value: &Value) -> LintReport {
     let obj = match value.as_object() {
         Some(o) => o,
         None => {
-            errors.push(LintIssue::error(
-                "",
-                "Root JSON value must be an object.",
-            ));
+            errors.push(LintIssue::error("", "Root JSON value must be an object."));
             return LintReport {
                 rules_count: 0,
                 errors,
@@ -142,8 +139,7 @@ pub fn lint_stig(value: &Value) -> LintReport {
     rules_count = rules.len() as i64;
 
     // Track rule.id positions so we can flag duplicates with both indices.
-    let mut seen_ids: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut seen_ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for (idx, rule) in rules.iter().enumerate() {
         let base = format!("/rules/{idx}");
@@ -164,10 +160,7 @@ pub fn lint_stig(value: &Value) -> LintReport {
             Some(Value::String(s)) => {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
-                    errors.push(LintIssue::error(
-                        format!("{base}/id"),
-                        "Rule id is empty.",
-                    ));
+                    errors.push(LintIssue::error(format!("{base}/id"), "Rule id is empty."));
                 } else {
                     // 13. character set
                     if !s.chars().all(is_safe_rule_id_char) {
@@ -257,18 +250,22 @@ pub async fn lint_handler(
     mut multipart: Multipart,
 ) -> Result<Json<LintReport>, (StatusCode, String)> {
     let mut file_bytes: Option<Vec<u8>> = None;
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Multipart error: {e}"))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {e}")))?
+    {
         if field.name() == Some("file") {
             let bytes = field.bytes().await.map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Failed to read file field: {e}"))
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read file field: {e}"),
+                )
             })?;
             file_bytes = Some(bytes.to_vec());
         }
     }
-    let bytes = file_bytes
-        .ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
+    let bytes = file_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
 
     // We deliberately treat a JSON parse failure as a single top-level error
     // rather than a 400 — the lint endpoint's job is to *report* problems,
@@ -278,10 +275,7 @@ pub async fn lint_handler(
         Err(e) => {
             return Ok(Json(LintReport {
                 rules_count: 0,
-                errors: vec![LintIssue::error(
-                    "",
-                    format!("Could not parse JSON: {e}"),
-                )],
+                errors: vec![LintIssue::error("", format!("Could not parse JSON: {e}"))],
                 warnings: vec![],
             }));
         }
@@ -333,7 +327,11 @@ mod tests {
                 {"id": "R-1", "severity": "CAT II", "title": "t", "description": "d", "fixText": "f", "check": "c"}
             ]
         }));
-        let dup = report.errors.iter().find(|e| e.path == "/rules/1/id").expect("dup error");
+        let dup = report
+            .errors
+            .iter()
+            .find(|e| e.path == "/rules/1/id")
+            .expect("dup error");
         assert!(dup.message.contains("rules[0]"));
         assert!(dup.message.contains("rules[1]"));
     }
@@ -363,10 +361,19 @@ mod tests {
             "rules": [{"id": "R-1", "severity": "CAT II", "title": "", "description": "", "fixText": "", "check": ""}]
         }));
         let ws = paths(&report.warnings);
-        for p in ["/rules/0/title", "/rules/0/description", "/rules/0/fixText", "/rules/0/check"] {
+        for p in [
+            "/rules/0/title",
+            "/rules/0/description",
+            "/rules/0/fixText",
+            "/rules/0/check",
+        ] {
             assert!(ws.contains(&p), "expected {p} in {ws:?}");
         }
-        assert!(report.errors.is_empty(), "no errors expected, got {:?}", report.errors);
+        assert!(
+            report.errors.is_empty(),
+            "no errors expected, got {:?}",
+            report.errors
+        );
     }
 
     #[test]

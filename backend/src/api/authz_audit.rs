@@ -11,9 +11,8 @@ use axum::{
     extract::{MatchedPath, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    Router,
     response::Response,
-    Extension,
+    Extension, Router,
 };
 use serde_json::json;
 
@@ -66,7 +65,9 @@ pub async fn authz_audit(
         .map(|m| m.as_str().chars().take(MAX_ROUTE_CHARS).collect::<String>())
         .unwrap_or_else(|| "unmatched".to_string());
     let resp = next.run(req).await;
-    if resp.status() == StatusCode::FORBIDDEN && !ctx.audited.load(std::sync::atomic::Ordering::Relaxed) {
+    if resp.status() == StatusCode::FORBIDDEN
+        && !ctx.audited.load(std::sync::atomic::Ordering::Relaxed)
+    {
         // Detached from the connection: a client that hangs up must not
         // cancel the write. The handle is awaited so the response still
         // waits for it (bounded by `WRITE_TIMEOUT` inside `record_or_log`).
@@ -105,7 +106,10 @@ mod tests {
     };
     use sqlx::PgPool;
 
-    async fn own_denial(State(state): State<AppState>, Extension(ctx): Extension<RequestCtx>) -> StatusCode {
+    async fn own_denial(
+        State(state): State<AppState>,
+        Extension(ctx): Extension<RequestCtx>,
+    ) -> StatusCode {
         record_or_log(
             state.pool.as_ref(),
             NewAuditEvent {
@@ -157,7 +161,12 @@ mod tests {
 
     async fn send(app: &Server, method: &str, uri: &str) -> StatusCode {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
-        let status = reqwest::Client::new().request(m, format!("{}{uri}", app.0)).send().await.unwrap().status();
+        let status = reqwest::Client::new()
+            .request(m, format!("{}{uri}", app.0))
+            .send()
+            .await
+            .unwrap()
+            .status();
         StatusCode::from_u16(status.as_u16()).unwrap()
     }
 
@@ -167,14 +176,20 @@ mod tests {
         seed_user(&pool, "u1").await;
         let (state, _dir) = app_state(pool.clone());
         let app = serve(app(state, "u1", "viewer")).await;
-        assert_eq!(send(&app, "POST", "/api/things/secret-id-123?q=free%20text").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            send(&app, "POST", "/api/things/secret-id-123?q=free%20text").await,
+            StatusCode::FORBIDDEN
+        );
         let got: Vec<(String, String, String, Option<String>)> =
             sqlx::query_as("SELECT action, outcome, detail::text, user_role FROM audit_events")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!((got[0].0.as_str(), got[0].1.as_str()), ("authz.denied", "denied"));
+        assert_eq!(
+            (got[0].0.as_str(), got[0].1.as_str()),
+            ("authz.denied", "denied")
+        );
         let d: serde_json::Value = serde_json::from_str(&got[0].2).unwrap();
         assert_eq!(d, json!({ "method": "POST", "route": "/api/things/:id" }));
         assert!(!got[0].2.contains("secret-id-123"));
@@ -187,7 +202,10 @@ mod tests {
         let (state, _dir) = app_state(pool.clone());
         let app = serve(app(state, "u1", "author")).await;
         assert_eq!(send(&app, "POST", "/api/own").await, StatusCode::FORBIDDEN);
-        let got: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events").fetch_all(&pool).await.unwrap();
+        let got: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(got, ["checklist.save"]);
     }
 
@@ -197,15 +215,24 @@ mod tests {
         seed_user(&pool, "u1").await;
         let (state, _dir) = app_state(pool.clone());
         let app = serve(app(state, "u1", "viewer")).await;
-        assert_eq!(send(&app, "GET", "/api/unauth").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            send(&app, "GET", "/api/unauth").await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_eq!(send(&app, "GET", "/api/ok").await, StatusCode::OK);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
         for _ in 0..3 {
             send(&app, "POST", "/api/things/a").await;
             send(&app, "POST", "/api/things/b").await;
         }
-        let got: Vec<i32> = sqlx::query_scalar("SELECT repeat_count FROM audit_events").fetch_all(&pool).await.unwrap();
+        let got: Vec<i32> = sqlx::query_scalar("SELECT repeat_count FROM audit_events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(got, [6]);
     }
 
@@ -213,7 +240,10 @@ mod tests {
     fn methods_are_normalised() {
         use axum::http::Method;
         assert_eq!(normalized_method(&Method::PATCH), "PATCH");
-        assert_eq!(normalized_method(&Method::from_bytes(b"BREW").unwrap()), "OTHER");
+        assert_eq!(
+            normalized_method(&Method::from_bytes(b"BREW").unwrap()),
+            "OTHER"
+        );
         assert_eq!(normalized_method(&Method::TRACE), "OTHER");
     }
 
@@ -225,10 +255,16 @@ mod tests {
         // viewer_guard answers 403 for any non-GET method, extension ones included.
         let viewer = serve(app(state.clone(), "u1", "viewer")).await;
         for m in ["BREW", "PROPFIND", "X-ONE", "X-TWO"] {
-            assert_eq!(send(&viewer, m, "/api/things/a").await, StatusCode::FORBIDDEN);
+            assert_eq!(
+                send(&viewer, m, "/api/things/a").await,
+                StatusCode::FORBIDDEN
+            );
         }
         let got: Vec<(String, i32)> =
-            sqlx::query_as("SELECT detail->>'method', repeat_count FROM audit_events").fetch_all(&pool).await.unwrap();
+            sqlx::query_as("SELECT detail->>'method', repeat_count FROM audit_events")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(got, [("OTHER".to_string(), 4)]);
 
         // An author past the burst gets 429 from rate_limit, which is not recorded.
@@ -241,12 +277,17 @@ mod tests {
             }
         }
         assert!(limited > 0, "never rate limited");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE user_id = 'rl-author-pkg6'")
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE user_id = 'rl-author-pkg6'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(n, 0);
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
         assert_eq!(total, 1);
     }
 }

@@ -20,8 +20,8 @@ use crate::api::{api_fetch, api_get, api_json, api_upload_raw, response_blob, BA
 use crate::hooks::use_interval;
 use crate::ui::*;
 use crate::util::{
-    confirm, copy_to_clipboard, download_blob, encode_uri_component, now_iso, now_ms, parse_date_ms, spawn_local,
-    to_locale_date_string, to_locale_string, window,
+    confirm, copy_to_clipboard, download_blob, encode_uri_component, now_iso, now_ms,
+    parse_date_ms, spawn_local, to_locale_date_string, to_locale_string, window,
 };
 
 // ── Option tables ───────────────────────────────────────────────────────────
@@ -29,8 +29,12 @@ use crate::util::{
 /// (label, value)
 type OptionTable = &'static [(&'static str, &'static str)];
 
-const ROLE_OPTIONS: OptionTable =
-    &[("Author", "author"), ("Reviewer", "reviewer"), ("Admin", "admin"), ("Viewer", "viewer")];
+const ROLE_OPTIONS: OptionTable = &[
+    ("Author", "author"),
+    ("Reviewer", "reviewer"),
+    ("Admin", "admin"),
+    ("Viewer", "viewer"),
+];
 
 // Event kinds the backend currently knows how to fire. Keep in sync
 // with ALLOWED_KINDS in backend/src/api/webhooks.rs — the create/update
@@ -43,13 +47,18 @@ const KIND_OPTIONS: OptionTable = &[
 
 // Wire-payload flavor a webhook is configured to receive. Keep in sync
 // with ALLOWED_FLAVORS in backend/src/api/webhooks.rs.
-const FLAVOR_OPTIONS: OptionTable = &[("Slack", "slack"), ("Microsoft Teams", "teams"), ("Generic", "generic")];
+const FLAVOR_OPTIONS: OptionTable = &[
+    ("Slack", "slack"),
+    ("Microsoft Teams", "teams"),
+    ("Generic", "generic"),
+];
 
 // ABAC effect/level enumerations. Mirror the validation in
 // backend/src/api/abac.rs — anything outside these sets is rejected
 // with 400 by the create/update handlers.
 const POLICY_EFFECT_OPTIONS: OptionTable = &[("Allow", "allow"), ("Deny", "deny")];
-const POLICY_LEVEL_OPTIONS: OptionTable = &[("Read", "read"), ("Write", "write"), ("Admin", "admin")];
+const POLICY_LEVEL_OPTIONS: OptionTable =
+    &[("Read", "read"), ("Write", "write"), ("Admin", "admin")];
 // Role options for the policy modal — the wildcard "Any role" row
 // maps to an empty string, which the backend stores as NULL.
 const POLICY_ROLE_OPTIONS: OptionTable = &[
@@ -63,12 +72,21 @@ const POLICY_ROLE_OPTIONS: OptionTable = &[
 // Five known scheduler names, ordered the way ops scan them. We
 // render a row per name even if no run has happened yet so the
 // dashboard is recognizable as soon as the table loads.
-const SCHEDULER_NAMES: [&str; 5] = ["sync", "snapshot", "overdue_digest", "audit_retention", "compliance_report"];
+const SCHEDULER_NAMES: [&str; 5] = [
+    "sync",
+    "snapshot",
+    "overdue_digest",
+    "audit_retention",
+    "compliance_report",
+];
 
 const AUDIT_PAGE_SIZE: i64 = 50;
 
 fn select_options(table: OptionTable) -> Vec<SelectOption> {
-    table.iter().map(|(label, value)| SelectOption::new(*value, *label)).collect()
+    table
+        .iter()
+        .map(|(label, value)| SelectOption::new(*value, *label))
+        .collect()
 }
 
 /// The option matching `value`, falling back to the first one (the
@@ -151,7 +169,11 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn or_dash(s: &str) -> String {
-    if s.is_empty() { "—".into() } else { s.to_string() }
+    if s.is_empty() {
+        "—".into()
+    } else {
+        s.to_string()
+    }
 }
 
 fn empty_note(text: &'static str) -> Html {
@@ -434,7 +456,11 @@ impl RestoreResult {
             self.restored.values().sum::<i64>(),
             self.restored.len(),
             self.attachments_written,
-            if self.forced == Some(true) { " (force overwrite)" } else { "" },
+            if self.forced == Some(true) {
+                " (force overwrite)"
+            } else {
+                ""
+            },
         );
         match self.signature_status.as_str() {
             "verified" => ("success", format!("{base} Signature verified.")),
@@ -475,7 +501,9 @@ struct Console {
 
 /// Start `fut` now and park its output in a slot, so several requests can run
 /// concurrently and be awaited together with `Promise.all`.
-fn start<T: 'static>(fut: impl Future<Output = T> + 'static) -> (Rc<RefCell<Option<T>>>, js_sys::Promise) {
+fn start<T: 'static>(
+    fut: impl Future<Output = T> + 'static,
+) -> (Rc<RefCell<Option<T>>>, js_sys::Promise) {
     let slot = Rc::new(RefCell::new(None));
     let out = slot.clone();
     let promise = wasm_bindgen_futures::future_to_promise(async move {
@@ -533,7 +561,10 @@ impl Console {
     fn asset_options(&self) -> Vec<SelectOption> {
         self.assets
             .iter()
-            .map(|a| SelectOption::new(a.id.clone(), a.name.clone()).description(format!("Owner: {}", a.owner_name)))
+            .map(|a| {
+                SelectOption::new(a.id.clone(), a.name.clone())
+                    .description(format!("Owner: {}", a.owner_name))
+            })
             .collect()
     }
 
@@ -541,7 +572,11 @@ impl Console {
         self.users
             .iter()
             .map(|u| {
-                let description = if u.email.is_empty() { role_label(&u.role) } else { u.email.clone() };
+                let description = if u.email.is_empty() {
+                    role_label(&u.role)
+                } else {
+                    u.email.clone()
+                };
                 SelectOption::new(u.id.clone(), u.display_name.clone()).description(description)
             })
             .collect()
@@ -656,14 +691,20 @@ pub fn AdminConsole(_props: &AdminConsoleProps) -> Html {
 
 fn scheduler_columns() -> Vec<Column<SchedulerRun>> {
     vec![
-        Column::new("name", "Scheduler", |r: &SchedulerRun| html! { {r.name.clone()} }),
+        Column::new(
+            "name",
+            "Scheduler",
+            |r: &SchedulerRun| html! { {r.name.clone()} },
+        ),
         Column::new("started", "Started", |r: &SchedulerRun| {
             html! { {r.started_at.as_deref().filter(|s| !s.is_empty()).map(|s| relative_time(Some(s))).unwrap_or_else(|| "—".into())} }
         }),
         Column::new("finished", "Finished", |r: &SchedulerRun| {
             html! { {r.finished_at.as_deref().filter(|s| !s.is_empty()).map(|s| relative_time(Some(s))).unwrap_or_else(|| "—".into())} }
         }),
-        Column::new("status", "Status", |r: &SchedulerRun| status_badge(&r.status)),
+        Column::new("status", "Status", |r: &SchedulerRun| {
+            status_badge(&r.status)
+        }),
         Column::new("message", "Message", |r: &SchedulerRun| {
             let message = r.message.clone().unwrap_or_default();
             html! { <UiBox variant="code" title={message.clone()}>{head(&message, 80)}</UiBox> }
@@ -675,11 +716,14 @@ fn scheduler_tables(runs: &SchedulerRuns) -> Html {
     let latest_rows: Vec<SchedulerRun> = SCHEDULER_NAMES
         .iter()
         .map(|name| {
-            runs.latest.get(*name).cloned().unwrap_or_else(|| SchedulerRun {
-                name: (*name).to_string(),
-                status: "—".into(),
-                ..Default::default()
-            })
+            runs.latest
+                .get(*name)
+                .cloned()
+                .unwrap_or_else(|| SchedulerRun {
+                    name: (*name).to_string(),
+                    status: "—".into(),
+                    ..Default::default()
+                })
         })
         .collect();
     html! {
@@ -742,13 +786,25 @@ fn SessionsSection(props: &SectionProps) -> Html {
 
     let busy = (*busy_id).clone();
     let columns = vec![
-        Column::new("user", "User", |s: &Session| html! { {s.user_name.clone()} }),
+        Column::new(
+            "user",
+            "User",
+            |s: &Session| html! { {s.user_name.clone()} },
+        ),
         Column::new("ip", "IP", |s: &Session| html! { {or_dash(&s.ip)} }),
         Column::new("user_agent", "User-Agent", |s: &Session| {
-            let shown = if s.user_agent.is_empty() { "—".to_string() } else { truncate(&s.user_agent, 60) };
+            let shown = if s.user_agent.is_empty() {
+                "—".to_string()
+            } else {
+                truncate(&s.user_agent, 60)
+            };
             html! { <span title={s.user_agent.clone()}>{shown}</span> }
         }),
-        Column::new("created", "Created", |s: &Session| html! { {relative_time(s.created_at.as_deref())} }),
+        Column::new(
+            "created",
+            "Created",
+            |s: &Session| html! { {relative_time(s.created_at.as_deref())} },
+        ),
         Column::new("expires", "Expires", |s: &Session| {
             html! { {s.expires_at.as_deref().filter(|e| !e.is_empty()).map(to_locale_string).unwrap_or_else(|| "—".into())} }
         }),
@@ -816,13 +872,19 @@ fn UsersSection(props: &SectionProps) -> Html {
         let error = error.clone();
         Callback::from(move |_: MouseEvent| {
             let Some(edit) = (*modal).clone() else { return };
-            let (console, modal, submitting, error) =
-                (console.clone(), modal.clone(), submitting.clone(), error.clone());
+            let (console, modal, submitting, error) = (
+                console.clone(),
+                modal.clone(),
+                submitting.clone(),
+                error.clone(),
+            );
             spawn_local(async move {
                 submitting.set(true);
                 error.set(None);
                 let path = format!("/api/admin/users/{}/role", edit.user.id);
-                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "role": edit.role }))).await {
+                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "role": edit.role })))
+                    .await
+                {
                     Ok(_) => {
                         modal.set(None);
                         console.refresh().await;
@@ -851,12 +913,24 @@ fn UsersSection(props: &SectionProps) -> Html {
     };
 
     let columns = vec![
-        Column::new("display_name", "Display name", |u: &AdminUser| html! { {u.display_name.clone()} }),
-        Column::new("email", "Email", |u: &AdminUser| html! { {or_dash(&u.email)} }),
+        Column::new(
+            "display_name",
+            "Display name",
+            |u: &AdminUser| html! { {u.display_name.clone()} },
+        ),
+        Column::new(
+            "email",
+            "Email",
+            |u: &AdminUser| html! { {or_dash(&u.email)} },
+        ),
         Column::new("role", "Role", |u: &AdminUser| {
             html! { <Badge color={role_badge(&u.role)}>{role_label(&u.role)}</Badge> }
         }),
-        Column::new("last_login", "Last login", |u: &AdminUser| html! { {relative_time(u.last_login.as_deref())} }),
+        Column::new(
+            "last_login",
+            "Last login",
+            |u: &AdminUser| html! { {relative_time(u.last_login.as_deref())} },
+        ),
         Column::new("created", "Created", |u: &AdminUser| {
             html! { {u.created_at.as_deref().filter(|c| !c.is_empty()).map(to_locale_date_string).unwrap_or_else(|| "—".into())} }
         }),
@@ -865,7 +939,10 @@ fn UsersSection(props: &SectionProps) -> Html {
         }),
     ];
 
-    let editing_name = modal.as_ref().map(|m| m.user.display_name.clone()).unwrap_or_default();
+    let editing_name = modal
+        .as_ref()
+        .map(|m| m.user.display_name.clone())
+        .unwrap_or_default();
     let editing_role = modal.as_ref().map(|m| m.role.clone()).unwrap_or_default();
     html! {
         <>
@@ -930,7 +1007,13 @@ fn ApprovalsSection(props: &SectionProps) -> Html {
             let busy_id = busy_id.clone();
             spawn_local(async move {
                 busy_id.set(Some(id.clone()));
-                match api_json::<Value, _>(&format!("/api/approvals/{id}/approve"), "POST", Some(&json!({}))).await {
+                match api_json::<Value, _>(
+                    &format!("/api/approvals/{id}/approve"),
+                    "POST",
+                    Some(&json!({})),
+                )
+                .await
+                {
                     Ok(_) => console.refresh().await,
                     Err(e) => console.fail(e),
                 }
@@ -939,7 +1022,11 @@ fn ApprovalsSection(props: &SectionProps) -> Html {
         })
     };
     let open_reject = {
-        let (modal, reason, error) = (reject_modal.clone(), reject_reason.clone(), reject_error.clone());
+        let (modal, reason, error) = (
+            reject_modal.clone(),
+            reject_reason.clone(),
+            reject_error.clone(),
+        );
         Callback::from(move |row: Approval| {
             modal.set(Some(row));
             reason.set(String::new());
@@ -952,8 +1039,12 @@ fn ApprovalsSection(props: &SectionProps) -> Html {
     };
     let submit_reject = {
         let console = console.clone();
-        let (modal, reason, busy, error) =
-            (reject_modal.clone(), reject_reason.clone(), reject_busy.clone(), reject_error.clone());
+        let (modal, reason, busy, error) = (
+            reject_modal.clone(),
+            reject_reason.clone(),
+            reject_busy.clone(),
+            reject_error.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let Some(row) = (*modal).clone() else { return };
             let text = reason.trim().to_string();
@@ -962,7 +1053,8 @@ fn ApprovalsSection(props: &SectionProps) -> Html {
                 return;
             }
             let console = console.clone();
-            let (modal, reason, busy, error) = (modal.clone(), reason.clone(), busy.clone(), error.clone());
+            let (modal, reason, busy, error) =
+                (modal.clone(), reason.clone(), busy.clone(), error.clone());
             spawn_local(async move {
                 busy.set(true);
                 error.set(None);
@@ -986,12 +1078,32 @@ fn ApprovalsSection(props: &SectionProps) -> Html {
 
     let busy = (*approve_busy_id).clone();
     let columns = vec![
-        Column::new("asset", "Asset", |r: &Approval| html! { {r.asset_name.clone()} }),
-        Column::new("stig", "STIG", |r: &Approval| html! { {r.stig_title.clone()} }),
+        Column::new(
+            "asset",
+            "Asset",
+            |r: &Approval| html! { {r.asset_name.clone()} },
+        ),
+        Column::new(
+            "stig",
+            "STIG",
+            |r: &Approval| html! { {r.stig_title.clone()} },
+        ),
         Column::new("rule", "Rule", |r: &Approval| html! { {r.rule_id.clone()} }),
-        Column::new("proposed", "Proposed status", |r: &Approval| html! { <Badge>{r.proposed_status.clone()}</Badge> }),
-        Column::new("requested_by", "Requested by", |r: &Approval| html! { {r.requested_by_name.clone()} }),
-        Column::new("requested_at", "Requested", |r: &Approval| html! { {relative_time(r.requested_at.as_deref())} }),
+        Column::new(
+            "proposed",
+            "Proposed status",
+            |r: &Approval| html! { <Badge>{r.proposed_status.clone()}</Badge> },
+        ),
+        Column::new(
+            "requested_by",
+            "Requested by",
+            |r: &Approval| html! { {r.requested_by_name.clone()} },
+        ),
+        Column::new(
+            "requested_at",
+            "Requested",
+            |r: &Approval| html! { {relative_time(r.requested_at.as_deref())} },
+        ),
         Column::new("actions", "", move |r: &Approval| {
             html! {
                 <SpaceBetween direction="horizontal" size="xs">
@@ -1065,22 +1177,38 @@ fn OwnerSection(props: &SectionProps) -> Html {
 
     let submit = {
         let console = console.clone();
-        let (asset, user, submitting, error, success) =
-            (asset.clone(), user.clone(), submitting.clone(), error.clone(), success.clone());
+        let (asset, user, submitting, error, success) = (
+            asset.clone(),
+            user.clone(),
+            submitting.clone(),
+            error.clone(),
+            success.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let (Some(a), Some(u)) = ((*asset).clone(), (*user).clone()) else {
                 error.set(Some("Pick an asset and a new owner.".into()));
                 return;
             };
             let console = console.clone();
-            let (asset, user, submitting, error, success) =
-                (asset.clone(), user.clone(), submitting.clone(), error.clone(), success.clone());
+            let (asset, user, submitting, error, success) = (
+                asset.clone(),
+                user.clone(),
+                submitting.clone(),
+                error.clone(),
+                success.clone(),
+            );
             spawn_local(async move {
                 submitting.set(true);
                 error.set(None);
                 success.set(None);
                 let path = format!("/api/admin/assets/{}/owner", a.value);
-                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "ownerId": u.value.as_str() }))).await {
+                match api_json::<Value, _>(
+                    &path,
+                    "PATCH",
+                    Some(&json!({ "ownerId": u.value.as_str() })),
+                )
+                .await
+                {
                     Ok(_) => {
                         success.set(Some(format!("Re-assigned {} to {}.", a.label, u.label)));
                         asset.set(None);
@@ -1181,64 +1309,72 @@ fn AuditSection(props: &SectionProps) -> Html {
     // to 1) so a click always lands on page 1 even if the previous run
     // was on a later page.
     {
-        let (rows, event_rows, total, loading, error) =
-            (rows.clone(), event_rows.clone(), total.clone(), loading.clone(), error.clone());
-        use_effect_with((*search_tick, *page, (*submitted).clone(), (*view).clone()), move |(tick, page, filters, view)| {
-            let cancelled = Rc::new(Cell::new(false));
-            if *tick != 0 {
-                let mut qs = Vec::new();
-                for (key, value) in [
-                    ("userId", &filters.user_id),
-                    ("assetId", &filters.asset_id),
-                    ("from", &filters.from),
-                    ("to", &filters.to),
-                ] {
-                    if !value.is_empty() {
-                        qs.push(format!("{key}={}", encode_uri_component(value)));
+        let (rows, event_rows, total, loading, error) = (
+            rows.clone(),
+            event_rows.clone(),
+            total.clone(),
+            loading.clone(),
+            error.clone(),
+        );
+        use_effect_with(
+            (*search_tick, *page, (*submitted).clone(), (*view).clone()),
+            move |(tick, page, filters, view)| {
+                let cancelled = Rc::new(Cell::new(false));
+                if *tick != 0 {
+                    let mut qs = Vec::new();
+                    for (key, value) in [
+                        ("userId", &filters.user_id),
+                        ("assetId", &filters.asset_id),
+                        ("from", &filters.from),
+                        ("to", &filters.to),
+                    ] {
+                        if !value.is_empty() {
+                            qs.push(format!("{key}={}", encode_uri_component(value)));
+                        }
                     }
+                    qs.push(format!("page={page}"));
+                    qs.push(format!("pageSize={AUDIT_PAGE_SIZE}"));
+                    let requests = view == "requests";
+                    let endpoint = if requests { "events" } else { "search" };
+                    let path = format!("/api/audit/{endpoint}?{}", qs.join("&"));
+                    let cancelled = cancelled.clone();
+                    spawn_local(async move {
+                        loading.set(true);
+                        error.set(None);
+                        // Apply a response only if this effect run is still current
+                        // (cancelled is set by the cleanup on a view/page/filter change),
+                        // so a late response never fills the table under the wrong view.
+                        if requests {
+                            let result = api_get::<AuditEvents>(&path).await;
+                            if cancelled.get() {
+                                return;
+                            }
+                            match result {
+                                Ok(res) => {
+                                    event_rows.set(res.rows);
+                                    total.set(res.total_count);
+                                }
+                                Err(e) => error.set(Some(e)),
+                            }
+                        } else {
+                            let result = api_get::<AuditSearch>(&path).await;
+                            if cancelled.get() {
+                                return;
+                            }
+                            match result {
+                                Ok(res) => {
+                                    rows.set(res.rows);
+                                    total.set(res.total_count);
+                                }
+                                Err(e) => error.set(Some(e)),
+                            }
+                        }
+                        loading.set(false);
+                    });
                 }
-                qs.push(format!("page={page}"));
-                qs.push(format!("pageSize={AUDIT_PAGE_SIZE}"));
-                let requests = view == "requests";
-                let endpoint = if requests { "events" } else { "search" };
-                let path = format!("/api/audit/{endpoint}?{}", qs.join("&"));
-                let cancelled = cancelled.clone();
-                spawn_local(async move {
-                    loading.set(true);
-                    error.set(None);
-                    // Apply a response only if this effect run is still current
-                    // (cancelled is set by the cleanup on a view/page/filter change),
-                    // so a late response never fills the table under the wrong view.
-                    if requests {
-                        let result = api_get::<AuditEvents>(&path).await;
-                        if cancelled.get() {
-                            return;
-                        }
-                        match result {
-                            Ok(res) => {
-                                event_rows.set(res.rows);
-                                total.set(res.total_count);
-                            }
-                            Err(e) => error.set(Some(e)),
-                        }
-                    } else {
-                        let result = api_get::<AuditSearch>(&path).await;
-                        if cancelled.get() {
-                            return;
-                        }
-                        match result {
-                            Ok(res) => {
-                                rows.set(res.rows);
-                                total.set(res.total_count);
-                            }
-                            Err(e) => error.set(Some(e)),
-                        }
-                    }
-                    loading.set(false);
-                });
-            }
-            move || cancelled.set(true)
-        });
+                move || cancelled.set(true)
+            },
+        );
     }
 
     let run_search = {
@@ -1246,8 +1382,14 @@ fn AuditSection(props: &SectionProps) -> Html {
         let (submitted, page, search_tick) = (submitted.clone(), page.clone(), search_tick.clone());
         Callback::from(move |_: MouseEvent| {
             submitted.set(AuditFilters {
-                user_id: user.as_ref().map(|o| o.value.to_string()).unwrap_or_default(),
-                asset_id: asset.as_ref().map(|o| o.value.to_string()).unwrap_or_default(),
+                user_id: user
+                    .as_ref()
+                    .map(|o| o.value.to_string())
+                    .unwrap_or_default(),
+                asset_id: asset
+                    .as_ref()
+                    .map(|o| o.value.to_string())
+                    .unwrap_or_default(),
                 from: (*from).clone(),
                 to: (*to).clone(),
             });
@@ -1267,8 +1409,18 @@ fn AuditSection(props: &SectionProps) -> Html {
     // Switching the view drops the other view's results and waits for a new
     // Search, so a stale table never sits under the wrong columns.
     let on_view = {
-        let (view, rows, event_rows, total) = (view.clone(), rows.clone(), event_rows.clone(), total.clone());
-        let (page, search_tick, error, loading) = (page.clone(), search_tick.clone(), error.clone(), loading.clone());
+        let (view, rows, event_rows, total) = (
+            view.clone(),
+            rows.clone(),
+            event_rows.clone(),
+            total.clone(),
+        );
+        let (page, search_tick, error, loading) = (
+            page.clone(),
+            search_tick.clone(),
+            error.clone(),
+            loading.clone(),
+        );
         Callback::from(move |id: AttrValue| {
             view.set(id.to_string());
             rows.set(Vec::new());
@@ -1311,8 +1463,16 @@ fn AuditSection(props: &SectionProps) -> Html {
             html! { {r.occurred_at.as_deref().filter(|s| !s.is_empty()).map(to_locale_string).unwrap_or_else(|| "—".into())} }
         }),
         Column::new("by", "By", |r: &AuditRow| html! { {r.by_name.clone()} }),
-        Column::new("asset", "Asset", |r: &AuditRow| html! { {r.asset_name.clone().unwrap_or_else(|| "—".into())} }),
-        Column::new("stig", "STIG", |r: &AuditRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new(
+            "asset",
+            "Asset",
+            |r: &AuditRow| html! { {r.asset_name.clone().unwrap_or_else(|| "—".into())} },
+        ),
+        Column::new(
+            "stig",
+            "STIG",
+            |r: &AuditRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} },
+        ),
         Column::new("rule", "Rule", |r: &AuditRow| html! { {r.rule_id.clone()} }),
         Column::new("field", "Field", |r: &AuditRow| html! { {r.field.clone()} }),
         Column::new("from", "From", move |r: &AuditRow| clipped(&r.from_value)),
@@ -1322,21 +1482,59 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("when", "When", |r: &AuditEventRow| {
             html! { {r.occurred_at.as_deref().filter(|s| !s.is_empty()).map(to_locale_string).unwrap_or_else(|| "—".into())} }
         }),
-        Column::new("by", "By", |r: &AuditEventRow| html! { {r.by_name.clone()} }),
-        Column::new("asset", "Asset", |r: &AuditEventRow| html! { {r.asset_name.clone().unwrap_or_else(|| "—".into())} }),
-        Column::new("stig", "STIG", |r: &AuditEventRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} }),
-        Column::new("action", "Action", |r: &AuditEventRow| html! { {r.action.clone()} }),
-        Column::new("outcome", "Outcome", |r: &AuditEventRow| html! { {r.outcome.clone()} }),
-        Column::new("role", "Role", |r: &AuditEventRow| html! { {r.user_role.clone().unwrap_or_else(|| "—".into())} }),
-        Column::new("ip", "Source IP", |r: &AuditEventRow| html! { {r.source_ip.clone().unwrap_or_else(|| "—".into())} }),
+        Column::new(
+            "by",
+            "By",
+            |r: &AuditEventRow| html! { {r.by_name.clone()} },
+        ),
+        Column::new(
+            "asset",
+            "Asset",
+            |r: &AuditEventRow| html! { {r.asset_name.clone().unwrap_or_else(|| "—".into())} },
+        ),
+        Column::new(
+            "stig",
+            "STIG",
+            |r: &AuditEventRow| html! { {r.stig_title.clone().unwrap_or_else(|| "—".into())} },
+        ),
+        Column::new(
+            "action",
+            "Action",
+            |r: &AuditEventRow| html! { {r.action.clone()} },
+        ),
+        Column::new(
+            "outcome",
+            "Outcome",
+            |r: &AuditEventRow| html! { {r.outcome.clone()} },
+        ),
+        Column::new(
+            "role",
+            "Role",
+            |r: &AuditEventRow| html! { {r.user_role.clone().unwrap_or_else(|| "—".into())} },
+        ),
+        Column::new(
+            "ip",
+            "Source IP",
+            |r: &AuditEventRow| html! { {r.source_ip.clone().unwrap_or_else(|| "—".into())} },
+        ),
         Column::new("request", "Request ID", |r: &AuditEventRow| {
             html! { <UiBox variant="code">{r.request_id.clone().unwrap_or_else(|| "—".into())}</UiBox> }
         }),
-        Column::new("count", "Count", |r: &AuditEventRow| html! { {repeat_label(r)} }),
-        Column::new("summary", "Summary", |r: &AuditEventRow| html! { {event_summary(r)} }),
+        Column::new(
+            "count",
+            "Count",
+            |r: &AuditEventRow| html! { {repeat_label(r)} },
+        ),
+        Column::new(
+            "summary",
+            "Summary",
+            |r: &AuditEventRow| html! { {event_summary(r)} },
+        ),
     ];
     let requests_view = *view == "requests";
-    let pages_count = usize::try_from((*total + AUDIT_PAGE_SIZE - 1) / AUDIT_PAGE_SIZE).unwrap_or(1).max(1);
+    let pages_count = usize::try_from((*total + AUDIT_PAGE_SIZE - 1) / AUDIT_PAGE_SIZE)
+        .unwrap_or(1)
+        .max(1);
     let empty_text = if *search_tick == 0 {
         "Click Search to query the audit log."
     } else {
@@ -1510,7 +1708,8 @@ fn PoliciesSection(props: &SectionProps) -> Html {
             let console = console.clone();
             spawn_local(async move {
                 let path = format!("/api/admin/policies/{id}");
-                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "enabled": next }))).await {
+                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "enabled": next }))).await
+                {
                     Ok(_) => console.refresh().await,
                     Err(e) => console.fail(e),
                 }
@@ -1520,12 +1719,21 @@ fn PoliciesSection(props: &SectionProps) -> Html {
     let delete = {
         let console = console.clone();
         Callback::from(move |policy: Policy| {
-            if !confirm(&format!("Delete policy \"{}\"? This can't be undone.", policy.name)) {
+            if !confirm(&format!(
+                "Delete policy \"{}\"? This can't be undone.",
+                policy.name
+            )) {
                 return;
             }
             let console = console.clone();
             spawn_local(async move {
-                match expect_ok("DELETE", &format!("/api/admin/policies/{}", policy.id), "Delete").await {
+                match expect_ok(
+                    "DELETE",
+                    &format!("/api/admin/policies/{}", policy.id),
+                    "Delete",
+                )
+                .await
+                {
                     Ok(()) => console.refresh().await,
                     Err(e) => console.fail(e),
                 }
@@ -1551,11 +1759,23 @@ fn PoliciesSection(props: &SectionProps) -> Html {
             html! { <Badge color={if p.effect == "deny" { "red" } else { "green" }}>{p.effect.clone()}</Badge> }
         }),
         Column::new("level", "Level", |p: &Policy| html! { {p.level.clone()} }),
-        Column::new("role_match", "Role match", move |p: &Policy| html! { {any(&p.role_match)} }),
-        Column::new("classification_match", "Classification match", move |p: &Policy| {
-            html! { {any(&p.classification_match)} }
-        }),
-        Column::new("tag_match", "Tag match", move |p: &Policy| html! { {any(&p.tag_match)} }),
+        Column::new(
+            "role_match",
+            "Role match",
+            move |p: &Policy| html! { {any(&p.role_match)} },
+        ),
+        Column::new(
+            "classification_match",
+            "Classification match",
+            move |p: &Policy| {
+                html! { {any(&p.classification_match)} }
+            },
+        ),
+        Column::new(
+            "tag_match",
+            "Tag match",
+            move |p: &Policy| html! { {any(&p.tag_match)} },
+        ),
         Column::new("enabled", "Enabled", move |p: &Policy| {
             let id = p.id.clone();
             let on_change = toggle_enabled.reform(move |next: bool| (id.clone(), next));
@@ -1575,7 +1795,8 @@ fn PoliciesSection(props: &SectionProps) -> Html {
     ];
 
     let form = (*modal).clone();
-    let field = |get: fn(&PolicyForm) -> &String| form.as_ref().map(|f| get(f).clone()).unwrap_or_default();
+    let field =
+        |get: fn(&PolicyForm) -> &String| form.as_ref().map(|f| get(f).clone()).unwrap_or_default();
     html! {
         <>
             <Table<Policy>
@@ -1734,7 +1955,11 @@ fn WebhooksSection(props: &SectionProps) -> Html {
     };
     let submit_hook = {
         let console = console.clone();
-        let (modal, submitting, error) = (hook_modal.clone(), hook_submitting.clone(), hook_error.clone());
+        let (modal, submitting, error) = (
+            hook_modal.clone(),
+            hook_submitting.clone(),
+            hook_error.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let Some(form) = (*modal).clone() else { return };
             let console = console.clone();
@@ -1753,7 +1978,8 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                     None => api_json::<Value, _>("/api/webhooks", "POST", Some(&body)).await,
                     Some(id) => {
                         body["enabled"] = json!(form.enabled);
-                        api_json::<Value, _>(&format!("/api/webhooks/{id}"), "PATCH", Some(&body)).await
+                        api_json::<Value, _>(&format!("/api/webhooks/{id}"), "PATCH", Some(&body))
+                            .await
                     }
                 };
                 match result {
@@ -1773,7 +1999,8 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             let console = console.clone();
             spawn_local(async move {
                 let path = format!("/api/webhooks/{id}");
-                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "enabled": next }))).await {
+                match api_json::<Value, _>(&path, "PATCH", Some(&json!({ "enabled": next }))).await
+                {
                     Ok(_) => console.refresh().await,
                     Err(e) => console.fail(e),
                 }
@@ -1783,7 +2010,10 @@ fn WebhooksSection(props: &SectionProps) -> Html {
     let delete = {
         let console = console.clone();
         Callback::from(move |hook: Webhook| {
-            if !confirm(&format!("Delete webhook \"{}\"? This can't be undone.", hook.name)) {
+            if !confirm(&format!(
+                "Delete webhook \"{}\"? This can't be undone.",
+                hook.name
+            )) {
                 return;
             }
             let console = console.clone();
@@ -1816,15 +2046,28 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         Callback::from(move |hook: Webhook| {
             let panel = panel.clone();
             let webhook_name = hook.name.clone();
-            panel.set(Some(DeliveriesPanel { webhook_name: webhook_name.clone(), loading: true, ..Default::default() }));
+            panel.set(Some(DeliveriesPanel {
+                webhook_name: webhook_name.clone(),
+                loading: true,
+                ..Default::default()
+            }));
             spawn_local(async move {
-                let next = match api_get::<Vec<Delivery>>(&format!("/api/webhooks/{}/deliveries", hook.id)).await {
+                let next = match api_get::<Vec<Delivery>>(&format!(
+                    "/api/webhooks/{}/deliveries",
+                    hook.id
+                ))
+                .await
+                {
                     Ok(rows) => DeliveriesPanel {
                         webhook_name,
                         rows: rows.into_iter().take(10).collect(),
                         ..Default::default()
                     },
-                    Err(e) => DeliveriesPanel { webhook_name, error: Some(e), ..Default::default() },
+                    Err(e) => DeliveriesPanel {
+                        webhook_name,
+                        error: Some(e),
+                        ..Default::default()
+                    },
                 };
                 panel.set(Some(next));
             });
@@ -1842,9 +2085,13 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         Callback::from(move |hook: Webhook| {
             let (verify, verify_error) = (verify.clone(), verify_error.clone());
             verify_error.set(None);
-            verify.set(Some(VerifyState::Loading { webhook_name: hook.name.clone() }));
+            verify.set(Some(VerifyState::Loading {
+                webhook_name: hook.name.clone(),
+            }));
             spawn_local(async move {
-                match api_get::<VerifyRecipe>(&format!("/api/webhooks/{}/verify-recipe", hook.id)).await {
+                match api_get::<VerifyRecipe>(&format!("/api/webhooks/{}/verify-recipe", hook.id))
+                    .await
+                {
                     Ok(recipe) => verify.set(Some(VerifyState::Ready(recipe))),
                     Err(e) => {
                         verify.set(None);
@@ -1880,7 +2127,11 @@ fn WebhooksSection(props: &SectionProps) -> Html {
 
     let columns = vec![
         Column::new("name", "Name", |w: &Webhook| html! { {w.name.clone()} }),
-        Column::new("url", "URL", |w: &Webhook| html! { <span title={w.url.clone()}>{truncate(&w.url, 50)}</span> }),
+        Column::new(
+            "url",
+            "URL",
+            |w: &Webhook| html! { <span title={w.url.clone()}>{truncate(&w.url, 50)}</span> },
+        ),
         Column::new("kinds", "Events", |w: &Webhook| {
             html! {
                 <SpaceBetween direction="horizontal" size="xxs">
@@ -1915,18 +2166,31 @@ fn WebhooksSection(props: &SectionProps) -> Html {
     ];
 
     let form = (*hook_modal).clone();
-    let field = |get: fn(&HookForm) -> &String| form.as_ref().map(|f| get(f).clone()).unwrap_or_default();
+    let field =
+        |get: fn(&HookForm) -> &String| form.as_ref().map(|f| get(f).clone()).unwrap_or_default();
     let selected_kinds: Vec<AttrValue> = form
         .as_ref()
         .map(|f| f.kinds.iter().cloned().map(AttrValue::from).collect())
         .unwrap_or_default();
-    let hook_header = if form.as_ref().is_some_and(|f| f.id.is_some()) { "Edit webhook" } else { "Add webhook" };
-    let flavor = form.as_ref().map(|f| f.flavor.clone()).unwrap_or_else(|| "slack".into());
+    let hook_header = if form.as_ref().is_some_and(|f| f.id.is_some()) {
+        "Edit webhook"
+    } else {
+        "Add webhook"
+    };
+    let flavor = form
+        .as_ref()
+        .map(|f| f.flavor.clone())
+        .unwrap_or_else(|| "slack".into());
 
-    let deliveries_name = deliveries.as_ref().map(|d| d.webhook_name.clone()).unwrap_or_default();
+    let deliveries_name = deliveries
+        .as_ref()
+        .map(|d| d.webhook_name.clone())
+        .unwrap_or_default();
     let deliveries_body = match &*deliveries {
         Some(d) if d.loading => empty_plain("Loading…"),
-        Some(DeliveriesPanel { error: Some(e), .. }) => html! { <Alert kind="error">{e.clone()}</Alert> },
+        Some(DeliveriesPanel { error: Some(e), .. }) => {
+            html! { <Alert kind="error">{e.clone()}</Alert> }
+        }
         Some(d) if !d.rows.is_empty() => html! {
             <Table<Delivery> variant="embedded" items={d.rows.clone()} columns={delivery_columns()} />
         },
@@ -1942,7 +2206,11 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         (Some(VerifyState::Loading { .. }), _) => empty_plain("Loading…"),
         (Some(VerifyState::Ready(recipe)), _) => {
             let tab = |language: &'static str, label: &'static str, text: &String| {
-                TabItem::new(language, label, html! { <SnippetBlock {language} text={text.clone()} /> })
+                TabItem::new(
+                    language,
+                    label,
+                    html! { <SnippetBlock {language} text={text.clone()} /> },
+                )
             };
             html! {
                 <SpaceBetween direction="vertical" size="m">
@@ -2054,19 +2322,31 @@ fn WebhooksSection(props: &SectionProps) -> Html {
 
 fn delivery_columns() -> Vec<Column<Delivery>> {
     vec![
-        Column::new("attempted_at", "When", |d: &Delivery| html! { {relative_time(d.attempted_at.as_deref())} }),
+        Column::new(
+            "attempted_at",
+            "When",
+            |d: &Delivery| html! { {relative_time(d.attempted_at.as_deref())} },
+        ),
         Column::new("kind", "Kind", |d: &Delivery| html! { {d.kind.clone()} }),
-        Column::new("status", "Status", |d: &Delivery| match (&d.error, d.http_status) {
-            (Some(e), _) if !e.is_empty() => html! { <StatusIndicator kind="error">{"Failed"}</StatusIndicator> },
-            (_, Some(code)) if (200..300).contains(&code) => {
-                html! { <StatusIndicator kind="success">{code}</StatusIndicator> }
+        Column::new("status", "Status", |d: &Delivery| {
+            match (&d.error, d.http_status) {
+                (Some(e), _) if !e.is_empty() => {
+                    html! { <StatusIndicator kind="error">{"Failed"}</StatusIndicator> }
+                }
+                (_, Some(code)) if (200..300).contains(&code) => {
+                    html! { <StatusIndicator kind="success">{code}</StatusIndicator> }
+                }
+                (_, code) => html! {
+                    <StatusIndicator kind="warning">{code.map(|c| c.to_string()).unwrap_or_else(|| "—".into())}</StatusIndicator>
+                },
             }
-            (_, code) => html! {
-                <StatusIndicator kind="warning">{code.map(|c| c.to_string()).unwrap_or_else(|| "—".into())}</StatusIndicator>
-            },
         }),
         Column::new("detail", "Detail", |d: &Delivery| {
-            let detail = d.error.clone().or_else(|| d.response.clone()).unwrap_or_default();
+            let detail = d
+                .error
+                .clone()
+                .or_else(|| d.response.clone())
+                .unwrap_or_default();
             html! { <UiBox variant="code">{head(&detail, 200)}</UiBox> }
         }),
     ]
@@ -2094,9 +2374,10 @@ fn SnippetBlock(props: &SnippetBlockProps) -> Html {
             let text = text.clone();
             spawn_local(async move {
                 // `navigator.clipboard` is absent outside secure contexts.
-                let available = js_sys::Reflect::get(&window().navigator(), &JsValue::from_str("clipboard"))
-                    .map(|c| !c.is_undefined() && !c.is_null())
-                    .unwrap_or(false);
+                let available =
+                    js_sys::Reflect::get(&window().navigator(), &JsValue::from_str("clipboard"))
+                        .map(|c| !c.is_undefined() && !c.is_null())
+                        .unwrap_or(false);
                 // Permission denied / unavailable is silently swallowed —
                 // the button is just a convenience; the text is selectable too.
                 if available && !copy_to_clipboard(&text).await {
@@ -2130,10 +2411,26 @@ fn SnippetBlock(props: &SnippetBlockProps) -> Html {
 fn reports_table(reports: &[Report]) -> Html {
     let summary = |r: &Report| r.summary.clone().unwrap_or_default();
     let columns = vec![
-        Column::new("generated", "Generated", |r: &Report| html! { {to_locale_string(&r.generated_at)} }),
-        Column::new("compliance", "Compliance", move |r: &Report| html! { {format!("{}%", summary(r).compliance_score)} }),
-        Column::new("assets", "Assets", move |r: &Report| html! { {summary(r).assets} }),
-        Column::new("open", "Open findings", move |r: &Report| html! { {summary(r).open_findings} }),
+        Column::new(
+            "generated",
+            "Generated",
+            |r: &Report| html! { {to_locale_string(&r.generated_at)} },
+        ),
+        Column::new(
+            "compliance",
+            "Compliance",
+            move |r: &Report| html! { {format!("{}%", summary(r).compliance_score)} },
+        ),
+        Column::new(
+            "assets",
+            "Assets",
+            move |r: &Report| html! { {summary(r).assets} },
+        ),
+        Column::new(
+            "open",
+            "Open findings",
+            move |r: &Report| html! { {summary(r).open_findings} },
+        ),
         Column::new("top", "Top-risk system", move |r: &Report| {
             html! { {summary(r).top_asset_name.unwrap_or_else(|| "—".into())} }
         }),
@@ -2164,10 +2461,22 @@ fn reports_table(reports: &[Report]) -> Html {
 
 fn emails_table(emails: &[EmailDelivery]) -> Html {
     let columns = vec![
-        Column::new("when", "When", |e: &EmailDelivery| html! { {relative_time(e.attempted_at.as_deref())} }),
-        Column::new("kind", "Kind", |e: &EmailDelivery| html! { {e.kind.clone()} }),
+        Column::new(
+            "when",
+            "When",
+            |e: &EmailDelivery| html! { {relative_time(e.attempted_at.as_deref())} },
+        ),
+        Column::new(
+            "kind",
+            "Kind",
+            |e: &EmailDelivery| html! { {e.kind.clone()} },
+        ),
         Column::new("to", "To", |e: &EmailDelivery| {
-            let shown = if e.to_addresses.is_empty() { "—".to_string() } else { truncate(&e.to_addresses, 40) };
+            let shown = if e.to_addresses.is_empty() {
+                "—".to_string()
+            } else {
+                truncate(&e.to_addresses, 40)
+            };
             html! { <span title={e.to_addresses.clone()}>{shown}</span> }
         }),
         Column::new("subject", "Subject", |e: &EmailDelivery| {
@@ -2182,9 +2491,13 @@ fn emails_table(emails: &[EmailDelivery]) -> Html {
                 html! { <Badge color="grey">{e.mode.clone()}</Badge> }
             }
         }),
-        Column::new("error", "Error", |e: &EmailDelivery| match e.error.as_deref().filter(|x| !x.is_empty()) {
-            Some(err) => html! { <UiBox variant="code" title={err.to_string()}>{head(err, 80)}</UiBox> },
-            None => html! { {"—"} },
+        Column::new("error", "Error", |e: &EmailDelivery| {
+            match e.error.as_deref().filter(|x| !x.is_empty()) {
+                Some(err) => {
+                    html! { <UiBox variant="code" title={err.to_string()}>{head(err, 80)}</UiBox> }
+                }
+                None => html! { {"—"} },
+            }
         }),
     ];
     html! {
@@ -2251,7 +2564,11 @@ fn BackupSection(props: &SectionProps) -> Html {
     let submit_restore = {
         let console = console.clone();
         let (files, force) = (restore_files.clone(), restore_force.clone());
-        let (busy, result, error) = (restore_busy.clone(), restore_result.clone(), restore_error.clone());
+        let (busy, result, error) = (
+            restore_busy.clone(),
+            restore_result.clone(),
+            restore_error.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let Some(file) = files.first().cloned() else {
                 error.set(Some("Pick a backup .zip first.".into()));
@@ -2265,10 +2582,14 @@ fn BackupSection(props: &SectionProps) -> Html {
                 error.set(None);
                 result.set(None);
                 let outcome = async {
-                    let res = api_upload_raw(&format!("/api/admin/restore?force={force}"), &file).await?;
+                    let res =
+                        api_upload_raw(&format!("/api/admin/restore?force={force}"), &file).await?;
                     let body = res.json::<Value>().await.unwrap_or_else(|_| json!({}));
                     if !res.ok() {
-                        let message = body.get("error").and_then(Value::as_str).filter(|m| !m.is_empty());
+                        let message = body
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .filter(|m| !m.is_empty());
                         return Err(message
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("restore failed: {}", res.status())));
@@ -2290,7 +2611,11 @@ fn BackupSection(props: &SectionProps) -> Html {
         })
     };
     let on_files = {
-        let (files, result, error) = (restore_files.clone(), restore_result.clone(), restore_error.clone());
+        let (files, result, error) = (
+            restore_files.clone(),
+            restore_result.clone(),
+            restore_error.clone(),
+        );
         Callback::from(move |picked: Vec<web_sys::File>| {
             files.set(picked);
             result.set(None);
@@ -2386,28 +2711,40 @@ mod audit_event_tests {
                 serde_json::from_value(json!({ "signatureStatus": status })).unwrap();
             let (kind, text) = r.summary();
             assert_eq!(kind, "warning");
-            assert!(text.contains("integrity was not verified") && text.contains(status), "{text}");
+            assert!(
+                text.contains("integrity was not verified") && text.contains(status),
+                "{text}"
+            );
         }
         // An older backend sends no status.
         let (kind, _) = RestoreResult::default().summary();
         assert_eq!(kind, "warning");
     }
 
-
     fn event(detail: Value) -> AuditEventRow {
-        AuditEventRow { detail, ..AuditEventRow::default() }
+        AuditEventRow {
+            detail,
+            ..AuditEventRow::default()
+        }
     }
 
     #[test]
     fn event_rows_deserialize_the_request_context() {
-        let r: AuditEventRow =
-            serde_json::from_value(json!({ "sourceIp": "10.0.0.1", "requestId": "abc", "userRole": "admin" })).unwrap();
+        let r: AuditEventRow = serde_json::from_value(
+            json!({ "sourceIp": "10.0.0.1", "requestId": "abc", "userRole": "admin" }),
+        )
+        .unwrap();
         assert_eq!(
-            (r.source_ip.as_deref(), r.request_id.as_deref(), r.user_role.as_deref()),
+            (
+                r.source_ip.as_deref(),
+                r.request_id.as_deref(),
+                r.user_role.as_deref()
+            ),
             (Some("10.0.0.1"), Some("abc"), Some("admin"))
         );
         // Rows written before the context columns existed have none.
-        let old: AuditEventRow = serde_json::from_value(json!({ "action": "checklist.save" })).unwrap();
+        let old: AuditEventRow =
+            serde_json::from_value(json!({ "action": "checklist.save" })).unwrap();
         assert!(old.source_ip.is_none() && old.request_id.is_none() && old.user_role.is_none());
     }
 
@@ -2423,13 +2760,21 @@ mod audit_event_tests {
 
     #[test]
     fn summary_shows_the_reason_for_denied_and_rejected_requests() {
-        assert_eq!(event_summary(&event(json!({ "reason": "invalid_status" }))), "invalid status");
+        assert_eq!(
+            event_summary(&event(json!({ "reason": "invalid_status" }))),
+            "invalid status"
+        );
     }
 
     #[test]
     fn summary_lists_counts_and_creation() {
-        let e = event(json!({ "targetStatus": "open", "requested": 3, "applied": 2, "errors": 1, "created": true }));
-        assert_eq!(event_summary(&e), "status open, 3 requested, 2 applied, 1 errors, checklist created");
+        let e = event(
+            json!({ "targetStatus": "open", "requested": 3, "applied": 2, "errors": 1, "created": true }),
+        );
+        assert_eq!(
+            event_summary(&e),
+            "status open, 3 requested, 2 applied, 1 errors, checklist created"
+        );
     }
 
     #[test]

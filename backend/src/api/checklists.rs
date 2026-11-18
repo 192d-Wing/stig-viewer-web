@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::api::finding_approvals;
+use crate::api::request_ctx::RequestCtx;
 use crate::api::webhooks;
 use crate::db_assets;
-use crate::api::request_ctx::RequestCtx;
 use crate::db_audit;
 use crate::db_checklists;
 use crate::AppState;
@@ -705,14 +705,13 @@ async fn fire_assigned_event(
     };
 
     // Assignee display name — fall back to id if missing.
-    let assignee_name: String =
-        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
-            .bind(assignee_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| assignee_id.to_string());
+    let assignee_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+        .bind(assignee_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| assignee_id.to_string());
 
     // Severity lives in the STIG JSON. Best-effort lookup — if the file
     // is missing or the rule doesn't carry one we just send "unknown".
@@ -721,9 +720,8 @@ async fn fire_assigned_event(
             .get("rules")
             .and_then(|v| v.as_array())
             .and_then(|arr| {
-                arr.iter().find(|r| {
-                    r.get("id").and_then(|i| i.as_str()) == Some(rule_id)
-                })
+                arr.iter()
+                    .find(|r| r.get("id").and_then(|i| i.as_str()) == Some(rule_id))
             })
             .and_then(|r| r.get("severity").and_then(|v| v.as_str()))
             .unwrap_or("unknown")
@@ -818,10 +816,7 @@ fn merge_rule(
                 Value::String(o.finding_details.clone()),
             );
             state_obj.insert("comments".into(), Value::String(o.comments.clone()));
-            state_obj.insert(
-                "updatedAt".into(),
-                Value::String(o.updated_at.to_rfc3339()),
-            );
+            state_obj.insert("updatedAt".into(), Value::String(o.updated_at.to_rfc3339()));
             state_obj.insert(
                 "updatedBy".into(),
                 o.updated_by
@@ -873,14 +868,20 @@ fn map_unique_conflict(e: anyhow::Error) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{
+        app_state, auth, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID,
+    };
     use sqlx::PgPool;
 
     #[tokio::test]
     async fn load_stig_json_rejects_invalid_ids() {
         let (state, _dir) = crate::test_fixtures::lazy_state();
         for id in crate::test_fixtures::bad_ids() {
-            assert_eq!(load_stig_json(&state, &id).await.err(), Some(StatusCode::BAD_REQUEST), "{id:?}");
+            assert_eq!(
+                load_stig_json(&state, &id).await.err(),
+                Some(StatusCode::BAD_REQUEST),
+                "{id:?}"
+            );
         }
     }
 
@@ -890,7 +891,9 @@ mod tests {
             Extension(auth(user, "author")),
             Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
-            Json(CreateChecklistRequest { stig_id: stig_id.into() }),
+            Json(CreateChecklistRequest {
+                stig_id: stig_id.into(),
+            }),
         )
         .await
         .map(|(code, _)| code)
@@ -903,10 +906,22 @@ mod tests {
         seed_user(&pool, "other").await;
         seed_asset(&pool, "a1", "owner", false).await;
         let (state, _dir) = app_state(pool.clone());
-        assert_eq!(create(&state, "other", STIG_ID).await, Err(StatusCode::FORBIDDEN));
-        assert_eq!(create(&state, "owner", "../x").await, Err(StatusCode::BAD_REQUEST));
-        assert_eq!(create(&state, "owner", STIG_ID).await, Ok(StatusCode::CREATED));
-        assert_eq!(create(&state, "owner", STIG_ID).await, Err(StatusCode::CONFLICT));
+        assert_eq!(
+            create(&state, "other", STIG_ID).await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            create(&state, "owner", "../x").await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            create(&state, "owner", STIG_ID).await,
+            Ok(StatusCode::CREATED)
+        );
+        assert_eq!(
+            create(&state, "owner", STIG_ID).await,
+            Err(StatusCode::CONFLICT)
+        );
     }
 
     #[sqlx::test]
@@ -920,17 +935,20 @@ mod tests {
             Extension(auth("owner", "author")),
             Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
-            Json(CreateChecklistRequest { stig_id: STIG_ID.into() }),
+            Json(CreateChecklistRequest {
+                stig_id: STIG_ID.into(),
+            }),
         )
         .await
         .unwrap();
         assert_eq!(code, StatusCode::CREATED);
         assert_eq!(row.created_by.as_deref(), Some("owner"));
-        let stored: Option<String> = sqlx::query_scalar("SELECT created_by FROM checklists WHERE id = $1")
-            .bind(&row.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT created_by FROM checklists WHERE id = $1")
+                .bind(&row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(stored.as_deref(), Some("owner"));
         let ev: Vec<(String, String, Option<String>, Option<String>)> =
             sqlx::query_as("SELECT action, outcome, checklist_id, asset_id FROM audit_events")
@@ -939,7 +957,12 @@ mod tests {
                 .unwrap();
         assert_eq!(
             ev,
-            [("checklist.create".to_string(), "ok".to_string(), Some(row.id.clone()), Some("a1".to_string()))]
+            [(
+                "checklist.create".to_string(),
+                "ok".to_string(),
+                Some(row.id.clone()),
+                Some("a1".to_string())
+            )]
         );
     }
 
@@ -950,10 +973,22 @@ mod tests {
         seed_user(&pool, "other").await;
         seed_asset(&pool, "a1", "owner", false).await;
         let (state, _dir) = app_state(pool.clone());
-        assert_eq!(create(&state, "other", STIG_ID).await, Err(StatusCode::FORBIDDEN));
-        assert_eq!(create(&state, "owner", "../etc").await, Err(StatusCode::BAD_REQUEST));
-        assert_eq!(create(&state, "owner", STIG_ID).await, Ok(StatusCode::CREATED));
-        assert_eq!(create(&state, "owner", STIG_ID).await, Err(StatusCode::CONFLICT));
+        assert_eq!(
+            create(&state, "other", STIG_ID).await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            create(&state, "owner", "../etc").await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            create(&state, "owner", STIG_ID).await,
+            Ok(StatusCode::CREATED)
+        );
+        assert_eq!(
+            create(&state, "owner", STIG_ID).await,
+            Err(StatusCode::CONFLICT)
+        );
         let ev: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT outcome, COALESCE(detail->>'reason', detail->>'via'), COALESCE(stig_id, '') FROM audit_events ORDER BY id",
         )
@@ -983,16 +1018,27 @@ mod tests {
         seed_asset(&pool, "a1", "owner", false).await;
         let (state, _dir) = app_state(pool.clone());
         let huge = "A".repeat(100_000);
-        assert_eq!(create(&state, "other", &huge).await, Err(StatusCode::FORBIDDEN));
-        assert_eq!(create(&state, "owner", &huge).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            create(&state, "other", &huge).await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            create(&state, "owner", &huge).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
         let ev: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT outcome, stig_id FROM audit_events ORDER BY id")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(ev, [("denied".to_string(), None), ("rejected".to_string(), None)]);
+        assert_eq!(
+            ev,
+            [("denied".to_string(), None), ("rejected".to_string(), None)]
+        );
         assert!(is_valid_stig_id(&"a".repeat(crate::stig_id::MAX_BYTES)));
-        assert!(!is_valid_stig_id(&"a".repeat(crate::stig_id::MAX_BYTES + 1)));
+        assert!(!is_valid_stig_id(
+            &"a".repeat(crate::stig_id::MAX_BYTES + 1)
+        ));
     }
 
     /// Relies on the current-thread runtime `#[sqlx::test]` uses: after one
@@ -1014,14 +1060,20 @@ mod tests {
         h.abort();
         let mut seen = 0i64;
         for _ in 0..200 {
-            seen = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+            seen = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             if seen > 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(seen, 1);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklists").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklists")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -1046,8 +1098,13 @@ mod tests {
         .await
         .unwrap_or_else(|r| r);
         let code = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            code,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     #[sqlx::test]
@@ -1070,7 +1127,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((stored_id, details.as_str()), (approval_id, "because"));
-        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(live, "open");
 
         let (code, body) = patch(&state, RULES[0], "not_a_finding", "because").await;
@@ -1082,7 +1142,10 @@ mod tests {
                 "message": "an approval request is already pending for this rule",
             })
         );
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -1096,9 +1159,15 @@ mod tests {
         let (code, body) = patch(&state, RULES[0], "open", "").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["status"], "open");
-        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(live, "open");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1111,8 +1180,14 @@ mod tests {
         let (state, _dir) = app_state(pool.clone());
         let (code, body) = patch(&state, RULES[0], "not_a_finding", "  ").await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "finding_details required for status not_a_finding");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            body["error"],
+            "finding_details required for status not_a_finding"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1121,15 +1196,31 @@ mod tests {
     /// the handler's write gets the lock.
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn gated_already_closed_patch_conflicts_when_the_rule_is_reopened_before_the_write(pool: PgPool) {
+    async fn gated_already_closed_patch_conflicts_when_the_rule_is_reopened_before_the_write(
+        pool: PgPool,
+    ) {
         seed_user(&pool, "owner").await;
         seed_asset(&pool, "a1", "owner", true).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
-        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
-        let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        seed_rule(
+            &pool,
+            "c1",
+            RULES[0],
+            "not_a_finding",
+            "because",
+            "",
+            "owner",
+        )
+        .await;
+        let audit_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         let mut holder = pool.begin().await.unwrap();
-        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1")
+            .await
+            .unwrap();
         sqlx::query("UPDATE checklist_rules SET status = 'open' WHERE rule_id = $1")
             .bind(RULES[0])
             .execute(&mut *holder)
@@ -1137,7 +1228,8 @@ mod tests {
             .unwrap();
 
         let (state, _dir) = app_state(pool.clone());
-        let h = tokio::spawn(async move { patch(&state, RULES[0], "not_a_finding", "because").await });
+        let h =
+            tokio::spawn(async move { patch(&state, RULES[0], "not_a_finding", "because").await });
         let mut waiting = false;
         for _ in 0..400 {
             let n: i64 = sqlx::query_scalar(
@@ -1146,9 +1238,9 @@ mod tests {
                 "SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
                  WHERE NOT l.granted AND a.datname = current_database()",
             )
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             if n > 0 {
                 waiting = true;
                 break;
@@ -1161,11 +1253,20 @@ mod tests {
         let (code, body) = h.await.unwrap();
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(body["error"], "rule changed while saving; try again");
-        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules").fetch_one(&pool).await.unwrap();
+        let live: String = sqlx::query_scalar("SELECT status FROM checklist_rules")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(live, "open");
-        let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit").fetch_one(&pool).await.unwrap();
+        let audit_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(audit_after, audit_before);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1175,12 +1276,24 @@ mod tests {
         seed_user(&pool, "owner").await;
         seed_asset(&pool, "a1", "owner", true).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
-        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
+        seed_rule(
+            &pool,
+            "c1",
+            RULES[0],
+            "not_a_finding",
+            "because",
+            "",
+            "owner",
+        )
+        .await;
         let (state, _dir) = app_state(pool.clone());
         let (code, body) = patch(&state, RULES[0], "not_a_finding", "updated reason").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["findingDetails"], "updated reason");
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1190,7 +1303,16 @@ mod tests {
         seed_user(&pool, "owner").await;
         seed_asset(&pool, "a1", "owner", false).await;
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
-        seed_rule(&pool, "c1", RULES[0], "not_a_finding", "because", "", "owner").await;
+        seed_rule(
+            &pool,
+            "c1",
+            RULES[0],
+            "not_a_finding",
+            "because",
+            "",
+            "owner",
+        )
+        .await;
         let (state, _dir) = app_state(pool.clone());
         let (code, _) = patch(&state, RULES[0], "open", "").await;
         assert_eq!(code, StatusCode::OK);

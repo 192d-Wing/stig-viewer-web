@@ -36,9 +36,10 @@ pub fn RuleDetail(p: &RuleDetailProps) -> Html {
         });
     }
 
-    let on_status = p
-        .on_update_rule
-        .reform(|id: AttrValue| RuleUpdate { status: Some(id.to_string()), ..RuleUpdate::default() });
+    let on_status = p.on_update_rule.reform(|id: AttrValue| RuleUpdate {
+        status: Some(id.to_string()),
+        ..RuleUpdate::default()
+    });
     let close = p.on_close.reform(|_: MouseEvent| ());
 
     html! {

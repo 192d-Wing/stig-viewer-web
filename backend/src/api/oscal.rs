@@ -416,7 +416,10 @@ mod id_tests {
     async fn invalid_ids_are_rejected_before_any_file_access() {
         let (state, _dir) = lazy_state();
         for id in bad_ids() {
-            assert!(load_stig_json(&state.config.data_dir, &id).await.is_none(), "{id:?}");
+            assert!(
+                load_stig_json(&state.config.data_dir, &id).await.is_none(),
+                "{id:?}"
+            );
         }
     }
 }

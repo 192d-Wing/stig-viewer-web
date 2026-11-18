@@ -9,7 +9,9 @@ pub const MAX_BYTES: usize = 128;
 
 /// Read rule: non-empty, at most [`MAX_BYTES`], ASCII alphanumerics and `-`.
 pub fn is_valid(id: &str) -> bool {
-    !id.is_empty() && id.len() <= MAX_BYTES && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    !id.is_empty()
+        && id.len() <= MAX_BYTES
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Create rule: [`is_valid`] and no upper-case letters.
@@ -31,7 +33,12 @@ pub fn warning_message(rows: &[(String, String)]) -> Option<String> {
     if bad.is_empty() {
         return None;
     }
-    let mut list = bad.iter().take(WARN_LIST_CAP).cloned().collect::<Vec<_>>().join(", ");
+    let mut list = bad
+        .iter()
+        .take(WARN_LIST_CAP)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     if bad.len() > WARN_LIST_CAP {
         list.push_str(&format!(" and {} more", bad.len() - WARN_LIST_CAP));
     }
@@ -98,12 +105,21 @@ mod tests {
 
     #[test]
     fn warning_message_lists_and_caps() {
-        let mut rows = vec![("checklist".to_string(), "\u{e9}".to_string()), ("catalog".into(), "fine".into())];
+        let mut rows = vec![
+            ("checklist".to_string(), "\u{e9}".to_string()),
+            ("catalog".into(), "fine".into()),
+        ];
         let m = warning_message(&rows).expect("message");
-        assert!(m.starts_with("1 STIG id(s)") && m.contains("checklist:") && !m.contains("fine"), "{m}");
+        assert!(
+            m.starts_with("1 STIG id(s)") && m.contains("checklist:") && !m.contains("fine"),
+            "{m}"
+        );
         rows.extend((0..59).map(|i| ("catalog".to_string(), format!("bad.{i}"))));
         let m = warning_message(&rows).expect("message");
-        assert!(m.starts_with("60 STIG id(s)") && m.ends_with("and 10 more"), "{m}");
+        assert!(
+            m.starts_with("60 STIG id(s)") && m.ends_with("and 10 more"),
+            "{m}"
+        );
     }
 
     #[sqlx::test]
@@ -120,7 +136,10 @@ mod tests {
         let found = warn_non_conforming(&pool).await;
         assert_eq!(
             found,
-            [("catalog".to_string(), "bad.cat".to_string()), ("checklist".to_string(), "bad id".to_string())]
+            [
+                ("catalog".to_string(), "bad.cat".to_string()),
+                ("checklist".to_string(), "bad id".to_string())
+            ]
         );
     }
 }

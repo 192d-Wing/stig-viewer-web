@@ -599,7 +599,12 @@ pub struct TabItem {
 
 impl TabItem {
     pub fn new(id: impl Into<AttrValue>, label: impl Into<AttrValue>, content: Html) -> Self {
-        Self { id: id.into(), label: label.into(), content, disabled: false }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            content,
+            disabled: false,
+        }
     }
 }
 
@@ -667,7 +672,10 @@ const ISSUE_LIST_CAP: usize = 10;
 /// `None` are skipped; at most ten are listed, followed by
 /// "…and N more{more_suffix}." when rows were left out. Renders nothing when
 /// there are no rows to show.
-pub fn issue_list<'a>(rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>, more_suffix: &str) -> Html {
+pub fn issue_list<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    more_suffix: &str,
+) -> Html {
     let (lines, more) = crate::util::issue_lines(rows, ISSUE_LIST_CAP);
     if lines.is_empty() {
         return Html::default();

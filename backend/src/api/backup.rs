@@ -177,7 +177,13 @@ pub async fn download_handler(
     let signing = state.signing.clone();
 
     let zip_bytes = tokio::task::spawn_blocking(move || {
-        build_backup_zip(manifest, table_rows, attachment_ids, attachments_dir, signing.as_ref())
+        build_backup_zip(
+            manifest,
+            table_rows,
+            attachment_ids,
+            attachments_dir,
+            signing.as_ref(),
+        )
     })
     .await
     .map_err(|e| {
@@ -219,13 +225,9 @@ async fn load_table_rows(pool: &PgPool, table: &str) -> Result<Vec<Value>, Statu
     // only and intended to run rarely. If a table grows pathological we
     // can stream row-by-row, but the JSONL files in the zip already
     // assume "fits in memory" at restore time anyway.
-    let sql = format!(
-        "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS rows FROM \"{table}\" t"
-    );
-    let row = sqlx::query(&sql)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx)?;
+    let sql =
+        format!("SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) AS rows FROM \"{table}\" t");
+    let row = sqlx::query(&sql).fetch_one(pool).await.map_err(map_sqlx)?;
     let v: Value = row.try_get("rows").map_err(|e| {
         tracing::error!("backup decode {table} rows: {e:#}");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -373,8 +375,8 @@ pub async fn restore_handler(
             break;
         }
     }
-    let zip_bytes = zip_bytes
-        .ok_or_else(|| err_response(StatusCode::BAD_REQUEST, "missing file in upload"))?;
+    let zip_bytes =
+        zip_bytes.ok_or_else(|| err_response(StatusCode::BAD_REQUEST, "missing file in upload"))?;
 
     // Parse the zip on a blocking pool — the central directory walk is
     // sync and could be large.
@@ -419,17 +421,24 @@ pub async fn restore_handler(
                 },
             )
             .await;
-            let status = if f.too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::BAD_REQUEST };
-            return Err(err_response(status, format!("invalid backup: {}", f.message)));
+            let status = if f.too_large {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return Err(err_response(
+                status,
+                format!("invalid backup: {}", f.message),
+            ));
         }
     };
 
     // Schema version gate — refuse to load a backup taken against a
     // different migration set. Reduces the blast radius if someone
     // tries to restore last year's backup onto today's schema.
-    let live_version = current_schema_version(pool).await.map_err(|s| {
-        err_response(s, "failed to read schema version")
-    })?;
+    let live_version = current_schema_version(pool)
+        .await
+        .map_err(|s| err_response(s, "failed to read schema version"))?;
     if manifest.schema_migration != live_version {
         return Err(err_response(
             StatusCode::BAD_REQUEST,
@@ -493,22 +502,25 @@ pub async fn restore_handler(
     })?;
     // The acting admin's row, so it can be put back if the backup lacks it
     // (the restore event references it by foreign key).
-    let actor_row: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
-        .bind(&user.id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("restore actor lookup: {e:#}");
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        })?;
+    let actor_row: Option<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(u) FROM users u WHERE id = $1")
+            .bind(&user.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("restore actor lookup: {e:#}");
+                err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
 
     if q.force {
         // The truncate reaches the audit tables, whose guard triggers need the
         // `restore` maintenance mode (transaction-local).
-        crate::db_audit::set_maintenance(&mut tx, "restore").await.map_err(|e| {
-            tracing::error!("restore maintenance mode: {e:#}");
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        })?;
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .map_err(|e| {
+                tracing::error!("restore maintenance mode: {e:#}");
+                err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
         // CASCADE so children get cleared too. Quoted to keep the
         // identifier list safe even if a name ever collides with a
         // reserved word.
@@ -535,10 +547,17 @@ pub async fn restore_handler(
         let sql = format!(
             "INSERT INTO \"{t}\" SELECT * FROM jsonb_populate_recordset(NULL::\"{t}\", $1)"
         );
-        let res = sqlx::query(&sql).bind(&arr).execute(&mut *tx).await.map_err(|e| {
-            tracing::error!("restore insert {t}: {e:#}");
-            err_response(StatusCode::BAD_REQUEST, format!("failed to insert {t}: {e}"))
-        })?;
+        let res = sqlx::query(&sql)
+            .bind(&arr)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("restore insert {t}: {e:#}");
+                err_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to insert {t}: {e}"),
+                )
+            })?;
         restored.insert(t.to_string(), res.rows_affected() as i64);
     }
 
@@ -653,14 +672,17 @@ async fn record_restore(
         .fetch_optional(&mut **tx)
         .await?;
     if attributed.is_none() {
-        let provider = actor_row.and_then(|r| r.get("provider")).and_then(Value::as_str);
+        let provider = actor_row
+            .and_then(|r| r.get("provider"))
+            .and_then(Value::as_str);
         let sub = actor_row.and_then(|r| r.get("sub")).and_then(Value::as_str);
         if let (Some(provider), Some(sub)) = (provider, sub) {
-            attributed = sqlx::query_scalar("SELECT id FROM users WHERE provider = $1 AND sub = $2")
-                .bind(provider)
-                .bind(sub)
-                .fetch_optional(&mut **tx)
-                .await?;
+            attributed =
+                sqlx::query_scalar("SELECT id FROM users WHERE provider = $1 AND sub = $2")
+                    .bind(provider)
+                    .bind(sub)
+                    .fetch_optional(&mut **tx)
+                    .await?;
         }
     }
     let Some(attributed) = attributed else {
@@ -708,13 +730,21 @@ struct VerifyFailure {
 
 impl VerifyFailure {
     fn new(status: &'static str, message: impl Into<String>) -> Self {
-        Self { message: message.into(), status, code: "invalid_backup", too_large: false }
+        Self {
+            message: message.into(),
+            status,
+            code: "invalid_backup",
+            too_large: false,
+        }
     }
 }
 
 impl From<anyhow::Error> for VerifyFailure {
     fn from(e: anyhow::Error) -> Self {
-        Self { code: "malformed", ..Self::new("not_evaluated", format!("{e:#}")) }
+        Self {
+            code: "malformed",
+            ..Self::new("not_evaluated", format!("{e:#}"))
+        }
     }
 }
 
@@ -755,9 +785,17 @@ fn parse_and_verify_backup(
     // be a matter of choice.
     let mut seen = std::collections::HashSet::new();
     for i in 0..zip.len() {
-        let name = zip.by_index_raw(i).map_err(anyhow::Error::from)?.name().map_err(anyhow::Error::from)?.into_owned();
+        let name = zip
+            .by_index_raw(i)
+            .map_err(anyhow::Error::from)?
+            .name()
+            .map_err(anyhow::Error::from)?
+            .into_owned();
         if !seen.insert(name.clone()) {
-            return Err(VerifyFailure::new("not_evaluated", format!("duplicate entry {name:?}")));
+            return Err(VerifyFailure::new(
+                "not_evaluated",
+                format!("duplicate entry {name:?}"),
+            ));
         }
     }
     // Local headers must agree with the central directory, before any entry
@@ -776,14 +814,23 @@ fn parse_and_verify_backup(
     if !ACCEPTED_VERSIONS.contains(&manifest.version.as_str()) {
         return Err(VerifyFailure::new(
             "not_evaluated",
-            format!("unsupported backup version: {:?} (expected one of {:?})", manifest.version, ACCEPTED_VERSIONS),
+            format!(
+                "unsupported backup version: {:?} (expected one of {:?})",
+                manifest.version, ACCEPTED_VERSIONS
+            ),
         ));
     }
     let sig_bytes = match zip.by_name(MANIFEST_SIG_NAME) {
         Ok(mut e) => Some(read_entry(&mut e, MAX_MANIFEST_BYTES, &mut budget)?),
         Err(_) => None,
     };
-    let status = verify_signature(&manifest, &manifest_bytes, sig_bytes.as_deref(), signing, require)?;
+    let status = verify_signature(
+        &manifest,
+        &manifest_bytes,
+        sig_bytes.as_deref(),
+        signing,
+        require,
+    )?;
     let fail = |msg: String| VerifyFailure::new(status.as_str(), msg);
 
     let mut digests: BTreeMap<String, String> = BTreeMap::new();
@@ -821,12 +868,22 @@ fn parse_and_verify_backup(
         for (name, digest) in &digests {
             match manifest.entries.get(name) {
                 Some(expected) if expected == digest => {}
-                Some(_) => return Err(fail(format!("integrity check failed: entry {name:?} does not match its digest"))),
-                None => return Err(fail(format!("integrity check failed: entry {name:?} is not listed in the manifest"))),
+                Some(_) => {
+                    return Err(fail(format!(
+                        "integrity check failed: entry {name:?} does not match its digest"
+                    )))
+                }
+                None => {
+                    return Err(fail(format!(
+                        "integrity check failed: entry {name:?} is not listed in the manifest"
+                    )))
+                }
             }
         }
         if let Some(missing) = manifest.entries.keys().find(|n| !digests.contains_key(*n)) {
-            return Err(fail(format!("integrity check failed: entry {missing:?} is listed but missing")));
+            return Err(fail(format!(
+                "integrity check failed: entry {missing:?} is listed but missing"
+            )));
         }
     }
     Ok((manifest, tables, attachments, status))
@@ -864,7 +921,12 @@ fn verify_signature(
     if m.version == "1" {
         // A version 1 backup has no digests or signature. Refuse anything that
         // looks like a downgraded version 2 backup.
-        if sig.is_some() || !m.entries.is_empty() || !m.signers.is_empty() || !m.kind.is_empty() || !m.entries_digest.is_empty() {
+        if sig.is_some()
+            || !m.entries.is_empty()
+            || !m.signers.is_empty()
+            || !m.kind.is_empty()
+            || !m.entries_digest.is_empty()
+        {
             return Err(VerifyFailure::new(
                 "invalid",
                 "version 1 manifest carries version 2 integrity fields (downgrade)",
@@ -873,10 +935,16 @@ fn verify_signature(
         return policy(SignatureStatus::Unsigned);
     }
     if m.kind != integrity::BACKUP_TYPE {
-        return Err(VerifyFailure::new("invalid", format!("manifest type is not {}", integrity::BACKUP_TYPE)));
+        return Err(VerifyFailure::new(
+            "invalid",
+            format!("manifest type is not {}", integrity::BACKUP_TYPE),
+        ));
     }
     if m.entries_digest != "sha-512" {
-        return Err(VerifyFailure::new("invalid", format!("unsupported entries digest {:?}", m.entries_digest)));
+        return Err(VerifyFailure::new(
+            "invalid",
+            format!("unsupported entries digest {:?}", m.entries_digest),
+        ));
     }
     let status = match (sig, m.signers.is_empty()) {
         (None, true) => SignatureStatus::Unsigned,
@@ -886,15 +954,17 @@ fn verify_signature(
                 format!("manifest names signers but {MANIFEST_SIG_NAME} is missing"),
             ))
         }
-        (Some(sig), _) => integrity::verify_envelope(
-            integrity::BACKUP_DOMAIN,
-            integrity::BACKUP_TYPE,
-            sig,
-            Some(manifest_bytes),
-            signing,
-        )
-        .map_err(|e| VerifyFailure::new("invalid", e.to_string()))?
-        .status,
+        (Some(sig), _) => {
+            integrity::verify_envelope(
+                integrity::BACKUP_DOMAIN,
+                integrity::BACKUP_TYPE,
+                sig,
+                Some(manifest_bytes),
+                signing,
+            )
+            .map_err(|e| VerifyFailure::new("invalid", e.to_string()))?
+            .status
+        }
     };
     policy(status)
 }
@@ -929,14 +999,35 @@ mod restore_record_tests {
         seed_user(&pool, "admin1").await;
         let row = actor_row(&pool).await;
         let mut tx = pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
         // The backup contains no users at all.
-        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
-        record_restore(&mut tx, "admin1", &ctx(), true, 0, Some(&row), (SignatureStatus::Unsigned, false)).await.unwrap();
+        sqlx::query("TRUNCATE users CASCADE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        record_restore(
+            &mut tx,
+            "admin1",
+            &ctx(),
+            true,
+            0,
+            Some(&row),
+            (SignatureStatus::Unsigned, false),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'admin1'").fetch_one(&pool).await.unwrap();
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'admin1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(users, 1);
-        let events: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events").fetch_all(&pool).await.unwrap();
+        let events: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(events, ["backup.restore"]);
     }
 
@@ -947,16 +1038,36 @@ mod restore_record_tests {
         sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('admin1','checklist.save','ok')")
             .execute(&pool).await.unwrap();
         let mut tx = pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
-        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE users CASCADE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         // No actor row to restore: the event's user FK fails.
         assert!(matches!(
-            record_restore(&mut tx, "admin1", &ctx(), true, 0, None, (SignatureStatus::Unsigned, false)).await,
+            record_restore(
+                &mut tx,
+                "admin1",
+                &ctx(),
+                true,
+                0,
+                None,
+                (SignatureStatus::Unsigned, false)
+            )
+            .await,
             Err(RecordRestoreError::NoActor)
         ));
         drop(tx);
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!((users, events), (1, 1));
     }
 
@@ -966,15 +1077,34 @@ mod restore_record_tests {
         seed_user(&pool, "admin1").await; // provider 'test', sub 'admin1'
         let row = actor_row(&pool).await;
         let mut tx = pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
-        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE users CASCADE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         // The backup holds the same (provider, sub) under another id.
         sqlx::query("INSERT INTO users (id, display_name, email, role, sub, provider) VALUES ('old-id', 'x', '', 'admin', 'admin1', 'test')")
             .execute(&mut *tx).await.unwrap();
-        record_restore(&mut tx, "admin1", &ctx(), true, 0, Some(&row), (SignatureStatus::Unsigned, false)).await.unwrap();
+        record_restore(
+            &mut tx,
+            "admin1",
+            &ctx(),
+            true,
+            0,
+            Some(&row),
+            (SignatureStatus::Unsigned, false),
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
-        let rows: Vec<(String, Value)> = sqlx::query_as("SELECT user_id, detail FROM audit_events WHERE action = 'backup.restore'")
-            .fetch_all(&pool).await.unwrap();
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT user_id, detail FROM audit_events WHERE action = 'backup.restore'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "old-id");
         assert_eq!(rows[0].1["actorIdBeforeRestore"], "admin1");
@@ -989,15 +1119,32 @@ mod restore_record_tests {
         row["id"] = json!("ghost");
         row["sub"] = json!("ghost-sub");
         let mut tx = pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "restore").await.unwrap();
-        sqlx::query("TRUNCATE users CASCADE").execute(&mut *tx).await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE users CASCADE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         // Re-inserting the captured row would restore it, so omit the row.
         assert!(matches!(
-            record_restore(&mut tx, "ghost", &ctx(), true, 0, None, (SignatureStatus::Unsigned, false)).await,
+            record_restore(
+                &mut tx,
+                "ghost",
+                &ctx(),
+                true,
+                0,
+                None,
+                (SignatureStatus::Unsigned, false)
+            )
+            .await,
             Err(RecordRestoreError::NoActor)
         ));
         drop(tx);
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap();
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(users, 1);
     }
 }
@@ -1005,8 +1152,8 @@ mod restore_record_tests {
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
-    use std::io::Read;
     use crate::integrity::test_key;
+    use std::io::Read;
 
     fn manifest() -> Manifest {
         Manifest {
@@ -1027,13 +1174,17 @@ mod integrity_tests {
         std::fs::write(dir.join("att-1"), b"blob").unwrap();
         let mut rows = HashMap::new();
         rows.insert("users".to_string(), vec![json!({"id": "u1"})]);
-        let zip = build_backup_zip(manifest(), rows, vec!["att-1".into()], dir.clone(), key).unwrap();
+        let zip =
+            build_backup_zip(manifest(), rows, vec!["att-1".into()], dir.clone(), key).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         zip
     }
 
     /// Rewrite every entry through `f`; `None` drops it.
-    pub(super) fn rewrite(zip: &[u8], mut f: impl FnMut(&str, Vec<u8>) -> Option<Vec<u8>>) -> Vec<u8> {
+    pub(super) fn rewrite(
+        zip: &[u8],
+        mut f: impl FnMut(&str, Vec<u8>) -> Option<Vec<u8>>,
+    ) -> Vec<u8> {
         let mut src = ZipArchive::new(Cursor::new(zip)).unwrap();
         let mut out = ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default();
@@ -1053,16 +1204,28 @@ mod integrity_tests {
     fn manifest_of(zip: &[u8]) -> (Manifest, Vec<u8>) {
         let mut z = ZipArchive::new(Cursor::new(zip)).unwrap();
         let mut b = Vec::new();
-        z.by_name(MANIFEST_NAME).unwrap().read_to_end(&mut b).unwrap();
+        z.by_name(MANIFEST_NAME)
+            .unwrap()
+            .read_to_end(&mut b)
+            .unwrap();
         (serde_json::from_slice(&b).unwrap(), b)
     }
 
     fn has_entry(zip: &[u8], name: &str) -> bool {
-        ZipArchive::new(Cursor::new(zip)).unwrap().by_name(name).is_ok()
+        ZipArchive::new(Cursor::new(zip))
+            .unwrap()
+            .by_name(name)
+            .is_ok()
     }
 
-    fn check(zip: &[u8], key: Option<&SigningState>, require: bool) -> Result<SignatureStatus, String> {
-        parse_and_verify_backup(zip, key, require).map(|r| r.3).map_err(|f| f.message)
+    fn check(
+        zip: &[u8],
+        key: Option<&SigningState>,
+        require: bool,
+    ) -> Result<SignatureStatus, String> {
+        parse_and_verify_backup(zip, key, require)
+            .map(|r| r.3)
+            .map_err(|f| f.message)
     }
 
     #[test]
@@ -1076,7 +1239,10 @@ mod integrity_tests {
         assert!(m.entries.contains_key("attachments/att-1"));
         assert_eq!(m.signers.len(), 1);
         assert!(has_entry(&zip, MANIFEST_SIG_NAME));
-        assert_eq!(check(&zip, Some(&k), true).unwrap(), SignatureStatus::Verified);
+        assert_eq!(
+            check(&zip, Some(&k), true).unwrap(),
+            SignatureStatus::Verified
+        );
     }
 
     #[test]
@@ -1086,7 +1252,13 @@ mod integrity_tests {
         assert!(!has_entry(&zip, MANIFEST_SIG_NAME) && m.signers.is_empty());
         assert!(!m.entries.is_empty());
         assert_eq!(check(&zip, None, false).unwrap(), SignatureStatus::Unsigned);
-        let bad = rewrite(&zip, |n, b| Some(if n == "tables/users.jsonl" { b"{}\n".to_vec() } else { b }));
+        let bad = rewrite(&zip, |n, b| {
+            Some(if n == "tables/users.jsonl" {
+                b"{}\n".to_vec()
+            } else {
+                b
+            })
+        });
         assert!(check(&bad, None, false).is_err());
     }
 
@@ -1100,22 +1272,30 @@ mod integrity_tests {
             }
             Some(b)
         });
-        assert!(check(&tampered, Some(&k), false).unwrap_err().contains("attachments/att-1"));
+        assert!(check(&tampered, Some(&k), false)
+            .unwrap_err()
+            .contains("attachments/att-1"));
         let removed = rewrite(&zip, |n, b| (n != "attachments/att-1").then_some(b));
-        assert!(check(&removed, Some(&k), false).unwrap_err().contains("missing"));
+        assert!(check(&removed, Some(&k), false)
+            .unwrap_err()
+            .contains("missing"));
         let mut w = ZipWriter::new(Cursor::new(Vec::new()));
         let mut src = ZipArchive::new(Cursor::new(&zip)).unwrap();
         for i in 0..src.len() {
             let mut e = src.by_index(i).unwrap();
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
-            w.start_file(e.name().unwrap().into_owned(), SimpleFileOptions::default()).unwrap();
+            w.start_file(e.name().unwrap().into_owned(), SimpleFileOptions::default())
+                .unwrap();
             w.write_all(&b).unwrap();
         }
-        w.start_file("attachments/extra", SimpleFileOptions::default()).unwrap();
+        w.start_file("attachments/extra", SimpleFileOptions::default())
+            .unwrap();
         w.write_all(b"x").unwrap();
         let with_extra = w.finish().unwrap().into_inner();
-        assert!(check(&with_extra, Some(&k), false).unwrap_err().contains("not listed"));
+        assert!(check(&with_extra, Some(&k), false)
+            .unwrap_err()
+            .contains("not listed"));
     }
 
     #[test]
@@ -1123,18 +1303,25 @@ mod integrity_tests {
         let k = test_key(1);
         let bad = rewrite(&build(Some(&k)), |n, b| {
             Some(if n == MANIFEST_NAME {
-                String::from_utf8(b).unwrap().replace("2026-01-01", "2027-01-01").into_bytes()
+                String::from_utf8(b)
+                    .unwrap()
+                    .replace("2026-01-01", "2027-01-01")
+                    .into_bytes()
             } else {
                 b
             })
         });
-        assert!(check(&bad, Some(&k), false).unwrap_err().contains("PayloadMismatch"));
+        assert!(check(&bad, Some(&k), false)
+            .unwrap_err()
+            .contains("PayloadMismatch"));
     }
 
     #[test]
     fn stripping_the_signature_entry_is_rejected_when_signers_are_named() {
         let k = test_key(1);
-        let bad = rewrite(&build(Some(&k)), |n, b| (n != MANIFEST_SIG_NAME).then_some(b));
+        let bad = rewrite(&build(Some(&k)), |n, b| {
+            (n != MANIFEST_SIG_NAME).then_some(b)
+        });
         assert!(check(&bad, Some(&k), false).is_err());
     }
 
@@ -1143,11 +1330,22 @@ mod integrity_tests {
         let k = test_key(1);
         let zip = build(Some(&k));
         let (_, manifest_bytes) = manifest_of(&zip);
-        let replay = integrity::seal(integrity::ARCHIVE_DOMAIN, integrity::BACKUP_TYPE, &manifest_bytes, Some(&k));
+        let replay = integrity::seal(
+            integrity::ARCHIVE_DOMAIN,
+            integrity::BACKUP_TYPE,
+            &manifest_bytes,
+            Some(&k),
+        );
         let bad = rewrite(&zip, |n, b| {
-            Some(if n == MANIFEST_SIG_NAME { serde_json::to_vec(&replay).unwrap() } else { b })
+            Some(if n == MANIFEST_SIG_NAME {
+                serde_json::to_vec(&replay).unwrap()
+            } else {
+                b
+            })
         });
-        assert!(check(&bad, Some(&k), false).unwrap_err().contains("SignatureInvalid"));
+        assert!(check(&bad, Some(&k), false)
+            .unwrap_err()
+            .contains("SignatureInvalid"));
     }
 
     fn as_v1(zip: &[u8], keep_v2_fields: bool) -> Vec<u8> {
@@ -1186,7 +1384,9 @@ mod integrity_tests {
         let err = check(&as_v1(&signed, false), Some(&k), false).unwrap_err();
         assert!(err.contains("downgrade"), "{err}");
         // Fully stripped (no signature entry): only the policy stops it.
-        let stripped = rewrite(&as_v1(&signed, false), |n, b| (n != MANIFEST_SIG_NAME).then_some(b));
+        let stripped = rewrite(&as_v1(&signed, false), |n, b| {
+            (n != MANIFEST_SIG_NAME).then_some(b)
+        });
         assert!(check(&stripped, Some(&k), false).is_ok());
         assert!(check(&stripped, Some(&k), true).is_err());
     }
@@ -1195,7 +1395,10 @@ mod integrity_tests {
     fn unsupported_versions_are_rejected() {
         let zip = rewrite(&build(None), |n, b| {
             Some(if n == MANIFEST_NAME {
-                String::from_utf8(b).unwrap().replace("\"version\": \"2\"", "\"version\": \"9\"").into_bytes()
+                String::from_utf8(b)
+                    .unwrap()
+                    .replace("\"version\": \"2\"", "\"version\": \"9\"")
+                    .into_bytes()
             } else {
                 b
             })
@@ -1207,13 +1410,24 @@ mod integrity_tests {
     fn requiring_a_signature_rejects_unsigned_and_unknown_key_backups() {
         let k = test_key(1);
         let unsigned = build(None);
-        assert!(check(&unsigned, Some(&k), true).unwrap_err().contains("required"));
-        assert_eq!(check(&unsigned, Some(&k), false).unwrap(), SignatureStatus::Unsigned);
+        assert!(check(&unsigned, Some(&k), true)
+            .unwrap_err()
+            .contains("required"));
+        assert_eq!(
+            check(&unsigned, Some(&k), false).unwrap(),
+            SignatureStatus::Unsigned
+        );
         let signed = build(Some(&k));
         let other = test_key(2);
         assert!(check(&signed, Some(&other), true).is_err());
-        assert_eq!(check(&signed, Some(&other), false).unwrap(), SignatureStatus::UnknownKey);
-        assert_eq!(check(&signed, None, false).unwrap(), SignatureStatus::UnknownKey);
+        assert_eq!(
+            check(&signed, Some(&other), false).unwrap(),
+            SignatureStatus::UnknownKey
+        );
+        assert_eq!(
+            check(&signed, None, false).unwrap(),
+            SignatureStatus::UnknownKey
+        );
         let f = parse_and_verify_backup(&signed, Some(&other), true).unwrap_err();
         assert_eq!(f.status, "unknown_key");
     }
@@ -1231,10 +1445,12 @@ mod integrity_tests {
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
             let n = e.name().unwrap().into_owned();
-            w.start_file(n.clone(), SimpleFileOptions::default()).unwrap();
+            w.start_file(n.clone(), SimpleFileOptions::default())
+                .unwrap();
             w.write_all(&b).unwrap();
             if n == name {
-                w.start_file(decoy.clone(), SimpleFileOptions::default()).unwrap();
+                w.start_file(decoy.clone(), SimpleFileOptions::default())
+                    .unwrap();
                 w.write_all(b"{\"id\":\"evil\"}\n").unwrap();
             }
         }
@@ -1266,7 +1482,10 @@ mod integrity_tests {
             let dup = with_duplicate(&zip, name);
             // The zip crate does not reject exact duplicate names: it keeps one
             // copy (the decoy), which the signed manifest / digests then refuse.
-            assert!(parse_and_verify_backup(&dup, Some(&k), false).is_err(), "{name}");
+            assert!(
+                parse_and_verify_backup(&dup, Some(&k), false).is_err(),
+                "{name}"
+            );
         }
     }
 }
@@ -1274,19 +1493,26 @@ mod integrity_tests {
 #[cfg(test)]
 mod restore_integrity_db_tests {
     use super::*;
-    use std::io::Read;
     use crate::integrity::test_key;
     use crate::test_fixtures::{app_state, auth, ctx, seed_asset, seed_user};
-    use axum::{extract::Request, middleware::{self, Next}, routing::post, Router};
+    use axum::{
+        extract::Request,
+        middleware::{self, Next},
+        routing::post,
+        Router,
+    };
+    use std::io::Read;
 
     async fn serve(state: AppState) -> String {
         let app = Router::new()
             .route("/api/admin/restore", post(restore_handler))
-            .route_layer(middleware::from_fn(|mut req: Request, next: Next| async move {
-                req.extensions_mut().insert(auth("admin1", "admin"));
-                req.extensions_mut().insert(ctx());
-                next.run(req).await
-            }))
+            .route_layer(middleware::from_fn(
+                |mut req: Request, next: Next| async move {
+                    req.extensions_mut().insert(auth("admin1", "admin"));
+                    req.extensions_mut().insert(ctx());
+                    next.run(req).await
+                },
+            ))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1296,8 +1522,14 @@ mod restore_integrity_db_tests {
 
     async fn backup_of(state: &AppState) -> Vec<u8> {
         let user = auth("admin1", "admin");
-        let resp = download_handler(State(state.clone()), Extension(user)).await.unwrap().into_response();
-        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+        let resp = download_handler(State(state.clone()), Extension(user))
+            .await
+            .unwrap()
+            .into_response();
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     async fn post_restore(base: &str, zip: &[u8]) -> (u16, Value) {
@@ -1310,7 +1542,10 @@ mod restore_integrity_db_tests {
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let r = reqwest::Client::new()
             .post(format!("{base}/api/admin/restore?force=true"))
-            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
             .body(body)
             .send()
             .await
@@ -1322,9 +1557,14 @@ mod restore_integrity_db_tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn signed_restore_is_recorded_as_verified_and_a_tampered_one_changes_nothing(pool: PgPool) {
+    async fn signed_restore_is_recorded_as_verified_and_a_tampered_one_changes_nothing(
+        pool: PgPool,
+    ) {
         seed_user(&pool, "admin1").await;
-        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (mut state, _dir) = app_state(pool.clone());
         state.signing = Some(test_key(7));
@@ -1340,7 +1580,10 @@ mod restore_integrity_db_tests {
             let mut b = Vec::new();
             e.read_to_end(&mut b).unwrap();
             if name == "tables/assets.jsonl" {
-                b = String::from_utf8(b).unwrap().replace("\"a1\"", "\"evil\"").into_bytes();
+                b = String::from_utf8(b)
+                    .unwrap()
+                    .replace("\"a1\"", "\"evil\"")
+                    .into_bytes();
             }
             w.start_file(name, SimpleFileOptions::default()).unwrap();
             w.write_all(&b).unwrap();
@@ -1348,29 +1591,41 @@ mod restore_integrity_db_tests {
         let tampered = w.finish().unwrap().into_inner();
         let (status, body) = post_restore(&base, &tampered).await;
         assert_eq!(status, 400, "{body}");
-        assert!(body["error"].as_str().unwrap().contains("tables/assets.jsonl"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("tables/assets.jsonl"));
         // Rejected before the TRUNCATE: the data and the audit trail are untouched.
-        let assets: Vec<String> = sqlx::query_scalar("SELECT id FROM assets").fetch_all(&pool).await.unwrap();
-        assert_eq!(assets, ["a1"]);
-        // The rejection is recorded, outside any restore transaction.
-        let (outcome, d): (String, Value) = sqlx::query_as("SELECT outcome, detail FROM audit_events WHERE action = 'backup.restore'")
-            .fetch_one(&pool)
+        let assets: Vec<String> = sqlx::query_scalar("SELECT id FROM assets")
+            .fetch_all(&pool)
             .await
             .unwrap();
+        assert_eq!(assets, ["a1"]);
+        // The rejection is recorded, outside any restore transaction.
+        let (outcome, d): (String, Value) = sqlx::query_as(
+            "SELECT outcome, detail FROM audit_events WHERE action = 'backup.restore'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(outcome, "failure");
         // The manifest signature itself verified; an entry then failed its digest.
         assert_eq!(d["signatureStatus"], "verified");
         assert_eq!(d["requireSignature"], true);
-        assert!(d["reason"].as_str().unwrap().contains("tables/assets.jsonl"));
+        assert!(d["reason"]
+            .as_str()
+            .unwrap()
+            .contains("tables/assets.jsonl"));
 
         // The genuine backup restores and records the status.
         let (status, body) = post_restore(&base, &zip).await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["signatureStatus"], "verified");
-        let detail: Value = sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let detail: Value =
+            sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(detail["signatureStatus"], "verified");
         assert_eq!(detail["requireSignature"], true);
     }
@@ -1386,15 +1641,20 @@ mod restore_integrity_db_tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn an_oversized_manifest_is_413_and_recorded_and_changes_nothing(pool: PgPool) {
         seed_user(&pool, "admin1").await;
-        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (state, _dir) = app_state(pool.clone());
         let base = serve(state).await;
 
         let mut w = ZipWriter::new(Cursor::new(Vec::new()));
-        w.start_file(MANIFEST_NAME, SimpleFileOptions::default()).unwrap();
+        w.start_file(MANIFEST_NAME, SimpleFileOptions::default())
+            .unwrap();
         w.write_all(b"{}").unwrap();
-        w.write_all(&vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
+        w.write_all(&vec![b' '; MAX_MANIFEST_BYTES as usize + 1])
+            .unwrap();
         let zip = w.finish().unwrap().into_inner();
 
         let (status, body) = post_restore(&base, &zip).await;
@@ -1403,7 +1663,10 @@ mod restore_integrity_db_tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["reasonCode"], "entry_too_large");
         assert_eq!(rows[0]["signatureStatus"], "not_evaluated");
-        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets").fetch_one(&pool).await.unwrap();
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(assets, 1);
     }
 
@@ -1411,7 +1674,10 @@ mod restore_integrity_db_tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_header_mismatch_is_400_and_recorded_and_changes_nothing(pool: PgPool) {
         seed_user(&pool, "admin1").await;
-        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (state, _dir) = app_state(pool.clone());
         let base = serve(state.clone()).await;
@@ -1426,7 +1692,10 @@ mod restore_integrity_db_tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["reasonCode"], "header_inconsistency");
         assert_eq!(rows[0]["signatureStatus"], "not_evaluated");
-        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets").fetch_one(&pool).await.unwrap();
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(assets, 1);
     }
 
@@ -1434,17 +1703,21 @@ mod restore_integrity_db_tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn unsigned_backup_restores_with_the_unsigned_status(pool: PgPool) {
         seed_user(&pool, "admin1").await;
-        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         let (state, _dir) = app_state(pool.clone());
         let base = serve(state.clone()).await;
         let zip = backup_of(&state).await;
         let (status, body) = post_restore(&base, &zip).await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["signatureStatus"], "unsigned");
-        let detail: Value = sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let detail: Value =
+            sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(detail["signatureStatus"], "unsigned");
     }
 
@@ -1452,7 +1725,10 @@ mod restore_integrity_db_tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn with_a_key_an_unsigned_backup_is_refused_unless_explicitly_allowed(pool: PgPool) {
         seed_user(&pool, "admin1").await;
-        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (plain, _dir) = app_state(pool.clone());
         let unsigned = backup_of(&plain).await;
@@ -1468,7 +1744,10 @@ mod restore_integrity_db_tests {
             .await
             .unwrap();
         assert_eq!(d["signatureStatus"], "unsigned");
-        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets").fetch_one(&pool).await.unwrap();
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(assets, 1);
 
         // Explicit opt-out (BACKUP_REQUIRE_SIGNATURE=false).
@@ -1479,10 +1758,11 @@ mod restore_integrity_db_tests {
         let (status, body) = post_restore(&base, &unsigned).await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["signatureStatus"], "unsigned");
-        let d: Value = sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let d: Value =
+            sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'backup.restore'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(d["requireSignature"], false);
     }
 }
@@ -1493,7 +1773,9 @@ mod tests {
 
     /// The tests below predate integrity checking; they go through the full
     /// parse-and-verify path with an unsigned, digest-free version 2 manifest.
-    fn parse_backup_zip(bytes: &[u8]) -> anyhow::Result<(Manifest, ParsedTables, ParsedAttachments)> {
+    fn parse_backup_zip(
+        bytes: &[u8],
+    ) -> anyhow::Result<(Manifest, ParsedTables, ParsedAttachments)> {
         parse_and_verify_backup(bytes, None, false)
             .map(|(m, t, a, _)| (m, t, a))
             .map_err(|f| anyhow::anyhow!(f.message))
@@ -1566,8 +1848,14 @@ mod tests {
         bytes[cd + 24..cd + 28].copy_from_slice(&smaller);
         let lh = bytes.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
         bytes[lh + 22..lh + 26].copy_from_slice(&smaller);
-        let err = parse_backup_zip(&bytes).unwrap_err().to_string().to_lowercase();
-        assert!(err.contains("larger than its declared uncompressed size"), "{err}");
+        let err = parse_backup_zip(&bytes)
+            .unwrap_err()
+            .to_string()
+            .to_lowercase();
+        assert!(
+            err.contains("larger than its declared uncompressed size"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1605,7 +1893,10 @@ mod tests {
             }
         }
         let err = parse_backup_zip(&bytes).unwrap_err().to_string();
-        assert!(err.contains("compression method not supported: 12"), "{err}");
+        assert!(
+            err.contains("compression method not supported: 12"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1637,8 +1928,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let tables = || HashMap::from([("users".to_string(), vec![json!({"id": 1})])]);
-        let unsigned =
-            build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();
+        let unsigned = build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();
         let (_, t, _, status) = parse_and_verify_backup(&unsigned, None, false).unwrap();
         assert_eq!(t.get("users").map(Vec::len), Some(1));
         assert_eq!(status.as_str(), "unsigned");

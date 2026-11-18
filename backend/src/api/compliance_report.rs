@@ -265,10 +265,18 @@ fn layout_report(
     let mut y = PAGE_H - MARGIN_T;
 
     // Cover
-    doc.text("Fleet Compliance Report", SIZE_TITLE, MARGIN_L, y, Face::Bold);
+    doc.text(
+        "Fleet Compliance Report",
+        SIZE_TITLE,
+        MARGIN_L,
+        y,
+        Face::Bold,
+    );
     y -= LH * 1.6;
     doc.text(
-        generated_at.format("Generated %Y-%m-%d %H:%M UTC").to_string(),
+        generated_at
+            .format("Generated %Y-%m-%d %H:%M UTC")
+            .to_string(),
         SIZE_BODY,
         MARGIN_L,
         y,
@@ -433,16 +441,15 @@ pub async fn download_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, StatusCode> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT pdf_path FROM compliance_reports WHERE id = $1",
-    )
-    .bind(&id)
-    .fetch_optional(state.pool.as_ref())
-    .await
-    .map_err(|e| {
-        tracing::error!("compliance report download lookup failed: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT pdf_path FROM compliance_reports WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(state.pool.as_ref())
+            .await
+            .map_err(|e| {
+                tracing::error!("compliance report download lookup failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     let pdf_path = match row {
         Some((p,)) => p,
         None => return Err(StatusCode::NOT_FOUND),
@@ -454,7 +461,10 @@ pub async fn download_handler(
     })?;
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/pdf"),
+        )
         .header(
             header::CONTENT_DISPOSITION,
             HeaderValue::from_str(&format!("inline; filename=\"compliance-{id}.pdf\""))

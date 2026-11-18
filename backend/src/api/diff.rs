@@ -100,7 +100,7 @@ pub async fn diff_handler(
     //   final transition.
     use std::collections::BTreeMap;
     type RuleKey = (String, String); // (checklist_id, rule_id)
-    // Per-rule metadata + per-field collapsed change.
+                                     // Per-rule metadata + per-field collapsed change.
     struct Acc {
         asset_id: String,
         asset_name: String,
@@ -158,7 +158,13 @@ pub async fn diff_handler(
                     if from == to {
                         None
                     } else {
-                        Some(FieldChange { field, from, to, by, at })
+                        Some(FieldChange {
+                            field,
+                            from,
+                            to,
+                            by,
+                            at,
+                        })
                     }
                 })
                 .collect();

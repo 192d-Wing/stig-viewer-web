@@ -81,7 +81,10 @@ mod tests {
     #[test]
     fn source_ip_is_a_canonical_ip_and_never_header_text_by_default() {
         let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", HeaderValue::from_static("evil\"; DROP TABLE x"));
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("evil\"; DROP TABLE x"),
+        );
         h.insert("x-real-ip", HeaderValue::from_static("10.0.0.9"));
         // Without STIG_TRUST_PROXY_HEADERS the headers are not used at all.
         let c = RequestCtx::new(&h, None, "viewer");

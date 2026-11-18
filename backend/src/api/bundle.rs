@@ -92,17 +92,16 @@ pub async fn bundle_handler(
 
     // Owner display name for XCCDF <identity>. Falls back to the owner_id
     // if the join fails so we never block the export on a missing user.
-    let owner_display: String = sqlx::query_scalar::<_, String>(
-        "SELECT display_name FROM users WHERE id = $1",
-    )
-    .bind(&asset.owner_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("bundle owner lookup: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .unwrap_or_else(|| asset.owner_id.clone());
+    let owner_display: String =
+        sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id = $1")
+            .bind(&asset.owner_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("bundle owner lookup: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .unwrap_or_else(|| asset.owner_id.clone());
 
     let asset_ctx = AssetCtx {
         name: asset.name.clone(),
@@ -113,19 +112,22 @@ pub async fn bundle_handler(
     let zip_bytes = tokio::task::spawn_blocking(move || {
         build_zip(host, asset_ctx, sections, attachment_entries)
     })
-        .await
-        .map_err(|e| {
-            tracing::error!("bundle join error: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .map_err(|e| {
-            tracing::error!("bundle build failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    .await
+    .map_err(|e| {
+        tracing::error!("bundle join error: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        tracing::error!("bundle build failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let filename = sanitize_filename(&format!("{}-bundle.zip", asset.name));
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
     if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
@@ -461,9 +463,7 @@ fn render_xccdf(asset: &AssetCtx, section: &ChecklistSection, ts: &str) -> Strin
 
     // Profile: a single "Mission Critical Classified" profile that
     // selects every rule defined in the benchmark.
-    out.push_str(
-        "  <Profile id=\"xccdf_mil.disa.stig_profile_MAC-1_Classified\">\n",
-    );
+    out.push_str("  <Profile id=\"xccdf_mil.disa.stig_profile_MAC-1_Classified\">\n");
     out.push_str("    <title>I - Mission Critical Classified</title>\n");
     for rule in &rules {
         if let Some(rid) = rule.get("id").and_then(|v| v.as_str()) {
@@ -503,13 +503,8 @@ fn render_xccdf(asset: &AssetCtx, section: &ChecklistSection, ts: &str) -> Strin
             "    <description>{}</description>\n",
             esc_xml(&description),
         ));
-        out.push_str(&format!(
-            "    <fixtext>{}</fixtext>\n",
-            esc_xml(&fix_text),
-        ));
-        out.push_str(
-            "    <check system=\"http://scap.nist.gov/schema/ocil/2\">",
-        );
+        out.push_str(&format!("    <fixtext>{}</fixtext>\n", esc_xml(&fix_text),));
+        out.push_str("    <check system=\"http://scap.nist.gov/schema/ocil/2\">");
         out.push_str(&format!(
             "<check-content>{}</check-content></check>\n",
             esc_xml(&check_text),
@@ -524,10 +519,7 @@ fn render_xccdf(asset: &AssetCtx, section: &ChecklistSection, ts: &str) -> Strin
         esc_xml(ts),
         esc_xml(ts),
     ));
-    out.push_str(&format!(
-        "    <target>{}</target>\n",
-        esc_xml(&asset.name),
-    ));
+    out.push_str(&format!("    <target>{}</target>\n", esc_xml(&asset.name),));
     out.push_str(&format!(
         "    <target-address>{}</target-address>\n",
         esc_xml(&asset.hostname),

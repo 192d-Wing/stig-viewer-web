@@ -16,9 +16,14 @@ use roxmltree::{Document, Node, ParsingOptions};
 pub(crate) fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}'
-            | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
-            | '\u{3000}' | '\u{FEFF}'
+        '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     )
 }
 
@@ -31,7 +36,10 @@ pub(crate) fn js_trim(s: &str) -> &str {
 /// for the `<parsererror>` document the browser returns for malformed input.
 pub(crate) fn parse_document(xml: &str) -> Option<Document<'_>> {
     let xml = xml.strip_prefix('\u{FEFF}').unwrap_or(xml);
-    let options = ParsingOptions { allow_dtd: true, ..ParsingOptions::default() };
+    let options = ParsingOptions {
+        allow_dtd: true,
+        ..ParsingOptions::default()
+    };
     Document::parse_with_options(xml, options).ok()
 }
 
@@ -56,7 +64,10 @@ pub(crate) fn elements_by_tag_name<'a, 'input>(
     scope: Node<'a, 'input>,
     tag: &'a str,
 ) -> impl Iterator<Item = Node<'a, 'input>> {
-    scope.descendants().skip(1).filter(move |n| has_qualified_name(*n, tag))
+    scope
+        .descendants()
+        .skip(1)
+        .filter(move |n| has_qualified_name(*n, tag))
 }
 
 /// `scope.getElementsByTagNameNS('*', local)`: any namespace, any prefix.
@@ -72,7 +83,10 @@ fn elements_by_local_name<'a, 'input>(
 
 /// `node.textContent`: every descendant text node concatenated.
 pub(crate) fn text_content(node: Node) -> String {
-    node.descendants().filter(|n| n.is_text()).filter_map(|n| n.text()).collect()
+    node.descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect()
 }
 
 /// Trimmed text of the first `tag` descendant, or `""` when there is none.
@@ -126,7 +140,9 @@ fn remove_element_ci(s: &str, tag: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut pos = 0;
     while let Some(start) = find_ascii_ci(s, &open, pos) {
-        let Some(end) = find_ascii_ci(s, &close, start + open.len()) else { break };
+        let Some(end) = find_ascii_ci(s, &close, start + open.len()) else {
+            break;
+        };
         out.push_str(&s[pos..start]);
         pos = end + close.len();
     }
@@ -212,8 +228,15 @@ pub fn parse_xccdf(xml: &str) -> Result<Stig, String> {
         .ok_or(NO_BENCHMARK)?;
 
     let title = first_text(benchmark, &["title", "Title"]);
-    let title = if title.is_empty() { "Unknown STIG".to_string() } else { title };
-    let title = title.strip_prefix("DPMS Target ").unwrap_or(&title).to_string();
+    let title = if title.is_empty() {
+        "Unknown STIG".to_string()
+    } else {
+        title
+    };
+    let title = title
+        .strip_prefix("DPMS Target ")
+        .unwrap_or(&title)
+        .to_string();
     let description = first_text(benchmark, &["description", "Description"]);
     let version = first_text(benchmark, &["version", "Version"]);
     let release_info = first_text(benchmark, &["plain-text", "release-info"]);
@@ -235,7 +258,11 @@ pub fn parse_xccdf(xml: &str) -> Result<Stig, String> {
 
         let rule_id = get_attribute(rule_el, "id");
         let severity = get_attribute(rule_el, "severity");
-        let severity = if severity.is_empty() { "medium" } else { severity.as_str() };
+        let severity = if severity.is_empty() {
+            "medium"
+        } else {
+            severity.as_str()
+        };
         let rule_title = first_text(rule_el, &["title", "Title"]);
         let rule_desc = first_text(rule_el, &["description", "Description"]);
         let fix_text = first_text(rule_el, &["fixtext", "fix", "Fix"]);
@@ -246,10 +273,18 @@ pub fn parse_xccdf(xml: &str) -> Result<Stig, String> {
             .filter(|val| !val.is_empty())
             .collect();
 
-        let stig_id = if group_id.is_empty() { format!("V-{}", 100_000 + i) } else { group_id.clone() };
+        let stig_id = if group_id.is_empty() {
+            format!("V-{}", 100_000 + i)
+        } else {
+            group_id.clone()
+        };
 
         rules.push(Rule {
-            id: if rule_id.is_empty() { format!("rule-{i}") } else { rule_id },
+            id: if rule_id.is_empty() {
+                format!("rule-{i}")
+            } else {
+                rule_id
+            },
             stig_id,
             group_id,
             title: rule_title,
@@ -265,7 +300,13 @@ pub fn parse_xccdf(xml: &str) -> Result<Stig, String> {
         });
     }
 
-    Ok(Stig { title, description, version, release_info, rules })
+    Ok(Stig {
+        title,
+        description,
+        version,
+        release_info,
+        rules,
+    })
 }
 
 #[cfg(test)]
@@ -277,7 +318,10 @@ mod tests {
     const XML: &str = include_str!("../../../testdata/fixtures/minimal.xccdf.xml");
 
     fn by_stig_id<'a>(stig: &'a Stig, stig_id: &str) -> &'a Rule {
-        stig.rules.iter().find(|r| r.stig_id == stig_id).expect("rule present")
+        stig.rules
+            .iter()
+            .find(|r| r.stig_id == stig_id)
+            .expect("rule present")
     }
 
     #[test]
@@ -285,7 +329,10 @@ mod tests {
         let stig = parse_xccdf(XML).unwrap();
         assert_eq!(stig.title, "Parity Fixture STIG");
         assert_eq!(stig.version, "2");
-        assert_eq!(stig.description, "Shared fixture for FE/BE parser parity tests.");
+        assert_eq!(
+            stig.description,
+            "Shared fixture for FE/BE parser parity tests."
+        );
         assert_eq!(stig.release_info, "Release: 4 Benchmark Date: 01 Jan 2026");
     }
 
@@ -296,7 +343,10 @@ mod tests {
 
         assert_eq!(by_stig_id(&stig, "V-1001").severity, "CAT I");
         assert_eq!(by_stig_id(&stig, "V-1001").id, "SV-1001r1_rule");
-        assert_eq!(by_stig_id(&stig, "V-1001").title, "Critical rule under test");
+        assert_eq!(
+            by_stig_id(&stig, "V-1001").title,
+            "Critical rule under test"
+        );
         // The fixture's <reference><dc:title> must not replace rule titles.
         assert_eq!(by_stig_id(&stig, "V-1002").title, "Medium-severity rule");
         assert_eq!(by_stig_id(&stig, "V-1003").title, "Informational finding");
@@ -311,7 +361,11 @@ mod tests {
     #[test]
     fn strips_vuln_discussion_and_false_positives_from_descriptions() {
         let stig = parse_xccdf(XML).unwrap();
-        let critical = stig.rules.iter().find(|r| r.id == "SV-1001r1_rule").unwrap();
+        let critical = stig
+            .rules
+            .iter()
+            .find(|r| r.id == "SV-1001r1_rule")
+            .unwrap();
         assert_eq!(critical.description, "Why this critical finding matters.");
         assert!(!critical.description.contains("FalsePositives"));
         assert!(!critical.description.contains('<'));
@@ -320,7 +374,11 @@ mod tests {
     #[test]
     fn collects_cci_references_per_rule() {
         let stig = parse_xccdf(XML).unwrap();
-        let critical = stig.rules.iter().find(|r| r.id == "SV-1001r1_rule").unwrap();
+        let critical = stig
+            .rules
+            .iter()
+            .find(|r| r.id == "SV-1001r1_rule")
+            .unwrap();
         assert_eq!(critical.cci_ids, vec!["CCI-000015", "CCI-000017"]);
         assert!(by_stig_id(&stig, "V-1003").cci_ids.is_empty());
     }
@@ -340,7 +398,10 @@ mod tests {
         let stig = parse_xccdf(XML).unwrap();
         let critical = by_stig_id(&stig, "V-1001");
         assert_eq!(critical.fix_text, "Apply the configuration change.");
-        assert_eq!(critical.check_text, "Verify the setting with a runtime probe.");
+        assert_eq!(
+            critical.check_text,
+            "Verify the setting with a runtime probe."
+        );
         assert_eq!(critical.group_id, "V-1001");
     }
 

@@ -1,17 +1,19 @@
-use crate::components::asset_modal::{asset_field, with_asset_field, ASSET_FIELDS};
-use crate::auth::use_current_user;
-use std::collections::HashSet;
 use crate::api::{api_get, api_send};
+use crate::auth::use_current_user;
 use crate::autosave::{Autosave, SaveStatus};
-use crate::components::save_to_system_modal::SaveToSystemModal;
-use gloo_timers::future::TimeoutFuture;
+use crate::components::asset_modal::{asset_field, with_asset_field, ASSET_FIELDS};
 use crate::components::poam_export_modal::{export_base_name, PoamExportModal};
 use crate::components::rule_list::RuleList;
-use crate::constants::{severity_badge_color, status_indicator_kind, SEVERITY_ORDER, STATUS_OPTIONS};
+use crate::components::save_to_system_modal::SaveToSystemModal;
+use crate::constants::{
+    severity_badge_color, status_indicator_kind, SEVERITY_ORDER, STATUS_OPTIONS,
+};
 use crate::model::*;
 use crate::ui::*;
 use crate::util::{download_text, file_list_to_vec, spawn_local};
 use crate::utils::export_ckl::export_ckl;
+use gloo_timers::future::TimeoutFuture;
+use std::collections::HashSet;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
@@ -27,13 +29,18 @@ fn capture_after(text: &str, marker: &str, digits_only: bool) -> Option<String> 
         let rest = &text[start..];
         let trimmed = rest.trim_start();
         let capture: &str = if digits_only {
-            let end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(trimmed.len());
+            let end = trimmed
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(trimmed.len());
             &trimmed[..end]
         } else {
             // `.` stops at a line terminator. If nothing follows the
             // whitespace, the regex backtracks and lets `.+` take trailing
             // whitespace instead.
-            let line = |s: &'_ str| -> usize { s.find(['\n', '\r', '\u{2028}', '\u{2029}']).unwrap_or(s.len()) };
+            let line = |s: &'_ str| -> usize {
+                s.find(['\n', '\r', '\u{2028}', '\u{2029}'])
+                    .unwrap_or(s.len())
+            };
             let mut candidate = &trimmed[..line(trimmed)];
             if candidate.is_empty() {
                 let ws_len = rest.len() - trimmed.len();
@@ -57,7 +64,9 @@ fn capture_after(text: &str, marker: &str, digits_only: bool) -> Option<String> 
 }
 
 fn or_dash(value: Option<String>) -> String {
-    value.filter(|v| !v.is_empty()).unwrap_or_else(|| "—".to_string())
+    value
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn key_value(label: &'static str, value: Html) -> Html {
@@ -138,14 +147,26 @@ fn SetBar(p: &SetBarProps) -> Html {
                 Callback::from(move |v: String| renaming.set(Some(v)))
             };
             let save = {
-                let (renaming, error, on_rename, id, text) =
-                    (renaming.clone(), error.clone(), p.on_rename_set.clone(), set.id.clone(), text.clone());
+                let (renaming, error, on_rename, id, text) = (
+                    renaming.clone(),
+                    error.clone(),
+                    p.on_rename_set.clone(),
+                    set.id.clone(),
+                    text.clone(),
+                );
                 Callback::from(move |_: MouseEvent| {
-                    let (renaming, error, on_rename, id, text) =
-                        (renaming.clone(), error.clone(), on_rename.clone(), id.clone(), text.clone());
+                    let (renaming, error, on_rename, id, text) = (
+                        renaming.clone(),
+                        error.clone(),
+                        on_rename.clone(),
+                        id.clone(),
+                        text.clone(),
+                    );
                     spawn_local(async move {
                         let body = serde_json::json!({ "name": text });
-                        match api_send(&format!("/api/checklist-sets/{id}"), "PATCH", Some(&body)).await {
+                        match api_send(&format!("/api/checklist-sets/{id}"), "PATCH", Some(&body))
+                            .await
+                        {
                             Ok(()) => {
                                 on_rename.emit(text.trim().to_string());
                                 renaming.set(None);
@@ -179,7 +200,9 @@ fn SetBar(p: &SetBarProps) -> Html {
                 </SpaceBetween>
             }
         }
-        _ => html! { <UiBox color="text-status-inactive">{"Your edits are saved to My checklists automatically."}</UiBox> },
+        _ => {
+            html! { <UiBox color="text-status-inactive">{"Your edits are saved to My checklists automatically."}</UiBox> }
+        }
     };
 
     let toggle_add = {
@@ -196,17 +219,33 @@ fn SetBar(p: &SetBarProps) -> Html {
             }
         })
     };
-    let options: Vec<SelectOption> = catalog.iter().map(|c| SelectOption::new(c.id.clone(), c.title.clone())).collect();
+    let options: Vec<SelectOption> = catalog
+        .iter()
+        .map(|c| SelectOption::new(c.id.clone(), c.title.clone()))
+        .collect();
     let on_pick = {
         let picked = picked.clone();
-        Callback::from(move |v: Vec<SelectOption>| picked.set(v.into_iter().map(|o| o.value).collect()))
+        Callback::from(move |v: Vec<SelectOption>| {
+            picked.set(v.into_iter().map(|o| o.value).collect())
+        })
     };
     let add = {
-        let (picked, adding, error, set, on_add) = (picked.clone(), adding.clone(), error.clone(), p.set.clone(), p.on_add_stig.clone());
+        let (picked, adding, error, set, on_add) = (
+            picked.clone(),
+            adding.clone(),
+            error.clone(),
+            p.set.clone(),
+            p.on_add_stig.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let Some(set) = set.clone() else { return };
             let ids: Vec<String> = picked.iter().map(|s| s.to_string()).collect();
-            let (picked, adding, error, on_add) = (picked.clone(), adding.clone(), error.clone(), on_add.clone());
+            let (picked, adding, error, on_add) = (
+                picked.clone(),
+                adding.clone(),
+                error.clone(),
+                on_add.clone(),
+            );
             spawn_local(async move {
                 for id in ids {
                     let body = serde_json::json!({ "stigId": id });
@@ -240,8 +279,14 @@ fn SetBar(p: &SetBarProps) -> Html {
 
     let conflict = match (&status, &p.set) {
         (SaveStatus::Conflict, Some(set)) => {
-            let (a1, a2, id1, id2, err1, err2) =
-                (p.autosave.clone(), p.autosave.clone(), set.id.clone(), set.id.clone(), error.clone(), error.clone());
+            let (a1, a2, id1, id2, err1, err2) = (
+                p.autosave.clone(),
+                p.autosave.clone(),
+                set.id.clone(),
+                set.id.clone(),
+                error.clone(),
+                error.clone(),
+            );
             let reload = Callback::from(move |_: MouseEvent| {
                 let (a, id, err) = (a1.clone(), id1.clone(), err1.clone());
                 spawn_local(async move {
@@ -313,7 +358,11 @@ pub fn StigView(p: &StigViewProps) -> Html {
     // Rule ids ticked for a multi-rule status change, tagged with the tab
     // they were ticked in; ticks from another open STIG read as empty.
     let checked = use_state(|| (String::new(), Vec::<String>::new()));
-    let checked_ids: &[String] = if checked.0 == p.tab.id { &checked.1 } else { &[] };
+    let checked_ids: &[String] = if checked.0 == p.tab.id {
+        &checked.1
+    } else {
+        &[]
+    };
     // Switching tabs discards the old tab's ticks. The read above is already
     // empty on the switching render; this only drops the stash so the ticks
     // do not come back when the viewer returns. No state is set on mount.
@@ -328,7 +377,12 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let file_input_ref = use_node_ref();
 
     let filtered_rules = use_memo(
-        (stig.clone(), (*search_term).clone(), (*severity_filter).clone(), (*status_filter).clone()),
+        (
+            stig.clone(),
+            (*search_term).clone(),
+            (*severity_filter).clone(),
+            (*status_filter).clone(),
+        ),
         |(stig, search, severity, status)| {
             let term = search.to_lowercase();
             stig.rules
@@ -343,9 +397,16 @@ pub fn StigView(p: &StigViewProps) -> Html {
                     if term.is_empty() {
                         return true;
                     }
-                    [&r.title, &r.stig_id, &r.id, &r.description, &r.check_text, &r.fix_text]
-                        .iter()
-                        .any(|field| field.to_lowercase().contains(&term))
+                    [
+                        &r.title,
+                        &r.stig_id,
+                        &r.id,
+                        &r.description,
+                        &r.check_text,
+                        &r.fix_text,
+                    ]
+                    .iter()
+                    .any(|field| field.to_lowercase().contains(&term))
                 })
                 .cloned()
                 .collect::<Vec<Rule>>()
@@ -357,13 +418,21 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let count_severity = |sev: &str| stig.rules.iter().filter(|r| r.severity == sev).count();
     let count_status = |status: &str| stig.rules.iter().filter(|r| r.status == status).count();
     let evaluated = total - count_status("not_reviewed");
-    let pct = if total > 0 { (evaluated as f64 / total as f64 * 100.0).round() } else { 0.0 };
+    let pct = if total > 0 {
+        (evaluated as f64 / total as f64 * 100.0).round()
+    } else {
+        0.0
+    };
 
     let handle_export_ckl = {
         let (stig, asset) = (stig.clone(), asset_info.clone());
         Callback::from(move |_: MouseEvent| {
             let xml = export_ckl(&stig, &asset.hostname, &asset.ip, &asset.mac, &asset.fqdn);
-            download_text(&xml, "application/xml", &format!("{}.ckl", export_base_name(&stig.title)));
+            download_text(
+                &xml,
+                "application/xml",
+                &format!("{}.ckl", export_base_name(&stig.title)),
+            );
         })
     };
 
@@ -387,7 +456,9 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let on_files_picked = {
         let on_add_files = p.on_add_files.clone();
         Callback::from(move |e: Event| {
-            let input = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok());
+            let input = e
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok());
             let files = file_list_to_vec(input.and_then(|i| i.files()));
             if !files.is_empty() {
                 on_add_files.emit(files);
@@ -401,11 +472,16 @@ pub fn StigView(p: &StigViewProps) -> Html {
     let (open_poam, close_poam) = (set_poam_modal(true), set_poam_modal(false));
 
     // ── Rules tab ───────────────────────────────────────────────────────────
-    let severity_options: Vec<SelectOption> = std::iter::once(SelectOption::new("", "All severities"))
-        .chain(SEVERITY_ORDER.iter().map(|s| SelectOption::new(*s, *s)))
-        .collect();
+    let severity_options: Vec<SelectOption> =
+        std::iter::once(SelectOption::new("", "All severities"))
+            .chain(SEVERITY_ORDER.iter().map(|s| SelectOption::new(*s, *s)))
+            .collect();
     let status_options: Vec<SelectOption> = std::iter::once(SelectOption::new("", "All statuses"))
-        .chain(STATUS_OPTIONS.iter().map(|o| SelectOption::new(o.value, o.label)))
+        .chain(
+            STATUS_OPTIONS
+                .iter()
+                .map(|o| SelectOption::new(o.value, o.label)),
+        )
         .collect();
     let set_filter = |state: &UseStateHandle<String>| {
         let state = state.clone();
@@ -425,7 +501,11 @@ pub fn StigView(p: &StigViewProps) -> Html {
         Callback::from(move |(ids, on): (Vec<String>, bool)| {
             let changed: HashSet<&str> = ids.iter().map(String::as_str).collect();
             let current: &[String] = if checked.0 == tab_id { &checked.1 } else { &[] };
-            let mut next: Vec<String> = current.iter().filter(|id| !changed.contains(id.as_str())).cloned().collect();
+            let mut next: Vec<String> = current
+                .iter()
+                .filter(|id| !changed.contains(id.as_str()))
+                .cloned()
+                .collect();
             if on {
                 next.extend(ids);
             }

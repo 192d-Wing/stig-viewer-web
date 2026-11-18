@@ -27,7 +27,11 @@ type PoamRow = [String; 16];
 /// mapped controls in first-seen order, comma-joined (unmapped CCIs are skipped).
 fn resolve_control(cci_ids: &[String]) -> String {
     let mut unique: Vec<&str> = Vec::new();
-    for control in cci_ids.iter().filter_map(|id| cci_info(id)).map(|info| info.control) {
+    for control in cci_ids
+        .iter()
+        .filter_map(|id| cci_info(id))
+        .map(|info| info.control)
+    {
         if !control.is_empty() && !unique.contains(&control) {
             unique.push(control);
         }
@@ -75,7 +79,12 @@ fn build_rows(stig: &Stig, asset: &AssetInfo, include_non_reviewed: bool) -> Vec
                 String::new(),
                 String::new(),
                 js_trim(&source).to_string(),
-                if r.status == "open" { "Ongoing" } else { "Submitted" }.to_string(),
+                if r.status == "open" {
+                    "Ongoing"
+                } else {
+                    "Submitted"
+                }
+                .to_string(),
                 r.comments.clone(),
             ]
         })
@@ -83,7 +92,11 @@ fn build_rows(stig: &Stig, asset: &AssetInfo, include_non_reviewed: bool) -> Vec
 }
 
 fn csv_line<S: AsRef<str>>(fields: &[S]) -> String {
-    fields.iter().map(|f| csv_field(f.as_ref())).collect::<Vec<_>>().join(",")
+    fields
+        .iter()
+        .map(|f| csv_field(f.as_ref()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A JSON string literal, escaped the way `JSON.stringify` does.
@@ -96,7 +109,11 @@ fn json_string(s: &str) -> String {
 pub fn export_poam_csv(stig: &Stig, asset: &AssetInfo, include_non_reviewed: bool) -> String {
     let rows = build_rows(stig, asset, include_non_reviewed);
     let header = csv_line(&POAM_HEADERS);
-    let body = rows.iter().map(|row| csv_line(row)).collect::<Vec<_>>().join("\n");
+    let body = rows
+        .iter()
+        .map(|row| csv_line(row))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("{header}\n{body}")
 }
 
@@ -114,7 +131,9 @@ pub fn export_poam_json(stig: &Stig, asset: &AssetInfo, include_non_reviewed: bo
             let members: Vec<String> = POAM_HEADERS
                 .iter()
                 .zip(row)
-                .map(|(header, value)| format!("    {}: {}", json_string(header), json_string(value)))
+                .map(|(header, value)| {
+                    format!("    {}: {}", json_string(header), json_string(value))
+                })
                 .collect();
             format!("  {{\n{}\n  }}", members.join(",\n"))
         })
@@ -135,7 +154,10 @@ mod tests {
         Status,Comments";
 
     fn asset(hostname: &str) -> AssetInfo {
-        AssetInfo { hostname: hostname.into(), ..AssetInfo::default() }
+        AssetInfo {
+            hostname: hostname.into(),
+            ..AssetInfo::default()
+        }
     }
 
     fn rule(stig_id: &str, status: &str) -> Rule {
@@ -168,15 +190,26 @@ mod tests {
         assert_eq!(resolve_control(&ids(&["CCI-999999"])), "");
         // CCI-000015 and CCI-000010 both map to AC-2(c).
         assert_eq!(
-            resolve_control(&ids(&["CCI-000015", "CCI-000010", "CCI-999999", "CCI-000040"])),
+            resolve_control(&ids(&[
+                "CCI-000015",
+                "CCI-000010",
+                "CCI-999999",
+                "CCI-000040"
+            ])),
             "AC-2(c), AC-3"
         );
     }
 
     #[test]
     fn csv_has_header_only_when_nothing_matches() {
-        let stig = Stig { rules: vec![rule("V-1", "not_a_finding")], ..Stig::default() };
-        assert_eq!(export_poam_csv(&stig, &asset("h"), true), format!("{HEADER}\n"));
+        let stig = Stig {
+            rules: vec![rule("V-1", "not_a_finding")],
+            ..Stig::default()
+        };
+        assert_eq!(
+            export_poam_csv(&stig, &asset("h"), true),
+            format!("{HEADER}\n")
+        );
         assert_eq!(export_poam_json(&stig, &asset("h"), true), "[]");
     }
 
@@ -192,7 +225,10 @@ mod tests {
             ..Stig::default()
         };
         let ids = |include| {
-            build_rows(&stig, &asset(""), include).iter().map(|r| r[0].clone()).collect::<Vec<_>>()
+            build_rows(&stig, &asset(""), include)
+                .iter()
+                .map(|r| r[0].clone())
+                .collect::<Vec<_>>()
         };
         assert_eq!(ids(false), vec!["V-1"]);
         assert_eq!(ids(true), vec!["V-1", "V-2"]);
@@ -225,9 +261,16 @@ mod tests {
 
     #[test]
     fn source_column_keeps_inner_gaps_but_trims_the_ends() {
-        let stig = Stig { title: "T".into(), rules: vec![rule("V-1", "open")], ..Stig::default() };
+        let stig = Stig {
+            title: "T".into(),
+            rules: vec![rule("V-1", "open")],
+            ..Stig::default()
+        };
         assert_eq!(build_rows(&stig, &asset(""), false)[0][13], "T");
-        let stig = Stig { release_info: "R1".into(), ..stig };
+        let stig = Stig {
+            release_info: "R1".into(),
+            ..stig
+        };
         assert_eq!(build_rows(&stig, &asset(""), false)[0][13], "T  R1");
     }
 
@@ -235,7 +278,11 @@ mod tests {
     fn json_is_pretty_printed_in_header_order() {
         let mut open = rule("V-1", "open");
         open.comments = "say \"hi\"\n\ttab \\ é \u{1}".into();
-        let stig = Stig { title: "S".into(), rules: vec![open], ..Stig::default() };
+        let stig = Stig {
+            title: "S".into(),
+            rules: vec![open],
+            ..Stig::default()
+        };
         let expected = r#"[
   {
     "Control Vulnerability ID": "V-1",

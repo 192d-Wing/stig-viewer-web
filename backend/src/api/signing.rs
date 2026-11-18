@@ -518,8 +518,7 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    const TEST_SEED_HEX: &str =
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SEED_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn test_state() -> SigningState {
         let bytes = hex::decode(TEST_SEED_HEX).unwrap();
@@ -835,7 +834,10 @@ mod tests {
                 padded_cases += 1;
                 let mut bad = v.clone();
                 bad["payload"] = padded.into();
-                assert_eq!(verify(&bad, &st, None), Err(VerifyError::BadPayloadEncoding));
+                assert_eq!(
+                    verify(&bad, &st, None),
+                    Err(VerifyError::BadPayloadEncoding)
+                );
                 // Non-canonical trailing bits: same length, last char differs in the
                 // unused low bits.
                 let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -845,7 +847,10 @@ mod tests {
                 chars[last] = alphabet.chars().nth(idx ^ 1).unwrap();
                 let mut bad = v.clone();
                 bad["payload"] = chars.into_iter().collect::<String>().into();
-                assert_eq!(verify(&bad, &st, None), Err(VerifyError::BadPayloadEncoding));
+                assert_eq!(
+                    verify(&bad, &st, None),
+                    Err(VerifyError::BadPayloadEncoding)
+                );
                 bits_cases += 1;
             }
         }
@@ -892,11 +897,20 @@ mod tests {
     fn invalid_signature_encoding_rejected() {
         let st = test_state();
         let mut v = wire(&st);
-        let sig = v["signatures"][0]["signature"].as_str().unwrap().to_string();
+        let sig = v["signatures"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
         v["signatures"][0]["signature"] = format!("!{}", &sig[1..]).into();
-        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadSignatureEncoding));
+        assert_eq!(
+            verify(&v, &st, None),
+            Err(VerifyError::BadSignatureEncoding)
+        );
         v["signatures"][0]["signature"] = sig[..10].into();
-        assert_eq!(verify(&v, &st, None), Err(VerifyError::BadSignatureEncoding));
+        assert_eq!(
+            verify(&v, &st, None),
+            Err(VerifyError::BadSignatureEncoding)
+        );
     }
 
     #[test]
@@ -1025,7 +1039,9 @@ mod tests {
         let err = SigningState::from_hex(Some("deadbeef")).unwrap_err();
         assert!(err.to_string().contains("32 bytes"));
         assert!(SigningState::from_hex(Some("zz")).is_err());
-        assert!(SigningState::from_hex(Some(&"ab".repeat(32))).unwrap().is_some());
+        assert!(SigningState::from_hex(Some(&"ab".repeat(32)))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

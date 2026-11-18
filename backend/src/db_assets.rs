@@ -112,11 +112,10 @@ pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
     }
 
     // Attach tags in a single grouped query.
-    let tag_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag",
-    )
-    .fetch_all(pool)
-    .await?;
+    let tag_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag")
+            .fetch_all(pool)
+            .await?;
     let mut by_asset: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (asset_id, tag) in tag_rows {
@@ -233,11 +232,7 @@ pub async fn set_runbook(pool: &PgPool, id: &str, runbook: &str) -> Result<()> {
 }
 
 /// Update the per-asset approval-policy flag.
-pub async fn set_requires_approval(
-    pool: &PgPool,
-    id: &str,
-    requires_approval: bool,
-) -> Result<()> {
+pub async fn set_requires_approval(pool: &PgPool, id: &str, requires_approval: bool) -> Result<()> {
     sqlx::query(
         "UPDATE assets \
          SET requires_approval = $1, updated_at = NOW() \

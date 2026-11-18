@@ -331,7 +331,12 @@ pub struct RadioItem {
 
 impl RadioItem {
     pub fn new(value: impl Into<AttrValue>, label: impl Into<AttrValue>) -> Self {
-        Self { value: value.into(), label: label.into(), description: None, disabled: false }
+        Self {
+            value: value.into(),
+            label: label.into(),
+            description: None,
+            disabled: false,
+        }
     }
 }
 
@@ -393,7 +398,11 @@ pub struct SegmentOption {
 
 impl SegmentOption {
     pub fn new(id: impl Into<AttrValue>, text: impl Into<AttrValue>) -> Self {
-        Self { id: id.into(), text: text.into(), disabled: false }
+        Self {
+            id: id.into(),
+            text: text.into(),
+            disabled: false,
+        }
     }
 }
 
@@ -445,7 +454,12 @@ pub struct SelectOption {
 
 impl SelectOption {
     pub fn new(value: impl Into<AttrValue>, label: impl Into<AttrValue>) -> Self {
-        Self { value: value.into(), label: label.into(), description: None, disabled: false }
+        Self {
+            value: value.into(),
+            label: label.into(),
+            description: None,
+            disabled: false,
+        }
     }
     pub fn description(mut self, d: impl Into<AttrValue>) -> Self {
         self.description = Some(d.into());
@@ -557,10 +571,13 @@ pub fn Select(p: &SelectProps) -> Html {
     };
     // As in Cloudscape, the trigger's name is the label plus whatever the
     // trigger shows: the selected option, or else the placeholder.
-    let aria_label = p.aria_label.as_ref().map(|l| match current.as_ref().or(p.placeholder.as_ref()) {
-        Some(c) => format!("{l} {c}"),
-        None => l.to_string(),
-    });
+    let aria_label =
+        p.aria_label
+            .as_ref()
+            .map(|l| match current.as_ref().or(p.placeholder.as_ref()) {
+                Some(c) => format!("{l} {c}"),
+                None => l.to_string(),
+            });
     html! {
         <div ref={root} class={classes!("ui-select", p.disabled.then_some("ui-disabled"))} data-testid={p.testid.clone()}>
             <button type="button" class="ui-select-trigger" aria-haspopup="listbox"
@@ -1011,7 +1028,10 @@ pub fn FileUpload(p: &FileUploadProps) -> Html {
         let existing = p.value.clone();
         let multiple = p.multiple;
         Callback::from(move |e: Event| {
-            let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else {
+            let Some(el) = e
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+            else {
                 return;
             };
             let picked = file_list_to_vec(el.files());
@@ -1031,7 +1051,11 @@ pub fn FileUpload(p: &FileUploadProps) -> Html {
     let text = p
         .upload_button_text
         .clone()
-        .unwrap_or(AttrValue::Static(if p.multiple { "Choose files" } else { "Choose file" }));
+        .unwrap_or(AttrValue::Static(if p.multiple {
+            "Choose files"
+        } else {
+            "Choose file"
+        }));
     html! {
         <div class="ui-file-upload" data-testid={p.testid.clone()}>
             <input ref={input} type="file" class="ui-file-input" multiple={p.multiple}

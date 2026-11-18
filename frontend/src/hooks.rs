@@ -147,7 +147,12 @@ fn read_from_url(defaults: &[(&'static str, UrlVal)]) -> UrlState {
     let params = web_sys::UrlSearchParams::new_with_str(&search).ok();
     let map = defaults
         .iter()
-        .map(|(k, dv)| (*k, UrlVal::decode(params.as_ref().and_then(|p| p.get(k)), dv)))
+        .map(|(k, dv)| {
+            (
+                *k,
+                UrlVal::decode(params.as_ref().and_then(|p| p.get(k)), dv),
+            )
+        })
         .collect();
     UrlState(Rc::new(map))
 }
@@ -198,11 +203,8 @@ pub fn use_url_state(
                 let current = format!("{path}{search}{hash}");
                 if next != current {
                     if let Ok(h) = window().history() {
-                        let _ = h.replace_state_with_url(
-                            &wasm_bindgen::JsValue::NULL,
-                            "",
-                            Some(&next),
-                        );
+                        let _ =
+                            h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&next));
                     }
                 }
             }

@@ -105,10 +105,13 @@ pub fn DiffView(p: &DiffViewProps) -> Html {
             .map(|t| t.stig.clone())
     };
 
-    let result = use_memo((find_stig(tab_a_id), find_stig(tab_b_id)), |pair| match pair {
-        (Some(a), Some(b)) => Some(diff_stigs(a, b)),
-        _ => None,
-    });
+    let result = use_memo(
+        (find_stig(tab_a_id), find_stig(tab_b_id)),
+        |pair| match pair {
+            (Some(a), Some(b)) => Some(diff_stigs(a, b)),
+            _ => None,
+        },
+    );
 
     let handle_set_a = {
         let (b, cb) = (tab_b_id.clone(), p.on_set_diff_pair.clone());
@@ -119,11 +122,16 @@ pub fn DiffView(p: &DiffViewProps) -> Html {
         Callback::from(move |o: SelectOption| cb.emit((a.clone(), Some(o.value.to_string()))))
     };
 
-    let tab_options: Vec<SelectOption> =
-        p.tabs.iter().map(|t| SelectOption::new(t.id.clone(), t.stig.title.clone())).collect();
+    let tab_options: Vec<SelectOption> = p
+        .tabs
+        .iter()
+        .map(|t| SelectOption::new(t.id.clone(), t.stig.title.clone()))
+        .collect();
     // Only ids of open tabs count as a selection.
     let selected = |id: &Option<String>| {
-        id.as_ref().filter(|id| p.tabs.iter().any(|t| &t.id == *id)).map(|id| AttrValue::from(id.clone()))
+        id.as_ref()
+            .filter(|id| p.tabs.iter().any(|t| &t.id == *id))
+            .map(|id| AttrValue::from(id.clone()))
     };
     let exit_diff = p.on_exit_diff.reform(|_: MouseEvent| ());
 

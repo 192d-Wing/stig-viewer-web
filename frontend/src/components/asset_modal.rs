@@ -3,8 +3,12 @@
 use crate::model::AssetInfo;
 
 /// (field key, label) for each editable asset identity field.
-pub(crate) const ASSET_FIELDS: [(&str, &str); 4] =
-    [("hostname", "Hostname"), ("ip", "IP Address"), ("mac", "MAC Address"), ("fqdn", "FQDN")];
+pub(crate) const ASSET_FIELDS: [(&str, &str); 4] = [
+    ("hostname", "Hostname"),
+    ("ip", "IP Address"),
+    ("mac", "MAC Address"),
+    ("fqdn", "FQDN"),
+];
 
 pub(crate) fn asset_field<'a>(info: &'a AssetInfo, key: &str) -> &'a str {
     match key {

@@ -10,6 +10,7 @@ pub mod audit;
 #[cfg(test)]
 pub(crate) mod audit_capture;
 pub mod auth;
+pub mod authz_audit;
 pub mod backup;
 pub mod baselines;
 pub mod bundle;
@@ -32,9 +33,8 @@ pub mod notice;
 pub mod notifications;
 pub mod oscal;
 pub mod rate_limit;
-pub mod authz_audit;
-pub mod request_ctx;
 pub mod report;
+pub mod request_ctx;
 pub mod rule_bulk_import;
 pub mod rule_bulk_status;
 pub mod rule_comments;

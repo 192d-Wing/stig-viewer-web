@@ -91,10 +91,7 @@ pub async fn search_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, MAX_LIMIT);
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let entries = list_catalog(state.pool.as_ref(), None).await.map_err(|e| {
         tracing::error!("catalog search: list_catalog failed: {e:#}");
@@ -146,20 +143,14 @@ pub async fn search_handler(
                 continue;
             }
             Err(e) => {
-                tracing::error!(
-                    "catalog search: read {} failed: {e:#}",
-                    path.display()
-                );
+                tracing::error!("catalog search: read {} failed: {e:#}", path.display());
                 continue;
             }
         };
         let stig: SearchStig = match serde_json::from_slice(&bytes) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!(
-                    "catalog search: parse {} failed: {e:#}",
-                    path.display()
-                );
+                tracing::error!("catalog search: parse {} failed: {e:#}", path.display());
                 continue;
             }
         };
@@ -272,7 +263,11 @@ fn build_snippet(haystack: &str, q: &str) -> String {
     let after = &haystack[match_end..after_end];
 
     let leading_ellipsis = if before_start > 0 { "…" } else { "" };
-    let trailing_ellipsis = if after_end < haystack.len() { "…" } else { "" };
+    let trailing_ellipsis = if after_end < haystack.len() {
+        "…"
+    } else {
+        ""
+    };
 
     let snippet = format!(
         "{lead}{before}<mark>{matched}</mark>{after}{trail}",
@@ -505,7 +500,10 @@ mod tests {
         let (state, _dir) = crate::test_fixtures::app_state(pool);
         let r = search_handler(
             State(state),
-            Query(SearchQuery { q: Some("findme".into()), limit: None }),
+            Query(SearchQuery {
+                q: Some("findme".into()),
+                limit: None,
+            }),
         )
         .await
         .expect("search succeeds");
@@ -514,4 +512,3 @@ mod tests {
         assert!(r.0.results[0].rule_id.is_none());
     }
 }
-

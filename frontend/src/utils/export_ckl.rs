@@ -84,12 +84,18 @@ pub fn export_ckl(stig: &Stig, hostname: &str, ip: &str, mac: &str, fqdn: &str) 
         for cci in &rule.cci_ids {
             push(&stig_data("CCI_REF", cci));
         }
-        push(&format!("        <STATUS>{}</STATUS>", status_ckl(&rule.status)));
+        push(&format!(
+            "        <STATUS>{}</STATUS>",
+            status_ckl(&rule.status)
+        ));
         push(&format!(
             "        <FINDING_DETAILS>{}</FINDING_DETAILS>",
             esc_xml(&rule.finding_details)
         ));
-        push(&format!("        <COMMENTS>{}</COMMENTS>", esc_xml(&rule.comments)));
+        push(&format!(
+            "        <COMMENTS>{}</COMMENTS>",
+            esc_xml(&rule.comments)
+        ));
         push("        <SEVERITY_OVERRIDE></SEVERITY_OVERRIDE>");
         push("        <SEVERITY_JUSTIFICATION></SEVERITY_JUSTIFICATION>");
         push("      </VULN>");
@@ -182,17 +188,26 @@ more</ATTRIBUTE_DATA></STIG_DATA>
     </iSTIG>
   </STIGS>
 </CHECKLIST>"#;
-        assert_eq!(export_ckl(&stig, "web<01>", "10.0.0.1", "aa:bb", "web01.example.mil"), expected);
+        assert_eq!(
+            export_ckl(&stig, "web<01>", "10.0.0.1", "aa:bb", "web01.example.mil"),
+            expected
+        );
     }
 
     #[test]
     fn unknown_severity_and_status_fall_back() {
         let stig = Stig {
-            rules: vec![Rule { severity: "bogus".into(), status: "weird".into(), ..Rule::default() }],
+            rules: vec![Rule {
+                severity: "bogus".into(),
+                status: "weird".into(),
+                ..Rule::default()
+            }],
             ..Stig::default()
         };
         let xml = export_ckl(&stig, "", "", "", "");
-        assert!(xml.contains("<VULN_ATTRIBUTE>Severity</VULN_ATTRIBUTE><ATTRIBUTE_DATA>medium</ATTRIBUTE_DATA>"));
+        assert!(xml.contains(
+            "<VULN_ATTRIBUTE>Severity</VULN_ATTRIBUTE><ATTRIBUTE_DATA>medium</ATTRIBUTE_DATA>"
+        ));
         assert!(xml.contains("<STATUS>Not_Reviewed</STATUS>"));
         assert!(!xml.ends_with('\n'));
     }

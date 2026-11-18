@@ -211,8 +211,7 @@ pub async fn send_compliance_report(
         cfg.from.clone()
     };
 
-    let mut builder = Message::builder()
-        .subject(subject.clone());
+    let mut builder = Message::builder().subject(subject.clone());
 
     let from_parsed = match from_addr.parse() {
         Ok(p) => p,
@@ -277,15 +276,14 @@ pub async fn send_compliance_report(
 
     // Build the SMTP transport. Use plain SMTP+STARTTLS on the
     // submission port; rustls is wired through tokio1-rustls-tls.
-    let transport_result = SmtpTransport::starttls_relay(&cfg.host)
-        .map(|b| {
-            let b = b.port(cfg.port);
-            if !cfg.user.is_empty() {
-                b.credentials(Credentials::new(cfg.user.clone(), cfg.pass.clone()))
-            } else {
-                b
-            }
-        });
+    let transport_result = SmtpTransport::starttls_relay(&cfg.host).map(|b| {
+        let b = b.port(cfg.port);
+        if !cfg.user.is_empty() {
+            b.credentials(Credentials::new(cfg.user.clone(), cfg.pass.clone()))
+        } else {
+            b
+        }
+    });
 
     let transport = match transport_result {
         Ok(b) => b.build(),

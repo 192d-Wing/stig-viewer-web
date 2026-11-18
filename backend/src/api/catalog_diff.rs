@@ -121,23 +121,22 @@ pub async fn diff_handler(
     }
 
     // Most recent archive entry for this STIG.
-    let prev: Option<(String, String, String)> =
-        sqlx::query_as::<_, (String, String, String)>(
-            r#"
+    let prev: Option<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
+        r#"
             SELECT version, release_info, json_path
               FROM catalog_archive
              WHERE stig_id = $1
              ORDER BY archived_at DESC
              LIMIT 1
             "#,
-        )
-        .bind(&stig_id)
-        .fetch_optional(state.pool.as_ref())
-        .await
-        .map_err(|e| {
-            tracing::error!("catalog_archive lookup failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    )
+    .bind(&stig_id)
+    .fetch_optional(state.pool.as_ref())
+    .await
+    .map_err(|e| {
+        tracing::error!("catalog_archive lookup failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let Some((from_version, from_release_info, from_rel_path)) = prev else {
         return Err(StatusCode::NOT_FOUND);
@@ -197,14 +196,16 @@ pub async fn list_archive_handler(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, stig_id, version, release_info, archived_at, json_path)| ArchiveRow {
-                id,
-                stig_id,
-                version,
-                release_info,
-                archived_at,
-                json_path,
-            })
+            .map(
+                |(id, stig_id, version, release_info, archived_at, json_path)| ArchiveRow {
+                    id,
+                    stig_id,
+                    version,
+                    release_info,
+                    archived_at,
+                    json_path,
+                },
+            )
             .collect(),
     ))
 }
@@ -326,8 +327,7 @@ fn compute_diff(
 ) -> (Vec<AddedRule>, Vec<RemovedRule>, Vec<ChangedField>) {
     let from_map: HashMap<&str, &DiffRule> =
         from.rules.iter().map(|r| (r.id.as_str(), r)).collect();
-    let to_map: HashMap<&str, &DiffRule> =
-        to.rules.iter().map(|r| (r.id.as_str(), r)).collect();
+    let to_map: HashMap<&str, &DiffRule> = to.rules.iter().map(|r| (r.id.as_str(), r)).collect();
 
     // Sorted output so diffs are stable across runs even though the
     // upstream JSON ordering is whatever DISA shipped.
@@ -389,7 +389,6 @@ fn compute_diff(
         changed_b.into_values().collect(),
     )
 }
-
 
 #[cfg(test)]
 mod id_tests {

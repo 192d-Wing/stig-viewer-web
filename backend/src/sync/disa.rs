@@ -174,13 +174,14 @@ async fn sync_one(
     //     pre-sync catalog row to capture the about-to-be-replaced
     //     metadata.
     if !unchanged && existing.is_some() {
-        if let Err(e) =
-            archive_previous_catalog(pool, data_dir, &source.id, &json_path).await
-        {
+        if let Err(e) = archive_previous_catalog(pool, data_dir, &source.id, &json_path).await {
             // Archive failures are non-fatal — log and continue so a
             // disk hiccup or unique-constraint race doesn't stop the
             // actual sync from updating the live catalog.
-            warn!("Failed to archive previous version of '{}': {e:#}", source.id);
+            warn!(
+                "Failed to archive previous version of '{}': {e:#}",
+                source.id
+            );
         }
     }
 
@@ -195,7 +196,11 @@ async fn sync_one(
     let entry = CatalogEntry {
         id: source.id.clone(),
         // Prefer title parsed from XCCDF; fall back to the manifest title
-        title: if stig.title.is_empty() { source.title.clone() } else { stig.title.clone() },
+        title: if stig.title.is_empty() {
+            source.title.clone()
+        } else {
+            stig.title.clone()
+        },
         category: source.category.clone(),
         version: stig.version.clone(),
         release_info: stig.release_info.clone(),
@@ -373,7 +378,12 @@ mod id_tests {
     use super::*;
 
     fn src(id: &str) -> StigSource {
-        StigSource { id: id.into(), title: "t".into(), category: "c".into(), url: "u".into() }
+        StigSource {
+            id: id.into(),
+            title: "t".into(),
+            category: "c".into(),
+            url: "u".into(),
+        }
     }
 
     #[test]
@@ -398,15 +408,25 @@ mod id_tests {
 
     #[test]
     fn summary_counts_stale_separately() {
-        let s = SyncSummary { synced: 5, stale: 2, errors: 1 };
+        let s = SyncSummary {
+            synced: 5,
+            stale: 2,
+            errors: 1,
+        };
         assert_eq!(s.describe(), "synced 5, 2 stale URL(s), 1 error(s)");
     }
 
     #[test]
     fn only_not_found_means_no_previous_file() {
         use std::io::{Error, ErrorKind};
-        assert_eq!(existing_bytes(Ok(b"x".to_vec())).unwrap(), Some(b"x".to_vec()));
-        assert_eq!(existing_bytes(Err(Error::from(ErrorKind::NotFound))).unwrap(), None);
+        assert_eq!(
+            existing_bytes(Ok(b"x".to_vec())).unwrap(),
+            Some(b"x".to_vec())
+        );
+        assert_eq!(
+            existing_bytes(Err(Error::from(ErrorKind::NotFound))).unwrap(),
+            None
+        );
         let e = existing_bytes(Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::PermissionDenied);
     }
@@ -455,17 +475,25 @@ mod id_tests {
     #[tokio::test]
     async fn an_over_cap_content_length_is_refused_without_reading_the_body() {
         // Headers promise 100 bytes, none follow: only a pre-check can refuse.
-        let e = fetch("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n", vec![], 10)
-            .await
-            .unwrap_err();
+        let e = fetch(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            vec![],
+            10,
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
     }
 
     #[tokio::test]
     async fn a_streamed_body_over_the_cap_is_cut_off_without_a_content_length() {
-        let e = fetch("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", vec![b'x'; 50], 10)
-            .await
-            .unwrap_err();
+        let e = fetch(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            vec![b'x'; 50],
+            10,
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
     }
 
@@ -474,18 +502,26 @@ mod id_tests {
         let mut body = b"32\r\n".to_vec();
         body.extend(vec![b'x'; 50]);
         body.extend(b"\r\n0\r\n\r\n");
-        let e = fetch("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", body, 10)
-            .await
-            .unwrap_err();
+        let e = fetch(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            body,
+            10,
+        )
+        .await
+        .unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
     }
 
     #[tokio::test]
     async fn an_under_cap_body_comes_back_intact() {
         let body: Vec<u8> = (0..200u8).collect();
-        let got = fetch("HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n", body.clone(), 200)
-            .await
-            .unwrap();
+        let got = fetch(
+            "HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n",
+            body.clone(),
+            200,
+        )
+        .await
+        .unwrap();
         assert_eq!(got, body);
     }
 

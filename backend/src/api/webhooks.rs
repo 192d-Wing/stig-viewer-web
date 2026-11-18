@@ -62,10 +62,13 @@ fn sign_body(secret: &str, body: &[u8]) -> Option<String> {
     }
     // Hmac::new_from_slice is infallible for HMAC-SHA256 — any byte
     // length is valid as a key — so the unwrap can never fire.
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(body);
-    Some(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+    Some(format!(
+        "sha256={}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -702,17 +705,23 @@ pub fn compliance_report_event(
     } else {
         "danger"
     };
-    let top = s.top_asset_name.clone().unwrap_or_else(|| "(none)".to_string());
+    let top = s
+        .top_asset_name
+        .clone()
+        .unwrap_or_else(|| "(none)".to_string());
     let download = format!("/api/reports/{}/report.pdf", row.id);
-    let body = format!(
-        "Top-risk system: {} — download at {}",
-        top, download,
-    );
+    let body = format!("Top-risk system: {} — download at {}", top, download,);
     let fields = vec![
-        ("Compliance score".to_string(), format!("{:.1}%", s.compliance_score)),
+        (
+            "Compliance score".to_string(),
+            format!("{:.1}%", s.compliance_score),
+        ),
         ("Assets".to_string(), s.assets.to_string()),
         ("Open findings".to_string(), s.open_findings.to_string()),
-        ("Overdue findings".to_string(), s.overdue_findings.to_string()),
+        (
+            "Overdue findings".to_string(),
+            s.overdue_findings.to_string(),
+        ),
         ("Top-risk system".to_string(), top),
         ("Download".to_string(), download),
     ];
@@ -796,11 +805,13 @@ fn format_slack(event: &WebhookEvent) -> Value {
         event
             .items
             .iter()
-            .map(|i| json!({
-                "title": i.title,
-                "text": i.text,
-                "color": i.color,
-            }))
+            .map(|i| {
+                json!({
+                    "title": i.title,
+                    "text": i.text,
+                    "color": i.color,
+                })
+            })
             .collect()
     };
     json!({
@@ -871,11 +882,13 @@ fn format_generic(event: &WebhookEvent) -> Value {
     let items: Vec<Value> = event
         .items
         .iter()
-        .map(|i| json!({
-            "title": i.title,
-            "text": i.text,
-            "color": i.color,
-        }))
+        .map(|i| {
+            json!({
+                "title": i.title,
+                "text": i.text,
+                "color": i.color,
+            })
+        })
         .collect();
     json!({
         "kind": event.kind,
@@ -947,15 +960,22 @@ async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) 
         }
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build();
+    let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build();
     let client = match client {
         Ok(c) => c,
         Err(e) => {
             // Couldn't even build the client — still record so the UI shows
             // *something* rather than silently dropping the event.
-            record_delivery(pool, &webhook.id, kind, &body, None, None, Some(&e.to_string())).await;
+            record_delivery(
+                pool,
+                &webhook.id,
+                kind,
+                &body,
+                None,
+                None,
+                Some(&e.to_string()),
+            )
+            .await;
             return;
         }
     };
@@ -988,8 +1008,16 @@ async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) 
             .await;
         }
         Err(e) => {
-            record_delivery(pool, &webhook.id, kind, &body, None, None, Some(&e.to_string()))
-                .await;
+            record_delivery(
+                pool,
+                &webhook.id,
+                kind,
+                &body,
+                None,
+                None,
+                Some(&e.to_string()),
+            )
+            .await;
         }
     }
 }

@@ -338,7 +338,9 @@ fn inactive_dash() -> Html {
 
 /// Run a future as a JS promise, parking its output in a slot, so several
 /// requests can be awaited together with `Promise.all`.
-fn start<T: 'static>(fut: impl Future<Output = T> + 'static) -> (js_sys::Promise, Rc<RefCell<Option<T>>>) {
+fn start<T: 'static>(
+    fut: impl Future<Output = T> + 'static,
+) -> (js_sys::Promise, Rc<RefCell<Option<T>>>) {
     let slot = Rc::new(RefCell::new(None));
     let s = slot.clone();
     let promise = future_to_promise(async move {
@@ -372,8 +374,12 @@ impl Drilldown {
     fn describe(&self) -> String {
         match self {
             Drilldown::Rule(id) => format!("Open instances of {id} across systems."),
-            Drilldown::Stale(days) => format!("Open findings with no activity in the last {days} days."),
-            Drilldown::Kind(k) if k == "overdue" => "Open findings whose due date has already passed.".into(),
+            Drilldown::Stale(days) => {
+                format!("Open findings with no activity in the last {days} days.")
+            }
+            Drilldown::Kind(k) if k == "overdue" => {
+                "Open findings whose due date has already passed.".into()
+            }
             Drilldown::Kind(_) => "All currently-open findings across systems.".into(),
         }
     }
@@ -423,7 +429,10 @@ fn bulk_result_summary(r: &BulkFindingsResult) -> String {
         s.push_str(&format!(", {} sent for approval", r.pending_approval));
     }
     if r.already_pending > 0 {
-        s.push_str(&format!(", {} already awaiting approval", r.already_pending));
+        s.push_str(&format!(
+            ", {} already awaiting approval",
+            r.already_pending
+        ));
     }
     if r.error_count > 0 {
         let mut reasons: Vec<&str> = Vec::new();
@@ -480,7 +489,11 @@ impl Refresher {
         let data = data.borrow_mut().take();
         let trend = trend.borrow_mut().take();
         // Activity is best-effort: a failure just leaves the section empty.
-        let activity = activity.borrow_mut().take().and_then(Result::ok).unwrap_or_default();
+        let activity = activity
+            .borrow_mut()
+            .take()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         match (data, trend) {
             (Some(Ok(d)), Some(Ok(t))) => {
                 self.data.set(Some(d));
@@ -567,7 +580,11 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                 Some(Drilldown::Stale(days)) => ("stale".to_string(), String::new(), days as f64),
                 Some(Drilldown::Kind(kind)) => (kind, String::new(), 0.0),
             };
-            set.emit(vec![("dd", dd.into()), ("rule", rule.into()), ("stale", stale.into())]);
+            set.emit(vec![
+                ("dd", dd.into()),
+                ("rule", rule.into()),
+                ("stale", stale.into()),
+            ]);
         })
     };
 
@@ -623,7 +640,10 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
     let saving_baseline = use_state(|| false);
     let save_baseline_error = use_state(|| None::<String>);
 
-    let tick = Tick { state: refresh_tick.clone(), latest: refresh_tick_latest };
+    let tick = Tick {
+        state: refresh_tick.clone(),
+        latest: refresh_tick_latest,
+    };
     let refresher = Refresher {
         loading: loading.clone(),
         error: error.clone(),
@@ -659,24 +679,28 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
     {
         let baseline_diff = baseline_diff.clone();
         let diff_loading = diff_loading.clone();
-        use_effect_with(((*selected_baseline_id).clone(), *refresh_tick), move |(id, _)| {
-            let cancelled = Rc::new(Cell::new(false));
-            match id.clone() {
-                None => baseline_diff.set(None),
-                Some(id) => {
-                    let cancelled = cancelled.clone();
-                    diff_loading.set(true);
-                    spawn_local(async move {
-                        let res = api_get::<BaselineDiff>(&format!("/api/baselines/{id}/diff")).await;
-                        if !cancelled.get() {
-                            baseline_diff.set(res.ok());
-                            diff_loading.set(false);
-                        }
-                    });
+        use_effect_with(
+            ((*selected_baseline_id).clone(), *refresh_tick),
+            move |(id, _)| {
+                let cancelled = Rc::new(Cell::new(false));
+                match id.clone() {
+                    None => baseline_diff.set(None),
+                    Some(id) => {
+                        let cancelled = cancelled.clone();
+                        diff_loading.set(true);
+                        spawn_local(async move {
+                            let res =
+                                api_get::<BaselineDiff>(&format!("/api/baselines/{id}/diff")).await;
+                            if !cancelled.get() {
+                                baseline_diff.set(res.ok());
+                                diff_loading.set(false);
+                            }
+                        });
+                    }
                 }
-            }
-            move || cancelled.set(true)
-        });
+                move || cancelled.set(true)
+            },
+        );
     }
 
     // Load the user list for the Reassign modal's Select. One-shot — the user
@@ -731,7 +755,9 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                             qs.push(("assignee", "me".into()));
                         }
                         match d {
-                            Drilldown::Kind(k) if k == "overdue" => qs.push(("pastDue", "true".into())),
+                            Drilldown::Kind(k) if k == "overdue" => {
+                                qs.push(("pastDue", "true".into()))
+                            }
                             Drilldown::Stale(days) => qs.push(("olderThanDays", days.to_string())),
                             _ => {}
                         }
@@ -801,10 +827,22 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             }
             saving.set(true);
             err.set(None);
-            let (name, new_baseline_name, saving, err, modal, ctl) =
-                (name.clone(), new_baseline_name.clone(), saving.clone(), err.clone(), modal.clone(), ctl.clone());
+            let (name, new_baseline_name, saving, err, modal, ctl) = (
+                name.clone(),
+                new_baseline_name.clone(),
+                saving.clone(),
+                err.clone(),
+                modal.clone(),
+                ctl.clone(),
+            );
             spawn_local(async move {
-                match api_json::<Baseline, _>("/api/baselines", "POST", Some(&json!({ "name": name }))).await {
+                match api_json::<Baseline, _>(
+                    "/api/baselines",
+                    "POST",
+                    Some(&json!({ "name": name })),
+                )
+                .await
+                {
                     Ok(created) => {
                         modal.set(false);
                         new_baseline_name.set(String::new());
@@ -827,10 +865,20 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
         Callback::from(move |_: MouseEvent| {
             running.set(true);
             err.set(None);
-            let (running, err, results, modal, refresher) =
-                (running.clone(), err.clone(), results.clone(), modal.clone(), refresher.clone());
+            let (running, err, results, modal, refresher) = (
+                running.clone(),
+                err.clone(),
+                results.clone(),
+                modal.clone(),
+                refresher.clone(),
+            );
             spawn_local(async move {
-                match api_json::<BulkReapplyResponse, _>("/api/checklists/bulk-reapply", "POST", Some(&json!({}))).await
+                match api_json::<BulkReapplyResponse, _>(
+                    "/api/checklists/bulk-reapply",
+                    "POST",
+                    Some(&json!({})),
+                )
+                .await
                 {
                     Ok(res) => {
                         results.set(Some(res.results));
@@ -894,7 +942,10 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                 patch.insert("status".into(), draft.status.clone().into());
             }
             if !draft.finding_details.is_empty() {
-                patch.insert("findingDetails".into(), draft.finding_details.clone().into());
+                patch.insert(
+                    "findingDetails".into(),
+                    draft.finding_details.clone().into(),
+                );
             }
             if !draft.comments.is_empty() {
                 patch.insert("comments".into(), draft.comments.clone().into());
@@ -906,10 +957,18 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             saving.set(true);
             err.set(None);
             let body = json!({ "targets": targets, "patch": patch });
-            let (saving, err, open, flash, selected, refresher) =
-                (saving.clone(), err.clone(), open.clone(), flash.clone(), selected.clone(), refresher.clone());
+            let (saving, err, open, flash, selected, refresher) = (
+                saving.clone(),
+                err.clone(),
+                open.clone(),
+                flash.clone(),
+                selected.clone(),
+                refresher.clone(),
+            );
             spawn_local(async move {
-                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
+                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body))
+                    .await
+                {
                     Ok(result) => {
                         flash.set(Some((bulk_result_summary(&result), result.error_count > 0)));
                         open.set(false);
@@ -962,18 +1021,31 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             // assignee_id treats as "unassign"; a user id reassigns.
             let body = json!({ "targets": targets, "patch": { "assigneeId": assignee } });
             let assignee_name = assignee_name.clone();
-            let (saving, err, open, flash, selected, refresher) =
-                (saving.clone(), err.clone(), open.clone(), flash.clone(), selected.clone(), refresher.clone());
+            let (saving, err, open, flash, selected, refresher) = (
+                saving.clone(),
+                err.clone(),
+                open.clone(),
+                flash.clone(),
+                selected.clone(),
+                refresher.clone(),
+            );
             spawn_local(async move {
-                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body)).await {
+                match api_json::<BulkFindingsResult, _>("/api/findings/bulk", "PATCH", Some(&body))
+                    .await
+                {
                     Ok(result) => {
                         let count = result.updated;
                         let mut message = match &assignee_name {
-                            Some(name) => format!("Reassigned {count} finding{} to {name}.", plural(count)),
+                            Some(name) => {
+                                format!("Reassigned {count} finding{} to {name}.", plural(count))
+                            }
                             None => format!("Unassigned {count} finding{}.", plural(count)),
                         };
                         if result.pending_approval > 0 {
-                            message.push_str(&format!(" {} sent for approval.", result.pending_approval));
+                            message.push_str(&format!(
+                                " {} sent for approval.",
+                                result.pending_approval
+                            ));
                         }
                         if result.error_count > 0 {
                             message.push_str(&format!(" {} not changed.", result.error_count));
@@ -1044,8 +1116,16 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
     // level — sum to "Reviewed (compliant or N/A)" for the headline pie.
     let pie_data: Vec<PieDatum> = [
         ("Open", totals.open_findings, "red"),
-        ("Reviewed", (totals.reviewed_rules - totals.open_findings).max(0), "green"),
-        ("Not reviewed", (totals.total_rules - totals.reviewed_rules).max(0), "grey"),
+        (
+            "Reviewed",
+            (totals.reviewed_rules - totals.open_findings).max(0),
+            "green",
+        ),
+        (
+            "Not reviewed",
+            (totals.total_rules - totals.reviewed_rules).max(0),
+            "grey",
+        ),
     ]
     .into_iter()
     .filter(|(_, value, _)| *value > 0)
@@ -1058,7 +1138,11 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
     );
     let outdated = totals.outdated_checklists;
     let selected_count = selected_findings.len();
-    let count_suffix = if selected_count > 0 { format!(" ({selected_count})") } else { String::new() };
+    let count_suffix = if selected_count > 0 {
+        format!(" ({selected_count})")
+    } else {
+        String::new()
+    };
 
     let kpi_drill = |d: Drilldown| {
         let set = set_drilldown.clone();
@@ -1176,9 +1260,13 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             let n = t.overall.len();
             let description = format!("{n} snapshot{} in the last 30 days", plural(n));
             let series = |y: fn(&TrendPoint) -> f64| -> Vec<(f64, f64)> {
-                t.overall.iter().map(|p| (parse_date_ms(&p.captured_at), y(p))).collect()
+                t.overall
+                    .iter()
+                    .map(|p| (parse_date_ms(&p.captured_at), y(p)))
+                    .collect()
             };
-            let no_snapshots = html! { <UiBox text_align="center" color="inherit">{"No snapshots yet"}</UiBox> };
+            let no_snapshots =
+                html! { <UiBox text_align="center" color="inherit">{"No snapshots yet"}</UiBox> };
             html! {
                 <>
                     // Trend over time
@@ -1236,7 +1324,11 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             }
         }
         let columns = vec![
-            Column::new("asset", "System", |r: &ChecklistRow| html! { {r.asset_name.clone()} }),
+            Column::new(
+                "asset",
+                "System",
+                |r: &ChecklistRow| html! { {r.asset_name.clone()} },
+            ),
             Column::new("stig", "STIG", |r: &ChecklistRow| match &r.checklist {
                 None => html! { {"—"} },
                 Some(c) if !c.outdated => html! { {c.stig_title.clone()} },
@@ -1247,29 +1339,43 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     </SpaceBetween>
                 },
             }),
-            Column::new("progress", "Review progress", |r: &ChecklistRow| match &r.checklist {
-                None => html! { <UiBox color="text-status-inactive">{"No STIGs applied"}</UiBox> },
-                Some(c) => html! {
-                    <ProgressBar
-                        value={pct(c.reviewed_count as f64, c.rule_count as f64)}
-                        additional_info={text(format!("{} of {}", c.reviewed_count, c.rule_count))}
-                    />
-                },
+            Column::new("progress", "Review progress", |r: &ChecklistRow| {
+                match &r.checklist {
+                    None => {
+                        html! { <UiBox color="text-status-inactive">{"No STIGs applied"}</UiBox> }
+                    }
+                    Some(c) => html! {
+                        <ProgressBar
+                            value={pct(c.reviewed_count as f64, c.rule_count as f64)}
+                            additional_info={text(format!("{} of {}", c.reviewed_count, c.rule_count))}
+                        />
+                    },
+                }
             }),
             Column::new("open", "Open", count_badge(|c| c.open_count, "red")),
-            Column::new("overdue", "Overdue", count_badge(|c| c.overdue_count, "red")),
-            Column::new("risk", "Risk", |r: &ChecklistRow| html! {
-                <Badge color={if r.risk_score > 0 { "red" } else { "grey" }}>{r.risk_score}</Badge>
+            Column::new(
+                "overdue",
+                "Overdue",
+                count_badge(|c| c.overdue_count, "red"),
+            ),
+            Column::new("risk", "Risk", |r: &ChecklistRow| {
+                html! {
+                    <Badge color={if r.risk_score > 0 { "red" } else { "grey" }}>{r.risk_score}</Badge>
+                }
             }),
-            Column::new("compliance", "Compliance score", |r: &ChecklistRow| match &r.checklist {
-                None => inactive_dash(),
-                Some(c) => html! {
-                    <ProgressBar
-                        value={c.compliance_score}
-                        additional_info={text(format!("{:.1}%", c.compliance_score))}
-                    />
+            Column::new(
+                "compliance",
+                "Compliance score",
+                |r: &ChecklistRow| match &r.checklist {
+                    None => inactive_dash(),
+                    Some(c) => html! {
+                        <ProgressBar
+                            value={c.compliance_score}
+                            additional_info={text(format!("{:.1}%", c.compliance_score))}
+                        />
+                    },
                 },
-            }),
+            ),
             Column::new("weightedRisk", "Weighted risk", |r: &ChecklistRow| {
                 let w = r.weighted_risk_score;
                 html! { <Badge color={weight_color(w)}>{format!("{w:.1}")}</Badge> }
@@ -1312,8 +1418,10 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     </Button>
                 }
             }),
-            Column::new("affected", "Affected systems", |r: &TopRule| html! {
-                <Badge color={if r.affected_systems > 1 { "red" } else { "grey" }}>{r.affected_systems}</Badge>
+            Column::new("affected", "Affected systems", |r: &TopRule| {
+                html! {
+                    <Badge color={if r.affected_systems > 1 { "red" } else { "grey" }}>{r.affected_systems}</Badge>
+                }
             }),
         ];
         html! {
@@ -1355,9 +1463,13 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                         </Button>
                     }
                 }),
-                Column::new("severity", "Severity", |f: &Finding| match f.severity.as_deref() {
-                    Some(sev) if !sev.is_empty() => html! { <Badge color={severity_badge(sev)}>{sev.to_string()}</Badge> },
-                    _ => inactive_dash(),
+                Column::new("severity", "Severity", |f: &Finding| {
+                    match f.severity.as_deref() {
+                        Some(sev) if !sev.is_empty() => {
+                            html! { <Badge color={severity_badge(sev)}>{sev.to_string()}</Badge> }
+                        }
+                        _ => inactive_dash(),
+                    }
                 }),
                 // Sortable so an auditor can pick the highest-impact
                 // findings out of a large drill-down list.
@@ -1366,12 +1478,26 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     html! { <Badge color={weight_color(w)}>{format!("{w:.1}")}</Badge> }
                 })
                 .sortable(),
-                Column::new("asset", "System", |f: &Finding| html! { {f.asset_name.clone()} }),
-                Column::new("stig", "STIG", |f: &Finding| html! { {f.stig_title.clone()} }),
-                Column::new("owner", "Owner", |f: &Finding| html! { {f.owner_name.clone()} }),
-                Column::new("assignee", "Assignee", |f: &Finding| match f.assignee_name.as_deref() {
-                    Some(name) if !name.is_empty() => html! { {name.to_string()} },
-                    _ => html! { <UiBox color="text-status-inactive">{"Unassigned"}</UiBox> },
+                Column::new(
+                    "asset",
+                    "System",
+                    |f: &Finding| html! { {f.asset_name.clone()} },
+                ),
+                Column::new(
+                    "stig",
+                    "STIG",
+                    |f: &Finding| html! { {f.stig_title.clone()} },
+                ),
+                Column::new(
+                    "owner",
+                    "Owner",
+                    |f: &Finding| html! { {f.owner_name.clone()} },
+                ),
+                Column::new("assignee", "Assignee", |f: &Finding| {
+                    match f.assignee_name.as_deref() {
+                        Some(name) if !name.is_empty() => html! { {name.to_string()} },
+                        _ => html! { <UiBox color="text-status-inactive">{"Unassigned"}</UiBox> },
+                    }
                 }),
                 Column::new("due", "Due", |f: &Finding| match f.due_date.as_deref() {
                     Some(due) if !due.is_empty() => {
@@ -1382,14 +1508,25 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     }
                     _ => inactive_dash(),
                 }),
-                Column::new("updated", "Last update", |f: &Finding| html! { {to_locale_string(&f.updated_at)} }),
+                Column::new(
+                    "updated",
+                    "Last update",
+                    |f: &Finding| html! { {to_locale_string(&f.updated_at)} },
+                ),
             ];
             let items = {
                 let mut items = (*findings).clone();
                 if let Some(desc) = *weight_sort {
                     items.sort_by(|a, b| {
-                        let ord = a.weighted_score.partial_cmp(&b.weighted_score).unwrap_or(Ordering::Equal);
-                        if desc { ord.reverse() } else { ord }
+                        let ord = a
+                            .weighted_score
+                            .partial_cmp(&b.weighted_score)
+                            .unwrap_or(Ordering::Equal);
+                        if desc {
+                            ord.reverse()
+                        } else {
+                            ord
+                        }
                     });
                 }
                 items
@@ -1404,7 +1541,9 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             };
             let on_severity = {
                 let set = set_url_filters.clone();
-                Callback::from(move |opt: SelectOption| set.emit(vec![("sev", opt.value.to_string().into())]))
+                Callback::from(move |opt: SelectOption| {
+                    set.emit(vec![("sev", opt.value.to_string().into())])
+                })
             };
             let on_mine = {
                 let set = set_url_filters.clone();
@@ -1476,10 +1615,16 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                 Callback::from(move |_: MouseEvent| expanded.set(None))
             };
             let section = |title: &'static str, body: Option<&str>| match body {
-                Some(body) if !body.is_empty() => html! { <RuleSection {title} body={body.to_string()} /> },
+                Some(body) if !body.is_empty() => {
+                    html! { <RuleSection {title} body={body.to_string()} /> }
+                }
                 _ => Html::default(),
             };
-            let description = f.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| f.stig_title.clone());
+            let description = f
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| f.stig_title.clone());
             html! {
                 <Container header={html! {
                     <Header
@@ -1535,8 +1680,16 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
         Html::default()
     } else {
         let selected = (*selected_baseline_id).clone();
-        let selected_row = selected.as_ref().and_then(|id| baselines.iter().find(|b| &b.id == id));
-        let label = |b: &Baseline| if b.is_stale { format!("{} (stale)", b.name) } else { b.name.clone() };
+        let selected_row = selected
+            .as_ref()
+            .and_then(|id| baselines.iter().find(|b| &b.id == id));
+        let label = |b: &Baseline| {
+            if b.is_stale {
+                format!("{} (stale)", b.name)
+            } else {
+                b.name.clone()
+            }
+        };
         let options: Vec<SelectOption> = baselines
             .iter()
             .map(|b| {
@@ -1564,7 +1717,8 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             None => "Pick a baseline to see what changed since.".to_string(),
         };
         let stale_alert = selected_row.filter(|b| b.is_stale).map(|b| {
-            let age_days = ((now_ms() - parse_date_ms(&b.created_at)) / (1000.0 * 60.0 * 60.0 * 24.0)).floor();
+            let age_days =
+                ((now_ms() - parse_date_ms(&b.created_at)) / (1000.0 * 60.0 * 60.0 * 24.0)).floor();
             html! {
                 <Alert kind="warning" header={text("Stale baseline")}>
                     {format!("This baseline is {age_days} days old. Consider saving a fresh one.")}
@@ -1746,7 +1900,11 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             })
         };
         let options: Vec<SelectOption> = std::iter::once(SelectOption::new("", "Unassign"))
-            .chain(users.iter().map(|u| SelectOption::new(u.id.clone(), u.display_name.clone())))
+            .chain(
+                users
+                    .iter()
+                    .map(|u| SelectOption::new(u.id.clone(), u.display_name.clone())),
+            )
             .collect();
         let selected = (*reassign_assignee_id).clone().unwrap_or_default();
         html! {
@@ -1860,10 +2018,24 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
             let results = bulk_reapply_results.clone();
             Callback::from(move |_: MouseEvent| results.set(None))
         };
-        let version_or_dash = |v: &str| if v.is_empty() { "—".to_string() } else { v.to_string() };
+        let version_or_dash = |v: &str| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.to_string()
+            }
+        };
         let columns = vec![
-            Column::new("asset", "System", |r: &BulkReapplyResult| html! { {r.asset_name.clone()} }),
-            Column::new("stig", "STIG", |r: &BulkReapplyResult| html! { {r.stig_title.clone()} }),
+            Column::new(
+                "asset",
+                "System",
+                |r: &BulkReapplyResult| html! { {r.asset_name.clone()} },
+            ),
+            Column::new(
+                "stig",
+                "STIG",
+                |r: &BulkReapplyResult| html! { {r.stig_title.clone()} },
+            ),
             Column::new("version", "Version", move |r: &BulkReapplyResult| {
                 if r.to_version.is_empty() {
                     html! { <UiBox color="text-status-inactive">{version_or_dash(&r.from_version)}</UiBox> }
@@ -1877,8 +2049,10 @@ pub fn Dashboard(_props: &DashboardProps) -> Html {
                     }
                 }
             }),
-            Column::new("pruned", "Pruned rules", |r: &BulkReapplyResult| html! {
-                <Badge color={if r.pruned_rules > 0 { "blue" } else { "grey" }}>{r.pruned_rules}</Badge>
+            Column::new("pruned", "Pruned rules", |r: &BulkReapplyResult| {
+                html! {
+                    <Badge color={if r.pruned_rules > 0 { "blue" } else { "grey" }}>{r.pruned_rules}</Badge>
+                }
             }),
             Column::new("status", "Status", |r: &BulkReapplyResult| {
                 let color = match r.status.as_str() {
@@ -2071,7 +2245,9 @@ struct KpiCardProps {
 fn KpiCard(p: &KpiCardProps) -> Html {
     let value = match p.tone {
         Some("ok") => html! { <StatusIndicator kind="success">{p.value.clone()}</StatusIndicator> },
-        Some("warning") => html! { <StatusIndicator kind="warning">{p.value.clone()}</StatusIndicator> },
+        Some("warning") => {
+            html! { <StatusIndicator kind="warning">{p.value.clone()}</StatusIndicator> }
+        }
         _ => html! { <UiBox variant="h1">{p.value.clone()}</UiBox> },
     };
     html! {
@@ -2092,7 +2268,9 @@ fn KpiCard(p: &KpiCardProps) -> Html {
 
 /// The date picker works in YYYY-MM-DD strings; default to 7 days ago.
 fn default_diff_since() -> String {
-    let d = js_sys::Date::new(&JsValue::from_f64(now_ms() - 7.0 * 24.0 * 60.0 * 60.0 * 1000.0));
+    let d = js_sys::Date::new(&JsValue::from_f64(
+        now_ms() - 7.0 * 24.0 * 60.0 * 60.0 * 1000.0,
+    ));
     String::from(d.to_iso_string()).chars().take(10).collect()
 }
 
@@ -2187,19 +2365,43 @@ fn DiffSection() -> Html {
         .collect();
 
     let on_change = Callback::from(move |value: String| {
-        let value = if value.is_empty() { default_diff_since() } else { value };
+        let value = if value.is_empty() {
+            default_diff_since()
+        } else {
+            value
+        };
         set_since.emit(vec![("diffSince", value.into())]);
     });
 
     let columns = vec![
-        Column::new("asset", "System", |r: &DiffRow| html! { {r.asset_name.clone()} }),
-        Column::new("stig", "STIG", |r: &DiffRow| html! { {r.stig_title.clone()} }),
+        Column::new(
+            "asset",
+            "System",
+            |r: &DiffRow| html! { {r.asset_name.clone()} },
+        ),
+        Column::new(
+            "stig",
+            "STIG",
+            |r: &DiffRow| html! { {r.stig_title.clone()} },
+        ),
         Column::new("rule", "Rule", |r: &DiffRow| html! { {r.rule_id.clone()} }),
-        Column::new("field", "Field", |r: &DiffRow| html! { {diff_field_label(&r.change.field).to_string()} }),
-        Column::new("from", "From", |r: &DiffRow| diff_value_cell(&r.change.field, &r.change.from)),
-        Column::new("to", "To", |r: &DiffRow| diff_value_cell(&r.change.field, &r.change.to)),
+        Column::new(
+            "field",
+            "Field",
+            |r: &DiffRow| html! { {diff_field_label(&r.change.field).to_string()} },
+        ),
+        Column::new("from", "From", |r: &DiffRow| {
+            diff_value_cell(&r.change.field, &r.change.from)
+        }),
+        Column::new("to", "To", |r: &DiffRow| {
+            diff_value_cell(&r.change.field, &r.change.to)
+        }),
         Column::new("by", "By", |r: &DiffRow| html! { {r.change.by.clone()} }),
-        Column::new("at", "When", |r: &DiffRow| html! { {to_locale_string(&r.change.at)} }),
+        Column::new(
+            "at",
+            "When",
+            |r: &DiffRow| html! { {to_locale_string(&r.change.at)} },
+        ),
     ];
 
     html! {
@@ -2312,7 +2514,11 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
         let mut buckets: Vec<(String, Vec<&AssetSummary>)> = Vec::new();
         for a in &p.by_asset {
             let untagged = ["(untagged)".to_string()];
-            let tags: &[String] = if a.tags.is_empty() { &untagged } else { &a.tags };
+            let tags: &[String] = if a.tags.is_empty() {
+                &untagged
+            } else {
+                &a.tags
+            };
             for t in tags {
                 match buckets.iter_mut().find(|(name, _)| name == t) {
                     Some((_, assets)) => assets.push(a),
@@ -2323,10 +2529,14 @@ fn HeatmapSection(p: &HeatmapSectionProps) -> Html {
         buckets.sort_by(|a, b| locale_compare(&a.0, &b.0));
         buckets
     } else {
-        p.by_asset.iter().map(|a| (a.name.clone(), vec![a])).collect()
+        p.by_asset
+            .iter()
+            .map(|a| (a.name.clone(), vec![a]))
+            .collect()
     };
 
-    let on_toggle = Callback::from(move |checked: bool| set_hm_state.emit(vec![("grpTag", checked.into())]));
+    let on_toggle =
+        Callback::from(move |checked: bool| set_hm_state.emit(vec![("grpTag", checked.into())]));
     let sticky = "position:sticky;left:0;background:var(--bg-raised);";
 
     html! {
@@ -2411,10 +2621,21 @@ mod bulk_result_summary_tests {
 
     #[test]
     fn plain_and_approval_wording() {
-        let r = BulkFindingsResult { updated: 3, ..Default::default() };
+        let r = BulkFindingsResult {
+            updated: 3,
+            ..Default::default()
+        };
         assert_eq!(bulk_result_summary(&r), "3 updated");
-        let r = BulkFindingsResult { updated: 3, pending_approval: 2, already_pending: 1, ..Default::default() };
-        assert_eq!(bulk_result_summary(&r), "3 updated, 2 sent for approval, 1 already awaiting approval");
+        let r = BulkFindingsResult {
+            updated: 3,
+            pending_approval: 2,
+            already_pending: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            bulk_result_summary(&r),
+            "3 updated, 2 sent for approval, 1 already awaiting approval"
+        );
     }
 
     #[test]
@@ -2425,7 +2646,10 @@ mod bulk_result_summary_tests {
             errors: vec![err("a"), err("a"), err("b"), err("c"), err("d")],
             ..Default::default()
         };
-        assert_eq!(bulk_result_summary(&r), "0 updated, 5 not changed (a; b; c)");
+        assert_eq!(
+            bulk_result_summary(&r),
+            "0 updated, 5 not changed (a; b; c)"
+        );
     }
 }
 

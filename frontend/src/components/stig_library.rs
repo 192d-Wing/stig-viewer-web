@@ -16,7 +16,9 @@ use crate::hooks::{use_url_state, UrlVal};
 use crate::model::Stig;
 use crate::ui::*;
 use crate::util::{encode_uri_component, spawn_local, to_locale_string};
-use crate::utils::offline_cache::{cache_catalog, cache_stig, read_cached_catalog, read_cached_stig};
+use crate::utils::offline_cache::{
+    cache_catalog, cache_stig, read_cached_catalog, read_cached_stig,
+};
 
 const CATEGORIES: [&str; 4] = ["Windows", "Linux", "Browser", "Network"];
 
@@ -260,7 +262,10 @@ fn num_cmp(a: f64, b: f64) -> Ordering {
 }
 
 fn release_cmp(a: &CatalogEntry, b: &CatalogEntry) -> Ordering {
-    num_cmp(parse_release(&a.release_info), parse_release(&b.release_info))
+    num_cmp(
+        parse_release(&a.release_info),
+        parse_release(&b.release_info),
+    )
 }
 
 /// Version, then release. A non-numeric version compares equal to everything
@@ -290,7 +295,10 @@ fn locale_cmp(a: &str, b: &str) -> Ordering {
 fn find_superseded(catalog: &[CatalogEntry]) -> HashSet<String> {
     let mut by_title: HashMap<&str, Vec<&CatalogEntry>> = HashMap::new();
     for entry in catalog {
-        by_title.entry(entry.title.as_str()).or_default().push(entry);
+        by_title
+            .entry(entry.title.as_str())
+            .or_default()
+            .push(entry);
     }
     let mut superseded = HashSet::new();
     for mut entries in by_title.into_values() {
@@ -345,7 +353,11 @@ async fn post_form<T: DeserializeOwned>(path: &str, form: web_sys::FormData) -> 
     let text = res.text().await.unwrap_or_default();
     let message = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|json| json.get("message").and_then(|m| m.as_str()).map(str::to_string));
+        .and_then(|json| {
+            json.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        });
     Err(match (message, status) {
         (Some(m), _) => m,
         (None, 401) => "Sign in to upload STIGs.".to_string(),
@@ -455,7 +467,12 @@ fn TablePreferences(p: &TablePreferencesProps) -> Html {
     let striped = use_state(|| true);
 
     let show = {
-        let (open, page_size, visible, striped) = (open.clone(), page_size.clone(), visible.clone(), striped.clone());
+        let (open, page_size, visible, striped) = (
+            open.clone(),
+            page_size.clone(),
+            visible.clone(),
+            striped.clone(),
+        );
         let (current_size, current_visible) = (p.page_size, p.visible_content.clone());
         Callback::from(move |_: MouseEvent| {
             // Start every session from the applied preferences.
@@ -586,7 +603,15 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
         ("dir", UrlVal::from("asc")),
         ("page", UrlVal::from(1.0)),
         ("size", UrlVal::from(DEFAULT_PAGE_SIZE as f64)),
-        ("cols", UrlVal::from(PREF_COLUMNS.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>())),
+        (
+            "cols",
+            UrlVal::from(
+                PREF_COLUMNS
+                    .iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
     ]);
     let category_filter = url_state.str("cat");
     let search_text = url_state.str("q");
@@ -633,7 +658,11 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
     let cross_error = use_state_eq(|| None::<String>);
 
     {
-        let (results, status, error) = (cross_results.clone(), cross_status.clone(), cross_error.clone());
+        let (results, status, error) = (
+            cross_results.clone(),
+            cross_status.clone(),
+            cross_error.clone(),
+        );
         use_effect_with((*cross_search).clone(), move |term| {
             let term = term.trim().to_string();
             let cancelled = Rc::new(Cell::new(false));
@@ -647,7 +676,10 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                 let cancelled = cancelled.clone();
                 debounce = Some(Timeout::new(250, move || {
                     spawn_local(async move {
-                        let path = format!("/api/catalog/search?q={}&limit=50", encode_uri_component(&term));
+                        let path = format!(
+                            "/api/catalog/search?q={}&limit=50",
+                            encode_uri_component(&term)
+                        );
                         let response = api_get::<SearchResponse>(&path).await;
                         if cancelled.get() {
                             return;
@@ -675,8 +707,12 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
     }
 
     let open_diff = {
-        let (stig_id, status, data, error) =
-            (diff_stig_id.clone(), diff_status.clone(), diff_data.clone(), diff_error.clone());
+        let (stig_id, status, data, error) = (
+            diff_stig_id.clone(),
+            diff_status.clone(),
+            diff_data.clone(),
+            diff_error.clone(),
+        );
         Callback::from(move |id: String| {
             let (status, data, error) = (status.clone(), data.clone(), error.clone());
             stig_id.set(Some(id.clone()));
@@ -695,7 +731,10 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                     if !res.ok() {
                         return Err(format!("Backend returned {}", res.status()));
                     }
-                    res.json::<DiffResponse>().await.map(Some).map_err(|e| e.to_string())
+                    res.json::<DiffResponse>()
+                        .await
+                        .map(Some)
+                        .map_err(|e| e.to_string())
                 }
                 .await;
                 match outcome {
@@ -714,8 +753,12 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
     };
 
     let close_diff = {
-        let (stig_id, status, data, error) =
-            (diff_stig_id.clone(), diff_status.clone(), diff_data.clone(), diff_error.clone());
+        let (stig_id, status, data, error) = (
+            diff_stig_id.clone(),
+            diff_status.clone(),
+            diff_data.clone(),
+            diff_error.clone(),
+        );
         Callback::from(move |_: ()| {
             stig_id.set(None);
             status.set(DiffPhase::Idle);
@@ -727,11 +770,20 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
     // Cleared on unmount so a late catalog response doesn't touch state.
     let alive = use_memo((), |_| Cell::new(true));
     let fetch_catalog = {
-        let (catalog, loading, error, warning) =
-            (catalog.clone(), catalog_loading.clone(), catalog_error.clone(), catalog_warning.clone());
+        let (catalog, loading, error, warning) = (
+            catalog.clone(),
+            catalog_loading.clone(),
+            catalog_error.clone(),
+            catalog_warning.clone(),
+        );
         let alive = alive.clone();
         Callback::from(move |_: ()| {
-            let (catalog, loading, error, warning) = (catalog.clone(), loading.clone(), error.clone(), warning.clone());
+            let (catalog, loading, error, warning) = (
+                catalog.clone(),
+                loading.clone(),
+                error.clone(),
+                warning.clone(),
+            );
             let alive = alive.clone();
             loading.set(true);
             error.set(None);
@@ -828,7 +880,11 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
 
     let handle_load = {
         let on_load = props.on_load.clone();
-        let (loading_id, error, warning) = (loading_id.clone(), catalog_error.clone(), catalog_warning.clone());
+        let (loading_id, error, warning) = (
+            loading_id.clone(),
+            catalog_error.clone(),
+            catalog_warning.clone(),
+        );
         Callback::from(move |id: String| {
             let on_load = on_load.clone();
             let (loading_id, error, warning) = (loading_id.clone(), error.clone(), warning.clone());
@@ -844,10 +900,15 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                     Err(err) => {
                         match read_cached_stig::<Stig>(&id).await {
                             Some(cached) => {
-                                let title = if cached.stig.title.is_empty() { id.clone() } else { cached.stig.title.clone() };
+                                let title = if cached.stig.title.is_empty() {
+                                    id.clone()
+                                } else {
+                                    cached.stig.title.clone()
+                                };
                                 let when = to_locale_string(&cached.cached_at);
                                 on_load.emit((id.clone(), cached.stig));
-                                warning.set(Some(format!("Loaded \"{title}\" from cache ({when}).")));
+                                warning
+                                    .set(Some(format!("Loaded \"{title}\" from cache ({when}).")));
                             }
                             None => error.set(Some(format!("Failed to load STIG: {err}"))),
                         }
@@ -893,7 +954,10 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
             spawn_local(async move {
                 let result = lint_file(&file).await.unwrap_or_else(|message| LintReport {
                     rules_count: 0,
-                    errors: vec![LintIssue { path: String::new(), message }],
+                    errors: vec![LintIssue {
+                        path: String::new(),
+                        message,
+                    }],
                     warnings: vec![],
                 });
                 report.set(Some(result));
@@ -905,8 +969,11 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
     let handle_add_submit = {
         let (files, id, category) = (add_files.clone(), add_id.clone(), add_category.clone());
         let (status, result) = (add_status.clone(), add_result.clone());
-        let (lint_report, lint_status, lint_expanded) =
-            (lint_report.clone(), lint_status.clone(), lint_expanded.clone());
+        let (lint_report, lint_status, lint_expanded) = (
+            lint_report.clone(),
+            lint_status.clone(),
+            lint_expanded.clone(),
+        );
         let fetch_catalog = fetch_catalog.clone();
         Callback::from(move |_: ()| {
             let stig_id = id.trim().to_string();
@@ -918,16 +985,21 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
             }
             let (files, id, category) = (files.clone(), id.clone(), (*category).clone());
             let (status, result) = (status.clone(), result.clone());
-            let (lint_report, lint_status, lint_expanded) =
-                (lint_report.clone(), lint_status.clone(), lint_expanded.clone());
+            let (lint_report, lint_status, lint_expanded) = (
+                lint_report.clone(),
+                lint_status.clone(),
+                lint_expanded.clone(),
+            );
             let fetch_catalog = fetch_catalog.clone();
             status.set(Phase::Loading);
             result.set(None);
             spawn_local(async move {
                 let outcome = async {
                     let form = form_with_file(&file)?;
-                    form.append_with_str("id", &stig_id).map_err(|e| format!("{e:?}"))?;
-                    form.append_with_str("category", &category).map_err(|e| format!("{e:?}"))?;
+                    form.append_with_str("id", &stig_id)
+                        .map_err(|e| format!("{e:?}"))?;
+                    form.append_with_str("category", &category)
+                        .map_err(|e| format!("{e:?}"))?;
                     post_form::<UploadResult>("/api/upload", form).await
                 }
                 .await;
@@ -1096,10 +1168,14 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
                 ("page", UrlVal::from(1.0)),
             ]
         });
-        let on_show_superseded = set_url_state
-            .reform(|checked: bool| vec![("super", UrlVal::from(checked)), ("page", UrlVal::from(1.0))]);
-        let on_search =
-            set_url_state.reform(|text: String| vec![("q", UrlVal::from(text)), ("page", UrlVal::from(1.0))]);
+        let on_show_superseded = set_url_state.reform(|checked: bool| {
+            vec![
+                ("super", UrlVal::from(checked)),
+                ("page", UrlVal::from(1.0)),
+            ]
+        });
+        let on_search = set_url_state
+            .reform(|text: String| vec![("q", UrlVal::from(text)), ("page", UrlVal::from(1.0))]);
         let on_category = set_url_state.reform(|id: AttrValue| {
             let category = if id == "all" { "" } else { id.as_str() };
             vec![("cat", UrlVal::from(category)), ("page", UrlVal::from(1.0))]
@@ -1170,7 +1246,11 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
 
         let mut segments = vec![SegmentOption::new("all", "All")];
         segments.extend(CATEGORIES.iter().map(|c| SegmentOption::new(*c, *c)));
-        let selected_segment = if category_filter.is_empty() { "all".to_string() } else { category_filter.clone() };
+        let selected_segment = if category_filter.is_empty() {
+            "all".to_string()
+        } else {
+            category_filter.clone()
+        };
 
         let filter = html! {
             <SpaceBetween size="s">
@@ -1228,7 +1308,10 @@ pub fn StigLibrary(props: &StigLibraryProps) -> Html {
             </UiBox>
         };
 
-        let diff_title = format!("Diff vs previous — {}", (*diff_stig_id).clone().unwrap_or_default());
+        let diff_title = format!(
+            "Diff vs previous — {}",
+            (*diff_stig_id).clone().unwrap_or_default()
+        );
         return html! {
             <>
                 <Table<CatalogEntry>
@@ -1510,10 +1593,7 @@ mod snippet_tests {
 
     #[test]
     fn keeps_server_mark_tags() {
-        assert_eq!(
-            sanitize_snippet("a <mark>b</mark> c"),
-            "a <mark>b</mark> c"
-        );
+        assert_eq!(sanitize_snippet("a <mark>b</mark> c"), "a <mark>b</mark> c");
     }
 
     #[test]

@@ -64,16 +64,12 @@ const EVENT_TYPES: &[&str] = &[
 
 /// Load the caller's prefs, applying the "missing row = true" default
 /// for any event_type without a row.
-async fn load_prefs(
-    pool: &sqlx::PgPool,
-    user_id: &str,
-) -> Result<NotificationPrefs, StatusCode> {
-    let rows =
-        sqlx::query("SELECT event_type, enabled FROM notification_prefs WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await
-            .map_err(map_sqlx)?;
+async fn load_prefs(pool: &sqlx::PgPool, user_id: &str) -> Result<NotificationPrefs, StatusCode> {
+    let rows = sqlx::query("SELECT event_type, enabled FROM notification_prefs WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx)?;
 
     let mut prefs = NotificationPrefs::default();
     for row in rows {
