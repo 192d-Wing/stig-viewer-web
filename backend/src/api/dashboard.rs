@@ -44,8 +44,8 @@ pub struct Totals {
     pub overdue_findings: i64, // Open with due_date < CURRENT_DATE
     pub stale_findings: i64,   // Open with no activity in N days (default 30)
     pub stale_threshold_days: i64,
-    pub reviewed_rules: i64,   // count of rule rows that have been touched
-    pub total_rules: i64,      // sum of stig.rule_count across all checklists
+    pub reviewed_rules: i64, // count of rule rows that have been touched
+    pub total_rules: i64,    // sum of stig.rule_count across all checklists
     pub highest_risk_score: i64,
     pub highest_risk_asset_name: Option<String>,
     /// SCAP-style score for the single worst open finding across the
@@ -344,15 +344,14 @@ pub async fn get_handler(
     // ── Tags per asset ─────────────────────────────────────────────────────
     // Attach the asset_tags rows in one grouped query — small table, fine
     // to fetch all rows and bucket client-side.
-    let tag_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("dashboard tag query failed: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let tag_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT asset_id, tag FROM asset_tags ORDER BY asset_id, tag")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("dashboard tag query failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     let mut tags_by_asset: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (asset_id, tag) in tag_rows {
@@ -390,9 +389,12 @@ pub async fn get_handler(
     })?;
 
     let today: NaiveDate = Utc::now().date_naive();
-    let mut sev_by_stig: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+    let mut sev_by_stig: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
+    let mut risk_by_asset: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
-    let mut risk_by_asset: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut weighted_by_asset: std::collections::HashMap<String, f64> =
         std::collections::HashMap::new();
     for row in open_rules {
@@ -482,11 +484,7 @@ async fn count_one(pool: &sqlx::PgPool, sql: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await
 }
 
-async fn count_one_with(
-    pool: &sqlx::PgPool,
-    sql: &str,
-    arg: String,
-) -> Result<i64, sqlx::Error> {
+async fn count_one_with(pool: &sqlx::PgPool, sql: &str, arg: String) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(sql)
         .bind(arg)
         .fetch_one(pool)

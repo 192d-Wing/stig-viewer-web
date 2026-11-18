@@ -98,7 +98,9 @@ async fn require_owner_or_admin(
     group_id: &str,
     user: &AuthUser,
 ) -> Result<(), StatusCode> {
-    let owner = fetch_owner(pool, group_id).await?.ok_or(StatusCode::NOT_FOUND)?;
+    let owner = fetch_owner(pool, group_id)
+        .await?
+        .ok_or(StatusCode::NOT_FOUND)?;
     if user.role == "admin" || owner == user.id {
         Ok(())
     } else {
@@ -384,14 +386,12 @@ pub async fn remove_member_handler(
 ) -> Result<StatusCode, StatusCode> {
     require_owner_or_admin(state.pool.as_ref(), &id, &user).await?;
 
-    let res = sqlx::query(
-        "DELETE FROM asset_group_members WHERE group_id = $1 AND asset_id = $2",
-    )
-    .bind(&id)
-    .bind(&asset_id)
-    .execute(state.pool.as_ref())
-    .await
-    .map_err(map_sqlx)?;
+    let res = sqlx::query("DELETE FROM asset_group_members WHERE group_id = $1 AND asset_id = $2")
+        .bind(&id)
+        .bind(&asset_id)
+        .execute(state.pool.as_ref())
+        .await
+        .map_err(map_sqlx)?;
     if res.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }

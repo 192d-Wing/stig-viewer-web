@@ -94,7 +94,11 @@ fn set_failure_text(status: u16) -> &'static str {
 
 fn save_summary(system: &str, r: &SaveResponse) -> String {
     let plural = |n: u64| if n == 1 { "" } else { "s" };
-    let mut parts = vec![format!("Saved {} rule{} to {system}.", r.applied_count, plural(r.applied_count))];
+    let mut parts = vec![format!(
+        "Saved {} rule{} to {system}.",
+        r.applied_count,
+        plural(r.applied_count)
+    )];
     if r.pending_count > 0 {
         parts.push(format!("{} submitted for review.", r.pending_count));
     }
@@ -161,7 +165,11 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                 result.set(None);
                 set_result.set(None);
                 // A linked set is saved back to its system.
-                selected.set(linked.map(|(id, name)| AssetOption { id, name, ..AssetOption::default() }));
+                selected.set(linked.map(|(id, name)| AssetOption {
+                    id,
+                    name,
+                    ..AssetOption::default()
+                }));
                 existing.set(None);
                 let my_gen = *generation.borrow();
                 spawn_local(async move {
@@ -185,14 +193,23 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
     let mut shown: Vec<AssetOption> = (*assets).clone();
     if let Some((id, name)) = &linked {
         if !shown.iter().any(|a| &a.id == id) {
-            shown.push(AssetOption { id: id.clone(), name: name.clone(), ..AssetOption::default() });
+            shown.push(AssetOption {
+                id: id.clone(),
+                name: name.clone(),
+                ..AssetOption::default()
+            });
         }
     }
     let options: Vec<SelectOption> = shown
         .iter()
         .map(|a| {
-            let label = if a.name.is_empty() { a.hostname.clone() } else { a.name.clone() };
-            SelectOption::new(a.id.clone(), label).description(format!("{} · {}", a.hostname, a.owner_name))
+            let label = if a.name.is_empty() {
+                a.hostname.clone()
+            } else {
+                a.name.clone()
+            };
+            SelectOption::new(a.id.clone(), label)
+                .description(format!("{} · {}", a.hostname, a.owner_name))
         })
         .collect();
 
@@ -220,16 +237,34 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
     };
 
     let save = {
-        let (selected, busy, error, result) = (selected.clone(), busy.clone(), error.clone(), result.clone());
-        let (stig, catalog_id, generation) = (p.stig.clone(), p.catalog_id.clone(), generation.clone());
-        let (set, autosave, on_linked, set_result) = (p.set.clone(), p.autosave.clone(), p.on_linked.clone(), set_result.clone());
+        let (selected, busy, error, result) = (
+            selected.clone(),
+            busy.clone(),
+            error.clone(),
+            result.clone(),
+        );
+        let (stig, catalog_id, generation) =
+            (p.stig.clone(), p.catalog_id.clone(), generation.clone());
+        let (set, autosave, on_linked, set_result) = (
+            p.set.clone(),
+            p.autosave.clone(),
+            p.on_linked.clone(),
+            set_result.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
-            let Some(asset) = (*selected).clone() else { return };
+            let Some(asset) = (*selected).clone() else {
+                return;
+            };
             if let (Some(set), Some(autosave)) = (set.clone(), autosave.clone()) {
                 *generation.borrow_mut() += 1;
                 let my_gen = *generation.borrow();
                 let generation = generation.clone();
-                let (busy, error, set_result, on_linked) = (busy.clone(), error.clone(), set_result.clone(), on_linked.clone());
+                let (busy, error, set_result, on_linked) = (
+                    busy.clone(),
+                    error.clone(),
+                    set_result.clone(),
+                    on_linked.clone(),
+                );
                 busy.set(true);
                 error.set(None);
                 spawn_local(async move {
@@ -237,7 +272,10 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                     let outcome: Result<SetSaveResponse, String> = match autosave.flush().await {
                         Err(e) => Err(format!("Your edits could not be saved yet: {e}")),
                         Ok(()) => {
-                            let body = SetSaveRequest { revision: autosave.revision(&set.id).unwrap_or(0), asset_id: &asset.id };
+                            let body = SetSaveRequest {
+                                revision: autosave.revision(&set.id).unwrap_or(0),
+                                asset_id: &asset.id,
+                            };
                             let path = format!("/api/checklist-sets/{}/save-to-system", set.id);
                             match api_fetch_json("POST", &path, &body).await {
                                 Ok(res) if res.ok() => {
@@ -294,9 +332,10 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                 let path = format!("/api/assets/{}/checklists/save", asset.id);
                 let outcome = api_fetch_json("POST", &path, &body).await;
                 let parsed: Result<SaveResponse, String> = match outcome {
-                    Ok(res) if res.ok() => {
-                        res.json::<SaveResponse>().await.map_err(|e| format!("Unexpected response: {e}"))
-                    }
+                    Ok(res) if res.ok() => res
+                        .json::<SaveResponse>()
+                        .await
+                        .map_err(|e| format!("Unexpected response: {e}")),
                     Ok(res) => Err(match res.status() {
                         403 => "You do not have write access to this system.".to_string(),
                         404 => "This STIG or system no longer exists on the server.".to_string(),
@@ -309,7 +348,11 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                 }
                 match parsed {
                     Ok(r) => {
-                        let name = if asset.name.is_empty() { asset.hostname.clone() } else { asset.name.clone() };
+                        let name = if asset.name.is_empty() {
+                            asset.hostname.clone()
+                        } else {
+                            asset.name.clone()
+                        };
                         result.set(Some((name, r)));
                     }
                     Err(e) => error.set(Some(e)),
@@ -322,13 +365,24 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
     };
 
     let unlink = {
-        let (set, selected, error, on_linked) = (p.set.clone(), selected.clone(), error.clone(), p.on_linked.clone());
+        let (set, selected, error, on_linked) = (
+            p.set.clone(),
+            selected.clone(),
+            error.clone(),
+            p.on_linked.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let Some(set) = set.clone() else { return };
             let (selected, error, on_linked) = (selected.clone(), error.clone(), on_linked.clone());
             spawn_local(async move {
                 let body = serde_json::json!({ "assetId": null });
-                match api_send(&format!("/api/checklist-sets/{}", set.id), "PATCH", Some(&body)).await {
+                match api_send(
+                    &format!("/api/checklist-sets/{}", set.id),
+                    "PATCH",
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(()) => {
                         selected.set(None);
                         on_linked.emit(None);
@@ -344,14 +398,21 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
     // The dialog cannot be dismissed while a save is in flight.
     let on_dismiss = {
         let (on_close, busy) = (p.on_close.clone(), *busy);
-        Callback::from(move |_: ()| if !busy { on_close.emit(()) })
+        Callback::from(move |_: ()| {
+            if !busy {
+                on_close.emit(())
+            }
+        })
     };
 
     let in_set_mode = p.set.is_some() && p.autosave.is_some();
     let body = match &*result {
         _ if in_set_mode && set_result.is_some() => {
             let r = (*set_result).clone().unwrap_or_default();
-            let any_issue = r.results.iter().any(|x| !x.ok || x.save.as_ref().is_some_and(|s| s.error_count > 0));
+            let any_issue = r
+                .results
+                .iter()
+                .any(|x| !x.ok || x.save.as_ref().is_some_and(|s| s.error_count > 0));
             html! {
                 <Alert kind={if any_issue { "warning" } else { "success" }} testid="save-system-result">
                     <SpaceBetween size="xs">
@@ -485,9 +546,18 @@ mod tests {
 
     #[test]
     fn save_summary_lists_each_outcome() {
-        let r = SaveResponse { applied_count: 1, ..Default::default() };
+        let r = SaveResponse {
+            applied_count: 1,
+            ..Default::default()
+        };
         assert_eq!(save_summary("web-01", &r), "Saved 1 rule to web-01.");
-        let r = SaveResponse { applied_count: 2, pending_count: 1, unchanged_count: 3, error_count: 4, ..Default::default() };
+        let r = SaveResponse {
+            applied_count: 2,
+            pending_count: 1,
+            unchanged_count: 3,
+            error_count: 4,
+            ..Default::default()
+        };
         assert_eq!(
             save_summary("web-01", &r),
             "Saved 2 rules to web-01. 1 submitted for review. 3 unchanged. 4 not saved."

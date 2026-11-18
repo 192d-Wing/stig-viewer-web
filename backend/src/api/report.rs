@@ -70,7 +70,10 @@ pub async fn report_handler(
 
     let filename = sanitize_filename(&format!("{}-stig-report.pdf", built.asset_name));
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/pdf"),
+    );
     if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
@@ -161,13 +164,8 @@ pub(crate) async fn build_asset_report(
                 _ => not_reviewed += 1,
             }
             let attachments = attachments_by_rule.get(&rid).copied().unwrap_or(0);
-            let weighted = weighted_score(
-                &severity,
-                &asset.classification,
-                &status,
-                due_date,
-                today,
-            );
+            let weighted =
+                weighted_score(&severity, &asset.classification, &status, due_date, today);
             rule_rows.push(RuleSummary {
                 id: rid,
                 title,
@@ -264,7 +262,14 @@ fn layout_report(
         state.text(&asset.name, SIZE_H2, Face::Bold);
         state.advance(LH_BODY);
 
-        state.kv("Hostname", if asset.hostname.is_empty() { "—" } else { &asset.hostname });
+        state.kv(
+            "Hostname",
+            if asset.hostname.is_empty() {
+                "—"
+            } else {
+                &asset.hostname
+            },
+        );
         state.kv("Classification", &asset.classification);
         state.kv("Owner", owner_name);
         state.kv(
@@ -415,7 +420,13 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -443,7 +454,12 @@ mod id_tests {
     async fn invalid_ids_are_rejected_before_any_file_access() {
         let (state, _dir) = lazy_state();
         for id in bad_ids() {
-            assert!(load_stig_json_from_dir(&state.config.data_dir, &id).await.is_none(), "{id:?}");
+            assert!(
+                load_stig_json_from_dir(&state.config.data_dir, &id)
+                    .await
+                    .is_none(),
+                "{id:?}"
+            );
         }
     }
 }
@@ -515,7 +531,11 @@ mod tests {
         assert!(doc.page_count() > 1);
         for p in 0..doc.page_count() {
             for r in doc.page_runs(p) {
-                assert!(r.y_mm >= MARGIN_B && r.y_mm <= PAGE_H - MARGIN_T, "{}", r.y_mm);
+                assert!(
+                    r.y_mm >= MARGIN_B && r.y_mm <= PAGE_H - MARGIN_T,
+                    "{}",
+                    r.y_mm
+                );
             }
         }
     }

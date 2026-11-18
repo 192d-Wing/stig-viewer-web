@@ -13,15 +13,18 @@ use crate::api::{api_get, api_json};
 use crate::model::{Rule, Stig};
 use crate::ui::*;
 use crate::util::{
-    copy_to_clipboard, download_text, encode_uri_component, file_text, spawn_local, to_locale_date_string,
-    to_locale_string,
+    copy_to_clipboard, download_text, encode_uri_component, file_text, spawn_local,
+    to_locale_date_string, to_locale_string,
 };
 use crate::utils::export_xccdf::export_xccdf;
 use crate::utils::parse_ckl::parse_ckl;
 use crate::utils::parse_xccdf::parse_xccdf;
 
-const SEVERITIES: [(&str, &str); 3] =
-    [("CAT I", "CAT I (High)"), ("CAT II", "CAT II (Medium)"), ("CAT III", "CAT III (Low)")];
+const SEVERITIES: [(&str, &str); 3] = [
+    ("CAT I", "CAT I (High)"),
+    ("CAT II", "CAT II (Medium)"),
+    ("CAT III", "CAT III (Low)"),
+];
 
 fn severity_badge_color(severity: &str) -> &'static str {
     match severity {
@@ -48,7 +51,11 @@ fn draft_path(id: &str) -> String {
 }
 
 fn or_untitled(title: &str, fallback: &'static str) -> String {
-    if title.is_empty() { fallback.to_string() } else { title.to_string() }
+    if title.is_empty() {
+        fallback.to_string()
+    } else {
+        title.to_string()
+    }
 }
 
 // ── API payloads ─────────────────────────────────────────────────────────────
@@ -302,7 +309,10 @@ impl EditorData {
 fn save_body(data: &Rc<RefCell<EditorData>>) -> Option<Value> {
     let data = data.borrow();
     let draft = data.draft.as_ref()?;
-    if matches!(draft.status.as_str(), "approved" | "submitted" | "in_review") {
+    if matches!(
+        draft.status.as_str(),
+        "approved" | "submitted" | "in_review"
+    ) {
         return None;
     }
     Some(json!({
@@ -356,8 +366,12 @@ impl Editor {
     /// Save 1.5s after the last edit.
     fn schedule_save(&self) {
         *self.dirty.borrow_mut() = true;
-        let (draft_id, data, dirty, saving) =
-            (self.draft_id.clone(), self.data.clone(), self.dirty.clone(), self.saving.clone());
+        let (draft_id, data, dirty, saving) = (
+            self.draft_id.clone(),
+            self.data.clone(),
+            self.dirty.clone(),
+            self.saving.clone(),
+        );
         let timer = Timeout::new(1500, move || {
             *dirty.borrow_mut() = false;
             save_draft(&draft_id, &data, &saving);
@@ -417,7 +431,9 @@ impl Editor {
         let ed = self.clone();
         Callback::from(move |v: String| {
             ed.mutate(|d| {
-                let Some(editing) = d.editing.as_mut() else { return };
+                let Some(editing) = d.editing.as_mut() else {
+                    return;
+                };
                 let id = editing.id.clone();
                 for rule in d.rules.iter_mut().filter(|r| r.id == id) {
                     apply(rule, v.clone());
@@ -435,7 +451,11 @@ fn parse_release_num(info: &str) -> Option<String> {
     let mut from = 0;
     while let Some(pos) = lower[from..].find(KEY) {
         let after = from + pos + KEY.len();
-        let digits: String = info[after..].trim_start().chars().take_while(char::is_ascii_digit).collect();
+        let digits: String = info[after..]
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
         if !digits.is_empty() {
             return Some(digits);
         }
@@ -482,7 +502,9 @@ fn join_release_info(release: &str, date: &str) -> String {
 
 async fn load_comments(draft_id: Rc<str>, comments: UseStateSetter<Vec<DraftComment>>) {
     // Silently fail for comments
-    if let Ok(data) = api_get::<Vec<DraftComment>>(&format!("{}/comments", draft_path(&draft_id))).await {
+    if let Ok(data) =
+        api_get::<Vec<DraftComment>>(&format!("{}/comments", draft_path(&draft_id))).await
+    {
         comments.set(data);
     }
 }
@@ -504,7 +526,10 @@ impl Workflow {
         let path = format!("{}/{action}", draft_path(&self.ed.draft_id));
         match api_json::<TransitionResult, Value>(&path, "POST", body.as_ref()).await {
             Ok(result) => {
-                self.success.set(Some(format!("Draft {}", result.status.replacen('_', " ", 1))));
+                self.success.set(Some(format!(
+                    "Draft {}",
+                    result.status.replacen('_', " ", 1)
+                )));
                 self.ed.set(|d| {
                     if let Some(draft) = d.draft.as_mut() {
                         draft.status = result.status;
@@ -571,8 +596,12 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
         saving: saving.setter(),
         redraw,
     };
-    let workflow =
-        Workflow { ed: ed.clone(), error: error.setter(), success: success.setter(), comments: comments.setter() };
+    let workflow = Workflow {
+        ed: ed.clone(),
+        error: error.setter(),
+        success: success.setter(),
+        comments: comments.setter(),
+    };
 
     // Load the draft and its comments; flush any pending save on unmount.
     {
@@ -683,14 +712,24 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
 
     let handle_import = {
         let ed = ed.clone();
-        let (import_error, selected_rules, active_tab_id) =
-            (import_error.setter(), selected_rules.setter(), active_tab_id.setter());
+        let (import_error, selected_rules, active_tab_id) = (
+            import_error.setter(),
+            selected_rules.setter(),
+            active_tab_id.setter(),
+        );
         Callback::from(move |e: Event| {
-            let Some(input) = e.target_dyn_into::<HtmlInputElement>() else { return };
-            let Some(file) = input.files().and_then(|files| files.get(0)) else { return };
+            let Some(input) = e.target_dyn_into::<HtmlInputElement>() else {
+                return;
+            };
+            let Some(file) = input.files().and_then(|files| files.get(0)) else {
+                return;
+            };
             let ed = ed.clone();
-            let (import_error, selected_rules, active_tab_id) =
-                (import_error.clone(), selected_rules.clone(), active_tab_id.clone());
+            let (import_error, selected_rules, active_tab_id) = (
+                import_error.clone(),
+                selected_rules.clone(),
+                active_tab_id.clone(),
+            );
             import_error.set(None);
             spawn_local(async move {
                 let parsed = match file_text(&file).await {
@@ -734,21 +773,39 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     let handle_export = {
         let ed = ed.clone();
         Callback::from(move |_: MouseEvent| {
-            let Some(stig) = ed.data.borrow().to_stig() else { return };
-            let base = if stig.title.is_empty() { "draft_stig" } else { stig.title.as_str() };
+            let Some(stig) = ed.data.borrow().to_stig() else {
+                return;
+            };
+            let base = if stig.title.is_empty() {
+                "draft_stig"
+            } else {
+                stig.title.as_str()
+            };
             // JS `/[^a-zA-Z0-9]/g` works on UTF-16 code units, hence one `_` per unit.
             let name: String = base
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_string() } else { "_".repeat(c.len_utf16()) })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_string()
+                    } else {
+                        "_".repeat(c.len_utf16())
+                    }
+                })
                 .collect();
-            download_text(&export_xccdf(&stig), "application/xml", &format!("{name}.xml"));
+            download_text(
+                &export_xccdf(&stig),
+                "application/xml",
+                &format!("{name}.xml"),
+            );
         })
     };
 
     let handle_copy_preview = {
         let ed = ed.clone();
         Callback::from(move |_: MouseEvent| {
-            let Some(stig) = ed.data.borrow().to_stig() else { return };
+            let Some(stig) = ed.data.borrow().to_stig() else {
+                return;
+            };
             spawn_local(async move {
                 copy_to_clipboard(&export_xccdf(&stig)).await;
             });
@@ -758,8 +815,11 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     // ── Workflow actions ─────────────────────────────────────────────────────
 
     let open_submit_modal = {
-        let (show_submit_modal, reviewer_options, selected_reviewer) =
-            (show_submit_modal.setter(), reviewer_options.setter(), selected_reviewer.setter());
+        let (show_submit_modal, reviewer_options, selected_reviewer) = (
+            show_submit_modal.setter(),
+            reviewer_options.setter(),
+            selected_reviewer.setter(),
+        );
         Callback::from(move |_: MouseEvent| {
             show_submit_modal.set(true);
             selected_reviewer.set(None);
@@ -781,14 +841,16 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
 
     let handle_submit = {
         let workflow = workflow.clone();
-        let (show_submit_modal, selected_reviewer) = (show_submit_modal.setter(), selected_reviewer.clone());
+        let (show_submit_modal, selected_reviewer) =
+            (show_submit_modal.setter(), selected_reviewer.clone());
         Callback::from(move |_: MouseEvent| {
             let body = (*selected_reviewer)
                 .as_ref()
                 .filter(|o| !o.value.is_empty())
                 .map(|o| json!({ "assignedReviewerId": o.value.as_str() }));
             let workflow = workflow.clone();
-            let (show_submit_modal, selected_reviewer) = (show_submit_modal.clone(), selected_reviewer.setter());
+            let (show_submit_modal, selected_reviewer) =
+                (show_submit_modal.clone(), selected_reviewer.setter());
             spawn_local(async move {
                 workflow.transition("submit", body).await;
                 show_submit_modal.set(false);
@@ -799,9 +861,14 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
 
     let handle_approve = {
         let workflow = workflow.clone();
-        let (show_approve_modal, action_comment) = (show_approve_modal.setter(), action_comment.clone());
+        let (show_approve_modal, action_comment) =
+            (show_approve_modal.setter(), action_comment.clone());
         Callback::from(move |_: MouseEvent| {
-            let body = if action_comment.is_empty() { json!({}) } else { json!({ "comment": *action_comment }) };
+            let body = if action_comment.is_empty() {
+                json!({})
+            } else {
+                json!({ "comment": *action_comment })
+            };
             let workflow = workflow.clone();
             spawn_local(async move { workflow.transition("approve", Some(body)).await });
             show_approve_modal.set(false);
@@ -811,11 +878,20 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
 
     let handle_reject = {
         let workflow = workflow.clone();
-        let (show_reject_modal, action_comment) = (show_reject_modal.setter(), action_comment.clone());
+        let (show_reject_modal, action_comment) =
+            (show_reject_modal.setter(), action_comment.clone());
         Callback::from(move |_: MouseEvent| {
-            let comment = if action_comment.is_empty() { "Rejected".to_string() } else { (*action_comment).clone() };
+            let comment = if action_comment.is_empty() {
+                "Rejected".to_string()
+            } else {
+                (*action_comment).clone()
+            };
             let workflow = workflow.clone();
-            spawn_local(async move { workflow.transition("reject", Some(json!({ "comment": comment }))).await });
+            spawn_local(async move {
+                workflow
+                    .transition("reject", Some(json!({ "comment": comment })))
+                    .await
+            });
             show_reject_modal.set(false);
             action_comment.set(String::new());
         })
@@ -823,14 +899,16 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
 
     let handle_add_comment = {
         let draft_id = ed.draft_id.clone();
-        let (new_comment, error, comments) = (new_comment.clone(), error.setter(), comments.setter());
+        let (new_comment, error, comments) =
+            (new_comment.clone(), error.setter(), comments.setter());
         Callback::from(move |_: MouseEvent| {
             let body = new_comment.trim().to_string();
             if body.is_empty() {
                 return;
             }
             let draft_id = draft_id.clone();
-            let (new_comment, error, comments) = (new_comment.setter(), error.clone(), comments.clone());
+            let (new_comment, error, comments) =
+                (new_comment.setter(), error.clone(), comments.clone());
             spawn_local(async move {
                 let path = format!("{}/comments", draft_path(&draft_id));
                 match api_json::<Value, _>(&path, "POST", Some(&json!({ "body": body }))).await {
@@ -880,7 +958,9 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     };
     let mut workflow_actions: Vec<Html> = Vec::new();
     if is_editable {
-        workflow_actions.push(html! { <Button key="import" onclick={open_file_picker}>{"Import File"}</Button> });
+        workflow_actions.push(
+            html! { <Button key="import" onclick={open_file_picker}>{"Import File"}</Button> },
+        );
     }
     match status {
         "draft" => workflow_actions.push(html! {
@@ -966,14 +1046,22 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     };
 
     let rule_editor_form = |rule: &Rule| {
-        let severity =
-            SEVERITIES.iter().map(|(value, _)| *value).find(|value| *value == rule.severity).unwrap_or("CAT II");
+        let severity = SEVERITIES
+            .iter()
+            .map(|(value, _)| *value)
+            .find(|value| *value == rule.severity)
+            .unwrap_or("CAT II");
         let on_severity = {
             let set = ed.rule_field(|r, v| r.severity = v);
             Callback::from(move |o: SelectOption| set.emit(o.value.to_string()))
         };
         let on_cci_ids = ed.rule_field(|r, v| {
-            r.cci_ids = v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+            r.cci_ids = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
         });
         html! {
             <SpaceBetween size="l">
@@ -1069,7 +1157,9 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
         ];
         let on_selection_change = {
             let selected_rules = selected_rules.setter();
-            Callback::from(move |items: Vec<Rule>| selected_rules.set(items.into_iter().map(|r| r.id).collect()))
+            Callback::from(move |items: Vec<Rule>| {
+                selected_rules.set(items.into_iter().map(|r| r.id).collect())
+            })
         };
         let on_row_click = {
             let ed = ed.clone();
@@ -1079,8 +1169,10 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
             let close = close_rule_editor.clone();
             Callback::from(move |_: MouseEvent| close.emit(()))
         };
-        let modal_header =
-            editing_rule.as_ref().map(|r| format!("Edit {}", r.stig_id)).unwrap_or_else(|| "Edit Rule".to_string());
+        let modal_header = editing_rule
+            .as_ref()
+            .map(|r| format!("Edit {}", r.stig_id))
+            .unwrap_or_else(|| "Edit Rule".to_string());
         html! {
             <SpaceBetween size="m">
                 <Table<Rule>
@@ -1192,7 +1284,12 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     };
 
     let preview_tab = || {
-        let xccdf_preview = ed.data.borrow().to_stig().map(|stig| export_xccdf(&stig)).unwrap_or_default();
+        let xccdf_preview = ed
+            .data
+            .borrow()
+            .to_stig()
+            .map(|stig| export_xccdf(&stig))
+            .unwrap_or_default();
         html! {
             <Container
                 header={html! {
@@ -1219,12 +1316,24 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
     };
 
     let tab = |id: &'static str, label: String, content: &dyn Fn() -> Html| {
-        TabItem::new(id, label, if active_tab == id { content() } else { Html::default() })
+        TabItem::new(
+            id,
+            label,
+            if active_tab == id {
+                content()
+            } else {
+                Html::default()
+            },
+        )
     };
     let tabs = vec![
         tab("metadata", "Metadata".to_string(), &metadata_tab),
         tab("rules", format!("Rules ({rule_count})"), &rules_tab),
-        tab("comments", format!("Comments ({})", comments.len()), &comments_tab),
+        tab(
+            "comments",
+            format!("Comments ({})", comments.len()),
+            &comments_tab,
+        ),
         tab("preview", "Preview".to_string(), &preview_tab),
     ];
 
@@ -1244,9 +1353,14 @@ fn DraftEditor(props: &DraftEditorProps) -> Html {
         let selected_reviewer = selected_reviewer.setter();
         Callback::from(move |o: SelectOption| selected_reviewer.set(Some(o)))
     };
-    let reviewer_value = (*selected_reviewer).as_ref().map(|o| o.value.clone()).unwrap_or_default();
-    let reviewer_label =
-        (*selected_reviewer).as_ref().map(|o| o.label.clone()).unwrap_or(AttrValue::Static("Any reviewer"));
+    let reviewer_value = (*selected_reviewer)
+        .as_ref()
+        .map(|o| o.value.clone())
+        .unwrap_or_default();
+    let reviewer_label = (*selected_reviewer)
+        .as_ref()
+        .map(|o| o.label.clone())
+        .unwrap_or(AttrValue::Static("Any reviewer"));
 
     html! {
         <SpaceBetween size="m">

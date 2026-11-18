@@ -23,9 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust stable with clippy and the wasm target
+      - name: Install Rust stable with clippy, rustfmt and the wasm target
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
           rustup target add wasm32-unknown-unknown
 
@@ -39,6 +39,7 @@ jobs:
             "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-musl.tar.gz" \
             | tar -xz -C "$HOME/.cargo/bin" trunk
 
+      - run: cargo fmt --check
       - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test --locked
       - run: trunk build --release --locked
@@ -53,15 +54,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust stable with clippy
+      - name: Install Rust stable with clippy and rustfmt
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: backend
 
+      - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       # sqlx::test creates a throwaway database per test, so the user must be

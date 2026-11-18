@@ -16,7 +16,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    EventTarget, IdbDatabase, IdbObjectStore, IdbObjectStoreParameters, IdbRequest, IdbTransactionMode,
+    EventTarget, IdbDatabase, IdbObjectStore, IdbObjectStoreParameters, IdbRequest,
+    IdbTransactionMode,
 };
 
 use crate::util::now_iso;
@@ -69,7 +70,11 @@ async fn open_db() -> Option<IdbDatabase> {
     let upgrade = {
         let request = request.clone();
         EventListener::new(&request.clone(), "upgradeneeded", move |_| {
-            let Some(db) = request.result().ok().and_then(|v| v.dyn_into::<IdbDatabase>().ok()) else {
+            let Some(db) = request
+                .result()
+                .ok()
+                .and_then(|v| v.dyn_into::<IdbDatabase>().ok())
+            else {
                 return;
             };
             for (store, key_path) in [(META_STORE, "key"), (STIG_STORE, "id")] {
@@ -118,7 +123,9 @@ async fn tx(
 fn to_js<T: Serialize + ?Sized>(value: &T) -> Option<JsValue> {
     // Plain objects / arrays (not `Map`s) so rows match what the previous
     // JavaScript implementation stored.
-    value.serialize(&serde_wasm_bindgen::Serializer::json_compatible()).ok()
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .ok()
 }
 
 fn row(fields: &[(&str, JsValue)]) -> JsValue {
@@ -126,7 +133,11 @@ fn row(fields: &[(&str, JsValue)]) -> JsValue {
     for (key, value) in fields {
         let _ = Reflect::set(&obj, &JsValue::from_str(key), value);
     }
-    let _ = Reflect::set(&obj, &JsValue::from_str("cachedAt"), &JsValue::from_str(&now_iso()));
+    let _ = Reflect::set(
+        &obj,
+        &JsValue::from_str("cachedAt"),
+        &JsValue::from_str(&now_iso()),
+    );
     obj.into()
 }
 
@@ -135,7 +146,9 @@ fn field(row: &JsValue, key: &str) -> Option<JsValue> {
 }
 
 fn cached_at(row: &JsValue) -> String {
-    field(row, "cachedAt").and_then(|v| v.as_string()).unwrap_or_default()
+    field(row, "cachedAt")
+        .and_then(|v| v.as_string())
+        .unwrap_or_default()
 }
 
 // ── Catalog ──────────────────────────────────────────────────────────────────
@@ -145,7 +158,10 @@ pub async fn cache_catalog<T: Serialize + ?Sized>(list: &T) {
         return;
     };
     let row = row(&[("key", JsValue::from_str(CATALOG_KEY)), ("value", value)]);
-    tx(META_STORE, IdbTransactionMode::Readwrite, |store| store.put(&row).ok()).await;
+    tx(META_STORE, IdbTransactionMode::Readwrite, |store| {
+        store.put(&row).ok()
+    })
+    .await;
 }
 
 pub async fn read_cached_catalog<T: DeserializeOwned>() -> Option<CachedCatalog<T>> {
@@ -154,7 +170,10 @@ pub async fn read_cached_catalog<T: DeserializeOwned>() -> Option<CachedCatalog<
     })
     .await?;
     let list = serde_wasm_bindgen::from_value(field(&row, "value")?).ok()?;
-    Some(CachedCatalog { list, cached_at: cached_at(&row) })
+    Some(CachedCatalog {
+        list,
+        cached_at: cached_at(&row),
+    })
 }
 
 // ── Per-STIG JSON ────────────────────────────────────────────────────────────
@@ -167,7 +186,10 @@ pub async fn cache_stig<T: Serialize + ?Sized>(id: &str, stig: &T) {
         return;
     };
     let row = row(&[("id", JsValue::from_str(id)), ("stig", value)]);
-    tx(STIG_STORE, IdbTransactionMode::Readwrite, |store| store.put(&row).ok()).await;
+    tx(STIG_STORE, IdbTransactionMode::Readwrite, |store| {
+        store.put(&row).ok()
+    })
+    .await;
 }
 
 pub async fn read_cached_stig<T: DeserializeOwned>(id: &str) -> Option<CachedStig<T>> {
@@ -179,7 +201,10 @@ pub async fn read_cached_stig<T: DeserializeOwned>(id: &str) -> Option<CachedSti
     })
     .await?;
     let stig = serde_wasm_bindgen::from_value(field(&row, "stig")?).ok()?;
-    Some(CachedStig { stig, cached_at: cached_at(&row) })
+    Some(CachedStig {
+        stig,
+        cached_at: cached_at(&row),
+    })
 }
 
 // ── Bulk ops ─────────────────────────────────────────────────────────────────
@@ -188,6 +213,12 @@ pub async fn read_cached_stig<T: DeserializeOwned>(id: &str) -> Option<CachedSti
 /// JavaScript original), hence the `allow`.
 #[allow(dead_code)]
 pub async fn clear_cache() {
-    tx(META_STORE, IdbTransactionMode::Readwrite, |store| store.clear().ok()).await;
-    tx(STIG_STORE, IdbTransactionMode::Readwrite, |store| store.clear().ok()).await;
+    tx(META_STORE, IdbTransactionMode::Readwrite, |store| {
+        store.clear().ok()
+    })
+    .await;
+    tx(STIG_STORE, IdbTransactionMode::Readwrite, |store| {
+        store.clear().ok()
+    })
+    .await;
 }

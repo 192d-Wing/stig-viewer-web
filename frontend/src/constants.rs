@@ -28,10 +28,22 @@ pub struct StatusOption {
 }
 
 pub const STATUS_OPTIONS: [StatusOption; 4] = [
-    StatusOption { value: "not_reviewed", label: "Not Reviewed" },
-    StatusOption { value: "not_a_finding", label: "Not a Finding" },
-    StatusOption { value: "open", label: "Open" },
-    StatusOption { value: "not_applicable", label: "Not Applicable" },
+    StatusOption {
+        value: "not_reviewed",
+        label: "Not Reviewed",
+    },
+    StatusOption {
+        value: "not_a_finding",
+        label: "Not a Finding",
+    },
+    StatusOption {
+        value: "open",
+        label: "Open",
+    },
+    StatusOption {
+        value: "not_applicable",
+        label: "Not Applicable",
+    },
 ];
 
 /// Status value → CKL `<STATUS>` text.
@@ -66,8 +78,10 @@ pub fn status_indicator_kind(status: &str) -> &'static str {
 }
 
 /// (rule field key, label) pairs for the free-text finding fields.
-pub const FINDING_DETAILS_FIELDS: [(&str, &str); 2] =
-    [("findingDetails", "Finding Details"), ("comments", "Comments")];
+pub const FINDING_DETAILS_FIELDS: [(&str, &str); 2] = [
+    ("findingDetails", "Finding Details"),
+    ("comments", "Comments"),
+];
 
 /// AC-8 system use notification shown before sign-in (NIST SP 800-53 Rev. 5 AC-8;
 /// DoDI 8500.01 and the DoD CIO standard Notice and Consent Banner).
@@ -98,7 +112,10 @@ mod use_notice_tests {
     #[test]
     fn notice_wording_is_pinned_to_version() {
         let mut text = String::new();
-        for t in [USE_NOTICE_INTRO, USE_NOTICE_LEAD].into_iter().chain(USE_NOTICE_CONDITIONS) {
+        for t in [USE_NOTICE_INTRO, USE_NOTICE_LEAD]
+            .into_iter()
+            .chain(USE_NOTICE_CONDITIONS)
+        {
             text.push_str(t);
             text.push('\n');
         }
@@ -117,9 +134,14 @@ mod use_notice_tests {
         assert!(USE_NOTICE_INTRO
             .starts_with("You are accessing a U.S. Government (USG) Information System (IS)"));
         assert!(USE_NOTICE_CONDITIONS[4].ends_with("See User Agreement for details."));
-        let all = [USE_NOTICE_TITLE, USE_NOTICE_INTRO, USE_NOTICE_LEAD, USE_NOTICE_ACK_LABEL]
-            .into_iter()
-            .chain(USE_NOTICE_CONDITIONS);
+        let all = [
+            USE_NOTICE_TITLE,
+            USE_NOTICE_INTRO,
+            USE_NOTICE_LEAD,
+            USE_NOTICE_ACK_LABEL,
+        ]
+        .into_iter()
+        .chain(USE_NOTICE_CONDITIONS);
         for t in all {
             assert!(!t.is_empty());
             assert_eq!(t, t.trim());

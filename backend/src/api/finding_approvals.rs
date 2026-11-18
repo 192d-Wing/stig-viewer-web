@@ -190,18 +190,20 @@ pub async fn approve_handler(
     // Preserve the current comments/assignee/due_date on the rule so we
     // don't accidentally clobber concurrent edits while we apply only the
     // status + finding_details from the approval row.
-    let current: Option<db_checklists::ChecklistRuleRow> = sqlx::query_as(
-        "SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = $2",
-    )
-    .bind(&approval.checklist_id)
-    .bind(&approval.rule_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("approve current-rule lookup: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
-    let comments = current.as_ref().map(|r| r.comments.clone()).unwrap_or_default();
+    let current: Option<db_checklists::ChecklistRuleRow> =
+        sqlx::query_as("SELECT * FROM checklist_rules WHERE checklist_id = $1 AND rule_id = $2")
+            .bind(&approval.checklist_id)
+            .bind(&approval.rule_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!("approve current-rule lookup: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?;
+    let comments = current
+        .as_ref()
+        .map(|r| r.comments.clone())
+        .unwrap_or_default();
     let assignee = current.as_ref().and_then(|r| r.assignee_id.clone());
     let due = current.as_ref().and_then(|r| r.due_date);
 
@@ -351,12 +353,22 @@ pub async fn request_many(
     requested_by: &str,
     items: &[ApprovalRequest<'_>],
 ) -> Vec<ApprovalOutcome> {
-    request_many_with(pool, checklist_id, requested_by, items, db_checklists::CHUNK_LOCK_TIMEOUT).await
+    request_many_with(
+        pool,
+        checklist_id,
+        requested_by,
+        items,
+        db_checklists::CHUNK_LOCK_TIMEOUT,
+    )
+    .await
 }
 
 /// Rule ids of `checklist_id` that currently have a pending approval request.
 /// A read-only preview helper; the queueing path re-checks under the lock.
-pub async fn pending_rule_ids(pool: &PgPool, checklist_id: &str) -> anyhow::Result<HashSet<String>> {
+pub async fn pending_rule_ids(
+    pool: &PgPool,
+    checklist_id: &str,
+) -> anyhow::Result<HashSet<String>> {
     let ids: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT rule_id FROM finding_approvals \
          WHERE checklist_id = $1 AND status = 'pending'",
@@ -513,12 +525,11 @@ fn map_sqlx(e: sqlx::Error) -> StatusCode {
 /// Optional helper for tests / future filters.
 #[allow(dead_code)]
 pub async fn get_by_id(pool: &PgPool, id: &str) -> anyhow::Result<Option<FindingApprovalRow>> {
-    let row = sqlx::query_as::<_, FindingApprovalRow>(
-        "SELECT * FROM finding_approvals WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        sqlx::query_as::<_, FindingApprovalRow>("SELECT * FROM finding_approvals WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row)
 }
 
@@ -541,7 +552,11 @@ mod tests {
 
     fn reqs(ids: &[String]) -> Vec<ApprovalRequest<'_>> {
         ids.iter()
-            .map(|id| ApprovalRequest { rule_id: id, proposed_status: "not_a_finding", finding_details: "why" })
+            .map(|id| ApprovalRequest {
+                rule_id: id,
+                proposed_status: "not_a_finding",
+                finding_details: "why",
+            })
             .collect()
     }
 
@@ -562,10 +577,17 @@ mod tests {
         setup(&pool).await;
         let ids = names(3);
         let first = request_many(&pool, "c1", "u1", &reqs(&ids[..1])).await;
-        let ApprovalOutcome::Queued { id: first_id } = &first[0] else { panic!("{first:?}") };
+        let ApprovalOutcome::Queued { id: first_id } = &first[0] else {
+            panic!("{first:?}")
+        };
 
         // r000 is pending; r001 is new; the second r001 repeats within the call.
-        let batch = [ids[0].clone(), ids[1].clone(), ids[1].clone(), ids[2].clone()];
+        let batch = [
+            ids[0].clone(),
+            ids[1].clone(),
+            ids[1].clone(),
+            ids[2].clone(),
+        ];
         let out = request_many(&pool, "c1", "u1", &reqs(&batch)).await;
         assert_eq!(out.len(), 4);
         assert_eq!(out[0], ApprovalOutcome::AlreadyPending);
@@ -582,7 +604,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            (rule.as_str(), status.as_str(), details.as_str(), by.as_str(), state.as_str()),
+            (
+                rule.as_str(),
+                status.as_str(),
+                details.as_str(),
+                by.as_str(),
+                state.as_str()
+            ),
             ("r000", "not_a_finding", "why", "u1", "pending")
         );
 
@@ -609,14 +637,19 @@ mod tests {
         }
         let mut queued = 0;
         while let Some(res) = tasks.join_next().await {
-            queued += res.unwrap().iter().filter(|o| matches!(o, ApprovalOutcome::Queued { .. })).count();
+            queued += res
+                .unwrap()
+                .iter()
+                .filter(|o| matches!(o, ApprovalOutcome::Queued { .. }))
+                .count();
         }
         assert_eq!(queued, 30);
         assert_eq!(pending_rows(&pool).await, 30);
-        let distinct: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT rule_id) FROM finding_approvals")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let distinct: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT rule_id) FROM finding_approvals")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(distinct, 30);
     }
 
@@ -635,10 +668,12 @@ mod tests {
             }
         }
         assert_eq!(pending_rows(&pool).await, 150);
-        let in_failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM finding_approvals WHERE rule_id >= 'r100' AND rule_id < 'r200'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let in_failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM finding_approvals WHERE rule_id >= 'r100' AND rule_id < 'r200'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(in_failed, 0);
 
         // A missing checklist fails the chunk through the foreign key.
@@ -655,7 +690,9 @@ mod tests {
         ids.push(ids[0].clone()); // repeat of a rule filed by the previous chunk
         let out = request_many(&pool, "c1", "u1", &reqs(&ids)).await;
         assert_eq!(out.len(), n + 1);
-        assert!(out[..n].iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
+        assert!(out[..n]
+            .iter()
+            .all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
         assert_eq!(out[n], ApprovalOutcome::AlreadyPending);
         assert_eq!(pending_rows(&pool).await as usize, n);
     }
@@ -666,16 +703,24 @@ mod tests {
     async fn request_many_chunk_fails_promptly_when_the_checklist_lock_is_held(pool: PgPool) {
         setup(&pool).await;
         let mut holder = pool.begin().await.unwrap();
-        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1")
+            .await
+            .unwrap();
         let ids = names(3);
         let t = std::time::Instant::now();
         let out = request_many_with(&pool, "c1", "u1", &reqs(&ids), "300ms").await;
-        assert!(t.elapsed() < std::time::Duration::from_secs(4), "took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(4),
+            "took {:?}",
+            t.elapsed()
+        );
         assert!(out.iter().all(|o| *o == ApprovalOutcome::Failed));
         holder.rollback().await.unwrap();
         assert_eq!(pending_rows(&pool).await, 0);
         let out = request_many_with(&pool, "c1", "u1", &reqs(&ids), "300ms").await;
-        assert!(out.iter().all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
+        assert!(out
+            .iter()
+            .all(|o| matches!(o, ApprovalOutcome::Queued { .. })));
     }
 
     // Timing-dependent (about 5s): the public entry point must bound the lock
@@ -685,13 +730,18 @@ mod tests {
     async fn request_many_passes_the_chunk_lock_timeout(pool: PgPool) {
         setup(&pool).await;
         let mut holder = pool.begin().await.unwrap();
-        db_checklists::lock_checklist(&mut holder, "c1").await.unwrap();
+        db_checklists::lock_checklist(&mut holder, "c1")
+            .await
+            .unwrap();
         let ids = names(2);
         let t = std::time::Instant::now();
         let out = request_many(&pool, "c1", "u1", &reqs(&ids)).await;
         let took = t.elapsed();
         assert!(out.iter().all(|o| *o == ApprovalOutcome::Failed));
-        assert!(took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15), "took {took:?}");
+        assert!(
+            took >= std::time::Duration::from_secs(4) && took < std::time::Duration::from_secs(15),
+            "took {took:?}"
+        );
         holder.rollback().await.unwrap();
     }
 
@@ -704,24 +754,42 @@ mod tests {
         let (state, _dir) = app_state(pool.clone());
         let ids = names(2);
         let items = [
-            ApprovalRequest { rule_id: &ids[0], proposed_status: "not_a_finding", finding_details: "fixed it" },
-            ApprovalRequest { rule_id: &ids[1], proposed_status: "not_applicable", finding_details: "n/a here" },
+            ApprovalRequest {
+                rule_id: &ids[0],
+                proposed_status: "not_a_finding",
+                finding_details: "fixed it",
+            },
+            ApprovalRequest {
+                rule_id: &ids[1],
+                proposed_status: "not_applicable",
+                finding_details: "n/a here",
+            },
         ];
         let out = request_many(&pool, "c1", "u1", &items).await;
-        let (ApprovalOutcome::Queued { id: first }, ApprovalOutcome::Queued { id: second }) = (&out[0], &out[1]) else {
+        let (ApprovalOutcome::Queued { id: first }, ApprovalOutcome::Queued { id: second }) =
+            (&out[0], &out[1])
+        else {
             panic!("{out:?}")
         };
 
-        let _ = approve_handler(State(state.clone()), Extension(auth("rev", "reviewer")), Path(first.clone()))
-            .await
-            .map_err(|r| r.status())
-            .unwrap();
-        let (status, details): (String, String) =
-            sqlx::query_as("SELECT status, finding_details FROM checklist_rules WHERE rule_id = 'r000'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!((status.as_str(), details.as_str()), ("not_a_finding", "fixed it"));
+        let _ = approve_handler(
+            State(state.clone()),
+            Extension(auth("rev", "reviewer")),
+            Path(first.clone()),
+        )
+        .await
+        .map_err(|r| r.status())
+        .unwrap();
+        let (status, details): (String, String) = sqlx::query_as(
+            "SELECT status, finding_details FROM checklist_rules WHERE rule_id = 'r000'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (status.as_str(), details.as_str()),
+            ("not_a_finding", "fixed it")
+        );
         let st: String = sqlx::query_scalar("SELECT status FROM finding_approvals WHERE id = $1")
             .bind(first)
             .fetch_one(&pool)
@@ -733,15 +801,18 @@ mod tests {
             State(state.clone()),
             Extension(auth("rev", "reviewer")),
             Path(second.clone()),
-            Json(RejectRequest { reason: "not enough".into() }),
+            Json(RejectRequest {
+                reason: "not enough".into(),
+            }),
         )
         .await
         .map_err(|r| r.status())
         .unwrap();
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules WHERE rule_id = 'r001'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules WHERE rule_id = 'r001'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows, 0);
         let (st, reason): (String, Option<String>) =
             sqlx::query_as("SELECT status, decision_reason FROM finding_approvals WHERE id = $1")
@@ -749,7 +820,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!((st.as_str(), reason.as_deref()), ("rejected", Some("not enough")));
+        assert_eq!(
+            (st.as_str(), reason.as_deref()),
+            ("rejected", Some("not enough"))
+        );
         assert_eq!(pending_rows(&pool).await, 0);
     }
 }

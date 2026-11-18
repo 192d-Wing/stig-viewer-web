@@ -125,7 +125,9 @@ pub fn confirm(msg: &str) -> bool {
 /// Current `location.search` as (key, value) lookups.
 pub fn url_param(key: &str) -> Option<String> {
     let search = window().location().search().ok()?;
-    web_sys::UrlSearchParams::new_with_str(&search).ok()?.get(key)
+    web_sys::UrlSearchParams::new_with_str(&search)
+        .ok()?
+        .get(key)
 }
 
 pub fn console_error(msg: &str) {
@@ -163,9 +165,14 @@ pub fn issue_lines<'a>(
     rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     cap: usize,
 ) -> (Vec<(String, String)>, usize) {
-    let mut issues = rows.into_iter().filter_map(|(id, text)| text.map(|t| (id, t)));
-    let lines: Vec<(String, String)> =
-        issues.by_ref().take(cap).map(|(id, t)| (id.to_string(), t.to_string())).collect();
+    let mut issues = rows
+        .into_iter()
+        .filter_map(|(id, text)| text.map(|t| (id, t)));
+    let lines: Vec<(String, String)> = issues
+        .by_ref()
+        .take(cap)
+        .map(|(id, t)| (id.to_string(), t.to_string()))
+        .collect();
     let more = issues.count();
     (lines, more)
 }
@@ -177,7 +184,13 @@ mod tests {
     #[test]
     fn issue_lines_skips_rows_without_text() {
         let (lines, more) = issue_lines([("a", Some("x")), ("b", None), ("c", Some("z"))], 10);
-        assert_eq!(lines, [("a".to_string(), "x".to_string()), ("c".to_string(), "z".to_string())]);
+        assert_eq!(
+            lines,
+            [
+                ("a".to_string(), "x".to_string()),
+                ("c".to_string(), "z".to_string())
+            ]
+        );
         assert_eq!(more, 0);
     }
 

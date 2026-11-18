@@ -185,12 +185,26 @@ struct AuditRead<'a> {
 
 /// Record that an admin read an audit view. Fails open like every audit event.
 /// Filter values are bounded and sanitised; nothing else from the request is kept.
-async fn record_audit_read(state: &AppState, user: &AuthUser, ctx: &RequestCtx, read: AuditRead<'_>) {
-    let AuditRead { view, filters, page, page_size, returned } = read;
+async fn record_audit_read(
+    state: &AppState,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    read: AuditRead<'_>,
+) {
+    let AuditRead {
+        view,
+        filters,
+        page,
+        page_size,
+        returned,
+    } = read;
     let mut f = serde_json::Map::new();
     for (k, v) in filters {
         if let Some(v) = v.as_deref().filter(|s| !s.is_empty()) {
-            f.insert((*k).to_string(), serde_json::Value::String(audit_safe_id(v)));
+            f.insert(
+                (*k).to_string(),
+                serde_json::Value::String(audit_safe_id(v)),
+            );
         }
     }
     db_audit::record_or_log(
@@ -305,13 +319,10 @@ pub async fn search_handler(
     if let Some(v) = to_val {
         count_q = count_q.bind(v);
     }
-    let total_count: i64 = count_q
-        .fetch_one(state.pool.as_ref())
-        .await
-        .map_err(|e| {
-            tracing::error!("audit search count failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let total_count: i64 = count_q.fetch_one(state.pool.as_ref()).await.map_err(|e| {
+        tracing::error!("audit search count failed: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let limit_idx = next_idx;
     let offset_idx = next_idx + 1;
@@ -370,12 +381,12 @@ pub async fn search_handler(
         AuditRead {
             view: "rules",
             filters: &[
-            ("userId", &params.user_id),
-            ("assetId", &params.asset_id),
-            ("checklistId", &params.checklist_id),
-            ("from", &params.from),
-            ("to", &params.to),
-        ],
+                ("userId", &params.user_id),
+                ("assetId", &params.asset_id),
+                ("checklistId", &params.checklist_id),
+                ("from", &params.from),
+                ("to", &params.to),
+            ],
             page,
             page_size,
             returned: rows.len(),
@@ -573,14 +584,14 @@ pub async fn events_handler(
         AuditRead {
             view: "events",
             filters: &[
-            ("userId", &params.user_id),
-            ("assetId", &params.asset_id),
-            ("checklistId", &params.checklist_id),
-            ("action", &params.action),
-            ("outcome", &params.outcome),
-            ("from", &params.from),
-            ("to", &params.to),
-        ],
+                ("userId", &params.user_id),
+                ("assetId", &params.asset_id),
+                ("checklistId", &params.checklist_id),
+                ("action", &params.action),
+                ("outcome", &params.outcome),
+                ("from", &params.from),
+                ("to", &params.to),
+            ],
             page,
             page_size,
             returned: rows.len(),
@@ -588,7 +599,12 @@ pub async fn events_handler(
     )
     .await;
 
-    Ok(Json(AuditEventsResponse { total_count, page, page_size, rows }))
+    Ok(Json(AuditEventsResponse {
+        total_count,
+        page,
+        page_size,
+        rows,
+    }))
 }
 
 #[cfg(test)]
@@ -611,8 +627,18 @@ mod events_tests {
         }
     }
 
-    async fn call(state: &AppState, role: &str, q: AuditEventsQuery) -> Result<Json<AuditEventsResponse>, StatusCode> {
-        events_handler(State(state.clone()), Extension(auth("u1", role)), Extension(crate::test_fixtures::ctx()), Query(q)).await
+    async fn call(
+        state: &AppState,
+        role: &str,
+        q: AuditEventsQuery,
+    ) -> Result<Json<AuditEventsResponse>, StatusCode> {
+        events_handler(
+            State(state.clone()),
+            Extension(auth("u1", role)),
+            Extension(crate::test_fixtures::ctx()),
+            Query(q),
+        )
+        .await
     }
 
     #[sqlx::test]
@@ -633,14 +659,23 @@ mod events_tests {
         }
         let (state, _dir) = app_state(pool.clone());
         for role in ["author", "reviewer", "viewer"] {
-            assert_eq!(call(&state, role, query(None)).await.err(), Some(StatusCode::FORBIDDEN), "{role}");
+            assert_eq!(
+                call(&state, role, query(None)).await.err(),
+                Some(StatusCode::FORBIDDEN),
+                "{role}"
+            );
         }
 
         let Json(all) = call(&state, "admin", query(None)).await.unwrap();
         assert_eq!(all.total_count, 2);
-        assert!(all.rows.iter().all(|r| r.asset_name.is_none() && r.detail["k"] == 1));
+        assert!(all
+            .rows
+            .iter()
+            .all(|r| r.asset_name.is_none() && r.detail["k"] == 1));
 
-        let Json(some) = call(&state, "admin", query(Some("checklist.create"))).await.unwrap();
+        let Json(some) = call(&state, "admin", query(Some("checklist.create")))
+            .await
+            .unwrap();
         assert_eq!(some.total_count, 1);
         assert_eq!(some.rows[0].repeat_count, 1);
         assert!(some.rows[0].last_occurred_at.is_none());
@@ -671,14 +706,24 @@ mod events_tests {
         seed_user(&pool, "u1").await;
         let (state, _dir) = app_state(pool.clone());
         let ctx = crate::test_fixtures::ctx();
-        let _ = search_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(search_query()))
-            .await
-            .unwrap();
+        let _ = search_handler(
+            State(state.clone()),
+            Extension(auth("u1", "admin")),
+            Extension(ctx.clone()),
+            Query(search_query()),
+        )
+        .await
+        .unwrap();
         let mut q = query(Some("checklist.save"));
         q.outcome = Some("denied".into());
-        let _ = events_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(q))
-            .await
-            .unwrap();
+        let _ = events_handler(
+            State(state.clone()),
+            Extension(auth("u1", "admin")),
+            Extension(ctx.clone()),
+            Query(q),
+        )
+        .await
+        .unwrap();
 
         type Row = (String, String, String, Option<String>, Option<String>);
         let rows: Vec<Row> = sqlx::query_as(
@@ -689,10 +734,20 @@ mod events_tests {
         .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.0 == "audit.read" && r.1 == "ok"));
-        assert!(rows.iter().all(|r| r.3.as_deref() == Some("198.51.100.4") && r.4.as_deref() == Some("test-request")));
+        assert!(rows
+            .iter()
+            .all(|r| r.3.as_deref() == Some("198.51.100.4")
+                && r.4.as_deref() == Some("test-request")));
         let a: serde_json::Value = serde_json::from_str(&rows[0].2).unwrap();
         assert_eq!(a["view"], "rules");
-        assert_eq!((a["page"].as_i64(), a["pageSize"].as_i64(), a["returned"].as_i64()), (Some(2), Some(200), Some(0)));
+        assert_eq!(
+            (
+                a["page"].as_i64(),
+                a["pageSize"].as_i64(),
+                a["returned"].as_i64()
+            ),
+            (Some(2), Some(200), Some(0))
+        );
         assert_eq!(a["filters"]["from"], "2024-01-02");
         let uid = a["filters"]["userId"].as_str().unwrap();
         assert_eq!(uid.len(), 64);
@@ -713,11 +768,23 @@ mod events_tests {
         let (state, _dir) = app_state(pool.clone());
         let ctx = crate::test_fixtures::ctx();
         for role in ["author", "reviewer", "viewer"] {
-            let s = search_handler(State(state.clone()), Extension(auth("u1", role)), Extension(ctx.clone()), Query(search_query())).await;
+            let s = search_handler(
+                State(state.clone()),
+                Extension(auth("u1", role)),
+                Extension(ctx.clone()),
+                Query(search_query()),
+            )
+            .await;
             assert_eq!(s.err(), Some(StatusCode::FORBIDDEN));
-            assert_eq!(call(&state, role, query(None)).await.err(), Some(StatusCode::FORBIDDEN));
+            assert_eq!(
+                call(&state, role, query(None)).await.err(),
+                Some(StatusCode::FORBIDDEN)
+            );
         }
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -729,12 +796,24 @@ mod events_tests {
         let ctx = crate::test_fixtures::ctx();
         let mut sq = search_query();
         sq.from = Some("not-a-date".into());
-        let s = search_handler(State(state.clone()), Extension(auth("u1", "admin")), Extension(ctx.clone()), Query(sq)).await;
+        let s = search_handler(
+            State(state.clone()),
+            Extension(auth("u1", "admin")),
+            Extension(ctx.clone()),
+            Query(sq),
+        )
+        .await;
         assert_eq!(s.err(), Some(StatusCode::BAD_REQUEST));
         let mut eq = query(None);
         eq.to = Some("nope".into());
-        assert_eq!(call(&state, "admin", eq).await.err(), Some(StatusCode::BAD_REQUEST));
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            call(&state, "admin", eq).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
     }
 }

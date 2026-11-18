@@ -25,23 +25,27 @@ pub async fn seed_user(pool: &PgPool, id: &str) {
 }
 
 pub async fn seed_asset(pool: &PgPool, id: &str, owner: &str, requires_approval: bool) {
-    sqlx::query("INSERT INTO assets (id, name, owner_id, requires_approval) VALUES ($1, $1, $2, $3)")
-        .bind(id)
-        .bind(owner)
-        .bind(requires_approval)
-        .execute(pool)
-        .await
-        .expect("seed asset");
+    sqlx::query(
+        "INSERT INTO assets (id, name, owner_id, requires_approval) VALUES ($1, $1, $2, $3)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(requires_approval)
+    .execute(pool)
+    .await
+    .expect("seed asset");
 }
 
 pub async fn seed_acl(pool: &PgPool, asset_id: &str, user_id: &str, permission: &str) {
-    sqlx::query("INSERT INTO asset_acl (asset_id, user_id, permission, granted_by) VALUES ($1, $2, $3, $2)")
-        .bind(asset_id)
-        .bind(user_id)
-        .bind(permission)
-        .execute(pool)
-        .await
-        .expect("seed acl");
+    sqlx::query(
+        "INSERT INTO asset_acl (asset_id, user_id, permission, granted_by) VALUES ($1, $2, $3, $2)",
+    )
+    .bind(asset_id)
+    .bind(user_id)
+    .bind(permission)
+    .execute(pool)
+    .await
+    .expect("seed acl");
 }
 
 pub async fn seed_tag(pool: &PgPool, asset_id: &str, tag: &str) {
@@ -140,7 +144,11 @@ pub async fn fail_writes_of(pool: &PgPool, table: &str, rule_ids: &[&str]) {
     .execute(pool)
     .await
     .expect("create fail function");
-    let args = rule_ids.iter().map(|r| format!("'{r}'")).collect::<Vec<_>>().join(",");
+    let args = rule_ids
+        .iter()
+        .map(|r| format!("'{r}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     sqlx::query(&format!(
         "CREATE TRIGGER test_fail BEFORE INSERT OR UPDATE ON {table} \
          FOR EACH ROW EXECUTE FUNCTION test_fail_rule({args})"
@@ -186,7 +194,10 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
     let stigs = dir.join("stigs");
     std::fs::create_dir_all(&stigs).expect("create stig dir");
-    let rules: Vec<_> = rule_ids.iter().map(|id| serde_json::json!({ "id": id, "title": id })).collect();
+    let rules: Vec<_> = rule_ids
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "title": id }))
+        .collect();
     std::fs::write(
         stigs.join(format!("{STIG_ID}.json")),
         serde_json::json!({ "id": STIG_ID, "rules": rules }).to_string(),
@@ -221,7 +232,14 @@ pub fn ctx() -> crate::api::request_ctx::RequestCtx {
 
 /// Ids every read point must reject (the 129-byte one is just over the cap).
 pub fn bad_ids() -> Vec<String> {
-    vec!["a.b".into(), "\u{e9}".into(), "../x".into(), "a b".into(), String::new(), "a".repeat(129)]
+    vec![
+        "a.b".into(),
+        "\u{e9}".into(),
+        "../x".into(),
+        "a b".into(),
+        String::new(),
+        "a".repeat(129),
+    ]
 }
 
 /// An `AppState` whose pool never connects, for handlers that must refuse

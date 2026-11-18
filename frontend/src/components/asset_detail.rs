@@ -125,7 +125,11 @@ struct EmailReportResult {
 /// Outcome of "Email report now".
 #[derive(Clone, PartialEq)]
 enum EmailSendStatus {
-    Success { recipients: Vec<String>, mode: String, error: Option<String> },
+    Success {
+        recipients: Vec<String>,
+        mode: String,
+        error: Option<String>,
+    },
     Error(String),
 }
 
@@ -168,13 +172,23 @@ struct CcState {
 
 async fn fetch_page(
     asset_id: &str,
-) -> Result<(LoadedAsset, Vec<Checklist>, Vec<CatalogEntry>, Option<Trend>), String> {
+) -> Result<
+    (
+        LoadedAsset,
+        Vec<Checklist>,
+        Vec<CatalogEntry>,
+        Option<Trend>,
+    ),
+    String,
+> {
     let asset = LoadedAsset::from_raw(api_get::<Value>(&format!("/api/assets/{asset_id}")).await?)?;
     let checklists = api_get(&format!("/api/assets/{asset_id}/checklists")).await?;
     // catalog is public — but api_get sends creds anyway, no harm
     let catalog = api_get("/api/catalog").await?;
     // The trend is optional: a failure just hides the charts.
-    let trend = api_get(&format!("/api/assets/{asset_id}/trend?days=30")).await.ok();
+    let trend = api_get(&format!("/api/assets/{asset_id}/trend?days=30"))
+        .await
+        .ok();
     Ok((asset, checklists, catalog, trend))
 }
 
@@ -212,7 +226,8 @@ async fn refresh_acl(asset_id: &str, st: &AclState) {
     st.visible.set(true);
     // Lazy-load the user picker too — only needed inside the section.
     // The picker just won't have options if this fails.
-    st.users.set(api_get("/api/users").await.unwrap_or_default());
+    st.users
+        .set(api_get("/api/users").await.unwrap_or_default());
 }
 
 /// Mirrors `refresh_acl` — a 403 from the list endpoint is the signal
@@ -311,7 +326,10 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
     // The list endpoint 403s for anyone who can't manage the asset, so we
     // probe it and only render the section if the response was 200 — same
     // pattern as the Sharing section above. Owner / write-ACL / admin.
-    let cc = CcState { rows: use_state(Vec::new), visible: use_state(|| false) };
+    let cc = CcState {
+        rows: use_state(Vec::new),
+        visible: use_state(|| false),
+    };
     let cc_input = use_state(String::new);
     let cc_error = use_state(|| None::<String>);
     let cc_busy = use_state(|| false);
@@ -343,14 +361,21 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             let Some(user) = (*target).clone() else {
                 return;
             };
-            let body = json!({ "userId": user.value.as_str(), "permission": permission.value.as_str() });
+            let body =
+                json!({ "userId": user.value.as_str(), "permission": permission.value.as_str() });
             let (asset_id, acl) = (asset_id.clone(), acl.clone());
             let (target, permission) = (target.clone(), permission.clone());
             let (error, busy) = (error.clone(), busy.clone());
             busy.set(true);
             error.set(None);
             spawn_local(async move {
-                match api_json::<Value, _>(&format!("/api/assets/{asset_id}/acl"), "POST", Some(&body)).await {
+                match api_json::<Value, _>(
+                    &format!("/api/assets/{asset_id}/acl"),
+                    "POST",
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(_) => {
                         target.set(None);
                         permission.set(default_permission());
@@ -368,7 +393,10 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         Callback::from(move |user_id: String| {
             let (asset_id, acl, error) = (asset_id.clone(), acl.clone(), error.clone());
             spawn_local(async move {
-                let path = format!("/api/assets/{asset_id}/acl/{}", encode_uri_component(&user_id));
+                let path = format!(
+                    "/api/assets/{asset_id}/acl/{}",
+                    encode_uri_component(&user_id)
+                );
                 match api_fetch("DELETE", &path).await {
                     Ok(res) if res.ok() => refresh_acl(&asset_id, &acl).await,
                     Ok(res) => error.set(Some(format!("Revoke failed: {}", res.status()))),
@@ -393,7 +421,13 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             error.set(None);
             spawn_local(async move {
                 let body = json!({ "email": email });
-                match api_json::<Vec<CcRow>, _>(&format!("/api/assets/{asset_id}/email-cc"), "POST", Some(&body)).await {
+                match api_json::<Vec<CcRow>, _>(
+                    &format!("/api/assets/{asset_id}/email-cc"),
+                    "POST",
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(rows) => {
                         cc.rows.set(rows);
                         input.set(String::new());
@@ -411,7 +445,10 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             let (asset_id, cc, error) = (asset_id.clone(), cc.clone(), error.clone());
             error.set(None);
             spawn_local(async move {
-                let path = format!("/api/assets/{asset_id}/email-cc/{}", encode_uri_component(&email));
+                let path = format!(
+                    "/api/assets/{asset_id}/email-cc/{}",
+                    encode_uri_component(&email)
+                );
                 match api_fetch("DELETE", &path).await {
                     Ok(res) if res.ok() => refresh_cc(&asset_id, &cc).await,
                     Ok(res) => error.set(Some(format!("Remove failed: {}", res.status()))),
@@ -438,9 +475,10 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             busy.set(true);
             spawn_local(async move {
                 let body = json!({ "emailCadence": next.value.as_str() });
-                let updated = api_json::<Value, _>(&format!("/api/assets/{asset_id}"), "PATCH", Some(&body))
-                    .await
-                    .and_then(LoadedAsset::from_raw);
+                let updated =
+                    api_json::<Value, _>(&format!("/api/assets/{asset_id}"), "PATCH", Some(&body))
+                        .await
+                        .and_then(LoadedAsset::from_raw);
                 match updated {
                     Ok(a) => asset.set(Some(a)),
                     Err(e) => error.set(Some(or_fallback(e, "Failed to update cadence."))),
@@ -460,14 +498,16 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             status.set(None);
             spawn_local(async move {
                 let path = format!("/api/assets/{asset_id}/email-report");
-                status.set(Some(match api_json::<EmailReportResult, _>(&path, "POST", Some(&json!({}))).await {
-                    Ok(r) => EmailSendStatus::Success {
-                        recipients: r.recipients,
-                        mode: r.mode,
-                        error: r.error.filter(|e| !e.is_empty()),
+                status.set(Some(
+                    match api_json::<EmailReportResult, _>(&path, "POST", Some(&json!({}))).await {
+                        Ok(r) => EmailSendStatus::Success {
+                            recipients: r.recipients,
+                            mode: r.mode,
+                            error: r.error.filter(|e| !e.is_empty()),
+                        },
+                        Err(e) => EmailSendStatus::Error(or_fallback(e, "Failed to send report.")),
                     },
-                    Err(e) => EmailSendStatus::Error(or_fallback(e, "Failed to send report.")),
-                }));
+                ));
                 sending.set(false);
             });
         })
@@ -488,7 +528,13 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             error.set(None);
             spawn_local(async move {
                 let body = json!({ "stigId": stig.value.as_str() });
-                match api_json::<Value, _>(&format!("/api/assets/{asset_id}/checklists"), "POST", Some(&body)).await {
+                match api_json::<Value, _>(
+                    &format!("/api/assets/{asset_id}/checklists"),
+                    "POST",
+                    Some(&body),
+                )
+                .await
+                {
                     Ok(_) => {
                         open.set(false);
                         selected.set(None);
@@ -508,7 +554,9 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             spawn_local(async move {
                 match api_fetch("DELETE", &format!("/api/checklists/{cid}")).await {
                     Ok(res) if res.ok() => refresh(&asset_id, &page).await,
-                    Ok(res) => page.error.set(Some(format!("Delete failed: {}", res.status()))),
+                    Ok(res) => page
+                        .error
+                        .set(Some(format!("Delete failed: {}", res.status()))),
                     Err(e) => page.error.set(Some(e)),
                 }
             });
@@ -525,9 +573,13 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             busy.set(true);
             spawn_local(async move {
                 let path = format!("/api/assets/{asset_id}/approval-policy");
-                let updated = api_json::<Value, _>(&path, "PATCH", Some(&json!({ "requiresApproval": next })))
-                    .await
-                    .and_then(LoadedAsset::from_raw);
+                let updated = api_json::<Value, _>(
+                    &path,
+                    "PATCH",
+                    Some(&json!({ "requiresApproval": next })),
+                )
+                .await
+                .and_then(LoadedAsset::from_raw);
                 match updated {
                     Ok(a) => page.asset.set(Some(a)),
                     Err(e) => page.error.set(Some(e)),
@@ -549,22 +601,25 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             };
             let error = page.error.clone();
             spawn_local(async move {
-                let res = match api_fetch("GET", &format!("/api/assets/{}/oscal.json", asset.data.id)).await {
-                    Ok(res) if res.ok() => res,
-                    Ok(res) => {
-                        error.set(Some(format!("OSCAL download failed: {}", res.status())));
-                        return;
-                    }
-                    Err(e) => {
-                        error.set(Some(or_fallback(e, "OSCAL download failed")));
-                        return;
-                    }
-                };
+                let res =
+                    match api_fetch("GET", &format!("/api/assets/{}/oscal.json", asset.data.id))
+                        .await
+                    {
+                        Ok(res) if res.ok() => res,
+                        Ok(res) => {
+                            error.set(Some(format!("OSCAL download failed: {}", res.status())));
+                            return;
+                        }
+                        Err(e) => {
+                            error.set(Some(or_fallback(e, "OSCAL download failed")));
+                            return;
+                        }
+                    };
                 match response_blob(&res).await {
                     Ok(blob) => {
                         // Fall back to a sensible default so we don't end up with "download".
-                        let filename =
-                            response_filename(&res).unwrap_or_else(|| format!("oscal-{}.json", asset.data.name));
+                        let filename = response_filename(&res)
+                            .unwrap_or_else(|| format!("oscal-{}.json", asset.data.name));
                         save_blob(&blob, &filename).await;
                     }
                     Err(e) => error.set(Some(or_fallback(e, "OSCAL download failed"))),
@@ -625,12 +680,16 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         return Html::default();
     };
     let asset = loaded.data.clone();
-    let is_owner = current_user.as_ref().is_some_and(|u| u.id == asset.owner_id);
+    let is_owner = current_user
+        .as_ref()
+        .is_some_and(|u| u.id == asset.owner_id);
 
     let checklists = (*page.checklists).clone();
     let catalog = (*page.catalog).clone();
-    let available_stigs: Vec<&CatalogEntry> =
-        catalog.iter().filter(|s| !checklists.iter().any(|c| c.stig_id == s.id)).collect();
+    let available_stigs: Vec<&CatalogEntry> = catalog
+        .iter()
+        .filter(|s| !checklists.iter().any(|c| c.stig_id == s.id))
+        .collect();
 
     // ── Summary ────────────────────────────────────────────────────────
     let summary = html! {
@@ -703,11 +762,19 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         None => Html::default(),
         Some(trend) => {
             let n = trend.overall.len();
-            let description = format!("{n} snapshot{} in the last 30 days", if n == 1 { "" } else { "s" });
+            let description = format!(
+                "{n} snapshot{} in the last 30 days",
+                if n == 1 { "" } else { "s" }
+            );
             let series = |y: fn(&TrendPoint) -> f64| -> Vec<(f64, f64)> {
-                trend.overall.iter().map(|p| (parse_date_ms(&p.captured_at), y(p))).collect()
+                trend
+                    .overall
+                    .iter()
+                    .map(|p| (parse_date_ms(&p.captured_at), y(p)))
+                    .collect()
             };
-            let empty = html! { <UiBox text_align="center" color="inherit">{"No snapshots yet"}</UiBox> };
+            let empty =
+                html! { <UiBox text_align="center" color="inherit">{"No snapshots yet"}</UiBox> };
             html! {
                 <>
                     <Container header={html! {
@@ -756,9 +823,14 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             let reapply_target = reapply_target.clone();
             move |c: &Checklist| {
                 let meta = catalog.iter().find(|s| s.id == c.stig_id);
-                let title = meta.map(|m| m.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| c.stig_id.clone());
+                let title = meta
+                    .map(|m| m.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| c.stig_id.clone());
                 let outdated = !c.applied_version.is_empty()
-                    && meta.is_some_and(|m| m.version != c.applied_version || m.release_info != c.applied_release);
+                    && meta.is_some_and(|m| {
+                        m.version != c.applied_version || m.release_info != c.applied_release
+                    });
                 let open = {
                     let (on_open, id) = (on_open.clone(), c.id.clone());
                     Callback::from(move |_: MouseEvent| on_open.emit(id.clone()))
@@ -791,8 +863,16 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         let remove_checklist = remove_checklist.clone();
         vec![
             Column::new("stig", "STIG", stig_cell),
-            Column::new("status", "Status", |c: &Checklist| html! { <Badge>{c.status.clone()}</Badge> }),
-            Column::new("updated", "Last activity", |c: &Checklist| html! { {to_locale_string(&c.updated_at)} }),
+            Column::new(
+                "status",
+                "Status",
+                |c: &Checklist| html! { <Badge>{c.status.clone()}</Badge> },
+            ),
+            Column::new(
+                "updated",
+                "Last activity",
+                |c: &Checklist| html! { {to_locale_string(&c.updated_at)} },
+            ),
             Column::new("actions", "", move |c: &Checklist| {
                 let (remove, id) = (remove_checklist.clone(), c.id.clone());
                 html! {
@@ -804,7 +884,11 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         ]
     };
     let open_apply = {
-        let (open, selected, error) = (apply_open.clone(), selected_stig.clone(), apply_error.clone());
+        let (open, selected, error) = (
+            apply_open.clone(),
+            selected_stig.clone(),
+            apply_error.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             selected.set(None);
             error.set(None);
@@ -847,8 +931,16 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
             Column::new("user", "User", |r: &AclRow| {
                 html! { {if r.display_name.is_empty() { r.user_id.clone() } else { r.display_name.clone() }} }
             }),
-            Column::new("permission", "Permission", |r: &AclRow| html! { <Badge>{r.permission.clone()}</Badge> }),
-            Column::new("grantedAt", "Granted", |r: &AclRow| html! { {to_locale_string(&r.granted_at)} }),
+            Column::new(
+                "permission",
+                "Permission",
+                |r: &AclRow| html! { <Badge>{r.permission.clone()}</Badge> },
+            ),
+            Column::new(
+                "grantedAt",
+                "Granted",
+                |r: &AclRow| html! { {to_locale_string(&r.granted_at)} },
+            ),
             Column::new("actions", "", move |r: &AclRow| {
                 let (revoke, id) = (revoke_acl.clone(), r.user_id.clone());
                 html! {
@@ -960,7 +1052,11 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         let rows = (*cc.rows).clone();
         let columns = vec![
             Column::new("email", "Email", |r: &CcRow| html! { {r.email.clone()} }),
-            Column::new("added", "Added", |r: &CcRow| html! { {to_locale_string(&r.added_at)} }),
+            Column::new(
+                "added",
+                "Added",
+                |r: &CcRow| html! { {to_locale_string(&r.added_at)} },
+            ),
             Column::new("actions", "", move |r: &CcRow| {
                 let (remove, email) = (remove_cc.clone(), r.email.clone());
                 html! {
@@ -984,17 +1080,29 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
         };
         let send_result = match &*email_send_status {
             None => Html::default(),
-            Some(EmailSendStatus::Success { recipients, mode, error }) => {
+            Some(EmailSendStatus::Success {
+                recipients,
+                mode,
+                error,
+            }) => {
                 let header = match error {
                     Some(_) => format!("Email send reported an error (mode: {mode})"),
                     None => format!(
                         "Email {} to {} recipient{}",
-                        if mode == "dryrun" { "queued (dry-run)" } else { "sent" },
+                        if mode == "dryrun" {
+                            "queued (dry-run)"
+                        } else {
+                            "sent"
+                        },
                         recipients.len(),
                         if recipients.len() == 1 { "" } else { "s" },
                     ),
                 };
-                let list = if recipients.is_empty() { "(no recipients)".to_string() } else { recipients.join(", ") };
+                let list = if recipients.is_empty() {
+                    "(no recipients)".to_string()
+                } else {
+                    recipients.join(", ")
+                };
                 html! {
                     <Alert
                         kind={if error.is_some() { "warning" } else { "success" }}
@@ -1171,7 +1279,8 @@ pub fn AssetDetail(props: &AssetDetailProps) -> Html {
     let stig_options: Vec<SelectOption> = available_stigs
         .iter()
         .map(|s| {
-            SelectOption::new(s.id.clone(), s.title.clone()).description(format!("{} · v{}", s.category, s.version))
+            SelectOption::new(s.id.clone(), s.title.clone())
+                .description(format!("{} · v{}", s.category, s.version))
         })
         .collect();
     let apply_modal = html! {

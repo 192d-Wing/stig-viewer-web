@@ -64,10 +64,7 @@ pub async fn list_for_rule(
 }
 
 #[allow(dead_code)]
-pub async fn list_for_checklist(
-    pool: &PgPool,
-    checklist_id: &str,
-) -> Result<Vec<AttachmentRow>> {
+pub async fn list_for_checklist(pool: &PgPool, checklist_id: &str) -> Result<Vec<AttachmentRow>> {
     let rows = sqlx::query_as::<_, AttachmentRow>(
         "SELECT * FROM attachments \
          WHERE checklist_id = $1 \
@@ -99,12 +96,10 @@ pub async fn counts_for_checklist(
 }
 
 pub async fn get_by_id(pool: &PgPool, id: &str) -> Result<Option<AttachmentRow>> {
-    let row = sqlx::query_as::<_, AttachmentRow>(
-        "SELECT * FROM attachments WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query_as::<_, AttachmentRow>("SELECT * FROM attachments WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row)
 }
 

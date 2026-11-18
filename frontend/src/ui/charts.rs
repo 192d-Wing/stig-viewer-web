@@ -15,10 +15,20 @@ pub struct ChartSeries {
 
 impl ChartSeries {
     pub fn line(title: impl Into<AttrValue>, data: Vec<(f64, f64)>) -> Self {
-        Self { title: title.into(), color: None, data, threshold: None }
+        Self {
+            title: title.into(),
+            color: None,
+            data,
+            threshold: None,
+        }
     }
     pub fn threshold(title: impl Into<AttrValue>, y: f64) -> Self {
-        Self { title: title.into(), color: None, data: vec![], threshold: Some(y) }
+        Self {
+            title: title.into(),
+            color: None,
+            data: vec![],
+            threshold: Some(y),
+        }
     }
     pub fn color(mut self, c: impl Into<AttrValue>) -> Self {
         self.color = Some(c.into());
@@ -84,7 +94,9 @@ pub fn LineChart(p: &LineChartProps) -> Html {
     let (w, h) = (720.0_f64, p.height as f64);
     let (ml, mr, mt, mb) = (56.0, 16.0, 12.0, 44.0);
     let xs = p.series.iter().flat_map(|s| s.data.iter().map(|d| d.0));
-    let (mut x0, mut x1) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(x), b.max(x)));
+    let (mut x0, mut x1) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| {
+        (a.min(x), b.max(x))
+    });
     if (x1 - x0).abs() < f64::EPSILON {
         x0 -= 1.0;
         x1 += 1.0;
@@ -108,10 +120,16 @@ pub fn LineChart(p: &LineChartProps) -> Html {
         Some(f) => f.emit(y),
         None => nice(y),
     };
-    let y_ticks: Vec<f64> = (0..=4).map(|i| y0 + (y1 - y0) * f64::from(i) / 4.0).collect();
-    let x_ticks: Vec<f64> = (0..=4).map(|i| x0 + (x1 - x0) * f64::from(i) / 4.0).collect();
+    let y_ticks: Vec<f64> = (0..=4)
+        .map(|i| y0 + (y1 - y0) * f64::from(i) / 4.0)
+        .collect();
+    let x_ticks: Vec<f64> = (0..=4)
+        .map(|i| x0 + (x1 - x0) * f64::from(i) / 4.0)
+        .collect();
     let color = |i: usize, s: &ChartSeries| {
-        s.color.clone().unwrap_or(AttrValue::Static(CHART_PALETTE[i % CHART_PALETTE.len()]))
+        s.color
+            .clone()
+            .unwrap_or(AttrValue::Static(CHART_PALETTE[i % CHART_PALETTE.len()]))
     };
     html! {
         <div class="ui-chart" data-testid={p.testid.clone()}>
@@ -171,7 +189,11 @@ pub struct PieDatum {
 
 impl PieDatum {
     pub fn new(title: impl Into<AttrValue>, value: f64) -> Self {
-        Self { title: title.into(), value, color: None }
+        Self {
+            title: title.into(),
+            value,
+            color: None,
+        }
     }
     pub fn color(mut self, c: impl Into<AttrValue>) -> Self {
         self.color = Some(c.into());
@@ -219,7 +241,9 @@ pub fn PieChart(p: &PieChartProps) -> Html {
     let inner = if p.variant == "donut" { 60.0 } else { 0.0 };
     let mut angle = -std::f64::consts::FRAC_PI_2;
     let color = |i: usize, d: &PieDatum| {
-        d.color.clone().unwrap_or(AttrValue::Static(CHART_PALETTE[i % CHART_PALETTE.len()]))
+        d.color
+            .clone()
+            .unwrap_or(AttrValue::Static(CHART_PALETTE[i % CHART_PALETTE.len()]))
     };
     let mut segments = Vec::new();
     for (i, d) in p.data.iter().enumerate() {
@@ -239,7 +263,12 @@ pub fn PieChart(p: &PieChartProps) -> Html {
         let large = i32::from(a1 - a0 > std::f64::consts::PI);
         let (x0, y0, x1, y1) = (r * a0.cos(), r * a0.sin(), r * a1.cos(), r * a1.sin());
         let path = if inner > 0.0 {
-            let (ix0, iy0, ix1, iy1) = (inner * a0.cos(), inner * a0.sin(), inner * a1.cos(), inner * a1.sin());
+            let (ix0, iy0, ix1, iy1) = (
+                inner * a0.cos(),
+                inner * a0.sin(),
+                inner * a1.cos(),
+                inner * a1.sin(),
+            );
             format!("M{x0:.2} {y0:.2}A{r} {r} 0 {large} 1 {x1:.2} {y1:.2}L{ix1:.2} {iy1:.2}A{inner} {inner} 0 {large} 0 {ix0:.2} {iy0:.2}Z")
         } else {
             format!("M0 0L{x0:.2} {y0:.2}A{r} {r} 0 {large} 1 {x1:.2} {y1:.2}Z")

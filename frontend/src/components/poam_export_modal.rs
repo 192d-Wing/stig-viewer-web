@@ -35,17 +35,29 @@ pub fn PoamExportModal(p: &PoamExportModalProps) -> Html {
     let base_name = export_base_name(&p.stig.title);
 
     let handle_csv = {
-        let (stig, asset, include, base_name) =
-            (p.stig.clone(), p.asset_info.clone(), *include_non_reviewed, base_name.clone());
+        let (stig, asset, include, base_name) = (
+            p.stig.clone(),
+            p.asset_info.clone(),
+            *include_non_reviewed,
+            base_name.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let csv = export_poam_csv(&stig, &asset, include);
-            download_text(&csv, "text/csv;charset=utf-8;", &format!("{base_name}_POAM.csv"));
+            download_text(
+                &csv,
+                "text/csv;charset=utf-8;",
+                &format!("{base_name}_POAM.csv"),
+            );
         })
     };
 
     let handle_json = {
-        let (stig, asset, include, base_name) =
-            (p.stig.clone(), p.asset_info.clone(), *include_non_reviewed, base_name.clone());
+        let (stig, asset, include, base_name) = (
+            p.stig.clone(),
+            p.asset_info.clone(),
+            *include_non_reviewed,
+            base_name.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let json = export_poam_json(&stig, &asset, include);
             download_text(&json, "application/json", &format!("{base_name}_POAM.json"));
@@ -53,7 +65,12 @@ pub fn PoamExportModal(p: &PoamExportModalProps) -> Html {
     };
 
     let open_count = p.stig.rules.iter().filter(|r| r.status == "open").count();
-    let pending_count = p.stig.rules.iter().filter(|r| r.status == "not_reviewed").count();
+    let pending_count = p
+        .stig
+        .rules
+        .iter()
+        .filter(|r| r.status == "not_reviewed")
+        .count();
 
     let on_scope = {
         let include_non_reviewed = include_non_reviewed.clone();

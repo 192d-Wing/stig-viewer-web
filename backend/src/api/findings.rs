@@ -177,13 +177,7 @@ pub async fn list_handler(
         // even when the STIG JSON is missing — matches the dashboard's
         // legacy behaviour.
         let sev = f.severity.as_deref().unwrap_or("");
-        f.weighted_score = weighted_score(
-            sev,
-            &f.classification,
-            &f.status,
-            f.due_date,
-            today,
-        );
+        f.weighted_score = weighted_score(sev, &f.classification, &f.status, f.due_date, today);
     }
 
     if let Some(sev) = params.severity.as_deref() {
@@ -201,10 +195,7 @@ pub async fn list_handler(
 
 /// Read a STIG JSON file from disk and build a {rule_id -> RuleMeta} map.
 /// Returns an empty map on any read/parse failure (logged).
-async fn load_rule_meta_map(
-    state: &AppState,
-    stig_id: &str,
-) -> HashMap<String, RuleMeta> {
+async fn load_rule_meta_map(state: &AppState, stig_id: &str) -> HashMap<String, RuleMeta> {
     if !crate::stig_id::is_valid(stig_id) {
         return HashMap::new();
     }
@@ -231,9 +222,8 @@ async fn load_rule_meta_map(
         Some(r) => r,
         None => return HashMap::new(),
     };
-    let s = |r: &serde_json::Value, k: &str| {
-        r.get(k).and_then(|v| v.as_str()).map(|x| x.to_string())
-    };
+    let s =
+        |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).map(|x| x.to_string());
     rules
         .iter()
         .filter_map(|r| {
@@ -253,7 +243,10 @@ async fn load_rule_meta_map(
 }
 
 fn is_valid_status(s: &str) -> bool {
-    matches!(s, "open" | "not_a_finding" | "not_applicable" | "not_reviewed")
+    matches!(
+        s,
+        "open" | "not_a_finding" | "not_applicable" | "not_reviewed"
+    )
 }
 
 #[cfg(test)]

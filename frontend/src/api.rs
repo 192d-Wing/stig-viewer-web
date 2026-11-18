@@ -112,7 +112,10 @@ pub async fn api_fetch_with_timeout(
     };
     let b = builder(method, path).abort_signal(Some(&ctl.signal()));
     let req = match json_body {
-        Some(body) => b.header("Content-Type", "application/json").body(body).map_err(|e| FetchFailure::Build(js_err(e)))?,
+        Some(body) => b
+            .header("Content-Type", "application/json")
+            .body(body)
+            .map_err(|e| FetchFailure::Build(js_err(e)))?,
         None => b.build().map_err(|e| FetchFailure::Build(js_err(e)))?,
     };
     match req.send().await {
@@ -140,13 +143,11 @@ pub async fn api_json<T: DeserializeOwned, B: Serialize + ?Sized>(
 ) -> Result<T, String> {
     let res = match body {
         Some(b) => api_fetch_json(method, path, b).await?,
-        None => {
-            builder(method, path)
-                .header("Content-Type", "application/json")
-                .send()
-                .await
-                .map_err(js_err)?
-        }
+        None => builder(method, path)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .map_err(js_err)?,
     };
     if !res.ok() {
         return Err(error_text(res).await);
@@ -196,7 +197,10 @@ pub async fn api_upload_raw(path: &str, file: &web_sys::File) -> Result<Response
 }
 
 /// Multipart POST of one file, parsing a JSON response (mirrors `apiUpload`).
-pub async fn api_upload<T: DeserializeOwned>(path: &str, file: &web_sys::File) -> Result<T, String> {
+pub async fn api_upload<T: DeserializeOwned>(
+    path: &str,
+    file: &web_sys::File,
+) -> Result<T, String> {
     let res = api_upload_raw(path, file).await?;
     if !res.ok() {
         return Err(error_text(res).await);
@@ -214,7 +218,8 @@ pub async fn response_blob(res: &Response) -> Result<web_sys::Blob, String> {
     if let Some(ct) = res.headers().get("content-type") {
         opts.set_type(&ct);
     }
-    web_sys::Blob::new_with_buffer_source_sequence_and_options(&parts, &opts).map_err(|e| format!("{e:?}"))
+    web_sys::Blob::new_with_buffer_source_sequence_and_options(&parts, &opts)
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// The filename from a `Content-Disposition` header, if any.

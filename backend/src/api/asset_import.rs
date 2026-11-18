@@ -85,18 +85,17 @@ pub async fn import_handler(
 
     // Existing names for the current user — used to flag duplicates as
     // "skipped" without performing a DB write per row.
-    let existing_names: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM assets WHERE owner_id = $1",
-    )
-    .bind(&user.id)
-    .fetch_all(state.pool.as_ref())
-    .await
-    .map_err(|e| {
-        tracing::error!("import: existing-names query failed: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .into_iter()
-    .collect();
+    let existing_names: std::collections::HashSet<String> =
+        sqlx::query_scalar::<_, String>("SELECT name FROM assets WHERE owner_id = $1")
+            .bind(&user.id)
+            .fetch_all(state.pool.as_ref())
+            .await
+            .map_err(|e| {
+                tracing::error!("import: existing-names query failed: {e:#}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .into_iter()
+            .collect();
 
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -204,10 +203,7 @@ pub async fn import_handler(
             .filter(|s| !s.is_empty())
             .collect();
         // Pre-check long tags so we can attach the offending tag in the message.
-        if let Some(bad) = raw_tags
-            .iter()
-            .find(|t| t.chars().count() > MAX_TAG_LEN)
-        {
+        if let Some(bad) = raw_tags.iter().find(|t| t.chars().count() > MAX_TAG_LEN) {
             results.push(ImportRowResult {
                 row_number,
                 name,

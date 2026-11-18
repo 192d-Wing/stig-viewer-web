@@ -22,7 +22,11 @@ fn benchmark_id_suffix(title: &str) -> String {
 
 /// First non-empty candidate (the JS `a || b || c` chain).
 fn first_non_empty<'a>(candidates: &[&'a str]) -> &'a str {
-    candidates.iter().copied().find(|s| !s.is_empty()).unwrap_or("")
+    candidates
+        .iter()
+        .copied()
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
 }
 
 pub fn export_xccdf(stig: &Stig) -> String {
@@ -37,7 +41,10 @@ pub fn export_xccdf(stig: &Stig) -> String {
     lines.push(r#"  xml:lang="en">"#.to_string());
     lines.push(format!("  <title>{}</title>", esc_xml(&stig.title)));
     if !stig.description.is_empty() {
-        lines.push(format!("  <description>{}</description>", esc_xml(&stig.description)));
+        lines.push(format!(
+            "  <description>{}</description>",
+            esc_xml(&stig.description)
+        ));
     }
     if !stig.version.is_empty() {
         lines.push(format!("  <version>{}</version>", esc_xml(&stig.version)));
@@ -58,14 +65,20 @@ pub fn export_xccdf(stig: &Stig) -> String {
             "    <title>{}</title>",
             esc_xml(first_non_empty(&[&rule.group_id, group_id]))
         ));
-        lines.push(format!(r#"    <Rule id="{}" severity="{severity}">"#, esc_xml(&rule.id)));
+        lines.push(format!(
+            r#"    <Rule id="{}" severity="{severity}">"#,
+            esc_xml(&rule.id)
+        ));
         lines.push(format!("      <title>{}</title>", esc_xml(&rule.title)));
         lines.push(format!(
             "      <description>&lt;VulnDiscussion&gt;{}&lt;/VulnDiscussion&gt;</description>",
             esc_xml(&rule.description)
         ));
         if !rule.fix_text.is_empty() {
-            lines.push(format!("      <fixtext>{}</fixtext>", esc_xml(&rule.fix_text)));
+            lines.push(format!(
+                "      <fixtext>{}</fixtext>",
+                esc_xml(&rule.fix_text)
+            ));
         }
         if !rule.check_text.is_empty() {
             lines.push(r#"      <check system="C-0_chk">"#.to_string());
@@ -116,8 +129,17 @@ mod tests {
                     cci_ids: vec!["CCI-000001".into()],
                     ..Rule::default()
                 },
-                Rule { id: "r2".into(), severity: "nope".into(), ..Rule::default() },
-                Rule { id: "r3".into(), group_id: "G-3".into(), severity: "CAT I".into(), ..Rule::default() },
+                Rule {
+                    id: "r2".into(),
+                    severity: "nope".into(),
+                    ..Rule::default()
+                },
+                Rule {
+                    id: "r3".into(),
+                    group_id: "G-3".into(),
+                    severity: "CAT I".into(),
+                    ..Rule::default()
+                },
             ],
         };
         let expected = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -160,7 +182,10 @@ mod tests {
 
     #[test]
     fn omits_empty_optional_header_elements() {
-        let xml = export_xccdf(&Stig { title: "T".into(), ..Stig::default() });
+        let xml = export_xccdf(&Stig {
+            title: "T".into(),
+            ..Stig::default()
+        });
         assert_eq!(
             xml,
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\

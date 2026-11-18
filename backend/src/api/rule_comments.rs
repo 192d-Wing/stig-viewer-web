@@ -67,12 +67,7 @@ fn extract_mention_handles(body: &str) -> Vec<String> {
 /// (mentioned_user_id == author_id) are skipped. All DB errors are
 /// swallowed with a tracing warning — mentions are a notification
 /// nice-to-have, not part of the comment-create contract.
-async fn record_mentions(
-    pool: &sqlx::PgPool,
-    comment_id: &str,
-    author_id: &str,
-    body: &str,
-) {
+async fn record_mentions(pool: &sqlx::PgPool, comment_id: &str, author_id: &str, body: &str) {
     let handles = extract_mention_handles(body);
     if handles.is_empty() {
         return;
@@ -433,12 +428,11 @@ pub async fn add_reaction_handler(
 
     // Confirm the comment exists so we return 404 cleanly instead of
     // letting the FK insert fail with a 500.
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM rule_comments WHERE id = $1")
-            .bind(&comment_id)
-            .fetch_optional(state.pool.as_ref())
-            .await
-            .map_err(err_500)?;
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM rule_comments WHERE id = $1")
+        .bind(&comment_id)
+        .fetch_optional(state.pool.as_ref())
+        .await
+        .map_err(err_500)?;
     if exists.is_none() {
         return Err(err_404());
     }

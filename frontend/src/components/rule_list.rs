@@ -31,7 +31,10 @@ pub struct RuleListProps {
 
 #[function_component]
 pub fn RuleList(p: &RuleListProps) -> Html {
-    let set_all = |status: &'static str| p.on_set_all_status.reform(move |_: MouseEvent| status.to_string());
+    let set_all = |status: &'static str| {
+        p.on_set_all_status
+            .reform(move |_: MouseEvent| status.to_string())
+    };
 
     // Last rule ticked or unticked; the anchor for shift-click ranges.
     let anchor = use_state(|| None::<String>);

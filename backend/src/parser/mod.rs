@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
 use crate::zip_safe::{open_validated, read_entry, ReadBudget, ZipReadError};
+use anyhow::{bail, Result};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
@@ -61,9 +61,16 @@ pub struct StigData {
 fn clean_description(raw: &str) -> String {
     // Tags to strip completely (with their contents)
     const STRIP_TAGS: &[&str] = &[
-        "FalsePositives", "FalseNegatives", "Documentable", "Mitigations",
-        "SeverityOverrideGuidance", "PotentialImpacts", "ThirdPartyTools",
-        "MitigationControl", "Responsibility", "IAControls",
+        "FalsePositives",
+        "FalseNegatives",
+        "Documentable",
+        "Mitigations",
+        "SeverityOverrideGuidance",
+        "PotentialImpacts",
+        "ThirdPartyTools",
+        "MitigationControl",
+        "Responsibility",
+        "IAControls",
     ];
 
     let mut s = raw.to_string();
@@ -175,15 +182,13 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                     }
                     "Group" if in_benchmark => {
                         in_group = true;
-                        current_group_id =
-                            attr_value(e.as_ref(), "id").unwrap_or_default();
+                        current_group_id = attr_value(e.as_ref(), "id").unwrap_or_default();
                     }
                     "Rule" if in_group => {
                         in_rule = true;
                         rule_depth = depth;
                         let rule_id = attr_value(e.as_ref(), "id").unwrap_or_default();
-                        let severity_raw =
-                            attr_value(e.as_ref(), "severity").unwrap_or_default();
+                        let severity_raw = attr_value(e.as_ref(), "severity").unwrap_or_default();
                         current_rule = Some(Rule {
                             id: rule_id,
                             stig_id: current_group_id.clone(),
@@ -205,8 +210,7 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                 // Capture the `system` attribute when entering an <ident>
                 // so the text-event handler can decide whether to keep it.
                 if local == "ident" {
-                    current_ident_system =
-                        attr_value(e.as_ref(), "system").unwrap_or_default();
+                    current_ident_system = attr_value(e.as_ref(), "system").unwrap_or_default();
                 }
                 current_tag = local;
             }
@@ -250,9 +254,7 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                             "fixtext" | "fix-text" if rule.fix_text.is_empty() => {
                                 rule.fix_text = text
                             }
-                            "check-content" if rule.check_text.is_empty() => {
-                                rule.check_text = text
-                            }
+                            "check-content" if rule.check_text.is_empty() => rule.check_text = text,
                             "ident" => {
                                 // Only retain idents whose `system` URI
                                 // names a CCI source — DISA, NIST, and
@@ -261,14 +263,9 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                                 // the substring "cci". Trim + dedupe so
                                 // the JSON shape is stable regardless of
                                 // upstream whitespace quirks.
-                                if current_ident_system
-                                    .to_lowercase()
-                                    .contains("cci")
-                                {
+                                if current_ident_system.to_lowercase().contains("cci") {
                                     let value = text.trim().to_string();
-                                    if !value.is_empty()
-                                        && !rule.cci.iter().any(|c| c == &value)
-                                    {
+                                    if !value.is_empty() && !rule.cci.iter().any(|c| c == &value) {
                                         rule.cci.push(value.clone());
                                         rule.cci_ids.push(value);
                                     }
@@ -322,7 +319,10 @@ pub struct ZipLimits {
     pub nested_zip: u64,
 }
 
-pub const ZIP_LIMITS: ZipLimits = ZipLimits { xccdf: 64 << 20, nested_zip: 128 << 20 };
+pub const ZIP_LIMITS: ZipLimits = ZipLimits {
+    xccdf: 64 << 20,
+    nested_zip: 128 << 20,
+};
 /// Cumulative decompressed bytes for one single-STIG upload or sync source.
 pub const SINGLE_STIG_BUDGET: u64 = 256 << 20;
 /// Cumulative decompressed bytes for one library import.
@@ -330,7 +330,10 @@ pub const LIBRARY_BUDGET: u64 = 2 << 30;
 
 fn utf8_entry(bytes: Vec<u8>) -> Result<String, ZipReadError> {
     String::from_utf8(bytes).map_err(|e| {
-        ZipReadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+        ZipReadError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.utf8_error(),
+        ))
     })
 }
 
@@ -421,10 +424,7 @@ pub fn filename_to_id(zip_name: &str) -> String {
         let bytes = base.as_bytes();
         let mut cut = base.len();
         for i in (0..bytes.len().saturating_sub(3)).rev() {
-            if bytes[i] == b'_'
-                && bytes[i + 1] == b'V'
-                && bytes[i + 2].is_ascii_digit()
-            {
+            if bytes[i] == b'_' && bytes[i + 1] == b'V' && bytes[i + 2].is_ascii_digit() {
                 cut = i;
                 break;
             }
@@ -435,7 +435,13 @@ pub fn filename_to_id(zip_name: &str) -> String {
     // Slugify: lowercase, non-alphanum → hyphen, collapse repeated hyphens
     let raw: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
 
     let mut slug = String::with_capacity(raw.len());
@@ -481,7 +487,15 @@ fn extract_all_xccdf_from_zip(
     skipped: &mut Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>, ZipReadError> {
     let mut out = Vec::new();
-    collect_xccdf(zip_bytes, MAX_ZIP_DEPTH, "(inner zip)", limits, budget, &mut out, skipped)?;
+    collect_xccdf(
+        zip_bytes,
+        MAX_ZIP_DEPTH,
+        "(inner zip)",
+        limits,
+        budget,
+        &mut out,
+        skipped,
+    )?;
     Ok(out)
 }
 
@@ -520,7 +534,9 @@ fn collect_xccdf(
             skipped.push((label.to_string(), "failed to read ZIP entry".into()));
             continue;
         };
-        let Ok(name) = file.name().map(|n| n.into_owned()) else { continue };
+        let Ok(name) = file.name().map(|n| n.into_owned()) else {
+            continue;
+        };
         let lower = name.to_lowercase();
         if lower.ends_with("_xccdf.xml") || lower.ends_with("-xccdf.xml") {
             match read_entry(&mut file, limits.xccdf, budget).and_then(utf8_entry) {
@@ -598,7 +614,11 @@ pub fn extract_all_from_library_full(library_bytes: &[u8]) -> LibraryFullResult 
 }
 
 pub type LibraryFullResult = Result<
-    (Vec<LibraryEntry>, Vec<(String, String)>, Option<&'static str>),
+    (
+        Vec<LibraryEntry>,
+        Vec<(String, String)>,
+        Option<&'static str>,
+    ),
     ZipReadError,
 >;
 
@@ -614,7 +634,11 @@ fn extract_all_from_library_with(
     let mut archive = match open_validated(library_bytes) {
         Ok(a) => a,
         Err(e) => {
-            return Ok((vec![], vec![("(outer zip)".into(), e.to_string())], Some(e.code())))
+            return Ok((
+                vec![],
+                vec![("(outer zip)".into(), e.to_string())],
+                Some(e.code()),
+            ))
         }
     };
 
@@ -636,12 +660,17 @@ fn extract_all_from_library_with(
         let nothing_found = docs.is_empty();
         let nothing_skipped = skipped.is_empty();
         // Report under the library entry's id; the reason names the culprit.
-        errors.extend(skipped.into_iter().map(|(label, why)| {
-            (outer_id.clone(), format!("skipped {label}: {why}"))
-        }));
+        errors.extend(
+            skipped
+                .into_iter()
+                .map(|(label, why)| (outer_id.clone(), format!("skipped {label}: {why}"))),
+        );
         if nothing_found {
             if nothing_skipped {
-                errors.push((outer_id, "ZIP extraction failed: No *_xccdf.xml found in ZIP archive".into()));
+                errors.push((
+                    outer_id,
+                    "ZIP extraction failed: No *_xccdf.xml found in ZIP archive".into(),
+                ));
             }
             continue;
         }
@@ -651,9 +680,14 @@ fn extract_all_from_library_with(
         // each XCCDF file name, so they no longer overwrite each other.
         let multi = docs.len() > 1;
         for (xccdf_name, xccdf) in docs {
-            if let Some(entry) =
-                library_entry(&xccdf_name, &xccdf, &outer_id, multi, &mut seen_ids, &mut errors)
-            {
+            if let Some(entry) = library_entry(
+                &xccdf_name,
+                &xccdf,
+                &outer_id,
+                multi,
+                &mut seen_ids,
+                &mut errors,
+            ) {
                 entries.push(entry);
             }
         }
@@ -672,8 +706,12 @@ fn read_library_stig_zip(
     budget: &mut ReadBudget,
     errors: &mut Vec<(String, String)>,
 ) -> Result<Option<(String, Vec<u8>)>, ZipReadError> {
-    let Ok(mut file) = archive.by_index(i) else { return Ok(None) };
-    let Ok(raw_name) = file.name().map(|n| n.into_owned()) else { return Ok(None) };
+    let Ok(mut file) = archive.by_index(i) else {
+        return Ok(None);
+    };
+    let Ok(raw_name) = file.name().map(|n| n.into_owned()) else {
+        return Ok(None);
+    };
     // Only process STIG ZIPs; skip SRGs, READMEs, manifests, etc.
     if !raw_name.to_lowercase().ends_with("_stig.zip") {
         return Ok(None);
@@ -682,7 +720,10 @@ fn read_library_stig_zip(
         Ok(bytes) => Ok(Some((raw_name, bytes))),
         Err(e @ ZipReadError::BudgetExceeded { .. }) => Err(e),
         Err(e) => {
-            errors.push((filename_to_id(&raw_name), format!("failed to read ZIP entry: {e}")));
+            errors.push((
+                filename_to_id(&raw_name),
+                format!("failed to read ZIP entry: {e}"),
+            ));
             Ok(None)
         }
     }
@@ -698,12 +739,19 @@ fn library_entry(
     seen_ids: &mut std::collections::HashSet<String>,
     errors: &mut Vec<(String, String)>,
 ) -> Option<LibraryEntry> {
-    let mut id = if multi { xccdf_name_to_id(xccdf_name) } else { outer_id.to_string() };
+    let mut id = if multi {
+        xccdf_name_to_id(xccdf_name)
+    } else {
+        outer_id.to_string()
+    };
     if id.is_empty() {
         id = outer_id.to_string();
     }
     if id.is_empty() {
-        errors.push((xccdf_name.chars().take(64).collect(), "could not derive a valid id from the file name; skipped".into()));
+        errors.push((
+            xccdf_name.chars().take(64).collect(),
+            "could not derive a valid id from the file name; skipped".into(),
+        ));
         return None;
     }
     if !seen_ids.insert(id.clone()) {
@@ -720,7 +768,10 @@ fn library_entry(
     if !crate::stig_id::is_valid_new(&id) {
         errors.push((
             id.chars().take(64).collect(),
-            format!("derived id is not a valid STIG id (max {} bytes); skipped", crate::stig_id::MAX_BYTES),
+            format!(
+                "derived id is not a valid STIG id (max {} bytes); skipped",
+                crate::stig_id::MAX_BYTES
+            ),
         ));
         return None;
     }
@@ -745,10 +796,15 @@ mod tests {
 
     #[test]
     fn filename_to_id_is_ascii_lower_only() {
-        assert_eq!(filename_to_id("U_Caf\u{e9}_Server_V1R1_STIG.zip"), "caf-server");
+        assert_eq!(
+            filename_to_id("U_Caf\u{e9}_Server_V1R1_STIG.zip"),
+            "caf-server"
+        );
         assert_eq!(filename_to_id("U_\u{e9}\u{e9}_STIG.zip"), "");
         assert_eq!(filename_to_id("!!!.zip"), "");
-        assert!(crate::stig_id::is_valid_new(&filename_to_id("U_MS_Windows_11_V2R3_STIG.zip")));
+        assert!(crate::stig_id::is_valid_new(&filename_to_id(
+            "U_MS_Windows_11_V2R3_STIG.zip"
+        )));
     }
 
     #[test]
@@ -803,7 +859,11 @@ mod tests {
                     r.title
                 );
                 for c in &r.cci_ids {
-                    assert!(c.starts_with("CCI-"), "{name}: rule {} has non-CCI id {c:?}", r.id);
+                    assert!(
+                        c.starts_with("CCI-"),
+                        "{name}: rule {} has non-CCI id {c:?}",
+                        r.id
+                    );
                 }
             }
             checked += 1;
@@ -866,7 +926,11 @@ mod tests {
                 continue;
             }
             let name = path.display().to_string();
-            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
             let bytes = std::fs::read(&path).expect("read catalog file");
             let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
             let stig: StigData = serde_json::from_value(value.clone())
@@ -893,9 +957,9 @@ mod tests {
                     && !id.contains("trellix-ens")
                     && !id.contains("tie-dxl")
                     && !id.contains("joint-regional")
-                    && !id_words.iter().any(|w| {
-                        ["ess", "epo", "jrss", "staging-server"].contains(w)
-                    })
+                    && !id_words
+                        .iter()
+                        .any(|w| { ["ess", "epo", "jrss", "staging-server"].contains(w) })
                     && !CUI_ID_SEQUENCES.iter().any(|seq| {
                         let n = seq.len();
                         id_words.windows(n).any(|win| win == *seq)
@@ -906,21 +970,32 @@ mod tests {
 
             let mut seen = std::collections::HashSet::new();
             for r in &stig.rules {
-                assert!(seen.insert(r.id.as_str()), "{name}: duplicate rule id {}", r.id);
+                assert!(
+                    seen.insert(r.id.as_str()),
+                    "{name}: duplicate rule id {}",
+                    r.id
+                );
             }
             present.insert(id);
         }
         let unlisted: Vec<_> = present.difference(&allow).collect();
         let missing: Vec<_> = allow.difference(&present).collect();
-        assert!(unlisted.is_empty(), "seed files not on seed/stigs.allowlist: {unlisted:?}");
-        assert!(missing.is_empty(), "allowlisted ids with no seed file: {missing:?}");
+        assert!(
+            unlisted.is_empty(),
+            "seed files not on seed/stigs.allowlist: {unlisted:?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "allowlisted ids with no seed file: {missing:?}"
+        );
     }
 
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write;
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, bytes) in files {
-            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
             w.write_all(bytes).unwrap();
         }
         w.finish().unwrap().into_inner()
@@ -967,9 +1042,18 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("cisco-ios-xe-router-ndm".to_string(), "Cisco IOS XE Router NDM".to_string()),
-                ("cisco-ios-xe-router-rtr".to_string(), "Cisco IOS XE Router RTR".to_string()),
-                ("ms-windows-11".to_string(), "Microsoft Windows 11".to_string()),
+                (
+                    "cisco-ios-xe-router-ndm".to_string(),
+                    "Cisco IOS XE Router NDM".to_string()
+                ),
+                (
+                    "cisco-ios-xe-router-rtr".to_string(),
+                    "Cisco IOS XE Router RTR".to_string()
+                ),
+                (
+                    "ms-windows-11".to_string(),
+                    "Microsoft Windows 11".to_string()
+                ),
             ]
         );
     }
@@ -979,7 +1063,10 @@ mod tests {
         let long_name = format!("U_{}_V1R1_STIG.zip", "A".repeat(200));
         let inner = zip_of(&[("x-xccdf.xml", &benchmark("Long"))]);
         let ok_inner = zip_of(&[("y-xccdf.xml", &benchmark("Short"))]);
-        let library = zip_of(&[(long_name.as_str(), &inner), ("U_Short_V1R1_STIG.zip", &ok_inner)]);
+        let library = zip_of(&[
+            (long_name.as_str(), &inner),
+            ("U_Short_V1R1_STIG.zip", &ok_inner),
+        ]);
         let (entries, errors) = extract_all_from_library(&library).unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["short"]);
@@ -1010,10 +1097,16 @@ mod tests {
     fn extract_xccdf_finds_direct_nested_and_rejects_bad_input() {
         let xml = benchmark("Direct");
         let direct = zip_of(&[("dir/U_X-xccdf.xml", &xml)]);
-        assert_eq!(extract_xccdf_from_zip(&direct).unwrap().as_bytes(), &xml[..]);
+        assert_eq!(
+            extract_xccdf_from_zip(&direct).unwrap().as_bytes(),
+            &xml[..]
+        );
 
         let nested = zip_of(&[("inner.zip", &direct)]);
-        assert_eq!(extract_xccdf_from_zip(&nested).unwrap().as_bytes(), &xml[..]);
+        assert_eq!(
+            extract_xccdf_from_zip(&nested).unwrap().as_bytes(),
+            &xml[..]
+        );
 
         let none = zip_of(&[("readme.txt", b"hi")]);
         let err = extract_xccdf_from_zip(&none).unwrap_err().to_string();
@@ -1037,7 +1130,10 @@ mod tests {
 
     #[test]
     fn library_import_accepts_a_non_utf8_entry_name() {
-        let mut lib = zip_of(&[("U_AXB_V1R1_STIG.zip", &zip_of(&[("a-xccdf.xml", &benchmark("Patched"))]))]);
+        let mut lib = zip_of(&[(
+            "U_AXB_V1R1_STIG.zip",
+            &zip_of(&[("a-xccdf.xml", &benchmark("Patched"))]),
+        )]);
         let hits = header_offsets(&lib, "U_AXB_V1R1_STIG.zip");
         assert_eq!(hits.len(), 2);
         for (name_off, _) in hits {
@@ -1182,7 +1278,10 @@ mod tests {
         let stig = parse_xccdf(xml).expect("parse");
         assert_eq!(stig.title, "Test");
         assert_eq!(stig.rules[0].title, "The real rule title");
-        assert_eq!(stig.rules[1].title, "", "dc:title must not stand in for a missing rule title");
+        assert_eq!(
+            stig.rules[1].title, "",
+            "dc:title must not stand in for a missing rule title"
+        );
     }
 
     // ── Parity with the frontend parser ──────────────────────────────────────
@@ -1239,7 +1338,10 @@ mod tests {
 
     // ── Decompression caps and header validation ──────────────────────────
 
-    const TINY: ZipLimits = ZipLimits { xccdf: 1024, nested_zip: 4096 };
+    const TINY: ZipLimits = ZipLimits {
+        xccdf: 1024,
+        nested_zip: 4096,
+    };
 
     fn big_xccdf(n: usize) -> Vec<u8> {
         let mut v = benchmark("Big");
@@ -1280,7 +1382,10 @@ mod tests {
         assert!(extract_xccdf_with(&z, &TINY, 1 << 20).is_ok());
         // Each part is under its own cap, but together they exceed the budget.
         let e = extract_xccdf_with(&z, &TINY, 1500).unwrap_err();
-        assert!(matches!(e, ZipReadError::BudgetExceeded { limit: 1500 }), "{e}");
+        assert!(
+            matches!(e, ZipReadError::BudgetExceeded { limit: 1500 }),
+            "{e}"
+        );
     }
 
     #[test]
@@ -1288,7 +1393,9 @@ mod tests {
         let good = zip_of(&[("a-xccdf.xml", &benchmark("Good"))]);
         let lib = zip_of(&[("U_Good_V1R1_STIG.zip", &nest(good, 2))]);
         assert!(extract_all_from_library_with(&lib, &TINY, 1 << 20).is_ok());
-        let e = extract_all_from_library_with(&lib, &TINY, 400).err().unwrap();
+        let e = extract_all_from_library_with(&lib, &TINY, 400)
+            .err()
+            .unwrap();
         assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
     }
 
@@ -1296,8 +1403,13 @@ mod tests {
     fn library_skips_an_over_cap_stig_zip_and_reports_it() {
         let good = zip_of(&[("g-xccdf.xml", &benchmark("Good"))]);
         let bad = zip_of(&[("b-xccdf.xml", &big_xccdf(2000))]);
-        let lib = zip_of(&[("U_Bad_V1R1_STIG.zip", &bad), ("U_Good_V1R1_STIG.zip", &good)]);
-        let (entries, errors) = extract_all_from_library_with(&lib, &TINY, 1 << 20).map(|(a, b, _)| (a, b)).unwrap();
+        let lib = zip_of(&[
+            ("U_Bad_V1R1_STIG.zip", &bad),
+            ("U_Good_V1R1_STIG.zip", &good),
+        ]);
+        let (entries, errors) = extract_all_from_library_with(&lib, &TINY, 1 << 20)
+            .map(|(a, b, _)| (a, b))
+            .unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["good"]);
         assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1326,13 +1438,19 @@ mod tests {
         let mut bad = zip_of(&[("b-xccdf.xml", &benchmark("Bad"))]);
         patch_central_name(&mut bad, "b-xccdf.xml", "c-xccdf.xml");
         let good = zip_of(&[("g-xccdf.xml", &benchmark("Good"))]);
-        let lib = zip_of(&[("U_Bad_V1R1_STIG.zip", &bad), ("U_Good_V1R1_STIG.zip", &good)]);
+        let lib = zip_of(&[
+            ("U_Bad_V1R1_STIG.zip", &bad),
+            ("U_Good_V1R1_STIG.zip", &good),
+        ]);
         let (entries, errors) = extract_all_from_library(&lib).unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["good"]);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].0, "bad");
-        assert!(errors[0].1.contains("inconsistent ZIP headers"), "{errors:?}");
+        assert!(
+            errors[0].1.contains("inconsistent ZIP headers"),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -1344,7 +1462,10 @@ mod tests {
         assert!(entries.is_empty());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].0, "(outer zip)");
-        assert!(errors[0].1.contains("inconsistent ZIP headers"), "{errors:?}");
+        assert!(
+            errors[0].1.contains("inconsistent ZIP headers"),
+            "{errors:?}"
+        );
         let (_, _, code) = extract_all_from_library_full(&lib).unwrap();
         assert_eq!(code, Some("header_inconsistency"));
     }
@@ -1377,12 +1498,22 @@ mod tests {
             break_crc(&mut inner, "b-xccdf.xml");
             entries.push((name, inner));
         }
-        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
         let lib = zip_of(&refs);
         // Without the charge nothing would add up and every entry would be skipped.
-        let e = extract_all_from_library_with(&lib, &ZipLimits { xccdf: 4096, nested_zip: 4096 }, 3000)
-            .err()
-            .expect("budget must be exhausted");
+        let e = extract_all_from_library_with(
+            &lib,
+            &ZipLimits {
+                xccdf: 4096,
+                nested_zip: 4096,
+            },
+            3000,
+        )
+        .err()
+        .expect("budget must be exhausted");
         assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
 
         // Single-STIG path: bad-CRC XCCDFs in sibling inner zips are skipped
@@ -1394,9 +1525,20 @@ mod tests {
                 (format!("i{i}.zip"), inner)
             })
             .collect();
-        let refs: Vec<(&str, &[u8])> = outer.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+        let refs: Vec<(&str, &[u8])> = outer
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
         let single = zip_of(&refs);
-        let e = extract_xccdf_with(&single, &ZipLimits { xccdf: 4096, nested_zip: 8192 }, 5000).unwrap_err();
+        let e = extract_xccdf_with(
+            &single,
+            &ZipLimits {
+                xccdf: 4096,
+                nested_zip: 8192,
+            },
+            5000,
+        )
+        .unwrap_err();
         assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
     }
 
@@ -1442,13 +1584,14 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.contains("Library"));
             if is_library {
-                let (entries, errors) = extract_all_from_library(&bytes)
-                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let (entries, errors) =
+                    extract_all_from_library(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert!(errors.is_empty(), "{name}: {errors:?}");
                 assert!(!entries.is_empty(), "{name}");
                 assert!(entries.iter().all(|e| !e.stig.rules.is_empty()), "{name}");
             } else {
-                let xccdf = extract_xccdf_from_zip(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let xccdf =
+                    extract_xccdf_from_zip(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
                 let stig = parse_xccdf(&xccdf).unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert!(!stig.rules.is_empty(), "{name}");
                 // Multi-STIG bundles must also pass the library path.
@@ -1457,7 +1600,10 @@ mod tests {
                 let docs =
                     extract_all_xccdf_from_zip(&bytes, &ZIP_LIMITS, &mut budget, &mut skipped)
                         .unwrap_or_else(|e| panic!("{name}: {e}"));
-                assert!(!docs.is_empty() && skipped.is_empty(), "{name}: {skipped:?}");
+                assert!(
+                    !docs.is_empty() && skipped.is_empty(),
+                    "{name}: {skipped:?}"
+                );
             }
             seen += 1;
         }

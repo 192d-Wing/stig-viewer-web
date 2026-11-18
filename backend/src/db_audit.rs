@@ -60,7 +60,13 @@ pub fn bound_id(id: &str) -> String {
 fn sanitize(id: &str, max: usize) -> String {
     id.chars()
         .take(max)
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                c
+            } else {
+                '?'
+            }
+        })
         .collect()
 }
 
@@ -80,7 +86,12 @@ fn bounded(ev: &NewAuditEvent<'_>) -> BoundedIds {
     }
 }
 
-async fn insert<'e, E: sqlx::PgExecutor<'e>>(pool: E, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<()> {
+async fn insert<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
+    ev: &NewAuditEvent<'_>,
+    ids: &BoundedIds,
+    detail: &Value,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO audit_events (user_id, action, outcome, asset_id, checklist_id, stig_id, detail, \
                                   source_ip, request_id, user_role) \
@@ -108,7 +119,8 @@ pub(crate) async fn record_in_tx(
     ev: &NewAuditEvent<'_>,
 ) -> Result<()> {
     if let Some(ctx) = ev.ctx {
-        ctx.audited.store(true, std::sync::atomic::Ordering::Relaxed);
+        ctx.audited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     insert(&mut **tx, ev, &bounded(ev), &ev.detail).await
 }
@@ -124,7 +136,12 @@ pub const COLLAPSE_WINDOW_SECS: i64 = 300;
 /// request's `request_id`, `source_ip` and `detail`. Returns whether a row was
 /// updated. Not atomic with the insert that follows a miss: a race yields at
 /// worst two rows.
-async fn collapse(pool: &PgPool, ev: &NewAuditEvent<'_>, ids: &BoundedIds, detail: &Value) -> Result<bool> {
+async fn collapse(
+    pool: &PgPool,
+    ev: &NewAuditEvent<'_>,
+    ids: &BoundedIds,
+    detail: &Value,
+) -> Result<bool> {
     if !matches!(ev.outcome, "denied" | "rejected") {
         return Ok(false);
     }
@@ -172,14 +189,17 @@ async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
 pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
     if let Some(ctx) = ev.ctx {
-        ctx.audited.store(true, std::sync::atomic::Ordering::Relaxed);
+        ctx.audited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let ids = bounded(&ev);
     let attempt = async {
         match collapse(pool, &ev, &ids, &ev.detail).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(e) => tracing::warn!(target: "audit", action = ev.action, "audit event collapse failed, inserting: {e:#}"),
+            Err(e) => {
+                tracing::warn!(target: "audit", action = ev.action, "audit event collapse failed, inserting: {e:#}")
+            }
         }
         if let Err(first) = insert(pool, &ev, &ids, &ev.detail).await {
             tracing::warn!(target: "audit", action = ev.action, "audit event insert failed, retrying without detail: {first:#}");
@@ -265,13 +285,27 @@ mod tests {
                 format!("TRUNCATE {t}"),
             ] {
                 let e = sqlx::query(&sql).execute(&pool).await.unwrap_err();
-                assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42501"), "{sql}");
+                assert_eq!(
+                    e.as_database_error().and_then(|d| d.code()).as_deref(),
+                    Some("42501"),
+                    "{sql}"
+                );
             }
         }
-        let e = sqlx::query("TRUNCATE users CASCADE").execute(&pool).await.unwrap_err();
-        assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42501"));
-        let n: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
-            .fetch_one(&pool).await.unwrap();
+        let e = sqlx::query("TRUNCATE users CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("42501")
+        );
+        let n: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 2);
     }
 
@@ -280,45 +314,95 @@ mod tests {
     async fn guard_modes_allow_only_their_operations(pool: PgPool) {
         seed_both(&pool).await;
         // retention: DELETE only.
-        assert!(is_guard_error(&in_mode(&pool, "retention", "UPDATE rule_audit SET field = 'x'").await.unwrap_err()));
-        assert!(is_guard_error(&in_mode(&pool, "retention", "TRUNCATE rule_audit").await.unwrap_err()));
+        assert!(is_guard_error(
+            &in_mode(&pool, "retention", "UPDATE rule_audit SET field = 'x'")
+                .await
+                .unwrap_err()
+        ));
+        assert!(is_guard_error(
+            &in_mode(&pool, "retention", "TRUNCATE rule_audit")
+                .await
+                .unwrap_err()
+        ));
         // test: UPDATE and TRUNCATE, not DELETE.
-        in_mode(&pool, "test", "UPDATE rule_audit SET field = 'x'").await.unwrap();
-        assert!(is_guard_error(&in_mode(&pool, "test", "DELETE FROM rule_audit").await.unwrap_err()));
+        in_mode(&pool, "test", "UPDATE rule_audit SET field = 'x'")
+            .await
+            .unwrap();
+        assert!(is_guard_error(
+            &in_mode(&pool, "test", "DELETE FROM rule_audit")
+                .await
+                .unwrap_err()
+        ));
         // An unknown mode permits nothing.
-        assert!(is_guard_error(&in_mode(&pool, "bogus", "DELETE FROM audit_events").await.unwrap_err()));
-        in_mode(&pool, "retention", "DELETE FROM rule_audit").await.unwrap();
-        in_mode(&pool, "retention", "DELETE FROM audit_events").await.unwrap();
+        assert!(is_guard_error(
+            &in_mode(&pool, "bogus", "DELETE FROM audit_events")
+                .await
+                .unwrap_err()
+        ));
+        in_mode(&pool, "retention", "DELETE FROM rule_audit")
+            .await
+            .unwrap();
+        in_mode(&pool, "retention", "DELETE FROM audit_events")
+            .await
+            .unwrap();
         // The mode is transaction-local: it does not leak to the next statement.
         let e = sqlx::query("DELETE FROM audit_events").execute(&pool).await;
         assert!(e.is_ok(), "no rows left, so nothing to guard");
         seed_both(&pool).await;
-        let e = sqlx::query("DELETE FROM audit_events").execute(&pool).await.unwrap_err();
+        let e = sqlx::query("DELETE FROM audit_events")
+            .execute(&pool)
+            .await
+            .unwrap_err();
         assert!(e.as_database_error().is_some());
         // restore: TRUNCATE (cascading from users) only; DELETE is rejected.
         seed_both(&pool).await;
-        assert!(is_guard_error(&in_mode(&pool, "restore", "DELETE FROM rule_audit").await.unwrap_err()));
-        in_mode(&pool, "restore", "TRUNCATE users CASCADE").await.unwrap();
-        let n: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
-            .fetch_one(&pool).await.unwrap();
+        assert!(is_guard_error(
+            &in_mode(&pool, "restore", "DELETE FROM rule_audit")
+                .await
+                .unwrap_err()
+        ));
+        in_mode(&pool, "restore", "TRUNCATE users CASCADE")
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 0);
         seed_both(&pool).await;
-        in_mode(&pool, "test", "TRUNCATE users CASCADE").await.unwrap();
+        in_mode(&pool, "test", "TRUNCATE users CASCADE")
+            .await
+            .unwrap();
     }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn guard_allows_only_the_collapse_update_without_a_mode(pool: PgPool) {
         seed_both(&pool).await;
-        let code = |e: sqlx::Error| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string()));
+        let code = |e: sqlx::Error| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+        };
         // An `ok` row has no collapse shape.
-        let e = sqlx::query("UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()")
-            .execute(&pool).await.unwrap_err();
+        let e = sqlx::query(
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
         assert_eq!(code(e).as_deref(), Some("42501"));
-        in_mode(&pool, "test", "UPDATE audit_events SET outcome = 'denied'").await.unwrap();
+        in_mode(&pool, "test", "UPDATE audit_events SET outcome = 'denied'")
+            .await
+            .unwrap();
         // The collapse shape on a denied row passes without any mode.
-        sqlx::query("UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()")
-            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = NOW()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         // Rejected: another column too, an outcome change, a jump over 1, a
         // decrease, no change, a past or future or infinite timestamp.
         for sql in [
@@ -336,7 +420,10 @@ mod tests {
             assert_eq!(code(e).as_deref(), Some("42501"), "{sql}");
         }
         // rule_audit has no collapse shape.
-        let e = sqlx::query("UPDATE rule_audit SET field = 'x'").execute(&pool).await.unwrap_err();
+        let e = sqlx::query("UPDATE rule_audit SET field = 'x'")
+            .execute(&pool)
+            .await
+            .unwrap_err();
         assert_eq!(code(e).as_deref(), Some("42501"));
     }
 
@@ -352,17 +439,35 @@ mod tests {
         .unwrap();
         assert_eq!(enabled.len(), 4);
         assert!(enabled.iter().all(|(_, e)| e == "A"), "{enabled:?}");
-        in_mode(&pool, "migration", "UPDATE rule_audit SET field = 'y'").await.unwrap();
-        assert!(is_guard_error(&in_mode(&pool, "migration", "DELETE FROM rule_audit").await.unwrap_err()));
-        assert!(is_guard_error(&in_mode(&pool, "migration", "TRUNCATE rule_audit").await.unwrap_err()));
+        in_mode(&pool, "migration", "UPDATE rule_audit SET field = 'y'")
+            .await
+            .unwrap();
+        assert!(is_guard_error(
+            &in_mode(&pool, "migration", "DELETE FROM rule_audit")
+                .await
+                .unwrap_err()
+        ));
+        assert!(is_guard_error(
+            &in_mode(&pool, "migration", "TRUNCATE rule_audit")
+                .await
+                .unwrap_err()
+        ));
     }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn collapse_onto_a_row_whose_last_occurrence_is_slightly_in_the_future_still_collapses(pool: PgPool) {
+    async fn collapse_onto_a_row_whose_last_occurrence_is_slightly_in_the_future_still_collapses(
+        pool: PgPool,
+    ) {
         seed_user(&pool, "u1").await;
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
-        in_mode(&pool, "test", "UPDATE audit_events SET last_occurred_at = NOW() + INTERVAL '30 seconds'").await.unwrap();
+        in_mode(
+            &pool,
+            "test",
+            "UPDATE audit_events SET last_occurred_at = NOW() + INTERVAL '30 seconds'",
+        )
+        .await
+        .unwrap();
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
         let got = rows(&pool).await;
         assert_eq!(got.len(), 1);
@@ -384,8 +489,9 @@ mod tests {
 
     #[test]
     fn rejected_detail_caps_the_list() {
-        let many: Vec<(String, String)> =
-            (0..150).map(|i| (format!("r{i}"), "why".to_string())).collect();
+        let many: Vec<(String, String)> = (0..150)
+            .map(|i| (format!("r{i}"), "why".to_string()))
+            .collect();
         let (listed, truncated) = rejected_detail(&many);
         assert_eq!(listed.as_array().unwrap().len(), MAX_REJECTED_LISTED);
         assert!(truncated);
@@ -399,7 +505,9 @@ mod tests {
     async fn records_one_row_per_outcome(pool: PgPool) {
         seed_user(&pool, "u1").await;
         for outcome in ["ok", "partial", "denied", "rejected"] {
-            record_event(&pool, &ev(outcome, json!({ "n": 1 }))).await.unwrap();
+            record_event(&pool, &ev(outcome, json!({ "n": 1 })))
+                .await
+                .unwrap();
         }
         let got: Vec<(String, String, Option<String>)> =
             sqlx::query_as("SELECT outcome, detail->>'n', asset_id FROM audit_events ORDER BY id")
@@ -408,7 +516,9 @@ mod tests {
                 .unwrap();
         let outcomes: Vec<&str> = got.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(outcomes, ["ok", "partial", "denied", "rejected"]);
-        assert!(got.iter().all(|r| r.1 == "1" && r.2.as_deref() == Some("a1")));
+        assert!(got
+            .iter()
+            .all(|r| r.1 == "1" && r.2.as_deref() == Some("a1")));
     }
 
     async fn rows(pool: &PgPool) -> Vec<(String, i32, bool, Option<String>)> {
@@ -432,10 +542,19 @@ mod tests {
             record_or_log(&pool, e).await;
         }
         let got = rows(&pool).await;
-        assert_eq!(got, vec![("denied".to_string(), 5, true, Some("req-0".to_string()))]);
+        assert_eq!(
+            got,
+            vec![("denied".to_string(), 5, true, Some("req-0".to_string()))]
+        );
         // Only repeat_count and last_occurred_at move: detail is untouched.
-        let d: String = sqlx::query_scalar("SELECT detail::text FROM audit_events").fetch_one(&pool).await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&d).unwrap(), json!({ "reason": "not_owner" }));
+        let d: String = sqlx::query_scalar("SELECT detail::text FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&d).unwrap(),
+            json!({ "reason": "not_owner" })
+        );
     }
 
     #[sqlx::test]
@@ -467,7 +586,11 @@ mod tests {
     }
 
     fn ctx_with(ip: &str, role: &str) -> RequestCtx {
-        RequestCtx { source_ip: Some(ip.into()), role: role.into(), ..ctx() }
+        RequestCtx {
+            source_ip: Some(ip.into()),
+            role: role.into(),
+            ..ctx()
+        }
     }
 
     async fn denied_authz(pool: &PgPool, c: &RequestCtx, method: &str, route: &str) {
@@ -495,7 +618,10 @@ mod tests {
         denied_authz(&pool, &again, "POST", "/api/a").await;
         let got = rows(&pool).await;
         assert_eq!(got.len(), 5);
-        assert_eq!(got[0], ("denied".to_string(), 2, true, Some("req-1".to_string())));
+        assert_eq!(
+            got[0],
+            ("denied".to_string(), 2, true, Some("req-1".to_string()))
+        );
         assert!(got[1..].iter().all(|r| r.1 == 1));
     }
 
@@ -504,12 +630,37 @@ mod tests {
     async fn client_derived_counters_do_not_split_the_key_but_reason_and_dry_run_do(pool: PgPool) {
         seed_user(&pool, "u1").await;
         for n in [1, 50, 9000] {
-            record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "requested": n }))).await;
+            record_or_log(
+                &pool,
+                ev(
+                    "rejected",
+                    json!({ "reason": "too_many_rules", "requested": n }),
+                ),
+            )
+            .await;
         }
         assert_eq!(rows(&pool).await.len(), 1);
-        record_or_log(&pool, ev("rejected", json!({ "reason": "other", "requested": 1 }))).await;
-        record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "dryRun": true, "requested": 1 }))).await;
-        record_or_log(&pool, ev("rejected", json!({ "reason": "too_many_rules", "dryRun": false, "requested": 1 }))).await;
+        record_or_log(
+            &pool,
+            ev("rejected", json!({ "reason": "other", "requested": 1 })),
+        )
+        .await;
+        record_or_log(
+            &pool,
+            ev(
+                "rejected",
+                json!({ "reason": "too_many_rules", "dryRun": true, "requested": 1 }),
+            ),
+        )
+        .await;
+        record_or_log(
+            &pool,
+            ev(
+                "rejected",
+                json!({ "reason": "too_many_rules", "dryRun": false, "requested": 1 }),
+            ),
+        )
+        .await;
         let got = rows(&pool).await;
         assert_eq!(got.len(), 4);
         assert_eq!(got[0].1, 3);
@@ -631,7 +782,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(got, (Some("203.0.113.7".into()), Some("req-1".into()), Some("author".into())));
+        assert_eq!(
+            got,
+            (
+                Some("203.0.113.7".into()),
+                Some("req-1".into()),
+                Some("author".into())
+            )
+        );
 
         // No context: the columns stay NULL.
         record_or_log(&pool, ev("ok", json!({}))).await;
@@ -658,7 +816,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&got.0).unwrap(), json!({ "detailDropped": true }));
-        assert_eq!((got.1.as_deref(), got.2.as_deref(), got.3.as_deref()), (Some("203.0.113.7"), Some("req-1"), Some("author")));
+        assert_eq!(
+            serde_json::from_str::<Value>(&got.0).unwrap(),
+            json!({ "detailDropped": true })
+        );
+        assert_eq!(
+            (got.1.as_deref(), got.2.as_deref(), got.3.as_deref()),
+            (Some("203.0.113.7"), Some("req-1"), Some("author"))
+        );
     }
 }

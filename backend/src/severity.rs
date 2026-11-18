@@ -174,10 +174,7 @@ mod tests {
             40.0
         );
         // CAT II on cui, not past-due: 3 × 1.2 × 1.0 = 3.6
-        assert_eq!(
-            weighted_score("CAT II", "cui", "open", None, today),
-            3.6
-        );
+        assert_eq!(weighted_score("CAT II", "cui", "open", None, today), 3.6);
         // CAT III on secret: 1 × 1.5 × 1.0 = 1.5
         assert_eq!(
             weighted_score("CAT III", "secret", "open", None, today),

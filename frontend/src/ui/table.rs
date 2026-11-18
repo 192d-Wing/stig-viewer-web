@@ -27,14 +27,27 @@ impl<T> Clone for Column<T> {
 
 impl<T> PartialEq for Column<T> {
     fn eq(&self, o: &Self) -> bool {
-        self.id == o.id && self.header == o.header && Rc::ptr_eq(&self.cell, &o.cell) && self.sortable == o.sortable
+        self.id == o.id
+            && self.header == o.header
+            && Rc::ptr_eq(&self.cell, &o.cell)
+            && self.sortable == o.sortable
     }
 }
 
 impl<T> Column<T> {
-    pub fn new(id: impl Into<AttrValue>, header: impl Into<AttrValue>, cell: impl Fn(&T) -> Html + 'static) -> Self {
+    pub fn new(
+        id: impl Into<AttrValue>,
+        header: impl Into<AttrValue>,
+        cell: impl Fn(&T) -> Html + 'static,
+    ) -> Self {
         let header: AttrValue = header.into();
-        Self { id: id.into(), header: html! { {header} }, cell: Rc::new(cell), sortable: false, width: None }
+        Self {
+            id: id.into(),
+            header: html! { {header} },
+            cell: Rc::new(cell),
+            sortable: false,
+            width: None,
+        }
     }
     /// Replace the plain-text header with arbitrary markup.
     pub fn header_html(mut self, h: Html) -> Self {
@@ -147,15 +160,30 @@ pub fn Table<T: Clone + PartialEq + 'static>(p: &TableProps<T>) -> Html {
     let header_id = use_id("ui-table");
     let has_header = p.header != Html::default();
     let key_of = |item: &T, idx: usize| -> String {
-        p.track_by.as_ref().map(|f| f.emit(item.clone())).unwrap_or_else(|| idx.to_string())
+        p.track_by
+            .as_ref()
+            .map(|f| f.emit(item.clone()))
+            .unwrap_or_else(|| idx.to_string())
     };
-    let disabled = |item: &T| p.is_item_disabled.as_ref().map(|f| f.emit(item.clone())).unwrap_or(false);
+    let disabled = |item: &T| {
+        p.is_item_disabled
+            .as_ref()
+            .map(|f| f.emit(item.clone()))
+            .unwrap_or(false)
+    };
     let selection = p.selection_type.as_deref();
     let ncols = p.columns.len() + usize::from(selection.is_some());
 
-    let selectable: Vec<(usize, &T)> = p.items.iter().enumerate().filter(|(_, it)| !disabled(it)).collect();
+    let selectable: Vec<(usize, &T)> = p
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| !disabled(it))
+        .collect();
     let all_selected = !selectable.is_empty()
-        && selectable.iter().all(|(i, it)| p.selected_keys.contains(&key_of(it, *i)));
+        && selectable
+            .iter()
+            .all(|(i, it)| p.selected_keys.contains(&key_of(it, *i)));
 
     let select_all = {
         let cb = p.on_selection_change.clone();

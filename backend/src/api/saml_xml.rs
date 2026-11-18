@@ -47,7 +47,10 @@ impl std::error::Error for Reject {}
 
 /// Build an error with a fixed reason code.
 pub fn reject(code: &'static str, detail: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(Reject { code, detail: detail.into() })
+    anyhow::Error::new(Reject {
+        code,
+        detail: detail.into(),
+    })
 }
 
 /// Give `e` the stage default `code` unless it already carries one.
@@ -162,7 +165,12 @@ fn add_node(nodes: &mut Vec<Node>, n: Node, in_assertion: bool) -> Result<usize>
         && !in_assertion
         && matches!(
             n.local.as_str(),
-            "Subject" | "NameID" | "EncryptedID" | "AttributeStatement" | "Attribute" | "AttributeValue"
+            "Subject"
+                | "NameID"
+                | "EncryptedID"
+                | "AttributeStatement"
+                | "Attribute"
+                | "AttributeValue"
         )
     {
         bail!("identity element {} outside Assertion", n.local);
@@ -264,7 +272,10 @@ impl SamlDoc {
         if !stack.is_empty() || nodes.is_empty() {
             bail!("incomplete XML document");
         }
-        let doc = SamlDoc { src: xml.to_string(), nodes };
+        let doc = SamlDoc {
+            src: xml.to_string(),
+            nodes,
+        };
         doc.validate()?;
         Ok(doc)
     }
@@ -419,14 +430,19 @@ mod tests {
 
     #[test]
     fn spans_slice_from_lt_to_gt() {
-        let xml = resp(r#"<saml:Assertion ID="a"><saml:Issuer>i &amp; j</saml:Issuer><saml:Empty x='1' /></saml:Assertion>"#);
+        let xml = resp(
+            r#"<saml:Assertion ID="a"><saml:Issuer>i &amp; j</saml:Issuer><saml:Empty x='1' /></saml:Assertion>"#,
+        );
         let d = SamlDoc::parse(&xml).unwrap();
         for i in 0..d.len() {
             let s = d.span(i);
             assert!(s.starts_with('<') && s.ends_with('>'), "{s}");
         }
         let a = d.assertion().unwrap();
-        assert_eq!(d.span(a), r#"<saml:Assertion ID="a"><saml:Issuer>i &amp; j</saml:Issuer><saml:Empty x='1' /></saml:Assertion>"#);
+        assert_eq!(
+            d.span(a),
+            r#"<saml:Assertion ID="a"><saml:Issuer>i &amp; j</saml:Issuer><saml:Empty x='1' /></saml:Assertion>"#
+        );
         let issuer = d.child_one(a, NS_ASSERT, "Issuer").unwrap();
         assert_eq!(d.leaf_text(issuer).unwrap(), "i & j");
         assert_eq!(d.span(issuer), "<saml:Issuer>i &amp; j</saml:Issuer>");
@@ -448,7 +464,7 @@ mod tests {
             format!("{}<samlp:Response {R}/>", resp(a)),
             format!("{}junk", resp(a)),
             resp(r#"<saml:Assertion ID="a"/><u:X/>"#),
-            resp("") ,
+            resp(""),
             "<other/>".to_string(),
             "x".repeat(MAX_DOC_BYTES + 1),
         ];
@@ -461,7 +477,11 @@ mod tests {
     #[test]
     fn structural_caps_and_xmlns_values() {
         let a = r#"<saml:Assertion ID="a"/>"#;
-        let deep = format!("{}{}", "<x:e xmlns:x=\"urn:x\">".repeat(MAX_DEPTH + 1), "</x:e>".repeat(MAX_DEPTH + 1));
+        let deep = format!(
+            "{}{}",
+            "<x:e xmlns:x=\"urn:x\">".repeat(MAX_DEPTH + 1),
+            "</x:e>".repeat(MAX_DEPTH + 1)
+        );
         assert!(SamlDoc::parse(&resp(&format!("{a}{deep}"))).is_err());
         let many = "<x:e xmlns:x=\"urn:x\"/>".repeat(MAX_ELEMENTS + 1);
         assert!(SamlDoc::parse(&resp(&format!("{a}{many}"))).is_err());
@@ -474,7 +494,9 @@ mod tests {
 
     #[test]
     fn namespaces_closed_requires_inner_declarations() {
-        let ok = resp(r#"<saml:Assertion ID="a" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Issuer/></saml:Assertion>"#);
+        let ok = resp(
+            r#"<saml:Assertion ID="a" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Issuer/></saml:Assertion>"#,
+        );
         let d = SamlDoc::parse(&ok).unwrap();
         assert!(d.namespaces_closed(d.assertion().unwrap(), None));
         // Assertion relies on the prefix declared on the Response.

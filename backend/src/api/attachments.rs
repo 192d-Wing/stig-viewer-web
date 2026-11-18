@@ -219,9 +219,7 @@ pub async fn download_handler(
         );
     }
     let safe_name = sanitize_filename(&row.filename);
-    if let Ok(v) = HeaderValue::from_str(&format!(
-        "attachment; filename=\"{safe_name}\""
-    )) {
+    if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{safe_name}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
 

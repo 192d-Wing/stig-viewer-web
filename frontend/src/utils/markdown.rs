@@ -96,7 +96,10 @@ fn is_url_end_char(c: char) -> bool {
 /// If a bare URL starts at the beginning of `s`, return its byte length.
 /// Matches `https?:\/\/[^\s<>"')]+[^\s<>"'.,;:!?)]`.
 fn url_len_at(s: &str) -> Option<usize> {
-    let scheme_len = ["https://", "http://"].iter().find(|p| s.starts_with(**p))?.len();
+    let scheme_len = ["https://", "http://"]
+        .iter()
+        .find(|p| s.starts_with(**p))?
+        .len();
     let body = &s[scheme_len..];
     // Longest run of URL characters, then back off to the last character
     // that may end a URL; at least one character must precede it.
@@ -122,7 +125,11 @@ fn autolink(s: &str) -> String {
                 // `[^"]` alternative: any other character, then the URL.
                 let c = s[pos..].chars().next().unwrap_or('\0');
                 let pre_len = c.len_utf8();
-                let url_len = if c == '"' { None } else { url_len_at(&s[pos + pre_len..]) };
+                let url_len = if c == '"' {
+                    None
+                } else {
+                    url_len_at(&s[pos + pre_len..])
+                };
                 (pre_len, url_len)
             }
         };
@@ -228,7 +235,8 @@ impl Renderer<'_> {
             return;
         }
         let joined = self.para_buf.join(" ");
-        self.out.push_str(&format!("<p>{}</p>", apply_inline(&escape_html(&joined))));
+        self.out
+            .push_str(&format!("<p>{}</p>", apply_inline(&escape_html(&joined))));
         self.para_buf.clear();
     }
 
@@ -252,12 +260,15 @@ impl Renderer<'_> {
     }
 
     fn push_item(&mut self, text: &str) {
-        self.out.push_str(&format!("<li>{}</li>", apply_inline(&escape_html(text))));
+        self.out
+            .push_str(&format!("<li>{}</li>", apply_inline(&escape_html(text))));
     }
 
     fn push_fence(&mut self, fence_buf: &[&str]) {
-        self.out
-            .push_str(&format!("<pre><code>{}</code></pre>", escape_html(&fence_buf.join("\n"))));
+        self.out.push_str(&format!(
+            "<pre><code>{}</code></pre>",
+            escape_html(&fence_buf.join("\n"))
+        ));
     }
 }
 
@@ -312,7 +323,10 @@ pub fn render_markdown(src: &str) -> String {
         if let Some((level, text)) = parse_heading(line) {
             r.flush_para();
             r.close_lists();
-            r.out.push_str(&format!("<h{level}>{}</h{level}>", apply_inline(&escape_html(text))));
+            r.out.push_str(&format!(
+                "<h{level}>{}</h{level}>",
+                apply_inline(&escape_html(text))
+            ));
             continue;
         }
 
@@ -424,7 +438,10 @@ mod tests {
 
     #[test]
     fn paragraphs_join_soft_breaks_and_handle_crlf() {
-        assert_eq!(render_markdown("text\nmore\r\n\r\nlast"), "<p>text more</p><p>last</p>");
+        assert_eq!(
+            render_markdown("text\nmore\r\n\r\nlast"),
+            "<p>text more</p><p>last</p>"
+        );
     }
 
     #[test]
@@ -434,7 +451,10 @@ mod tests {
             "<ul><li>a</li><li>b</li></ul><ol><li>c</li><li>d</li></ol><ul><li>e</li></ul>\
              <p>para</p><ul><li>f</li></ul><h2>h</h2>"
         );
-        assert_eq!(render_markdown("-nospace\n1.nospace\n1) paren"), "<p>-nospace 1.nospace 1) paren</p>");
+        assert_eq!(
+            render_markdown("-nospace\n1.nospace\n1) paren"),
+            "<p>-nospace 1.nospace 1) paren</p>"
+        );
     }
 
     #[test]
@@ -443,14 +463,26 @@ mod tests {
             render_markdown("para\n```js\nlet a = '<b>';\n  **not bold**\n\n- no list\n```\nafter"),
             "<p>para</p><pre><code>let a = &#39;&lt;b&gt;&#39;;\n  **not bold**\n\n- no list</code></pre><p>after</p>"
         );
-        assert_eq!(render_markdown("```\nunclosed `x`"), "<pre><code>unclosed `x`</code></pre>");
-        assert_eq!(render_markdown("a\n```"), "<p>a</p><pre><code></code></pre>");
+        assert_eq!(
+            render_markdown("```\nunclosed `x`"),
+            "<pre><code>unclosed `x`</code></pre>"
+        );
+        assert_eq!(
+            render_markdown("a\n```"),
+            "<p>a</p><pre><code></code></pre>"
+        );
     }
 
     #[test]
     fn inline_spans_follow_the_regex_semantics() {
-        assert_eq!(apply_inline("`a` `` `b*c*`"), "<code>a</code> `<code> </code>b<em>c</em>`");
-        assert_eq!(apply_inline("**a** **b**"), "<strong>a</strong> <strong>b</strong>");
+        assert_eq!(
+            apply_inline("`a` `` `b*c*`"),
+            "<code>a</code> `<code> </code>b<em>c</em>`"
+        );
+        assert_eq!(
+            apply_inline("**a** **b**"),
+            "<strong>a</strong> <strong>b</strong>"
+        );
         assert_eq!(apply_inline("***x***"), "<em><strong>x</strong></em>");
         assert_eq!(apply_inline("**a*b**"), "*<em>a</em>b**");
         assert_eq!(apply_inline("* ** `"), "<em> </em>* `");
@@ -463,13 +495,25 @@ mod tests {
         let a = |url: &str| {
             format!("<a href=\"{url}\" target=\"_blank\" rel=\"noopener noreferrer\">{url}</a>")
         };
-        assert_eq!(autolink("https://a.b/c."), format!("{}.", a("https://a.b/c")));
-        assert_eq!(autolink("(http://a.b/c?d=e&amp;f=g)!"), format!("({})!", a("http://a.b/c?d=e&amp;f=g")));
-        assert_eq!(autolink("x https://a.b, y"), format!("x {}, y", a("https://a.b")));
+        assert_eq!(
+            autolink("https://a.b/c."),
+            format!("{}.", a("https://a.b/c"))
+        );
+        assert_eq!(
+            autolink("(http://a.b/c?d=e&amp;f=g)!"),
+            format!("({})!", a("http://a.b/c?d=e&amp;f=g"))
+        );
+        assert_eq!(
+            autolink("x https://a.b, y"),
+            format!("x {}, y", a("https://a.b"))
+        );
         // Preceded by a double quote (an existing href): left alone.
         assert_eq!(autolink("\"https://a.b"), "\"https://a.b");
         // Too short to be a URL.
-        assert_eq!(autolink("https:// http://x https://."), "https:// http://x https://.");
+        assert_eq!(
+            autolink("https:// http://x https://."),
+            "https:// http://x https://."
+        );
         assert_eq!(autolink("http://xy"), a("http://xy"));
         assert_eq!(
             apply_inline("`https://in.code/x`"),

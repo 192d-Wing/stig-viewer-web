@@ -47,12 +47,9 @@ impl Config {
                 .unwrap_or_else(|_| "8080".into())
                 .parse()
                 .context("PORT must be a valid port number")?,
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://stig:stig_local@localhost:5432/stig_viewer".into()
-            }),
-            data_dir: PathBuf::from(
-                std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into()),
-            ),
+            database_url: std::env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://stig:stig_local@localhost:5432/stig_viewer".into()),
+            data_dir: PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into())),
             sync_interval_hours: std::env::var("STIG_SYNC_INTERVAL_HOURS")
                 .unwrap_or_else(|_| "24".into())
                 .parse()
@@ -189,8 +186,7 @@ impl TestHooks {
 pub fn load_sources() -> Result<Vec<StigSource>> {
     let raw = fs::read_to_string("stig-sources.toml")
         .context("Cannot read stig-sources.toml — run from the backend/ directory")?;
-    let parsed: SourcesFile =
-        toml::from_str(&raw).context("Failed to parse stig-sources.toml")?;
+    let parsed: SourcesFile = toml::from_str(&raw).context("Failed to parse stig-sources.toml")?;
     Ok(parsed.stigs)
 }
 
@@ -202,10 +198,18 @@ mod tests {
     fn require_signature_accepts_only_explicit_booleans() {
         assert_eq!(parse_require_signature(None).unwrap(), None);
         for on in ["true", "1", "YES", " yes "] {
-            assert_eq!(parse_require_signature(Some(on)).unwrap(), Some(true), "{on:?}");
+            assert_eq!(
+                parse_require_signature(Some(on)).unwrap(),
+                Some(true),
+                "{on:?}"
+            );
         }
         for off in ["false", "0", "No", " false "] {
-            assert_eq!(parse_require_signature(Some(off)).unwrap(), Some(false), "{off:?}");
+            assert_eq!(
+                parse_require_signature(Some(off)).unwrap(),
+                Some(false),
+                "{off:?}"
+            );
         }
         for bad in ["", "on", "tru", "2", "enabled"] {
             assert!(parse_require_signature(Some(bad)).is_err(), "{bad:?}");
@@ -232,7 +236,10 @@ mod tests {
         assert_eq!(parse_seed_dir(None), None);
         assert_eq!(parse_seed_dir(Some("")), None);
         assert_eq!(parse_seed_dir(Some("  \t")), None);
-        assert_eq!(parse_seed_dir(Some("/app/data")), Some(PathBuf::from("/app/data")));
+        assert_eq!(
+            parse_seed_dir(Some("/app/data")),
+            Some(PathBuf::from("/app/data"))
+        );
     }
 
     #[test]
@@ -295,7 +302,13 @@ mod tests {
     fn unset_or_misspelled_env_does_not_enable_test_routes() {
         // The old gate was `STIG_ENV != "production"`: any of these exposed
         // /api/test/*. None of them may do so now.
-        for env in [None, Some(""), Some("prod"), Some("producton"), Some("development")] {
+        for env in [
+            None,
+            Some(""),
+            Some("prod"),
+            Some("producton"),
+            Some("development"),
+        ] {
             let hooks = TestHooks::from_vars(env, None, None);
             assert!(!hooks.enable_test_routes, "{env:?}");
             assert!(!hooks.allow_test_auth_header, "{env:?}");
@@ -352,7 +365,11 @@ mod tests {
 
     #[test]
     fn production_with_hooks_off_starts() {
-        for (routes, header) in [(None, None), (Some("false"), Some("0")), (Some(""), Some("no"))] {
+        for (routes, header) in [
+            (None, None),
+            (Some("false"), Some("0")),
+            (Some(""), Some("no")),
+        ] {
             assert!(TestHooks::from_vars(Some("production"), routes, header)
                 .validate()
                 .is_ok());

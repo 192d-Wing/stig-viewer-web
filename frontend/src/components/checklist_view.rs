@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
-use crate::api::{api_fetch, api_fetch_json, api_get, api_json, api_upload, api_upload_raw, BACKEND};
+use crate::api::{
+    api_fetch, api_fetch_json, api_get, api_json, api_upload, api_upload_raw, BACKEND,
+};
 use crate::auth::use_current_user;
 use crate::model::visible_selection;
 use crate::ui::*;
@@ -38,7 +40,11 @@ const STATUSES: [(&str, &str, &str); 4] = [
 // Emoji-style reactions surfaced under each rule comment. Keep the
 // keys in sync with the allowlist in
 // backend/src/api/rule_comments.rs (ALLOWED_REACTIONS).
-const REACTION_TYPES: [(&str, &str); 3] = [("thumbs_up", "\u{1F44D}"), ("check", "✅"), ("question", "❓")];
+const REACTION_TYPES: [(&str, &str); 3] = [
+    ("thumbs_up", "\u{1F44D}"),
+    ("check", "✅"),
+    ("question", "❓"),
+];
 
 // Closing statuses require a written justification in `findingDetails`.
 // Keep in sync with `requires_finding_details` in
@@ -123,11 +129,17 @@ impl RuleRow {
         let to_strings = |v: &Value| -> Option<Vec<String>> {
             v.as_array().map(|a| {
                 a.iter()
-                    .map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
+                    .map(|x| {
+                        x.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| x.to_string())
+                    })
                     .collect()
             })
         };
-        to_strings(&self.cci).or_else(|| to_strings(&self.cci_ids)).unwrap_or_default()
+        to_strings(&self.cci)
+            .or_else(|| to_strings(&self.cci_ids))
+            .unwrap_or_default()
     }
 }
 
@@ -300,7 +312,11 @@ struct BulkStatusResponse {
 /// Summary line shown after a multi-select status change.
 fn bulk_status_summary(status_label: &str, r: &BulkStatusResponse) -> String {
     let plural = |n: u64| if n == 1 { "" } else { "s" };
-    let mut parts = vec![format!("Set {} rule{} to {status_label}.", r.applied_count, plural(r.applied_count))];
+    let mut parts = vec![format!(
+        "Set {} rule{} to {status_label}.",
+        r.applied_count,
+        plural(r.applied_count)
+    )];
     if r.pending_count > 0 {
         parts.push(format!("{} submitted for review.", r.pending_count));
     }
@@ -437,13 +453,14 @@ impl ViewState {
                 self.detail.set(Some(Rc::new(d.into())));
                 // Best-effort fetch of pending approvals scoped to this checklist.
                 // Non-fatal — the rule list still renders without the pill.
-                let ids: HashSet<String> = api_get::<Vec<ApprovalRow>>("/api/approvals?status=pending")
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|r| r.checklist_id == self.checklist_id)
-                    .map(|r| r.rule_id)
-                    .collect();
+                let ids: HashSet<String> =
+                    api_get::<Vec<ApprovalRow>>("/api/approvals?status=pending")
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| r.checklist_id == self.checklist_id)
+                        .map(|r| r.rule_id)
+                        .collect();
                 self.pending_approval_ids.set(Rc::new(ids));
             }
             Err(e) => self.error.set(Some(e)),
@@ -560,12 +577,22 @@ impl ViewState {
     /// Toggle one of the three emoji reactions on a comment. If `mine` is
     /// true we DELETE; otherwise we POST. After the request we refresh the
     /// comment list so the new count/mine flag are reflected.
-    async fn toggle_reaction(&self, rule_id: String, comment_id: String, reaction: &'static str, mine: bool) {
+    async fn toggle_reaction(
+        &self,
+        rule_id: String,
+        comment_id: String,
+        reaction: &'static str,
+        mine: bool,
+    ) {
         self.comment_error.set(None);
         // Both endpoints return 204 No Content, so use the raw fetch helpers
         // rather than `api_json`, which expects a JSON body.
         let res = if mine {
-            api_fetch("DELETE", &format!("/api/comments/{comment_id}/reactions/{reaction}")).await
+            api_fetch(
+                "DELETE",
+                &format!("/api/comments/{comment_id}/reactions/{reaction}"),
+            )
+            .await
         } else {
             let path = format!("/api/comments/{comment_id}/reactions");
             api_fetch_json("POST", &path, &json!({ "reaction": reaction })).await
@@ -588,7 +615,11 @@ impl ViewState {
             Err(e) => {
                 // The backend returns 413 for files over the size cap; surface a
                 // friendlier message in that case.
-                let msg = if e.contains("413") { "File too large (max 25 MB).".to_string() } else { e };
+                let msg = if e.contains("413") {
+                    "File too large (max 25 MB).".to_string()
+                } else {
+                    e
+                };
                 self.upload_error.set(Some(msg));
             }
         }
@@ -623,13 +654,24 @@ impl ViewState {
     }
 
     /// POST the CSV to the bulk-import endpoint and parse the JSON answer.
-    async fn bulk_request(&self, file: &web_sys::File, dry_run: bool) -> Result<BulkResponse, String> {
-        let path = format!("/api/checklists/{}/rules/bulk-import?dry_run={dry_run}", self.checklist_id);
+    async fn bulk_request(
+        &self,
+        file: &web_sys::File,
+        dry_run: bool,
+    ) -> Result<BulkResponse, String> {
+        let path = format!(
+            "/api/checklists/{}/rules/bulk-import?dry_run={dry_run}",
+            self.checklist_id
+        );
         let res = api_upload_raw(&path, file).await?;
         if !res.ok() {
             let status = res.status();
             let text = res.text().await.unwrap_or_else(|_| res.status_text());
-            return Err(if text.is_empty() { status.to_string() } else { text });
+            return Err(if text.is_empty() {
+                status.to_string()
+            } else {
+                text
+            });
         }
         res.json::<BulkResponse>().await.map_err(|e| e.to_string())
     }
@@ -835,15 +877,27 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let is_owner = current_user.as_ref().map(|u| u.id.as_str()) == Some(detail.owner_id.as_str());
     let gate_violated = finding_details_required(&s.draft.status, &s.draft.finding_details);
 
-    let count_of = |status: &str| detail.rules.iter().filter(|r| r.state.status == status).count();
+    let count_of = |status: &str| {
+        detail
+            .rules
+            .iter()
+            .filter(|r| r.state.status == status)
+            .count()
+    };
 
     let filtered_rules: Vec<Rc<RuleRow>> = {
         let f = filter.trim().to_lowercase();
         if f.is_empty() {
             detail.rules.clone()
         } else {
-            let has = |v: &Option<String>| v.as_deref().unwrap_or_default().to_lowercase().contains(&f);
-            detail.rules.iter().filter(|r| has(&r.id) || has(&r.title) || has(&r.severity)).cloned().collect()
+            let has =
+                |v: &Option<String>| v.as_deref().unwrap_or_default().to_lowercase().contains(&f);
+            detail
+                .rules
+                .iter()
+                .filter(|r| has(&r.id) || has(&r.title) || has(&r.severity))
+                .cloned()
+                .collect()
         }
     };
 
@@ -901,8 +955,11 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                 if pending_ids.contains(r.id()) {
                     return html! { <Badge color="blue" testid="status-pending-review">{"Pending review"}</Badge> };
                 }
-                let (_, label, color) =
-                    STATUSES.iter().find(|(v, _, _)| *v == r.state.status).copied().unwrap_or(STATUSES[0]);
+                let (_, label, color) = STATUSES
+                    .iter()
+                    .find(|(v, _, _)| *v == r.state.status)
+                    .copied()
+                    .unwrap_or(STATUSES[0]);
                 html! { <Badge {color}>{label}</Badge> }
             }),
         ]
@@ -917,7 +974,9 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let save_edit = {
         let s = s.clone();
         Callback::from(move |_: MouseEvent| {
-            let Some(rule) = (*s.editing).clone() else { return };
+            let Some(rule) = (*s.editing).clone() else {
+                return;
+            };
             let draft = (*s.draft).clone();
             let s = s.clone();
             spawn_local(async move { s.save_edit(rule.id().to_string(), draft).await });
@@ -1150,7 +1209,9 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let commit_bulk = {
         let s = s.clone();
         Callback::from(move |_: MouseEvent| {
-            let Some(file) = (*s.bulk_file).clone() else { return };
+            let Some(file) = (*s.bulk_file).clone() else {
+                return;
+            };
             let s = s.clone();
             spawn_local(async move { s.commit_bulk(file).await });
         })
@@ -1171,10 +1232,16 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     let selected_ids: Vec<String> = visible_selection(&filtered_ids, &selected);
     let on_selection_change = {
         let selected = selected.clone();
-        Callback::from(move |rows: Vec<Rc<RuleRow>>| selected.set(rows.iter().map(|r| r.id().to_string()).collect()))
+        Callback::from(move |rows: Vec<Rc<RuleRow>>| {
+            selected.set(rows.iter().map(|r| r.id().to_string()).collect())
+        })
     };
     let open_set_status = {
-        let (open, details, error) = (set_status_open.clone(), set_status_details.clone(), set_status_error.clone());
+        let (open, details, error) = (
+            set_status_open.clone(),
+            set_status_details.clone(),
+            set_status_error.clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             details.set(String::new());
             error.set(None);
@@ -1194,12 +1261,20 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
             set_status_error.clone(),
             set_status_result.clone(),
         );
-        let (rule_ids, status, details) =
-            (selected_ids.clone(), (*set_status_value).clone(), (*set_status_details).clone());
+        let (rule_ids, status, details) = (
+            selected_ids.clone(),
+            (*set_status_value).clone(),
+            (*set_status_details).clone(),
+        );
         Callback::from(move |_: MouseEvent| {
             let s = s.clone();
-            let (selected, open, busy, error, result) =
-                (selected.clone(), open.clone(), busy.clone(), error.clone(), result.clone());
+            let (selected, open, busy, error, result) = (
+                selected.clone(),
+                open.clone(),
+                busy.clone(),
+                error.clone(),
+                result.clone(),
+            );
             let status = status.clone();
             let body = json!({ "ruleIds": rule_ids, "status": status, "findingDetails": details });
             spawn_local(async move {
@@ -1211,7 +1286,11 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                         // Rules that could not be changed stay selected so
                         // they can be retried with a justification.
                         selected.set(
-                            r.results.iter().filter(|x| x.status == "error").map(|x| x.rule_id.clone()).collect(),
+                            r.results
+                                .iter()
+                                .filter(|x| x.status == "error")
+                                .map(|x| x.rule_id.clone())
+                                .collect(),
                         );
                         result.set(Some((status, r)));
                         open.set(false);
@@ -1224,7 +1303,12 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
         })
     };
     let status_label = |value: &str| {
-        STATUSES.iter().find(|(v, _, _)| *v == value).map(|(_, l, _)| *l).unwrap_or_default().to_string()
+        STATUSES
+            .iter()
+            .find(|(v, _, _)| *v == value)
+            .map(|(_, l, _)| *l)
+            .unwrap_or_default()
+            .to_string()
     };
     let set_status_closing = CLOSING_STATUSES.contains(&set_status_value.as_str());
     let set_status_alert = match &*set_status_result {
@@ -1248,13 +1332,27 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
     // one example row keep the CSV tiny and self-documenting.
     let bulk_template_href = format!(
         "data:text/csv;charset=utf-8,{}",
-        encode_uri_component("rule_id,status,finding_details\nV-12345,not_a_finding,Patched per vendor guidance.\n")
+        encode_uri_component(
+            "rule_id,status,finding_details\nV-12345,not_a_finding,Patched per vendor guidance.\n"
+        )
     );
     let bulk_columns = vec![
         Column::new("row", "Row", |r: &BulkRow| html! { {r.row_number} }),
-        Column::new("ruleId", "Rule", |r: &BulkRow| html! { {or_dash(&r.rule_id)} }),
-        Column::new("ruleStatus", "Status", |r: &BulkRow| html! { {or_dash(&r.rule_status)} }),
-        Column::new("findingDetails", "Finding details", |r: &BulkRow| html! { {or_dash(&r.finding_details)} }),
+        Column::new(
+            "ruleId",
+            "Rule",
+            |r: &BulkRow| html! { {or_dash(&r.rule_id)} },
+        ),
+        Column::new(
+            "ruleStatus",
+            "Status",
+            |r: &BulkRow| html! { {or_dash(&r.rule_status)} },
+        ),
+        Column::new(
+            "findingDetails",
+            "Finding details",
+            |r: &BulkRow| html! { {or_dash(&r.finding_details)} },
+        ),
         Column::new("status", "Result", |r: &BulkRow| {
             let (color, text) = match r.status.as_str() {
                 "ok" => ("green", "ok".to_string()),
@@ -1267,7 +1365,9 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
             html! { {r.error.clone().or_else(|| r.note.clone()).unwrap_or_default()} }
         }),
     ];
-    let bulk_rows_with = |preview: &BulkResponse, status: &str| preview.rows.iter().filter(|r| r.status == status).count();
+    let bulk_rows_with = |preview: &BulkResponse, status: &str| {
+        preview.rows.iter().filter(|r| r.status == status).count()
+    };
 
     html! {
         <UiBox padding="m">
@@ -1468,7 +1568,11 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
 }
 
 fn or_dash(s: &str) -> String {
-    if s.is_empty() { "—".to_string() } else { s.to_string() }
+    if s.is_empty() {
+        "—".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// One comment of the rule's thread: author line, then either the inline
@@ -1583,26 +1687,54 @@ mod bulk_status_summary_tests {
 
     #[test]
     fn import_summary_and_commit_label() {
-        let r = BulkResponse { applied_count: 2, ..Default::default() };
+        let r = BulkResponse {
+            applied_count: 2,
+            ..Default::default()
+        };
         assert_eq!(bulk_import_summary(&r), "Applied 2 rules.");
-        let r = BulkResponse { applied_count: 1, pending_count: 2, error_count: 3, ..Default::default() };
-        assert_eq!(bulk_import_summary(&r), "Applied 1 rule. 2 submitted for review. 3 not changed.");
+        let r = BulkResponse {
+            applied_count: 1,
+            pending_count: 2,
+            error_count: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            bulk_import_summary(&r),
+            "Applied 1 rule. 2 submitted for review. 3 not changed."
+        );
         assert_eq!(bulk_commit_label(4, 0), "Apply 4 rows");
         assert_eq!(bulk_commit_label(4, 2), "Apply 4 rows, submit 2 for review");
     }
 
     #[test]
     fn single_rule_wording() {
-        let r = BulkStatusResponse { applied_count: 1, ..Default::default() };
+        let r = BulkStatusResponse {
+            applied_count: 1,
+            ..Default::default()
+        };
         assert_eq!(bulk_status_summary("Open", &r), "Set 1 rule to Open.");
     }
 
     #[test]
     fn mentions_review_and_unchanged_counts() {
-        let r = BulkStatusResponse { applied_count: 3, pending_count: 2, ..Default::default() };
-        assert_eq!(bulk_status_summary("Open", &r), "Set 3 rules to Open. 2 submitted for review.");
-        let r = BulkStatusResponse { applied_count: 0, error_count: 4, ..Default::default() };
-        assert_eq!(bulk_status_summary("Open", &r), "Set 0 rules to Open. 4 not changed.");
+        let r = BulkStatusResponse {
+            applied_count: 3,
+            pending_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            bulk_status_summary("Open", &r),
+            "Set 3 rules to Open. 2 submitted for review."
+        );
+        let r = BulkStatusResponse {
+            applied_count: 0,
+            error_count: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            bulk_status_summary("Open", &r),
+            "Set 0 rules to Open. 4 not changed."
+        );
     }
 }
 

@@ -203,13 +203,20 @@ async fn import_request(file: &web_sys::File, dry_run: bool) -> Result<ImportRes
             Ok(t) => t,
             Err(_) => res.status_text(),
         };
-        return Err(if text.is_empty() { status.to_string() } else { text });
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
     }
-    res.json::<ImportResponse>().await.map_err(|e| e.to_string())
+    res.json::<ImportResponse>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    let n = js_sys::JsString::from(a).locale_compare(b, &js_sys::Array::new(), &js_sys::Object::new());
+    let n =
+        js_sys::JsString::from(a).locale_compare(b, &js_sys::Array::new(), &js_sys::Object::new());
     n.cmp(&0)
 }
 
@@ -241,8 +248,10 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
     // Active filters live in the URL. `tag` is CSV with AND semantics;
     // `group` is a single group id and narrows the list to that group's
     // membership. Both are independent and stack with each other.
-    let (url_state, set_url_state) =
-        use_url_state(vec![("tag", UrlVal::List(vec![])), ("group", UrlVal::from(""))]);
+    let (url_state, set_url_state) = use_url_state(vec![
+        ("tag", UrlVal::List(vec![])),
+        ("group", UrlVal::from("")),
+    ]);
     let active_tags = url_state.list("tag");
     let active_group = url_state.str("group");
 
@@ -257,7 +266,11 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
         use_effect_with((), move |_| {
             spawn_local(async move {
                 // Non-fatal on error — groups filter just stays empty.
-                groups.set(api_get::<Vec<Group>>("/api/asset-groups").await.unwrap_or_default());
+                groups.set(
+                    api_get::<Vec<Group>>("/api/asset-groups")
+                        .await
+                        .unwrap_or_default(),
+                );
             });
         });
     }
@@ -427,7 +440,8 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                     Ok(data) => {
                         import_success.set(Some(data));
                         refresh().await;
-                        gloo_timers::callback::Timeout::new(800, move || close_import.emit(())).forget();
+                        gloo_timers::callback::Timeout::new(800, move || close_import.emit(()))
+                            .forget();
                     }
                     Err(e) => import_error.set(Some(e)),
                 }
@@ -540,8 +554,12 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                         api_json::<serde_json::Value, _>("/api/assets", "POST", Some(&body)).await
                     }
                     ModalMode::Edit { asset_id } => {
-                        api_json::<serde_json::Value, _>(&format!("/api/assets/{asset_id}"), "PUT", Some(&body))
-                            .await
+                        api_json::<serde_json::Value, _>(
+                            &format!("/api/assets/{asset_id}"),
+                            "PUT",
+                            Some(&body),
+                        )
+                        .await
                     }
                 };
                 match res {
@@ -590,7 +608,10 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
     // the asset-detail view (the Edit button on AssetDetail opens it
     // without bouncing the user back to the list).
     let is_edit = matches!(&*modal, Some(ModalMode::Edit { .. }));
-    let selected_classification = if CLASSIFICATIONS.iter().any(|(v, _)| *v == form.classification) {
+    let selected_classification = if CLASSIFICATIONS
+        .iter()
+        .any(|(v, _)| *v == form.classification)
+    {
         form.classification.clone()
     } else {
         CLASSIFICATIONS[0].0.to_string()
@@ -689,7 +710,10 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                 let view = view.clone();
                 let asset_id = id.clone();
                 Callback::from(move |cid: String| {
-                    view.set(View::Checklist { id: cid, asset_id: asset_id.clone() })
+                    view.set(View::Checklist {
+                        id: cid,
+                        asset_id: asset_id.clone(),
+                    })
                 })
             };
             // AssetDetail hands over the asset JSON it fetched; turn it into
@@ -717,7 +741,11 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
             let on_back = {
                 let view = view.clone();
                 let asset_id = asset_id.clone();
-                Callback::from(move |_: ()| view.set(View::Asset { id: asset_id.clone() }))
+                Callback::from(move |_: ()| {
+                    view.set(View::Asset {
+                        id: asset_id.clone(),
+                    })
+                })
             };
             return html! { <ChecklistView checklist_id={id.clone()} {on_back} /> };
         }
@@ -740,7 +768,11 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                 }
             }
         }),
-        Column::new("hostname", "Hostname", |a: &Asset| html! { {or_dash(&a.hostname)} }),
+        Column::new(
+            "hostname",
+            "Hostname",
+            |a: &Asset| html! { {or_dash(&a.hostname)} },
+        ),
         Column::new("classification", "Classification", |a: &Asset| {
             html! {
                 <Badge color={classification_badge(&a.classification)}>
@@ -761,8 +793,16 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                 }
             }
         }),
-        Column::new("owner", "Owner", |a: &Asset| html! { {a.owner_name.clone()} }),
-        Column::new("updated", "Updated", |a: &Asset| html! { {to_locale_string(&a.updated_at)} }),
+        Column::new(
+            "owner",
+            "Owner",
+            |a: &Asset| html! { {a.owner_name.clone()} },
+        ),
+        Column::new(
+            "updated",
+            "Updated",
+            |a: &Asset| html! { {to_locale_string(&a.updated_at)} },
+        ),
         Column::new("actions", "", {
             let current_user_id = current_user.map(|u| u.id);
             let open_edit = open_edit.clone();
@@ -791,7 +831,9 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
 
     let set_tags = |tags: Vec<String>| {
         let set_url_state = set_url_state.clone();
-        Callback::from(move |_: MouseEvent| set_url_state.emit(vec![("tag", UrlVal::List(tags.clone()))]))
+        Callback::from(move |_: MouseEvent| {
+            set_url_state.emit(vec![("tag", UrlVal::List(tags.clone()))])
+        })
     };
     let set_group = {
         let set_url_state = set_url_state.clone();
@@ -808,7 +850,11 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
             String::new()
         };
         let group_options: Vec<SelectOption> = std::iter::once(SelectOption::new("", "All groups"))
-            .chain(groups.iter().map(|g| SelectOption::new(g.id.clone(), g.name.clone())))
+            .chain(
+                groups
+                    .iter()
+                    .map(|g| SelectOption::new(g.id.clone(), g.name.clone())),
+            )
             .collect();
         html! {
             <SpaceBetween direction="vertical" size="xs">
@@ -867,17 +913,28 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
         format!("({})", assets.len())
     };
 
-    let preview_rows: &[ImportRow] = import_preview.as_ref().map(|p| p.rows.as_slice()).unwrap_or_default();
+    let preview_rows: &[ImportRow] = import_preview
+        .as_ref()
+        .map(|p| p.rows.as_slice())
+        .unwrap_or_default();
     let ok_rows = preview_rows.iter().filter(|r| r.status == "ok").count();
     let error_rows = preview_rows.iter().filter(|r| r.status == "error").count();
     let import_columns: Vec<Column<ImportRow>> = vec![
         Column::new("row", "Row", |r: &ImportRow| html! { {r.row_number} }),
         Column::new("name", "Name", |r: &ImportRow| html! { {or_dash(&r.name)} }),
-        Column::new("hostname", "Hostname", |r: &ImportRow| html! { {or_dash(&r.hostname)} }),
+        Column::new(
+            "hostname",
+            "Hostname",
+            |r: &ImportRow| html! { {or_dash(&r.hostname)} },
+        ),
         Column::new("classification", "Classification", |r: &ImportRow| {
             html! { {or_dash(&r.classification)} }
         }),
-        Column::new("tags", "Tags", |r: &ImportRow| html! { {or_dash(&r.tags.join(", "))} }),
+        Column::new(
+            "tags",
+            "Tags",
+            |r: &ImportRow| html! { {or_dash(&r.tags.join(", "))} },
+        ),
         Column::new("status", "Status", |r: &ImportRow| {
             let color = match r.status.as_str() {
                 "ok" => "green",
@@ -888,7 +945,11 @@ pub fn AssetsLibrary(_props: &AssetsLibraryProps) -> Html {
                 <Badge {color} testid={format!("import-status-{}", r.row_number)}>{r.status.clone()}</Badge>
             }
         }),
-        Column::new("error", "Note", |r: &ImportRow| html! { {r.error.clone().unwrap_or_default()} }),
+        Column::new(
+            "error",
+            "Note",
+            |r: &ImportRow| html! { {r.error.clone().unwrap_or_default()} },
+        ),
     ];
 
     let close_import_click = close_import.reform(|_: MouseEvent| ());

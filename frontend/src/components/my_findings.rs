@@ -100,9 +100,13 @@ fn FindingsTable(p: &FindingsTableProps) -> Html {
     let tone = p.tone.clone();
     let columns = vec![
         Column::new("rule", "Rule", |f: &Finding| html! { {f.rule_id.clone()} }),
-        Column::new("severity", "Severity", move |f: &Finding| match &f.severity {
-            Some(s) if !s.is_empty() => html! { <Badge color={severity_badge(s)}>{s.clone()}</Badge> },
-            _ => dash(),
+        Column::new("severity", "Severity", move |f: &Finding| {
+            match &f.severity {
+                Some(s) if !s.is_empty() => {
+                    html! { <Badge color={severity_badge(s)}>{s.clone()}</Badge> }
+                }
+                _ => dash(),
+            }
         }),
         Column::new("weight", "Weight", |f: &Finding| {
             let w = f.weighted_score;
@@ -115,8 +119,16 @@ fn FindingsTable(p: &FindingsTableProps) -> Html {
             };
             html! { <Badge {color}>{format!("{w:.1}")}</Badge> }
         }),
-        Column::new("system", "System", |f: &Finding| html! { {f.asset_name.clone()} }),
-        Column::new("stig", "STIG", |f: &Finding| html! { {f.stig_title.clone()} }),
+        Column::new(
+            "system",
+            "System",
+            |f: &Finding| html! { {f.asset_name.clone()} },
+        ),
+        Column::new(
+            "stig",
+            "STIG",
+            |f: &Finding| html! { {f.stig_title.clone()} },
+        ),
         Column::new("due", "Due", move |f: &Finding| match &f.due_date {
             Some(d) if !d.is_empty() => html! {
                 <UiBox color={if tone == "red" { "text-status-error" } else { "inherit" }}>
@@ -125,7 +137,11 @@ fn FindingsTable(p: &FindingsTableProps) -> Html {
             },
             _ => dash(),
         }),
-        Column::new("updated", "Last update", |f: &Finding| html! { {to_locale_string(&f.updated_at)} }),
+        Column::new(
+            "updated",
+            "Last update",
+            |f: &Finding| html! { {to_locale_string(&f.updated_at)} },
+        ),
     ];
     html! {
         <Table<Finding>
@@ -232,7 +248,10 @@ pub fn MyFindings(_props: &MyFindingsProps) -> Html {
             let saved_searches = saved_searches.clone();
             let saved_error = saved_error.clone();
             spawn_local(async move {
-                let path = format!("/api/saved-searches?page={}", encode_uri_component(SAVED_PAGE));
+                let path = format!(
+                    "/api/saved-searches?page={}",
+                    encode_uri_component(SAVED_PAGE)
+                );
                 match api_get::<Vec<SavedSearch>>(&path).await {
                     Ok(rows) => {
                         saved_searches.set(rows);
@@ -280,7 +299,8 @@ pub fn MyFindings(_props: &MyFindingsProps) -> Html {
             let save_modal_open = save_modal_open.clone();
             let refresh_saved_searches = refresh_saved_searches.clone();
             spawn_local(async move {
-                let body = serde_json::json!({ "page": SAVED_PAGE, "name": name, "params": params });
+                let body =
+                    serde_json::json!({ "page": SAVED_PAGE, "name": name, "params": params });
                 let result = match api_fetch_json("POST", "/api/saved-searches", &body).await {
                     Ok(res) if res.ok() => Ok(()),
                     Ok(res) => {
@@ -354,9 +374,14 @@ pub fn MyFindings(_props: &MyFindingsProps) -> Html {
         .map(|s| SelectOption::new(s.id.clone(), s.name.clone()).description(s.params_label()))
         .collect();
     let has_saved = !saved_searches.is_empty();
-    let saved_placeholder = if has_saved { "Apply saved search" } else { "No saved searches yet" };
+    let saved_placeholder = if has_saved {
+        "Apply saved search"
+    } else {
+        "No saved searches yet"
+    };
 
-    let on_severity = set_filters.reform(|o: SelectOption| vec![("sev", UrlVal::from(o.value.to_string()))]);
+    let on_severity =
+        set_filters.reform(|o: SelectOption| vec![("sev", UrlVal::from(o.value.to_string()))]);
     let on_apply_saved = {
         let saved_searches = saved_searches.clone();
         Callback::from(move |o: SelectOption| {

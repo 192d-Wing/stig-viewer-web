@@ -32,7 +32,9 @@ pub async fn viewer_guard(
     let path = req.uri().path();
 
     let is_read = matches!(*method, Method::GET | Method::HEAD);
-    let is_allowlisted = VIEWER_MUTATION_ALLOWLIST.iter().any(|p| path.starts_with(p));
+    let is_allowlisted = VIEWER_MUTATION_ALLOWLIST
+        .iter()
+        .any(|p| path.starts_with(p));
 
     if user.role == "viewer" && !is_read && !is_allowlisted {
         return (

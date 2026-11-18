@@ -15,7 +15,10 @@
 //! The same `SIGNING_KEY_HEX` key signs all of them. The payload also carries
 //! a `type` string, checked on verification.
 
-use base64::{engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD}, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use ed25519_dalek::{Signature as EdSignature, Signer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -84,19 +87,17 @@ fn signing_input(domain: &[u8], payload: &[u8]) -> Vec<u8> {
 
 /// Wrap `payload` (which must already contain `signers_for(key)` and `type`)
 /// in an envelope, signing it when a key is configured.
-pub fn seal(
-    domain: &[u8],
-    kind: &str,
-    payload: &[u8],
-    key: Option<&SigningState>,
-) -> Envelope {
+pub fn seal(domain: &[u8], kind: &str, payload: &[u8], key: Option<&SigningState>) -> Envelope {
     let signatures = key
         .map(|k| {
             vec![EnvelopeSignature {
                 algorithm: ALGORITHM.into(),
                 key_id: k.key_id.clone(),
-                signature: BASE64
-                    .encode(k.signing_key.sign(&signing_input(domain, payload)).to_bytes()),
+                signature: BASE64.encode(
+                    k.signing_key
+                        .sign(&signing_input(domain, payload))
+                        .to_bytes(),
+                ),
             }]
         })
         .unwrap_or_default();
@@ -196,7 +197,10 @@ pub fn verify_envelope(
     }
     if head.signers.is_empty() {
         return if env.signatures.is_empty() {
-            Ok(Verification { status: SignatureStatus::Unsigned, payload })
+            Ok(Verification {
+                status: SignatureStatus::Unsigned,
+                payload,
+            })
         } else {
             Err(IntegrityError::UnexpectedSignature)
         };
@@ -212,7 +216,10 @@ pub fn verify_envelope(
     }
     let mut sig_seen = std::collections::HashSet::new();
     for sig in &env.signatures {
-        let id = SignerId { algorithm: sig.algorithm.clone(), key_id: sig.key_id.clone() };
+        let id = SignerId {
+            algorithm: sig.algorithm.clone(),
+            key_id: sig.key_id.clone(),
+        };
         if !seen.contains(&id) || !sig_seen.insert(id) {
             return Err(IntegrityError::UnexpectedSignature);
         }
@@ -241,14 +248,20 @@ pub fn verify_envelope(
         }
     }
     Ok(Verification {
-        status: if unknown { SignatureStatus::UnknownKey } else { SignatureStatus::Verified },
+        status: if unknown {
+            SignatureStatus::UnknownKey
+        } else {
+            SignatureStatus::Verified
+        },
         payload,
     })
 }
 
 #[cfg(test)]
 pub fn test_key(seed: u8) -> SigningState {
-    SigningState::from_hex(Some(&hex::encode([seed; 32]))).unwrap().unwrap()
+    SigningState::from_hex(Some(&hex::encode([seed; 32])))
+        .unwrap()
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -296,7 +309,8 @@ mod tests {
     fn export_domain_signature_is_not_accepted() {
         let k = test_key(1);
         let p = payload(BACKUP_TYPE, Some(&k));
-        let env = serde_json::to_vec(&seal(b"stig-viewer/sign/v2\0", BACKUP_TYPE, &p, Some(&k))).unwrap();
+        let env =
+            serde_json::to_vec(&seal(b"stig-viewer/sign/v2\0", BACKUP_TYPE, &p, Some(&k))).unwrap();
         assert_eq!(
             verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &env, None, Some(&k)).err(),
             Some(IntegrityError::SignatureInvalid)
@@ -306,7 +320,8 @@ mod tests {
     #[test]
     fn tampered_payload_or_signature_fails() {
         let k = test_key(1);
-        let mut env: Envelope = serde_json::from_slice(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&k))).unwrap();
+        let mut env: Envelope =
+            serde_json::from_slice(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&k))).unwrap();
         let mut p = URL_SAFE_NO_PAD.decode(&env.payload).unwrap();
         p.push(b' ');
         env.payload = URL_SAFE_NO_PAD.encode(&p);
@@ -326,17 +341,32 @@ mod tests {
     #[test]
     fn every_signer_must_have_a_signature_and_extras_are_refused() {
         let k = test_key(1);
-        let mut env: Envelope = serde_json::from_slice(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&k))).unwrap();
+        let mut env: Envelope =
+            serde_json::from_slice(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&k))).unwrap();
         let mut extra = env.signatures[0].clone();
         extra.key_id = "other".into();
         env.signatures.push(extra);
         assert_eq!(
-            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &serde_json::to_vec(&env).unwrap(), None, Some(&k)).err(),
+            verify_envelope(
+                BACKUP_DOMAIN,
+                BACKUP_TYPE,
+                &serde_json::to_vec(&env).unwrap(),
+                None,
+                Some(&k)
+            )
+            .err(),
             Some(IntegrityError::UnexpectedSignature)
         );
         env.signatures.clear();
         assert_eq!(
-            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &serde_json::to_vec(&env).unwrap(), None, Some(&k)).err(),
+            verify_envelope(
+                BACKUP_DOMAIN,
+                BACKUP_TYPE,
+                &serde_json::to_vec(&env).unwrap(),
+                None,
+                Some(&k)
+            )
+            .err(),
             Some(IntegrityError::MissingSignature)
         );
     }
@@ -346,17 +376,23 @@ mod tests {
         let k = test_key(1);
         let unsigned = sealed(BACKUP_DOMAIN, BACKUP_TYPE, None);
         assert_eq!(
-            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &unsigned, None, Some(&k)).unwrap().status,
+            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &unsigned, None, Some(&k))
+                .unwrap()
+                .status,
             SignatureStatus::Unsigned
         );
         let signed = sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&k));
         let other = test_key(2);
         assert_eq!(
-            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &signed, None, Some(&other)).unwrap().status,
+            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &signed, None, Some(&other))
+                .unwrap()
+                .status,
             SignatureStatus::UnknownKey
         );
         assert_eq!(
-            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &signed, None, None).unwrap().status,
+            verify_envelope(BACKUP_DOMAIN, BACKUP_TYPE, &signed, None, None)
+                .unwrap()
+                .status,
             SignatureStatus::UnknownKey
         );
     }

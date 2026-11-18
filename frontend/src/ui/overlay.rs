@@ -34,7 +34,9 @@ pub fn Modal(p: &ModalProps) -> Html {
         use_effect_with(p.visible, move |visible| {
             let listener = visible.then(|| {
                 EventListener::new(&crate::util::document(), "keydown", move |e| {
-                    if e.dyn_ref::<web_sys::KeyboardEvent>().map(|k| k.key()) == Some("Escape".into()) {
+                    if e.dyn_ref::<web_sys::KeyboardEvent>().map(|k| k.key())
+                        == Some("Escape".into())
+                    {
                         on_dismiss.emit(());
                     }
                 })

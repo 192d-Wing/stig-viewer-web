@@ -220,7 +220,10 @@ mod tests {
     fn has_the_demo_header() {
         let s = generate_sample_stig();
         assert_eq!(s.title, "Sample STIG - Web Application Security (Demo)");
-        assert_eq!(s.description, "Demonstration STIG for testing the Web STIG Tools");
+        assert_eq!(
+            s.description,
+            "Demonstration STIG for testing the Web STIG Tools"
+        );
         assert_eq!(s.version, "3");
         assert_eq!(s.release_info, "Release: 1 Benchmark Date: 19 Feb 2026");
     }
@@ -242,7 +245,9 @@ mod tests {
         }
         let third = &s.rules[2];
         assert_eq!(third.cci_ids, vec!["CCI-000197", "CCI-002420"]);
-        assert!(third.check_text.contains("\n\nRun: nmap --script ssl-enum-ciphers -p 443 <hostname>\n\n"));
+        assert!(third
+            .check_text
+            .contains("\n\nRun: nmap --script ssl-enum-ciphers -p 443 <hostname>\n\n"));
         assert_eq!(s.rules[5].comments, "Planned fix in next sprint.");
     }
 }

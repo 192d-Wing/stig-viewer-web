@@ -54,12 +54,7 @@ fn rank(level: &str) -> u8 {
 /// NOTE: [`writable_asset_ids`] re-implements the `"write"` decision in bulk.
 /// Change the two together; the control is the parity test
 /// `writable_asset_ids_matches_user_can_write`.
-pub async fn user_can(
-    pool: &PgPool,
-    asset_id: &str,
-    user: &AuthUser,
-    level: &str,
-) -> bool {
+pub async fn user_can(pool: &PgPool, asset_id: &str, user: &AuthUser, level: &str) -> bool {
     if user.role == "admin" {
         return true;
     }
@@ -312,12 +307,11 @@ pub async fn create_handler(
 
     // Verify the target user exists; surfaces 404 instead of a foreign
     // key violation 500.
-    let target_exists: Option<String> =
-        sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
-            .bind(&req.user_id)
-            .fetch_optional(state.pool.as_ref())
-            .await
-            .map_err(map_sqlx)?;
+    let target_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&req.user_id)
+        .fetch_optional(state.pool.as_ref())
+        .await
+        .map_err(map_sqlx)?;
     if target_exists.is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -379,14 +373,12 @@ pub async fn delete_handler(
 ) -> Result<StatusCode, StatusCode> {
     require_acl_admin(state.pool.as_ref(), &asset_id, &user).await?;
 
-    let result = sqlx::query(
-        "DELETE FROM asset_acl WHERE asset_id = $1 AND user_id = $2",
-    )
-    .bind(&asset_id)
-    .bind(&target_user_id)
-    .execute(state.pool.as_ref())
-    .await
-    .map_err(map_sqlx)?;
+    let result = sqlx::query("DELETE FROM asset_acl WHERE asset_id = $1 AND user_id = $2")
+        .bind(&asset_id)
+        .bind(&target_user_id)
+        .execute(state.pool.as_ref())
+        .await
+        .map_err(map_sqlx)?;
 
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
@@ -438,14 +430,102 @@ mod tests {
         seed_acl(&pool, "a_rd_abac", "rd", "read").await;
         // wr holds a write ACL on a denied asset: legacy grants beat ABAC deny.
         seed_acl(&pool, "a_secret", "wr", "write").await;
-        seed_policy(&pool, "allow-shared", "allow", "write", None, None, Some("shared"), true, "own").await;
-        seed_policy(&pool, "deny-secret", "deny", "write", None, Some("secret"), None, true, "own").await;
-        seed_policy(&pool, "disabled-allow", "allow", "write", None, None, Some("off"), false, "own").await;
-        seed_policy(&pool, "admin-level", "allow", "admin", None, None, Some("adminlvl"), true, "own").await;
-        seed_policy(&pool, "read-level", "allow", "read", None, None, Some("readlvl"), true, "own").await;
-        seed_policy(&pool, "viewer-role", "allow", "write", Some("viewer"), None, Some("vrole"), true, "own").await;
-        seed_policy(&pool, "deny-tag", "deny", "write", None, None, Some("denyonly"), true, "own").await;
-        seed_policy(&pool, "allow-cui", "allow", "write", None, Some("cui"), None, true, "own").await;
+        seed_policy(
+            &pool,
+            "allow-shared",
+            "allow",
+            "write",
+            None,
+            None,
+            Some("shared"),
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "deny-secret",
+            "deny",
+            "write",
+            None,
+            Some("secret"),
+            None,
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "disabled-allow",
+            "allow",
+            "write",
+            None,
+            None,
+            Some("off"),
+            false,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "admin-level",
+            "allow",
+            "admin",
+            None,
+            None,
+            Some("adminlvl"),
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "read-level",
+            "allow",
+            "read",
+            None,
+            None,
+            Some("readlvl"),
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "viewer-role",
+            "allow",
+            "write",
+            Some("viewer"),
+            None,
+            Some("vrole"),
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "deny-tag",
+            "deny",
+            "write",
+            None,
+            None,
+            Some("denyonly"),
+            true,
+            "own",
+        )
+        .await;
+        seed_policy(
+            &pool,
+            "allow-cui",
+            "allow",
+            "write",
+            None,
+            Some("cui"),
+            None,
+            true,
+            "own",
+        )
+        .await;
         // a_secret matches both allow-shared and deny-secret: deny wins.
 
         let assets = db_assets::list_assets(&pool).await.unwrap();
@@ -479,22 +559,43 @@ mod tests {
         assert!(nobody.contains("a_tag"), "ABAC allow");
         assert!(!nobody.contains("a_secret"), "ABAC deny beats allow");
         assert!(!nobody.contains("a_disabled"), "disabled policy ignored");
-        assert!(!nobody.contains("a_adminlvl") && !nobody.contains("a_readlvl"), "other levels ignored");
+        assert!(
+            !nobody.contains("a_adminlvl") && !nobody.contains("a_readlvl"),
+            "other levels ignored"
+        );
         assert!(!nobody.contains("a_vrole"), "role_match must match");
         assert!(!nobody.contains("a_plain") && !nobody.contains("a_deny_only"));
         assert!(nobody.contains("a_cls"), "classification-only ABAC allow");
-        assert!(nobody.contains("a_rd_abac"), "ABAC allow covers an unrelated user");
+        assert!(
+            nobody.contains("a_rd_abac"),
+            "ABAC allow covers an unrelated user"
+        );
         let wr = ids(&users[1]).await;
-        assert!(wr.contains("a_wr") && wr.contains("a_secret"), "write ACL, incl. over an ABAC deny");
+        assert!(
+            wr.contains("a_wr") && wr.contains("a_secret"),
+            "write ACL, incl. over an ABAC deny"
+        );
         assert!(!wr.contains("a_rd"));
-        assert!(ids(&users[2]).await.contains("a_ad"), "admin ACL implies write");
+        assert!(
+            ids(&users[2]).await.contains("a_ad"),
+            "admin ACL implies write"
+        );
         let rd = ids(&users[3]).await;
         assert!(!rd.contains("a_rd"), "read ACL is below write");
-        assert!(rd.contains("a_rd_abac"), "read ACL plus ABAC allow is writable via ABAC");
+        assert!(
+            rd.contains("a_rd_abac"),
+            "read ACL plus ABAC allow is writable via ABAC"
+        );
         assert_eq!(ids(&users[5]).await.len(), assets.len(), "global admin");
         let vic = ids(&users[6]).await;
-        assert!(vic.contains("a_vic") && vic.contains("a_vrole"), "viewer role has no special case");
-        assert!(ids(&users[0]).await.contains("a_deny_only"), "owner beats ABAC deny");
+        assert!(
+            vic.contains("a_vic") && vic.contains("a_vrole"),
+            "viewer role has no special case"
+        );
+        assert!(
+            ids(&users[0]).await.contains("a_deny_only"),
+            "owner beats ABAC deny"
+        );
     }
 
     #[sqlx::test]
@@ -512,7 +613,11 @@ mod tests {
         let assets = db_assets::list_assets(&pool).await.unwrap();
         let wr = writable_asset_ids(&pool, &auth("wr", "author"), &assets).await;
         assert_eq!(wr, HashSet::from(["a1".to_string()]));
-        assert!(writable_asset_ids(&pool, &auth("rd", "author"), &assets).await.is_empty());
-        assert!(writable_asset_ids(&pool, &auth("own", "author"), &[]).await.is_empty());
+        assert!(writable_asset_ids(&pool, &auth("rd", "author"), &assets)
+            .await
+            .is_empty());
+        assert!(writable_asset_ids(&pool, &auth("own", "author"), &[])
+            .await
+            .is_empty());
     }
 }

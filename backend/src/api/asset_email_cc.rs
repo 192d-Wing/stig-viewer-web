@@ -181,14 +181,12 @@ pub async fn delete_handler(
 ) -> Result<StatusCode, StatusCode> {
     require_asset_write(state.pool.as_ref(), &asset_id, &user).await?;
 
-    let result = sqlx::query(
-        "DELETE FROM asset_email_cc WHERE asset_id = $1 AND email = $2",
-    )
-    .bind(&asset_id)
-    .bind(&email)
-    .execute(state.pool.as_ref())
-    .await
-    .map_err(map_sqlx)?;
+    let result = sqlx::query("DELETE FROM asset_email_cc WHERE asset_id = $1 AND email = $2")
+        .bind(&asset_id)
+        .bind(&email)
+        .execute(state.pool.as_ref())
+        .await
+        .map_err(map_sqlx)?;
     if result.rows_affected() == 0 {
         return Err(StatusCode::NOT_FOUND);
     }
@@ -438,13 +436,9 @@ pub async fn send_handler(
 ) -> Result<Json<EmailReportResult>, StatusCode> {
     require_asset_write(state.pool.as_ref(), &asset_id, &user).await?;
 
-    let outcome = send_asset_report(
-        state.pool.as_ref(),
-        &state.config.data_dir,
-        &asset_id,
-    )
-    .await
-    .map_err(StatusCode::from)?;
+    let outcome = send_asset_report(state.pool.as_ref(), &state.config.data_dir, &asset_id)
+        .await
+        .map_err(StatusCode::from)?;
 
     Ok(Json(EmailReportResult {
         recipients: outcome.recipients,
@@ -530,9 +524,7 @@ pub async fn run_asset_email_schedules(
                 tracing::error!("asset email schedule: {asset_id} internal error: {e:#}");
                 // Stamp so a permanently-broken asset doesn't pin the
                 // loop in a hot retry.
-                if let Err(stamp_err) =
-                    db_assets::stamp_email_last_sent_at(pool, &asset_id).await
-                {
+                if let Err(stamp_err) = db_assets::stamp_email_last_sent_at(pool, &asset_id).await {
                     tracing::error!(
                         "asset email schedule: stamp_last_sent (post-error) failed for \
                          {asset_id}: {stamp_err:#}"

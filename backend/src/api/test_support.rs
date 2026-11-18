@@ -54,7 +54,11 @@ pub(crate) async fn reset_db(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 }
 
 /// The backdate transaction: shift matching `rule_audit` rows into the past.
-pub(crate) async fn backdate_audit(pool: &sqlx::PgPool, rule_id: &str, days: i64) -> anyhow::Result<()> {
+pub(crate) async fn backdate_audit(
+    pool: &sqlx::PgPool,
+    rule_id: &str,
+    days: i64,
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     crate::db_audit::set_maintenance(&mut tx, "test").await?;
     sqlx::query(
@@ -231,12 +235,8 @@ pub async fn run_report_handler(
     body: Option<Json<RunReportRequest>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
-    match compliance_report::run_report(
-        state.pool.as_ref(),
-        &state.config.data_dir,
-        req.range_days,
-    )
-    .await
+    match compliance_report::run_report(state.pool.as_ref(), &state.config.data_dir, req.range_days)
+        .await
     {
         Ok(row) => Ok(Json(json!({
             "id": row.id,
@@ -281,9 +281,9 @@ pub async fn run_retention_handler(
     )
     .await;
     match (rules, events) {
-        (Ok(pruned), Ok(pruned_events)) => {
-            Ok(Json(json!({ "pruned": pruned, "prunedEvents": pruned_events })))
-        }
+        (Ok(pruned), Ok(pruned_events)) => Ok(Json(
+            json!({ "pruned": pruned, "prunedEvents": pruned_events }),
+        )),
         (r, e) => {
             tracing::error!("Test run-retention failed: rule_audit={r:?} audit_events={e:?}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -469,10 +469,7 @@ pub async fn run_scheduler_handler(
         "compliance_report" => {
             scheduler_log::record(pool, "compliance_report", || async {
                 let row = compliance_report::run_report(pool, &data_dir, 7).await?;
-                Ok::<String, anyhow::Error>(format!(
-                    "generated id={} pdf={}",
-                    row.id, row.pdf_path
-                ))
+                Ok::<String, anyhow::Error>(format!("generated id={} pdf={}", row.id, row.pdf_path))
             })
             .await
         }
@@ -562,8 +559,12 @@ mod tests {
         sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
             .execute(&pool).await.unwrap();
         backdate_audit(&pool, "r1", 60).await.unwrap();
-        let old: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit WHERE occurred_at < NOW() - INTERVAL '59 days'")
-            .fetch_one(&pool).await.unwrap();
+        let old: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rule_audit WHERE occurred_at < NOW() - INTERVAL '59 days'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(old, 1);
         reset_db(&pool).await.unwrap();
         let left: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")

@@ -27,11 +27,12 @@ use serde_json::json;
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
 use crate::api::checklists::{is_valid_stig_id, load_stig_json, take_rules};
+use crate::api::request_ctx::RequestCtx;
 use crate::api::rule_bulk_status::{
-    apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES,
+    apply_plans, expected_status, has_nul, plan_rule, short_id, Plan, RuleOp, MAX_RULES,
+    MAX_RULE_ID_BYTES, VALID_STATUSES,
 };
 use crate::db_assets;
-use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklists::{self, ChecklistRuleRow};
 use crate::AppState;
@@ -104,17 +105,29 @@ fn merge_entry(existing: Option<&ChecklistRuleRow>, e: &SaveRule) -> Option<Merg
     if e.status == "not_reviewed" && !has_details && !has_comments {
         return None; // untouched
     }
-    let cur_status = existing.map(|x| x.status.as_str()).unwrap_or("not_reviewed");
+    let cur_status = existing
+        .map(|x| x.status.as_str())
+        .unwrap_or("not_reviewed");
     let cur_details = existing.map(|x| x.finding_details.as_str()).unwrap_or("");
     let cur_comments = existing.map(|x| x.comments.as_str()).unwrap_or("");
     let write_status = e.status != "not_reviewed";
-    let status = if write_status { e.status.as_str() } else { cur_status };
-    let finding_details = (has_details && e.finding_details != cur_details).then(|| e.finding_details.clone());
+    let status = if write_status {
+        e.status.as_str()
+    } else {
+        cur_status
+    };
+    let finding_details =
+        (has_details && e.finding_details != cur_details).then(|| e.finding_details.clone());
     let comments = (has_comments && e.comments != cur_comments).then(|| e.comments.clone());
     if status == cur_status && finding_details.is_none() && comments.is_none() {
         return None;
     }
-    Some(Merged { status: status.to_string(), write_status, finding_details, comments })
+    Some(Merged {
+        status: status.to_string(),
+        write_status,
+        finding_details,
+        comments,
+    })
 }
 
 /// POST /api/assets/:id/checklists/save
@@ -148,7 +161,9 @@ async fn save_work(
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    save_to_asset(&state, &user, &ctx, &asset, &req, SaveOrigin::Direct).await.map(Json)
+    save_to_asset(&state, &user, &ctx, &asset, &req, SaveOrigin::Direct)
+        .await
+        .map(Json)
 }
 
 /// Where a save came from. A checklist set only adds `via` / `setId` to the
@@ -203,18 +218,25 @@ pub(crate) async fn save_to_asset(
         return Err(StatusCode::FORBIDDEN);
     }
     if !is_valid_stig_id(&req.stig_id) {
-        request_event("rejected", json!({ "reason": "invalid_stig_id", "requested": req.rules.len() })).await;
+        request_event(
+            "rejected",
+            json!({ "reason": "invalid_stig_id", "requested": req.rules.len() }),
+        )
+        .await;
         return Err(StatusCode::BAD_REQUEST);
     }
     if req.rules.len() > MAX_RULES {
-        request_event("rejected", json!({ "reason": "too_many_rules", "requested": req.rules.len() })).await;
+        request_event(
+            "rejected",
+            json!({ "reason": "too_many_rules", "requested": req.rules.len() }),
+        )
+        .await;
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Load the catalog STIG before creating anything so a bad id never
     // leaves an empty checklist behind.
-    let mut stig = match load_stig_json(state, &req.stig_id).await
-    {
+    let mut stig = match load_stig_json(state, &req.stig_id).await {
         Ok(v) => v,
         Err(code) => {
             if code == StatusCode::BAD_REQUEST || code == StatusCode::NOT_FOUND {
@@ -268,8 +290,16 @@ pub(crate) async fn save_to_asset(
             .map(|r| (r.rule_id.clone(), r))
             .collect();
 
-    let results =
-        apply_entries(pool, &checklist.id, &user.id, asset.requires_approval, &known, &existing, &req.rules).await;
+    let results = apply_entries(
+        pool,
+        &checklist.id,
+        &user.id,
+        asset.requires_approval,
+        &known,
+        &existing,
+        &req.rules,
+    )
+    .await;
 
     let count = |s: &str| results.iter().filter(|r| r.status == s).count();
     let all_rejected: Vec<(String, String)> = results
@@ -277,7 +307,11 @@ pub(crate) async fn save_to_asset(
         .filter(|r| r.status == "error")
         .map(|r| (r.rule_id.clone(), r.error.clone().unwrap_or_default()))
         .collect();
-    let rejected: Vec<&str> = all_rejected.iter().take(100).map(|(id, _)| id.as_str()).collect();
+    let rejected: Vec<&str> = all_rejected
+        .iter()
+        .take(100)
+        .map(|(id, _)| id.as_str())
+        .collect();
     // The durable record is written below; this line stays as the fallback
     // when that write fails.
     tracing::info!(
@@ -406,12 +440,24 @@ fn plan_entry(
     };
     // A text-only update leaves the status alone, so the status gates do not apply.
     let plan = if merged.write_status {
-        plan_rule(true, prev, &merged.status, &e.finding_details, requires_approval)
+        plan_rule(
+            true,
+            prev,
+            &merged.status,
+            &e.finding_details,
+            requires_approval,
+        )
     } else {
-        Plan::Apply { finding_details: e.finding_details.clone() }
+        Plan::Apply {
+            finding_details: e.finding_details.clone(),
+        }
     };
     let expect = expected_status(requires_approval, &merged.status, prev);
-    Ok(Some(Planned { merged, expect, plan }))
+    Ok(Some(Planned {
+        merged,
+        expect,
+        plan,
+    }))
 }
 
 /// Plan every entry (first occurrence of a rule id wins), write them through
@@ -439,9 +485,24 @@ async fn apply_entries(
             continue; // duplicate rule id: first one wins
         }
         let rule_id = short_id(&entry.rule_id);
-        match plan_entry(requires_approval, known.contains(&entry.rule_id), existing.get(&entry.rule_id), entry) {
-            Err(error) => slots.push(Slot::Done(SaveRowResult { rule_id, status: "error".into(), error: Some(error), note: None })),
-            Ok(None) => slots.push(Slot::Done(SaveRowResult { rule_id, status: "unchanged".into(), error: None, note: None })),
+        match plan_entry(
+            requires_approval,
+            known.contains(&entry.rule_id),
+            existing.get(&entry.rule_id),
+            entry,
+        ) {
+            Err(error) => slots.push(Slot::Done(SaveRowResult {
+                rule_id,
+                status: "error".into(),
+                error: Some(error),
+                note: None,
+            })),
+            Ok(None) => slots.push(Slot::Done(SaveRowResult {
+                rule_id,
+                status: "unchanged".into(),
+                error: None,
+                note: None,
+            })),
             Ok(Some(p)) => {
                 slots.push(Slot::Op(planned.len()));
                 entries.push(entry);
@@ -449,8 +510,10 @@ async fn apply_entries(
             }
         }
     }
-    let (plans, rest): (Vec<Plan>, Vec<(Merged, Option<String>)>) =
-        planned.into_iter().map(|p| (p.plan, (p.merged, p.expect))).unzip();
+    let (plans, rest): (Vec<Plan>, Vec<(Merged, Option<String>)>) = planned
+        .into_iter()
+        .map(|p| (p.plan, (p.merged, p.expect)))
+        .unzip();
     let ops: Vec<RuleOp<'_>> = entries
         .iter()
         .zip(plans)
@@ -467,7 +530,9 @@ async fn apply_entries(
             plan,
         })
         .collect();
-    let mut applied = apply_plans(pool, checklist_id, user_id, &ops).await.into_iter();
+    let mut applied = apply_plans(pool, checklist_id, user_id, &ops)
+        .await
+        .into_iter();
     slots
         .into_iter()
         .map(|slot| match slot {
@@ -475,9 +540,24 @@ async fn apply_entries(
             Slot::Op(i) => {
                 let rule_id = short_id(&entries[i].rule_id);
                 match applied.next() {
-                    Some(Ok(a)) => SaveRowResult { rule_id, status: a.status.into(), error: None, note: a.note.map(str::to_string) },
-                    Some(Err(error)) => SaveRowResult { rule_id, status: "error".into(), error: Some(error), note: None },
-                    None => SaveRowResult { rule_id, status: "error".into(), error: Some("failed to save".into()), note: None },
+                    Some(Ok(a)) => SaveRowResult {
+                        rule_id,
+                        status: a.status.into(),
+                        error: None,
+                        note: a.note.map(str::to_string),
+                    },
+                    Some(Err(error)) => SaveRowResult {
+                        rule_id,
+                        status: "error".into(),
+                        error: Some(error),
+                        note: None,
+                    },
+                    None => SaveRowResult {
+                        rule_id,
+                        status: "error".into(),
+                        error: Some("failed to save".into()),
+                        note: None,
+                    },
                 }
             }
         })
@@ -534,7 +614,10 @@ mod tests {
     #[test]
     fn untouched_entry_never_downgrades() {
         let open = row("open", "d", "c");
-        assert_eq!(merge_entry(Some(&open), &entry("not_reviewed", "", "")), None);
+        assert_eq!(
+            merge_entry(Some(&open), &entry("not_reviewed", "", "")),
+            None
+        );
     }
 
     #[test]
@@ -542,7 +625,12 @@ mod tests {
         let open = row("open", "d", "old");
         assert_eq!(
             merge_entry(Some(&open), &entry("not_reviewed", "", "new")),
-            Some(Merged { status: "open".into(), write_status: false, finding_details: None, comments: Some("new".into()) })
+            Some(Merged {
+                status: "open".into(),
+                write_status: false,
+                finding_details: None,
+                comments: Some("new".into())
+            })
         );
     }
 
@@ -551,7 +639,12 @@ mod tests {
         let r = row("open", "d", "c");
         assert_eq!(
             merge_entry(Some(&r), &entry("not_a_finding", "", "")),
-            Some(Merged { status: "not_a_finding".into(), write_status: true, finding_details: None, comments: None })
+            Some(Merged {
+                status: "not_a_finding".into(),
+                write_status: true,
+                finding_details: None,
+                comments: None
+            })
         );
     }
 
@@ -586,7 +679,12 @@ mod tests {
         ));
     }
 
-    fn plan(requires_approval: bool, known: bool, prev: Option<&ChecklistRuleRow>, e: &SaveRule) -> Result<Option<Planned>, String> {
+    fn plan(
+        requires_approval: bool,
+        known: bool,
+        prev: Option<&ChecklistRuleRow>,
+        e: &SaveRule,
+    ) -> Result<Option<Planned>, String> {
         plan_entry(requires_approval, known, prev, e)
     }
 
@@ -597,9 +695,15 @@ mod tests {
         let mut e = entry("bogus", &long_text, "");
         e.rule_id = long_id;
         // Every check fails at once: the id length is reported first.
-        assert_eq!(plan(false, false, None, &e).err().as_deref(), Some("rule id too long"));
+        assert_eq!(
+            plan(false, false, None, &e).err().as_deref(),
+            Some("rule id too long")
+        );
         e.rule_id = "r".into();
-        assert_eq!(plan(false, false, None, &e).err().as_deref(), Some("invalid status"));
+        assert_eq!(
+            plan(false, false, None, &e).err().as_deref(),
+            Some("invalid status")
+        );
         e.status = "open".into();
         assert_eq!(
             plan(false, false, None, &e).err().as_deref(),
@@ -620,37 +724,84 @@ mod tests {
 
     #[test]
     fn plan_entry_unchanged_and_planned() {
-        assert!(matches!(plan(false, true, None, &entry("not_reviewed", "", "")), Ok(None)));
+        assert!(matches!(
+            plan(false, true, None, &entry("not_reviewed", "", "")),
+            Ok(None)
+        ));
         let open = row("open", "d", "c");
-        assert!(matches!(plan(false, true, Some(&open), &entry("open", "d", "c")), Ok(None)));
+        assert!(matches!(
+            plan(false, true, Some(&open), &entry("open", "d", "c")),
+            Ok(None)
+        ));
 
-        let p = plan(false, true, None, &entry("open", "", "")).unwrap().unwrap();
-        assert_eq!(p.plan, Plan::Apply { finding_details: String::new() });
-        assert_eq!((p.merged.status.as_str(), p.merged.write_status, p.expect), ("open", true, None));
+        let p = plan(false, true, None, &entry("open", "", ""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p.plan,
+            Plan::Apply {
+                finding_details: String::new()
+            }
+        );
+        assert_eq!(
+            (p.merged.status.as_str(), p.merged.write_status, p.expect),
+            ("open", true, None)
+        );
 
         // Text only: the status gates do not apply.
-        let p = plan(true, true, Some(&open), &entry("not_reviewed", "", "note")).unwrap().unwrap();
+        let p = plan(true, true, Some(&open), &entry("not_reviewed", "", "note"))
+            .unwrap()
+            .unwrap();
         assert!(!p.merged.write_status);
-        assert_eq!(p.plan, Plan::Apply { finding_details: String::new() });
+        assert_eq!(
+            p.plan,
+            Plan::Apply {
+                finding_details: String::new()
+            }
+        );
         assert_eq!(p.expect, None);
     }
 
     #[test]
     fn plan_entry_applies_the_approval_and_details_gates() {
-        let p = plan(true, true, None, &entry("not_a_finding", "why", "")).unwrap().unwrap();
-        assert_eq!(p.plan, Plan::RequestApproval { finding_details: "why".into() });
-        let p = plan(false, true, None, &entry("not_a_finding", "", "")).unwrap().unwrap();
+        let p = plan(true, true, None, &entry("not_a_finding", "why", ""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p.plan,
+            Plan::RequestApproval {
+                finding_details: "why".into()
+            }
+        );
+        let p = plan(false, true, None, &entry("not_a_finding", "", ""))
+            .unwrap()
+            .unwrap();
         assert!(matches!(p.plan, Plan::Reject(_)));
         // Already at the target on a gated asset: write, guarded by the snapshot status.
         let closed = row("not_a_finding", "why", "");
-        let p = plan(true, true, Some(&closed), &entry("not_a_finding", "why2", "")).unwrap().unwrap();
-        assert_eq!(p.plan, Plan::Apply { finding_details: "why2".into() });
+        let p = plan(
+            true,
+            true,
+            Some(&closed),
+            &entry("not_a_finding", "why2", ""),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            p.plan,
+            Plan::Apply {
+                finding_details: "why2".into()
+            }
+        );
         assert_eq!(p.expect.as_deref(), Some("not_a_finding"));
     }
 
     // ── Database-backed tests ──────────────────────────────────────────────
 
-    use crate::test_fixtures::{app_state, app_state_with_rules, auth, fail_writes_of, rule_ids, seed_asset, seed_checklist, seed_rule, seed_user, RULES, STIG_ID};
+    use crate::test_fixtures::{
+        app_state, app_state_with_rules, auth, fail_writes_of, rule_ids, seed_asset,
+        seed_checklist, seed_rule, seed_user, RULES, STIG_ID,
+    };
     use sqlx::PgPool;
 
     async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -669,7 +820,10 @@ mod tests {
             Extension(auth(user, role)),
             Extension(crate::test_fixtures::ctx()),
             Path("a1".into()),
-            Json(SaveRequest { stig_id: stig_id.into(), rules }),
+            Json(SaveRequest {
+                stig_id: stig_id.into(),
+                rules,
+            }),
         )
         .await
     }
@@ -700,7 +854,10 @@ mod tests {
         seed_checklist(&pool, "c1", "a1", STIG_ID).await;
         seed_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner").await;
         // The caller read the rule as closed...
-        let prev = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        let prev = db_checklists::list_rule_overrides(&pool, "c1")
+            .await
+            .unwrap()
+            .remove(0);
         let snapshot = HashMap::from([(RULES[0].to_string(), prev)]);
         // ...then someone reopened it before the save wrote.
         seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
@@ -717,12 +874,24 @@ mod tests {
         )
         .await;
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].error.as_deref(), Some("rule changed while saving; try again"));
+        assert_eq!(
+            out[0].error.as_deref(),
+            Some("rule changed while saving; try again")
+        );
 
-        let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        let live = db_checklists::list_rule_overrides(&pool, "c1")
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!((live.status.as_str(), live.comments.as_str()), ("open", ""));
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, audit_before);
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM rule_audit").await,
+            audit_before
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM finding_approvals").await,
+            0
+        );
     }
 
     #[sqlx::test]
@@ -741,8 +910,18 @@ mod tests {
         )
         .await;
         assert_eq!(out[0].status, "pending_approval");
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals WHERE status = 'pending'").await, 1);
-        let live = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM finding_approvals WHERE status = 'pending'"
+            )
+            .await,
+            1
+        );
+        let live = db_checklists::list_rule_overrides(&pool, "c1")
+            .await
+            .unwrap()
+            .remove(0);
         assert_eq!(live.status, "not_reviewed");
         assert_eq!(live.comments, "reviewer note");
         let fields: Vec<String> = sqlx::query_scalar("SELECT field FROM rule_audit")
@@ -760,7 +939,10 @@ mod tests {
         seed_rule(&pool, "c1", RULES[0], "open", "d", "", "owner").await;
         let snapshot = HashMap::from([(
             RULES[0].to_string(),
-            db_checklists::list_rule_overrides(&pool, "c1").await.unwrap().remove(0),
+            db_checklists::list_rule_overrides(&pool, "c1")
+                .await
+                .unwrap()
+                .remove(0),
         )]);
         // The status moves on after the snapshot; a text-only save must not revert it.
         seed_rule(&pool, "c1", RULES[0], "not_a_finding", "d", "", "owner").await;
@@ -780,11 +962,19 @@ mod tests {
         .await;
         let statuses: Vec<&str> = out.iter().map(|r| r.status.as_str()).collect();
         assert_eq!(statuses, ["applied", "applied", "applied"]);
-        let rows = db_checklists::list_rule_overrides(&pool, "c1").await.unwrap();
+        let rows = db_checklists::list_rule_overrides(&pool, "c1")
+            .await
+            .unwrap();
         let by = |id: &str| rows.iter().find(|r| r.rule_id == id).unwrap();
-        assert_eq!((by(RULES[0]).status.as_str(), by(RULES[0]).comments.as_str()), ("not_a_finding", "reviewer note"));
+        assert_eq!(
+            (by(RULES[0]).status.as_str(), by(RULES[0]).comments.as_str()),
+            ("not_a_finding", "reviewer note")
+        );
         assert_eq!(by(RULES[1]).status, "open");
-        assert_eq!((by(RULES[2]).status.as_str(), by(RULES[2]).comments.as_str()), ("not_reviewed", "note only"));
+        assert_eq!(
+            (by(RULES[2]).status.as_str(), by(RULES[2]).comments.as_str()),
+            ("not_reviewed", "note only")
+        );
     }
 
     #[sqlx::test]
@@ -795,15 +985,32 @@ mod tests {
         let (state, _dir) = app_state_with_rules(pool.clone(), &ids);
         fail_writes_of(&pool, "checklist_rules", &[ids[150].as_str()]).await;
         let rules: Vec<SaveRule> = ids.iter().map(|id| rule(id, "open", "", "")).collect();
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
-        assert_eq!((out.applied_count, out.error_count, out.unchanged_count), (150, 100, 0));
-        assert!(out.results[100..200].iter().all(|r| r.error.as_deref() == Some("failed to save")));
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 150);
-        let saves: Vec<_> = events(&pool).await.into_iter().filter(|e| e.0 == "checklist.save").collect();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
+        assert_eq!(
+            (out.applied_count, out.error_count, out.unchanged_count),
+            (150, 100, 0)
+        );
+        assert!(out.results[100..200]
+            .iter()
+            .all(|r| r.error.as_deref() == Some("failed to save")));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            150
+        );
+        let saves: Vec<_> = events(&pool)
+            .await
+            .into_iter()
+            .filter(|e| e.0 == "checklist.save")
+            .collect();
         assert_eq!(saves.len(), 1);
         assert_eq!(saves[0].1, "partial");
         let d: serde_json::Value = serde_json::from_str(&saves[0].4).unwrap();
-        assert_eq!((d["applied"].as_i64(), d["errors"].as_i64()), (Some(150), Some(100)));
+        assert_eq!(
+            (d["applied"].as_i64(), d["errors"].as_i64()),
+            (Some(150), Some(100))
+        );
         assert_eq!(d["rejected"].as_array().unwrap().len(), 100);
         assert_eq!(d["rejected"][0]["reason"], "failed to save");
         assert_eq!(d["rejectedTruncated"], false);
@@ -867,16 +1074,26 @@ mod tests {
     async fn save_handler_rejects_bad_requests_without_creating_a_checklist(pool: PgPool) {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
-        let bad_id = call(&state, "owner", "author", "../etc", vec![]).await.err();
+        let bad_id = call(&state, "owner", "author", "../etc", vec![])
+            .await
+            .err();
         assert_eq!(bad_id, Some(StatusCode::BAD_REQUEST));
-        let too_many: Vec<SaveRule> = (0..=MAX_RULES).map(|i| rule(&format!("r{i}"), "open", "", "")).collect();
-        let err = call(&state, "owner", "author", STIG_ID, too_many).await.err();
+        let too_many: Vec<SaveRule> = (0..=MAX_RULES)
+            .map(|i| rule(&format!("r{i}"), "open", "", ""))
+            .collect();
+        let err = call(&state, "owner", "author", STIG_ID, too_many)
+            .await
+            .err();
         assert_eq!(err, Some(StatusCode::BAD_REQUEST));
         // More distinct ids than the STIG has rules.
-        let extra: Vec<SaveRule> = (0..=RULES.len()).map(|i| rule(&format!("x{i}"), "open", "", "")).collect();
+        let extra: Vec<SaveRule> = (0..=RULES.len())
+            .map(|i| rule(&format!("x{i}"), "open", "", ""))
+            .collect();
         let err = call(&state, "owner", "author", STIG_ID, extra).await.err();
         assert_eq!(err, Some(StatusCode::BAD_REQUEST));
-        let err = call(&state, "owner", "author", "NO-SUCH-STIG", vec![]).await.err();
+        let err = call(&state, "owner", "author", "NO-SUCH-STIG", vec![])
+            .await
+            .err();
         assert_eq!(err, Some(StatusCode::NOT_FOUND));
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
     }
@@ -892,21 +1109,35 @@ mod tests {
             rule(RULES[1], "bogus", "", ""),                     // invalid status
             rule(RULES[2], "not_reviewed", "", ""),              // untouched
         ];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
         assert!(out.created);
         assert_eq!(out.results.len(), 3);
         assert_eq!(
-            (out.applied_count, out.pending_count, out.unchanged_count, out.error_count),
+            (
+                out.applied_count,
+                out.pending_count,
+                out.unchanged_count,
+                out.error_count
+            ),
             (1, 0, 1, 1)
         );
-        let stored = db_checklists::list_rule_overrides(&pool, &out.checklist_id).await.unwrap();
+        let stored = db_checklists::list_rule_overrides(&pool, &out.checklist_id)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), out.applied_count);
         assert_eq!(stored[0].status, "open");
 
         // A second save reuses the checklist and finds nothing to change.
         let again = vec![rule(RULES[0], "open", "", "")];
-        let Json(out2) = call(&state, "owner", "author", STIG_ID, again).await.unwrap();
-        assert_eq!((out2.created, out2.checklist_id.as_str()), (false, out.checklist_id.as_str()));
+        let Json(out2) = call(&state, "owner", "author", STIG_ID, again)
+            .await
+            .unwrap();
+        assert_eq!(
+            (out2.created, out2.checklist_id.as_str()),
+            (false, out.checklist_id.as_str())
+        );
         assert_eq!(out2.unchanged_count, 1);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
     }
@@ -917,9 +1148,17 @@ mod tests {
         base(&pool, true).await;
         let (state, _dir) = app_state(pool.clone());
         let rules = vec![rule(RULES[0], "not_a_finding", "why", "note")];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
-        assert_eq!((out.applied_count, out.pending_count, out.error_count), (0, 1, 0));
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM finding_approvals").await, 1);
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
+        assert_eq!(
+            (out.applied_count, out.pending_count, out.error_count),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM finding_approvals").await,
+            1
+        );
     }
 
     #[sqlx::test]
@@ -934,9 +1173,15 @@ mod tests {
             rule(&long_id, "open", "", ""),
             rule(RULES[0], "open", &long_text, ""),
         ];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
         assert_eq!((out.applied_count, out.error_count), (0, 3));
-        let msgs: Vec<&str> = out.results.iter().map(|r| r.error.as_deref().unwrap()).collect();
+        let msgs: Vec<&str> = out
+            .results
+            .iter()
+            .map(|r| r.error.as_deref().unwrap())
+            .collect();
         assert_eq!(
             msgs,
             [
@@ -945,11 +1190,16 @@ mod tests {
                 "finding details or comments too long"
             ]
         );
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            0
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await, 0);
     }
 
-    async fn events(pool: &PgPool) -> Vec<(String, String, Option<String>, Option<String>, String)> {
+    async fn events(
+        pool: &PgPool,
+    ) -> Vec<(String, String, Option<String>, Option<String>, String)> {
         sqlx::query_as(
             "SELECT action, outcome, checklist_id, stig_id, detail::text FROM audit_events ORDER BY id",
         )
@@ -963,31 +1213,54 @@ mod tests {
     async fn save_records_create_and_save_events_and_the_creator(pool: PgPool) {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
-        let rules = vec![rule(RULES[0], "open", "", ""), rule("SV-unknown", "open", "", "")];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
-        assert!(out.created);
-        let by: Option<String> = sqlx::query_scalar("SELECT created_by FROM checklists WHERE id = $1")
-            .bind(&out.checklist_id)
-            .fetch_one(&pool)
+        let rules = vec![
+            rule(RULES[0], "open", "", ""),
+            rule("SV-unknown", "open", "", ""),
+        ];
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
             .await
             .unwrap();
+        assert!(out.created);
+        let by: Option<String> =
+            sqlx::query_scalar("SELECT created_by FROM checklists WHERE id = $1")
+                .bind(&out.checklist_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(by.as_deref(), Some("owner"));
 
         // A second save reuses the checklist: a save event, no second create event.
-        let _ = call(&state, "owner", "author", STIG_ID, vec![rule(RULES[1], "open", "", "")]).await.unwrap();
+        let _ = call(
+            &state,
+            "owner",
+            "author",
+            STIG_ID,
+            vec![rule(RULES[1], "open", "", "")],
+        )
+        .await
+        .unwrap();
 
         let ev = events(&pool).await;
         let kinds: Vec<(&str, &str)> = ev.iter().map(|e| (e.0.as_str(), e.1.as_str())).collect();
         assert_eq!(
             kinds,
-            [("checklist.create", "ok"), ("checklist.save", "partial"), ("checklist.save", "ok")]
+            [
+                ("checklist.create", "ok"),
+                ("checklist.save", "partial"),
+                ("checklist.save", "ok")
+            ]
         );
-        assert!(ev.iter().all(|e| e.2.as_deref() == Some(out.checklist_id.as_str())));
+        assert!(ev
+            .iter()
+            .all(|e| e.2.as_deref() == Some(out.checklist_id.as_str())));
         assert!(ev.iter().all(|e| e.3.as_deref() == Some(STIG_ID)));
         let d = |i: usize| serde_json::from_str::<serde_json::Value>(&ev[i].4).unwrap();
         assert_eq!(d(0)["via"], "save");
         assert_eq!(d(1)["created"], true);
-        assert_eq!((d(1)["applied"].as_i64(), d(1)["errors"].as_i64()), (Some(1), Some(1)));
+        assert_eq!(
+            (d(1)["applied"].as_i64(), d(1)["errors"].as_i64()),
+            (Some(1), Some(1))
+        );
         assert_eq!(d(1)["rejected"][0]["ruleId"], "SV-unknown");
         assert_eq!(d(2)["created"], false);
     }
@@ -998,13 +1271,23 @@ mod tests {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
         call(&state, "other", "author", STIG_ID, vec![]).await.err();
-        call(&state, "owner", "author", "../etc", vec![]).await.err();
-        let too_many: Vec<SaveRule> = (0..=MAX_RULES).map(|i| rule(&format!("r{i}"), "open", "", "")).collect();
-        call(&state, "owner", "author", STIG_ID, too_many).await.err();
-        let extra: Vec<SaveRule> = (0..=RULES.len()).map(|i| rule(&format!("x{i}"), "open", "", "")).collect();
+        call(&state, "owner", "author", "../etc", vec![])
+            .await
+            .err();
+        let too_many: Vec<SaveRule> = (0..=MAX_RULES)
+            .map(|i| rule(&format!("r{i}"), "open", "", ""))
+            .collect();
+        call(&state, "owner", "author", STIG_ID, too_many)
+            .await
+            .err();
+        let extra: Vec<SaveRule> = (0..=RULES.len())
+            .map(|i| rule(&format!("x{i}"), "open", "", ""))
+            .collect();
         call(&state, "owner", "author", STIG_ID, extra).await.err();
         // An unknown STIG is a 404 to the client, recorded as stig_unavailable.
-        call(&state, "owner", "author", "NO-SUCH-STIG", vec![]).await.err();
+        call(&state, "owner", "author", "NO-SUCH-STIG", vec![])
+            .await
+            .err();
 
         let ev = events(&pool).await;
         let got: Vec<(String, String)> = ev
@@ -1037,14 +1320,30 @@ mod tests {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
         let rules = vec![
-            rule(RULES[0], "not_a_finding", "ZZ-RECOGNISABLE-DETAILS", "ZZ-RECOGNISABLE-COMMENT"),
-            rule(RULES[1], "bogus", "ZZ-RECOGNISABLE-DETAILS", "ZZ-RECOGNISABLE-COMMENT"),
+            rule(
+                RULES[0],
+                "not_a_finding",
+                "ZZ-RECOGNISABLE-DETAILS",
+                "ZZ-RECOGNISABLE-COMMENT",
+            ),
+            rule(
+                RULES[1],
+                "bogus",
+                "ZZ-RECOGNISABLE-DETAILS",
+                "ZZ-RECOGNISABLE-COMMENT",
+            ),
         ];
-        let _ = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let _ = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
         let ev = events(&pool).await;
         assert!(!ev.is_empty());
         for e in &ev {
-            assert!(!e.4.contains("ZZ-RECOGNISABLE"), "detail leaked request text: {}", e.4);
+            assert!(
+                !e.4.contains("ZZ-RECOGNISABLE"),
+                "detail leaked request text: {}",
+                e.4
+            );
         }
     }
 
@@ -1053,14 +1352,29 @@ mod tests {
     async fn save_still_succeeds_when_the_audit_event_cannot_be_written(pool: PgPool) {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
-        sqlx::query("DROP TABLE audit_events").execute(&pool).await.unwrap();
-        let Json(out) = call(&state, "owner", "author", STIG_ID, vec![rule(RULES[0], "open", "", "")])
+        sqlx::query("DROP TABLE audit_events")
+            .execute(&pool)
             .await
             .unwrap();
+        let Json(out) = call(
+            &state,
+            "owner",
+            "author",
+            STIG_ID,
+            vec![rule(RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
         assert!(out.created);
         assert_eq!(out.applied_count, 1);
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
-        assert_eq!(call(&state, "other", "author", STIG_ID, vec![]).await.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            1
+        );
+        assert_eq!(
+            call(&state, "other", "author", STIG_ID, vec![]).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
     }
 
     #[sqlx::test]
@@ -1074,14 +1388,25 @@ mod tests {
             rule("q\"b\\\n\t\u{7f}", "open", "", ""),
             rule(&long, "open", "", ""),
         ];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
         assert_eq!(out.error_count, 3);
-        let saves: Vec<_> = events(&pool).await.into_iter().filter(|e| e.0 == "checklist.save").collect();
+        let saves: Vec<_> = events(&pool)
+            .await
+            .into_iter()
+            .filter(|e| e.0 == "checklist.save")
+            .collect();
         assert_eq!(saves.len(), 1);
         assert_eq!(saves[0].1, "partial");
         let d: serde_json::Value = serde_json::from_str(&saves[0].4).unwrap();
         assert_ne!(d, serde_json::json!({ "detailDropped": true }));
-        let listed: Vec<&str> = d["rejected"].as_array().unwrap().iter().map(|r| r["ruleId"].as_str().unwrap()).collect();
+        let listed: Vec<&str> = d["rejected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ruleId"].as_str().unwrap())
+            .collect();
         assert_eq!(listed, ["?", "q?b????", "x".repeat(64).as_str()]);
     }
 
@@ -1097,7 +1422,14 @@ mod tests {
         let (state, _dir) = app_state(pool.clone());
         let st = state.clone();
         let h = tokio::spawn(async move {
-            let _ = call(&st, "owner", "author", STIG_ID, vec![rule(RULES[0], "open", "", "")]).await;
+            let _ = call(
+                &st,
+                "owner",
+                "author",
+                STIG_ID,
+                vec![rule(RULES[0], "open", "", "")],
+            )
+            .await;
         });
         tokio::task::yield_now().await;
         h.abort();
@@ -1110,7 +1442,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(seen, 2);
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            1
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
     }
 
@@ -1120,13 +1455,20 @@ mod tests {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
         let huge = "A".repeat(100_000);
-        assert_eq!(call(&state, "other", "author", &huge, vec![]).await.err(), Some(StatusCode::FORBIDDEN));
-        assert_eq!(call(&state, "owner", "author", &huge, vec![]).await.err(), Some(StatusCode::BAD_REQUEST));
-        let ev: Vec<(String, Option<String>, String)> =
-            sqlx::query_as("SELECT outcome, stig_id, detail->>'reason' FROM audit_events ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        assert_eq!(
+            call(&state, "other", "author", &huge, vec![]).await.err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            call(&state, "owner", "author", &huge, vec![]).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        let ev: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT outcome, stig_id, detail->>'reason' FROM audit_events ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             ev,
             [
@@ -1139,8 +1481,18 @@ mod tests {
     #[test]
     fn plan_entry_rejects_nul_text() {
         let msg = Some("text contains an unsupported character");
-        assert_eq!(plan(false, true, None, &entry("open", "a\0b", "")).err().as_deref(), msg);
-        assert_eq!(plan(false, true, None, &entry("open", "", "a\0b")).err().as_deref(), msg);
+        assert_eq!(
+            plan(false, true, None, &entry("open", "a\0b", ""))
+                .err()
+                .as_deref(),
+            msg
+        );
+        assert_eq!(
+            plan(false, true, None, &entry("open", "", "a\0b"))
+                .err()
+                .as_deref(),
+            msg
+        );
     }
 
     #[sqlx::test]
@@ -1153,10 +1505,18 @@ mod tests {
             rule(RULES[1], "open", "fine", ""),
             rule(RULES[2], "open", "", "bad\0comment"),
         ];
-        let Json(out) = call(&state, "owner", "author", STIG_ID, rules).await.unwrap();
+        let Json(out) = call(&state, "owner", "author", STIG_ID, rules)
+            .await
+            .unwrap();
         assert_eq!((out.applied_count, out.error_count), (1, 2));
-        assert_eq!(out.results[0].error.as_deref(), Some("text contains an unsupported character"));
+        assert_eq!(
+            out.results[0].error.as_deref(),
+            Some("text contains an unsupported character")
+        );
         assert_eq!(out.results[1].status, "applied");
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_rules").await, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            1
+        );
     }
 }
