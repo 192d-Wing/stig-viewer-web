@@ -348,6 +348,9 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
 
     html! {
         <Modal visible={p.show} on_dismiss={p.on_close.clone()} header="My checklists" {footer} size="large" testid="my-checklists">
+            // Rendered only while open: the dialog is mounted at the app root, so
+            // a hidden list would otherwise be the last table on every page.
+            if p.show {
             <SpaceBetween size="m">
                 if let Some(e) = &*error {
                     <Alert kind="error">{e.clone()}</Alert>
@@ -369,6 +372,7 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
                     </SpaceBetween>
                 </Container>
             </SpaceBetween>
+            }
         </Modal>
     }
 }
