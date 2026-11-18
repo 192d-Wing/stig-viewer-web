@@ -716,8 +716,18 @@ sets a 5-minute, single-use, HttpOnly `stig_notice_ack` cookie that
 `/auth/login` and `/auth/saml/login` consume; without it they redirect to the
 banner. A completed login writes an `auth.notice_ack` audit event. The wording
 version is `USE_NOTICE_VERSION` in both `frontend/src/constants.rs` and
-`backend/src/api/notice.rs`; keep them equal. `/auth/callback` and
-`/auth/saml/acs` do not enforce the proof (they only link the audit record).
+`backend/src/api/notice.rs`; keep them equal. The proof is enforced at
+session creation too. Login start stores the protocol values (OIDC state, nonce
+and PKCE verifier, or the SAML AuthnRequest id) on the consumed acknowledgement
+row. `/auth/callback` and `/auth/saml/acs` must atomically claim that row, using
+the id carried in the browser's cookie plus the value the IdP echoes back
+(`state`, or the signed `InResponseTo`), within 10 minutes of login start, or no
+session is created. `stig_oidc_state` now holds only the acknowledgement id.
+SAML sets a similar `stig_saml_req` cookie (path `/auth/saml`, `SameSite=None;
+Secure` over https, `Lax` over plain http). IdP-initiated SAML responses (no
+`InResponseTo`) are refused unconditionally. In plain-http dev, SAML therefore
+works only with an IdP that is same-site with the API, or behind https.
+Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored.
 
 The `stig_notice_ack` cookie is `SameSite=Strict`, so the frontend and the API
 must be same-site (for example `app.example.mil` and `api.example.mil`), or

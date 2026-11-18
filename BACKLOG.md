@@ -22,14 +22,14 @@ which every authenticated request updates.
 This plan is approved, and the decisions below are settled. It builds on the
 SAML `InResponseTo` check added in PR #49.
 
-- [ ] Add a migration that adds the columns `oidc_state`, `oidc_nonce` and `oidc_pkce_verifier` to `login_notice_acks`.
-- [ ] Store only the ack id in the `stig_oidc_state` cookie. Claim it with `claim_oidc`, which runs `DELETE … RETURNING` and only matches rows less than 10 minutes old.
-- [ ] Add a new `stig_saml_req` cookie with path `/auth/saml`. Set `SameSite=None; Secure` in production and `Lax` in dev.
-- [ ] Add `claim_saml`, which must match the response's `InResponseTo`. Refuse unsolicited, IdP-initiated responses, with no flag to allow them. Record refusals only as audit log lines.
-- [ ] Add a `LoginBinding` enum and change `consume_ack` to take a binding.
-- [ ] Remove `AuthState` and the `finish_*` helpers.
-- [ ] Delete consumed ack rows once they are more than 10 minutes old.
-- [ ] Add an acknowledge step to the `e2e-rs` auth_gate tests.
+- [x] Add a migration that adds the columns `oidc_state`, `oidc_nonce` and `oidc_pkce_verifier` to `login_notice_acks`.
+- [x] Store only the ack id in the `stig_oidc_state` cookie. Claim it with `claim_oidc`, which runs `DELETE … RETURNING` and only matches rows less than 10 minutes old.
+- [x] Add a new `stig_saml_req` cookie with path `/auth/saml`. Set `SameSite=None; Secure` in production and `Lax` in dev.
+- [x] Add `claim_saml`, which must match the response's `InResponseTo`. Refuse unsolicited, IdP-initiated responses, with no flag to allow them. Record refusals only as audit log lines.
+- [x] Add a `LoginBinding` enum and change `consume_ack` to take a binding.
+- [x] Remove `AuthState` and the `finish_*` helpers.
+- [x] Delete consumed ack rows once they are more than 10 minutes old.
+- [x] `e2e-rs` is deprecated; the acknowledge-step coverage lives in the Playwright spec `01-auth-gate`.
 - [ ] **Migration number:** `main` now uses up to `040_audit_guard.sql`. This change and checklist sets (item 5) both need a new number from `041` on. Whichever merges second takes the next free one.
 
 ## 3. Add exclusive XML canonicalisation for SAML

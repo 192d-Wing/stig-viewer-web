@@ -1,5 +1,13 @@
 import { test, expect, request as pwRequest } from "@playwright/test";
-import { acknowledgeNotice, BACKEND, FRONTEND, NOTICE_VERSION, loginAs, resetDb } from "./helpers.js";
+import {
+  acknowledgeNotice,
+  BACKEND,
+  FRONTEND,
+  NOTICE_VERSION,
+  loginAs,
+  resetDb,
+  setUserRole,
+} from "./helpers.js";
 
 test.describe("Auth Gate", () => {
   test.beforeEach(async () => {
@@ -321,6 +329,56 @@ test.describe("AC-8 server-side gate", () => {
     expect((await ack(ctx, { Origin: "http://evil.example" })).status()).toBe(403);
     expect((await ack(ctx, {}, "wrong-version")).status()).toBe(409);
     await ctx.dispose();
+  });
+
+  test("state cookie holds only the ack id, not the login secrets", async () => {
+    const ctx = await pwRequest.newContext();
+    expect((await ack(ctx)).status()).toBe(204);
+    const res = await ctx.get(`${BACKEND}/auth/login`, { maxRedirects: 0 });
+    expect(res.status()).toBe(303);
+    const setCookie = res
+      .headersArray()
+      .filter((h) => h.name.toLowerCase() === "set-cookie")
+      .map((h) => h.value)
+      .find((v) => v.startsWith("stig_oidc_state="));
+    expect(setCookie).toBeTruthy();
+    const value = setCookie.split(";")[0].slice("stig_oidc_state=".length);
+    expect(value).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(value.startsWith("{") || value.includes("%7B")).toBe(false);
+    expect(setCookie).toMatch(/;\s*HttpOnly/i);
+    expect(setCookie).toMatch(/Max-Age=600(;|$)/i);
+    await ctx.dispose();
+  });
+
+  test("callback without the state cookie is refused and sets no session", async () => {
+    const ctx = await pwRequest.newContext();
+    const res = await ctx.get(`${BACKEND}/auth/callback?code=x&state=y`, { maxRedirects: 0 });
+    expect(res.status()).toBe(400);
+    const cookies = res.headersArray().filter((h) => h.name.toLowerCase() === "set-cookie");
+    expect(cookies.some((h) => h.value.startsWith("stig_session="))).toBe(false);
+    await ctx.dispose();
+  });
+
+  test("acknowledge, sign in with Keycloak, and the login is audited", async ({ page, request }) => {
+    await setUserRole("gate-admin", "admin");
+    const okEvents = () =>
+      request
+        .get(`${BACKEND}/api/audit/events?action=auth.notice_ack&outcome=ok`, {
+          headers: { "X-User-Id": "gate-admin" },
+        })
+        .then((r) => r.json());
+    const before = (await okEvents()).totalCount;
+
+    await page.goto("/");
+    await acknowledgeNotice(page);
+    await page.getByRole("button", { name: /sign in/i }).first().click();
+    await page.locator("#username").fill("alice");
+    await page.locator("#password").fill("alice");
+    await page.locator("#kc-login").click();
+    await page.waitForURL((u) => u.origin === new URL(FRONTEND).origin);
+    await expect(page.getByTestId("login-notice")).toHaveCount(0);
+
+    expect((await okEvents()).totalCount).toBe(before + 1);
   });
 
   test("UI stays on the banner when the ack request fails", async ({ page }) => {

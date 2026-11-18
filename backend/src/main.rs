@@ -867,6 +867,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // AC-8: drop consumed login acknowledgements whose claim window has passed.
+    // Deliberately not registered with `scheduler_log` (not a status-page scheduler).
+    {
+        let db = pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = db_notice::prune_acks(&db).await {
+                    tracing::error!("login ack prune failed: {e:#}");
+                }
+            }
+        });
+    }
+
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");

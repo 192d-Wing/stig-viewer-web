@@ -47,6 +47,21 @@ test.describe("SAML 2.0 SSO", () => {
       expect(ackRes.status()).toBe(204);
       const res2 = await ctx.get(`${BACKEND}/auth/saml/login`, { maxRedirects: 0 });
       expect(res2.status()).toBe(303);
+      // The request cookie carries the ack id to the ACS, scoped to /auth/saml.
+      const reqCookie = res2
+        .headersArray()
+        .filter((h) => h.name.toLowerCase() === "set-cookie")
+        .map((h) => h.value)
+        .find((v) => v.startsWith("stig_saml_req="));
+      expect(reqCookie).toBeTruthy();
+      expect(reqCookie).toMatch(/Path=\/auth\/saml(;|$)/);
+      // Dev runs over plain http: Lax without Secure. https/production uses None; Secure.
+      if (new URL(BACKEND).protocol === "https:") {
+        expect(reqCookie).toMatch(/SameSite=None/i);
+        expect(reqCookie).toMatch(/;\s*Secure/i);
+      } else {
+        expect(reqCookie).toMatch(/SameSite=Lax/i);
+      }
       // Should carry a SAMLRequest query param (per HTTP-Redirect binding).
       expect(res2.headers()["location"]).toContain("SAMLRequest=");
     }

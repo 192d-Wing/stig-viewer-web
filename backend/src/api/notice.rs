@@ -1,7 +1,8 @@
 //! AC-8 server-side gate: `POST /auth/notice/ack` issues a short-lived,
 //! single-use proof cookie; the login-start endpoints consume it via
-//! [`require_ack`]. Completed logins link the acknowledgement into
-//! `audit_events` ([`record_ack_linked`]).
+//! [`require_ack`], binding it to the login's protocol values. Login completion
+//! must claim that row (`db_notice::claim_*`) or no session is created, and the
+//! claimed record is written to `audit_events` ([`record_ack_linked`]).
 
 use axum::{
     extract::{ConnectInfo, State},
@@ -16,7 +17,7 @@ use sqlx::PgPool;
 
 use crate::api::auth::{cookie_secure, removal_cookie, session_cookie, user_agent, AppAuthState};
 use crate::db_audit::{self, NewAuditEvent};
-use crate::db_notice::{self, AckRecord};
+use crate::db_notice::{self, AckRecord, LoginBinding};
 
 /// Version of the notice wording. MUST equal `USE_NOTICE_VERSION` in
 /// `frontend/src/constants.rs` (a mismatch makes every acknowledgement 409).
@@ -43,7 +44,10 @@ pub(crate) fn bound_ua(ua: &str) -> String {
 
 /// Canonical text of a valid IP address, else empty (never stores free text).
 pub(crate) fn canonical_ip(raw: &str) -> String {
-    raw.trim().parse::<std::net::IpAddr>().map(|i| i.to_string()).unwrap_or_default()
+    raw.trim()
+        .parse::<std::net::IpAddr>()
+        .map(|i| i.to_string())
+        .unwrap_or_default()
 }
 
 /// Client IP for the notice/login-start paths. The socket peer is used unless
@@ -75,7 +79,8 @@ pub(crate) fn request_ip(
             return ip;
         }
     }
-    peer.map(|p| canonical_ip(&p.ip().to_string())).unwrap_or_default()
+    peer.map(|p| canonical_ip(&p.ip().to_string()))
+        .unwrap_or_default()
 }
 
 /// Number of trusted proxy hops: 0 unless `STIG_TRUST_PROXY_HEADERS` is on, then
@@ -211,7 +216,11 @@ pub async fn ack_handler(
 }
 
 /// Response for a rate-limited login start: audit log line and a redirect to the banner.
-pub(crate) fn rate_limited_redirect(jar: CookieJar, frontend_url: &str, ip: &str) -> (CookieJar, Redirect) {
+pub(crate) fn rate_limited_redirect(
+    jar: CookieJar,
+    frontend_url: &str,
+    ip: &str,
+) -> (CookieJar, Redirect) {
     tracing::warn!(target: "audit", action = "auth.login_start", outcome = "denied", reason = "rate_limited", ip = %ip);
     (jar, Redirect::to(frontend_url))
 }
@@ -223,8 +232,7 @@ pub(crate) async fn require_ack(
     pool: &PgPool,
     jar: CookieJar,
     frontend_url: &str,
-    method: &str,
-    saml_request_id: Option<&str>,
+    binding: &LoginBinding<'_>,
     ip: &str,
 ) -> Result<(CookieJar, String), Box<(CookieJar, Redirect)>> {
     let raw = jar.get(ACK_COOKIE).map(|c| c.value().to_string());
@@ -233,10 +241,14 @@ pub(crate) async fn require_ack(
         tracing::warn!(target: "audit", action = "auth.login_start", outcome = "denied", reason, ip = %ip);
         Box::new((jar, Redirect::to(frontend_url)))
     };
-    let Some(raw) = raw else { return Err(deny(jar, "missing")) };
-    let Ok(id) = uuid::Uuid::parse_str(&raw) else { return Err(deny(jar, "malformed")) };
+    let Some(raw) = raw else {
+        return Err(deny(jar, "missing"));
+    };
+    let Ok(id) = uuid::Uuid::parse_str(&raw) else {
+        return Err(deny(jar, "malformed"));
+    };
     let id = id.to_string();
-    match db_notice::consume_ack(pool, &id, USE_NOTICE_VERSION, method, saml_request_id).await {
+    match db_notice::consume_ack(pool, &id, USE_NOTICE_VERSION, binding).await {
         Ok(true) => Ok((jar, id)),
         Ok(false) => Err(deny(jar, "invalid")),
         Err(e) => {
@@ -246,62 +258,13 @@ pub(crate) async fn require_ack(
     }
 }
 
-/// How to find the acknowledgement for a completed login.
-pub(crate) enum AckLookup<'a> {
-    /// OIDC: the id carried in the state cookie.
-    ById(Option<&'a str>),
-    /// SAML: the response's `InResponseTo` (AuthnRequest id).
-    BySamlRequest(Option<&'a str>),
-}
-
-/// Best-effort AU-2 link at login completion: one `auth.notice_ack` event,
-/// `ok` when a consumed acknowledgement was found, `missing` otherwise.
-pub(crate) async fn link_ack_at_login(
+/// Write the durable AU-2 record for a completed login. Never fails the caller.
+pub(crate) async fn record_ack_linked(
     pool: &PgPool,
-    lookup: AckLookup<'_>,
     user_id: &str,
     session_id: &str,
-    method: &'static str,
+    rec: AckRecord,
 ) {
-    let found = match lookup {
-        AckLookup::ById(Some(id)) => match uuid::Uuid::parse_str(id) {
-            Ok(u) => db_notice::take_consumed_by_id(pool, &u.to_string()).await,
-            Err(_) => Ok(None),
-        },
-        AckLookup::BySamlRequest(Some(req)) => db_notice::take_consumed_by_saml_request(pool, req).await,
-        _ => Ok(None),
-    };
-    match found {
-        Ok(Some(rec)) => record_ack_linked(pool, user_id, session_id, rec).await,
-        Ok(None) => {
-            tracing::warn!(target: "audit", method, "no consumed notice ack to link at login");
-            record_ack_missing(pool, user_id, session_id, method).await;
-        }
-        Err(e) => tracing::error!("notice ack link failed: {e:#}"),
-    }
-}
-
-/// AU-2 record that a login completed without a linkable AC-8 acknowledgement
-/// (callback/ACS reached directly), so banner bypass is detectable.
-pub(crate) async fn record_ack_missing(pool: &PgPool, user_id: &str, session_id: &str, method: &'static str) {
-    db_audit::record_or_log(
-        pool,
-        NewAuditEvent {
-            user_id,
-            action: "auth.notice_ack",
-            outcome: "missing",
-            asset_id: None,
-            checklist_id: None,
-            stig_id: None,
-            ctx: None,
-            detail: json!({ "method": method, "sessionId": session_id }),
-        },
-    )
-    .await;
-}
-
-/// Write the durable AU-2 record for a completed login. Never fails the caller.
-pub(crate) async fn record_ack_linked(pool: &PgPool, user_id: &str, session_id: &str, rec: AckRecord) {
     db_audit::record_or_log(
         pool,
         NewAuditEvent {
@@ -331,6 +294,11 @@ mod tests {
     use axum::http::HeaderValue;
 
     const FE: &str = "http://localhost:5173";
+    const TEST_BINDING: LoginBinding<'static> = LoginBinding::Oidc {
+        state: "s",
+        nonce: "n",
+        pkce_verifier: "p",
+    };
 
     fn hdrs(origin: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -344,7 +312,9 @@ mod tests {
     fn backend_notice_version_matches_frontend_constant() {
         let fe = include_str!("../../../frontend/src/constants.rs");
         assert!(
-            fe.contains(&format!("USE_NOTICE_VERSION: &str = \"{USE_NOTICE_VERSION}\"")),
+            fe.contains(&format!(
+                "USE_NOTICE_VERSION: &str = \"{USE_NOTICE_VERSION}\""
+            )),
             "frontend USE_NOTICE_VERSION differs from the backend's"
         );
     }
@@ -357,7 +327,10 @@ mod tests {
         assert_eq!(canonical_ip("not an ip\r\n"), "");
         assert_eq!(canonical_ip(&"1".repeat(200)), "");
         let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 203.0.113.9, 10.0.0.1"));
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("6.6.6.6, 203.0.113.9, 10.0.0.1"),
+        );
         let peer: SocketAddr = "192.0.2.7:5555".parse().unwrap();
         assert_eq!(request_ip(&h, Some(peer), 0), "192.0.2.7");
         // 1 = rightmost (appended by the trusted proxy); a forged leftmost is ignored.
@@ -371,7 +344,10 @@ mod tests {
         assert_eq!(request_ip(&two, Some(peer), 1), "203.0.113.9");
         // Mixed: merged first line plus a separate proxy line.
         let mut mixed = HeaderMap::new();
-        mixed.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6, 198.51.100.4"));
+        mixed.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("6.6.6.6, 198.51.100.4"),
+        );
         mixed.append("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
         assert_eq!(request_ip(&mixed, Some(peer), 1), "203.0.113.9");
         assert_eq!(request_ip(&mixed, Some(peer), 2), "198.51.100.4");
@@ -385,11 +361,17 @@ mod tests {
         let c = ack_cookie("id".into(), true);
         assert_eq!(c.secure(), Some(true));
         assert_eq!(c.http_only(), Some(true));
-        assert_eq!(c.same_site(), Some(axum_extra::extract::cookie::SameSite::Strict));
+        assert_eq!(
+            c.same_site(),
+            Some(axum_extra::extract::cookie::SameSite::Strict)
+        );
         assert_eq!(ack_cookie("id".into(), false).secure(), Some(false));
         // The flag fed to it in issue_ack is `cookie_secure()`: production or https frontend.
         assert!(crate::api::auth::secure_for(Some("production"), None));
-        assert!(crate::api::auth::secure_for(None, Some("https://app.example")));
+        assert!(crate::api::auth::secure_for(
+            None,
+            Some("https://app.example")
+        ));
     }
 
     #[test]
@@ -413,43 +395,22 @@ mod tests {
         let limiter = crate::api::rate_limit::PreAuthLimiter::from_vars(Some("2"), Some("1"));
         let h = hdrs(Some(FE));
         let peer = Some("192.0.2.1:1".parse().unwrap());
-        let call = |peer| ack_with_limiter(&limiter, &pool, FE, &h, peer, USE_NOTICE_VERSION, CookieJar::new());
+        let call = |peer| {
+            ack_with_limiter(
+                &limiter,
+                &pool,
+                FE,
+                &h,
+                peer,
+                USE_NOTICE_VERSION,
+                CookieJar::new(),
+            )
+        };
         assert!(call(peer).await.is_ok());
         assert!(call(peer).await.is_ok());
         assert_eq!(call(peer).await.err(), Some(StatusCode::TOO_MANY_REQUESTS));
         // A different client keeps its own budget.
         assert!(call(Some("192.0.2.2:1".parse().unwrap())).await.is_ok());
-    }
-
-    async fn audit_rows(pool: &PgPool) -> Vec<(String, String)> {
-        sqlx::query_as("SELECT action, outcome FROM audit_events ORDER BY id")
-            .fetch_all(pool).await.unwrap()
-    }
-
-    #[sqlx::test]
-    #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn link_ack_at_login_writes_ok_or_missing_for_oidc_and_saml(pool: PgPool) {
-        sqlx::query("INSERT INTO users (id, display_name, email, sub, provider) VALUES ('u1','U','','s','test')")
-            .execute(&pool).await.unwrap();
-        let id = "00000000-0000-4000-8000-0000000000aa";
-        // OIDC, consumed ack -> ok.
-        db_notice::insert_ack(&pool, id, USE_NOTICE_VERSION, "", "", 300).await.unwrap();
-        db_notice::consume_ack(&pool, id, USE_NOTICE_VERSION, "oidc", None).await.unwrap();
-        link_ack_at_login(&pool, AckLookup::ById(Some(id)), "u1", "s1", "oidc").await;
-        // OIDC: none, unknown id, malformed id -> missing.
-        link_ack_at_login(&pool, AckLookup::ById(None), "u1", "s2", "oidc").await;
-        link_ack_at_login(&pool, AckLookup::ById(Some("00000000-0000-4000-8000-0000000000bb")), "u1", "s3", "oidc").await;
-        link_ack_at_login(&pool, AckLookup::ById(Some("junk")), "u1", "s4", "oidc").await;
-        // SAML, consumed ack -> ok; none / unknown -> missing.
-        db_notice::insert_ack(&pool, "00000000-0000-4000-8000-0000000000cc", USE_NOTICE_VERSION, "", "", 300).await.unwrap();
-        db_notice::consume_ack(&pool, "00000000-0000-4000-8000-0000000000cc", USE_NOTICE_VERSION, "saml", Some("_r1")).await.unwrap();
-        link_ack_at_login(&pool, AckLookup::BySamlRequest(Some("_r1")), "u1", "s5", "saml").await;
-        link_ack_at_login(&pool, AckLookup::BySamlRequest(None), "u1", "s6", "saml").await;
-        link_ack_at_login(&pool, AckLookup::BySamlRequest(Some("_nope")), "u1", "s7", "saml").await;
-        let rows = audit_rows(&pool).await;
-        let outcomes: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        assert_eq!(outcomes, ["ok", "missing", "missing", "missing", "ok", "missing", "missing"]);
-        assert!(rows.iter().all(|r| r.0 == "auth.notice_ack"));
     }
 
     #[test]
@@ -473,18 +434,28 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn ack_success_sets_strict_httponly_cookie_and_require_consumes_once(pool: PgPool) {
-        let jar = issue_ack(&pool, FE, &hdrs(Some("http://localhost:5173/")), "1.2.3.4", USE_NOTICE_VERSION, CookieJar::new())
-            .await
-            .unwrap();
+        let jar = issue_ack(
+            &pool,
+            FE,
+            &hdrs(Some("http://localhost:5173/")),
+            "1.2.3.4",
+            USE_NOTICE_VERSION,
+            CookieJar::new(),
+        )
+        .await
+        .unwrap();
         let c = jar.get(ACK_COOKIE).unwrap().clone();
         assert_eq!(c.http_only(), Some(true));
-        assert_eq!(c.same_site(), Some(axum_extra::extract::cookie::SameSite::Strict));
+        assert_eq!(
+            c.same_site(),
+            Some(axum_extra::extract::cookie::SameSite::Strict)
+        );
         assert_eq!(c.path(), Some("/auth"));
         assert_eq!(c.max_age(), Some(time::Duration::seconds(300)));
         let req = CookieJar::new().add(c.clone());
-        let ok = require_ack(&pool, req.clone(), FE, "oidc", None, "").await;
+        let ok = require_ack(&pool, req.clone(), FE, &TEST_BINDING, "").await;
         assert!(ok.is_ok());
-        let again = require_ack(&pool, req, FE, "oidc", None, "").await;
+        let again = require_ack(&pool, req, FE, &TEST_BINDING, "").await;
         assert!(again.is_err());
     }
 
@@ -495,7 +466,10 @@ mod tests {
         let from = |c: Option<String>| {
             let mut h = HeaderMap::new();
             if let Some(c) = c {
-                h.insert("cookie", HeaderValue::from_str(&format!("{ACK_COOKIE}={c}")).unwrap());
+                h.insert(
+                    "cookie",
+                    HeaderValue::from_str(&format!("{ACK_COOKIE}={c}")).unwrap(),
+                );
             }
             CookieJar::from_headers(&h)
         };
@@ -505,7 +479,7 @@ mod tests {
             (from(Some(uuid::Uuid::new_v4().to_string())), true),
         ];
         for (jar, cleared) in cases {
-            let (jar, redirect) = *require_ack(&pool, jar, FE, "oidc", None, "")
+            let (jar, redirect) = *require_ack(&pool, jar, FE, &TEST_BINDING, "")
                 .await
                 .err()
                 .unwrap();
@@ -514,8 +488,17 @@ mod tests {
             // the response clears the cookie
             if cleared {
                 let set = axum::response::IntoResponse::into_response((jar, ()));
-                let set = set.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
-                assert!(set.starts_with("stig_notice_ack=;") && set.contains("Max-Age=0"), "{set}");
+                let set = set
+                    .headers()
+                    .get("set-cookie")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                assert!(
+                    set.starts_with("stig_notice_ack=;") && set.contains("Max-Age=0"),
+                    "{set}"
+                );
             }
         }
     }
@@ -525,15 +508,35 @@ mod tests {
     async fn record_ack_linked_writes_one_audit_row(pool: PgPool) {
         sqlx::query("INSERT INTO users (id, display_name, email, sub, provider) VALUES ('u1','U','','s','test')")
             .execute(&pool).await.unwrap();
-        db_notice::insert_ack(&pool, "a1", USE_NOTICE_VERSION, "1.1.1.1", "ua", 300).await.unwrap();
-        db_notice::consume_ack(&pool, "a1", USE_NOTICE_VERSION, "oidc", None).await.unwrap();
-        let rec = db_notice::take_consumed_by_id(&pool, "a1").await.unwrap().unwrap();
+        db_notice::insert_ack(&pool, "a1", USE_NOTICE_VERSION, "1.1.1.1", "ua", 300)
+            .await
+            .unwrap();
+        db_notice::consume_ack(&pool, "a1", USE_NOTICE_VERSION, &TEST_BINDING)
+            .await
+            .unwrap();
+        let rec = db_notice::claim_oidc(&pool, "a1", "s")
+            .await
+            .unwrap()
+            .unwrap()
+            .ack;
         record_ack_linked(&pool, "u1", "sess1", rec).await;
         let (action, outcome, detail): (String, String, serde_json::Value) =
             sqlx::query_as("SELECT action, outcome, detail FROM audit_events")
-                .fetch_one(&pool).await.unwrap();
-        assert_eq!((action.as_str(), outcome.as_str()), ("auth.notice_ack", "ok"));
-        for k in ["noticeVersion", "acknowledgedAt", "ip", "userAgent", "method", "sessionId"] {
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (action.as_str(), outcome.as_str()),
+            ("auth.notice_ack", "ok")
+        );
+        for k in [
+            "noticeVersion",
+            "acknowledgedAt",
+            "ip",
+            "userAgent",
+            "method",
+            "sessionId",
+        ] {
             assert!(detail.get(k).is_some(), "missing {k}");
         }
     }
