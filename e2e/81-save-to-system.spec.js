@@ -350,7 +350,8 @@ test.describe("Save to system — UI", () => {
     await page.getByTestId("save-to-system").click();
     await page.getByTestId("save-system-select").click();
     await page.getByRole("option", { name: new RegExp(ASSET_NAME) }).click();
-    await expect(page.getByText("A new checklist will be created.")).toBeVisible();
+    // The edits already created a checklist set, so the dialog saves the set.
+    await expect(page.getByText(/Every STIG in this checklist is saved/)).toBeVisible();
     await page.getByTestId("save-system-apply").click();
 
     const result = page.getByTestId("save-system-result");

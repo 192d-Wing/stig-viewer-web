@@ -1,13 +1,16 @@
 use crate::components::asset_modal::{asset_field, with_asset_field, ASSET_FIELDS};
 use crate::auth::use_current_user;
 use std::collections::HashSet;
+use crate::api::{api_get, api_send};
+use crate::autosave::{Autosave, SaveStatus};
 use crate::components::save_to_system_modal::SaveToSystemModal;
+use gloo_timers::future::TimeoutFuture;
 use crate::components::poam_export_modal::{export_base_name, PoamExportModal};
 use crate::components::rule_list::RuleList;
 use crate::constants::{severity_badge_color, status_indicator_kind, SEVERITY_ORDER, STATUS_OPTIONS};
 use crate::model::*;
 use crate::ui::*;
-use crate::util::{download_text, file_list_to_vec};
+use crate::util::{download_text, file_list_to_vec, spawn_local};
 use crate::utils::export_ckl::export_ckl;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -78,6 +81,221 @@ pub struct StigViewProps {
     /// (rule ids, new status) for the rules ticked in the list.
     pub on_set_status_for: Callback<(Vec<String>, String)>,
     pub on_add_files: Callback<Vec<web_sys::File>>,
+    /// The tab's checklist set, once its first edit has created one.
+    #[prop_or_default]
+    pub set: Option<ChecklistSet>,
+    /// Open tabs that belong to the same set.
+    #[prop_or_default]
+    pub set_tabs: Vec<StigTab>,
+    /// `None` for viewers, who have no autosave.
+    #[prop_or_default]
+    pub autosave: Option<Autosave>,
+    #[prop_or_default]
+    pub on_rename_set: Callback<String>,
+    /// A catalog STIG was added to the set on the server; open it as a tab.
+    #[prop_or_default]
+    pub on_add_stig: Callback<String>,
+    #[prop_or_default]
+    pub on_set_linked: Callback<Option<(String, String)>>,
+}
+
+#[derive(Clone, PartialEq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct CatalogItem {
+    id: String,
+    title: String,
+}
+
+/// Checklist-set strip above the STIG: name (renamable), Add STIG, autosave
+/// status, and the conflict prompt.
+#[derive(Properties, PartialEq)]
+struct SetBarProps {
+    set: Option<ChecklistSet>,
+    local_file: bool,
+    autosave: Autosave,
+    on_rename_set: Callback<String>,
+    on_add_stig: Callback<String>,
+    can_add: bool,
+}
+
+#[function_component]
+fn SetBar(p: &SetBarProps) -> Html {
+    let renaming = use_state(|| None::<String>);
+    let adding = use_state(|| false);
+    let catalog = use_state(Vec::<CatalogItem>::new);
+    let picked = use_state(Vec::<AttrValue>::new);
+    let error = use_state(|| None::<String>);
+    let status = p.autosave.status();
+
+    if p.local_file {
+        return html! { <UiBox color="text-status-inactive" testid="local-file-note">{"Not saved to your account (local file)"}</UiBox> };
+    }
+
+    let name_part = match (&*renaming, &p.set) {
+        (Some(text), Some(set)) => {
+            let on_change = {
+                let renaming = renaming.clone();
+                Callback::from(move |v: String| renaming.set(Some(v)))
+            };
+            let save = {
+                let (renaming, error, on_rename, id, text) =
+                    (renaming.clone(), error.clone(), p.on_rename_set.clone(), set.id.clone(), text.clone());
+                Callback::from(move |_: MouseEvent| {
+                    let (renaming, error, on_rename, id, text) =
+                        (renaming.clone(), error.clone(), on_rename.clone(), id.clone(), text.clone());
+                    spawn_local(async move {
+                        let body = serde_json::json!({ "name": text });
+                        match api_send(&format!("/api/checklist-sets/{id}"), "PATCH", Some(&body)).await {
+                            Ok(()) => {
+                                on_rename.emit(text.trim().to_string());
+                                renaming.set(None);
+                            }
+                            Err(e) => error.set(Some(format!("Could not rename: {e}"))),
+                        }
+                    });
+                })
+            };
+            let cancel = {
+                let renaming = renaming.clone();
+                Callback::from(move |_: MouseEvent| renaming.set(None))
+            };
+            html! {
+                <SpaceBetween direction="horizontal" size="xs">
+                    <Input value={text.clone()} {on_change} aria_label="Checklist name" testid="set-name-input" />
+                    <Button onclick={save} testid="set-name-save">{"Save"}</Button>
+                    <Button variant="link" onclick={cancel}>{"Cancel"}</Button>
+                </SpaceBetween>
+            }
+        }
+        (_, Some(set)) => {
+            let start = {
+                let (renaming, name) = (renaming.clone(), set.name.clone());
+                Callback::from(move |_: MouseEvent| renaming.set(Some(name.clone())))
+            };
+            html! {
+                <SpaceBetween direction="horizontal" size="xs">
+                    <strong data-testid="set-name">{set.name.clone()}</strong>
+                    <Button variant="inline-link" onclick={start} testid="set-rename">{"Rename"}</Button>
+                </SpaceBetween>
+            }
+        }
+        _ => html! { <UiBox color="text-status-inactive">{"Your edits are saved to My checklists automatically."}</UiBox> },
+    };
+
+    let toggle_add = {
+        let (adding, catalog) = (adding.clone(), catalog.clone());
+        Callback::from(move |_: MouseEvent| {
+            adding.set(!*adding);
+            if catalog.is_empty() {
+                let catalog = catalog.clone();
+                spawn_local(async move {
+                    if let Ok(list) = api_get::<Vec<CatalogItem>>("/api/catalog").await {
+                        catalog.set(list);
+                    }
+                });
+            }
+        })
+    };
+    let options: Vec<SelectOption> = catalog.iter().map(|c| SelectOption::new(c.id.clone(), c.title.clone())).collect();
+    let on_pick = {
+        let picked = picked.clone();
+        Callback::from(move |v: Vec<SelectOption>| picked.set(v.into_iter().map(|o| o.value).collect()))
+    };
+    let add = {
+        let (picked, adding, error, set, on_add) = (picked.clone(), adding.clone(), error.clone(), p.set.clone(), p.on_add_stig.clone());
+        Callback::from(move |_: MouseEvent| {
+            let Some(set) = set.clone() else { return };
+            let ids: Vec<String> = picked.iter().map(|s| s.to_string()).collect();
+            let (picked, adding, error, on_add) = (picked.clone(), adding.clone(), error.clone(), on_add.clone());
+            spawn_local(async move {
+                for id in ids {
+                    let body = serde_json::json!({ "stigId": id });
+                    let path = format!("/api/checklist-sets/{}/stigs", set.id);
+                    match api_send(&path, "POST", Some(&body)).await {
+                        Ok(()) => on_add.emit(id),
+                        Err(e) => {
+                            error.set(Some(format!("Could not add {id}: {e}")));
+                            return;
+                        }
+                    }
+                }
+                picked.set(Vec::new());
+                adding.set(false);
+            });
+        })
+    };
+
+    let indicator = status.indicator().map(|(kind, text)| {
+        let retry = {
+            let a = p.autosave.clone();
+            Callback::from(move |_: MouseEvent| a.flush_soon())
+        };
+        let retryable = matches!(status, SaveStatus::Error(_) | SaveStatus::Offline);
+        html! {
+            <span onclick={retryable.then_some(retry)} style={retryable.then_some("cursor:pointer;")}>
+                <StatusIndicator kind={kind} testid="autosave-status">{text}</StatusIndicator>
+            </span>
+        }
+    });
+
+    let conflict = match (&status, &p.set) {
+        (SaveStatus::Conflict, Some(set)) => {
+            let (a1, a2, id1, id2, err1, err2) =
+                (p.autosave.clone(), p.autosave.clone(), set.id.clone(), set.id.clone(), error.clone(), error.clone());
+            let reload = Callback::from(move |_: MouseEvent| {
+                let (a, id, err) = (a1.clone(), id1.clone(), err1.clone());
+                spawn_local(async move {
+                    if let Err(e) = a.reload_latest(&id).await {
+                        err.set(Some(e));
+                    }
+                });
+            });
+            let keep = Callback::from(move |_: MouseEvent| {
+                let (a, id, err) = (a2.clone(), id2.clone(), err2.clone());
+                spawn_local(async move {
+                    if let Err(e) = a.keep_my_edits(&id).await {
+                        err.set(Some(e));
+                    }
+                });
+            });
+            html! {
+                <Alert kind="warning" header={html! { {"Changed in another tab or device"} }} testid="set-conflict">
+                    <SpaceBetween size="xs">
+                        <div>{"This checklist was saved from somewhere else. Your edits are not saved yet."}</div>
+                        <SpaceBetween direction="horizontal" size="xs">
+                            <Button onclick={reload} testid="set-conflict-reload">{"Reload latest"}</Button>
+                            <Button variant="primary" onclick={keep} testid="set-conflict-keep">{"Keep my edits"}</Button>
+                        </SpaceBetween>
+                        <div>{"Reload latest discards your unsaved edits. Keep my edits takes the other changes for rules you have not touched and saves yours on top."}</div>
+                    </SpaceBetween>
+                </Alert>
+            }
+        }
+        _ => html! {},
+    };
+
+    html! {
+        <SpaceBetween size="xs">
+            <SpaceBetween direction="horizontal" size="m">
+                {name_part}
+                if p.can_add && p.set.is_some() {
+                    <Button onclick={toggle_add} testid="set-add-stig">{"Add STIG"}</Button>
+                }
+                {for indicator}
+            </SpaceBetween>
+            if *adding {
+                <SpaceBetween direction="horizontal" size="xs">
+                    <Multiselect options={options} selected={(*picked).clone()} on_change={on_pick}
+                                 placeholder="Choose STIGs to add" filtering=true testid="set-add-stig-select" />
+                    <Button variant="primary" onclick={add} disabled={picked.is_empty()} testid="set-add-stig-apply">{"Add"}</Button>
+                </SpaceBetween>
+            }
+            if let Some(e) = &*error {
+                <Alert kind="error" dismissible=true on_dismiss={{ let error = error.clone(); move |_| error.set(None) }}>{e.clone()}</Alert>
+            }
+            {conflict}
+        </SpaceBetween>
+    }
 }
 
 #[function_component]
@@ -301,7 +519,16 @@ pub fn StigView(p: &StigViewProps) -> Html {
         </Container>
     };
 
+    let on_focus_out = {
+        let a = p.autosave.clone();
+        Callback::from(move |_: FocusEvent| {
+            if let Some(a) = &a {
+                a.flush_soon();
+            }
+        })
+    };
     html! {
+        <div onfocusout={on_focus_out}>
         <SpaceBetween size="m">
             // Page header
             <Header
@@ -322,7 +549,21 @@ pub fn StigView(p: &StigViewProps) -> Html {
                         />
                         if can_save {
                             <Button
-                                onclick={{ let m = show_save_modal.clone(); move |_| m.set(true) }}
+                                onclick={{
+                                    let (m, a) = (show_save_modal.clone(), p.autosave.clone());
+                                    move |_| {
+                                        let (m, a) = (m.clone(), a.clone());
+                                        // Pending edits create/update the set first, so the
+                                        // dialog sees the set the edits belong to.
+                                        spawn_local(async move {
+                                            if let Some(a) = &a {
+                                                let _ = a.flush().await;
+                                                TimeoutFuture::new(0).await;
+                                            }
+                                            m.set(true);
+                                        });
+                                    }
+                                }}
                                 disabled={p.tab.catalog_id.is_none()}
                                 title={p.tab.catalog_id.is_none().then_some("Only STIGs opened from the library can be saved to a system.")}
                                 testid="save-to-system"
@@ -335,6 +576,12 @@ pub fn StigView(p: &StigViewProps) -> Html {
             >
                 {stig.title.clone()}
             </Header>
+
+            if let Some(a) = &p.autosave {
+                <SetBar set={p.set.clone()} local_file={p.tab.catalog_id.is_none()} autosave={a.clone()}
+                        on_rename_set={p.on_rename_set.clone()} on_add_stig={p.on_add_stig.clone()}
+                        can_add={p.tab.catalog_id.is_some()} />
+            }
 
             // Summary container
             <Container>
@@ -388,6 +635,10 @@ pub fn StigView(p: &StigViewProps) -> Html {
                         on_close={{ let m = show_save_modal.clone(); move |_| m.set(false) }}
                         stig={Rc::clone(stig)}
                         {catalog_id}
+                        set={p.set.clone()}
+                        autosave={p.autosave.clone()}
+                        set_tabs={p.set_tabs.clone()}
+                        on_linked={p.on_set_linked.clone()}
                     />
                 }
             }
@@ -398,5 +649,6 @@ pub fn StigView(p: &StigViewProps) -> Html {
                 asset_info={asset_info.clone()}
             />
         </SpaceBetween>
+        </div>
     }
 }

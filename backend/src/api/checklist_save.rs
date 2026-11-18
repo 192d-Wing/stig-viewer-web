@@ -38,9 +38,9 @@ use crate::AppState;
 
 /// Per-field cap (bytes) on each rule's finding details and comments. A rule
 /// over the cap gets a per-rule error and is not written.
-const MAX_TEXT_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_TEXT_BYTES: usize = 32 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveRule {
     pub rule_id: String,
@@ -51,7 +51,7 @@ pub struct SaveRule {
     pub comments: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveRequest {
     pub stig_id: String,
@@ -59,7 +59,7 @@ pub struct SaveRequest {
     pub rules: Vec<SaveRule>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveRowResult {
     pub rule_id: String,
@@ -72,7 +72,7 @@ pub struct SaveRowResult {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveResponse {
     pub checklist_id: String,
@@ -144,11 +144,43 @@ async fn save_work(
     asset_id: String,
     req: SaveRequest,
 ) -> Result<Json<SaveResponse>, StatusCode> {
-    let pool = state.pool.as_ref();
-    let asset = db_assets::get_asset(pool, &asset_id)
+    let asset = db_assets::get_asset(state.pool.as_ref(), &asset_id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    save_to_asset(&state, &user, &ctx, &asset, &req, SaveOrigin::Direct).await.map(Json)
+}
+
+/// Where a save came from. A checklist set only adds `via` / `setId` to the
+/// `checklist.save` and `checklist.create` event detail.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SaveOrigin<'a> {
+    Direct,
+    Set { set_id: &'a str },
+}
+
+impl SaveOrigin<'_> {
+    /// Adds the origin tags to an event detail object.
+    fn tag(self, mut detail: serde_json::Value) -> serde_json::Value {
+        if let (SaveOrigin::Set { set_id }, Some(obj)) = (self, detail.as_object_mut()) {
+            obj.insert("via".into(), json!("checklist_set"));
+            obj.insert("setId".into(), json!(set_id));
+        }
+        detail
+    }
+}
+
+/// Everything from the write-ACL check through the final audit events, for
+/// one STIG on one asset. Shared by the direct endpoint and checklist sets.
+pub(crate) async fn save_to_asset(
+    state: &AppState,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    asset: &db_assets::AssetRow,
+    req: &SaveRequest,
+    origin: SaveOrigin<'_>,
+) -> Result<SaveResponse, StatusCode> {
+    let pool = state.pool.as_ref();
     // The request's STIG id is recorded only once it has the expected shape.
     let event_stig = is_valid_stig_id(&req.stig_id).then_some(req.stig_id.as_str());
     let request_event = |outcome: &'static str, detail: serde_json::Value| {
@@ -156,7 +188,7 @@ async fn save_work(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
-                ctx: Some(&ctx),
+                ctx: Some(ctx),
                 action: "checklist.save",
                 outcome,
                 asset_id: Some(&asset.id),
@@ -166,7 +198,7 @@ async fn save_work(
             },
         )
     };
-    if !asset_acl::user_can(pool, &asset.id, &user, "write").await {
+    if !asset_acl::user_can(pool, &asset.id, user, "write").await {
         request_event("denied", json!({ "reason": "forbidden" })).await;
         return Err(StatusCode::FORBIDDEN);
     }
@@ -181,7 +213,7 @@ async fn save_work(
 
     // Load the catalog STIG before creating anything so a bad id never
     // leaves an empty checklist behind.
-    let mut stig = match load_stig_json(&state, &req.stig_id).await
+    let mut stig = match load_stig_json(state, &req.stig_id).await
     {
         Ok(v) => v,
         Err(code) => {
@@ -216,13 +248,13 @@ async fn save_work(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
-                ctx: Some(&ctx),
+                ctx: Some(ctx),
                 action: "checklist.create",
                 outcome: "ok",
                 asset_id: Some(&asset.id),
                 checklist_id: Some(&checklist.id),
                 stig_id: Some(&req.stig_id),
-                detail: json!({ "via": "save" }),
+                detail: origin.tag(json!({ "via": "save" })),
             },
         )
         .await;
@@ -268,13 +300,13 @@ async fn save_work(
         pool,
         NewAuditEvent {
             user_id: &user.id,
-            ctx: Some(&ctx),
+            ctx: Some(ctx),
             action: "checklist.save",
             outcome: if count("error") > 0 { "partial" } else { "ok" },
             asset_id: Some(&asset.id),
             checklist_id: Some(&checklist.id),
             stig_id: Some(&req.stig_id),
-            detail: json!({
+            detail: origin.tag(json!({
                 "created": created,
                 "requested": req.rules.len(),
                 "applied": count("applied"),
@@ -284,11 +316,11 @@ async fn save_work(
                 "alreadyPending": results.iter().filter(|r| r.note.is_some()).count(),
                 "rejected": rejected_list,
                 "rejectedTruncated": rejected_truncated,
-            }),
+            })),
         },
     )
     .await;
-    Ok(Json(SaveResponse {
+    Ok(SaveResponse {
         checklist_id: checklist.id,
         created,
         applied_count: count("applied"),
@@ -296,7 +328,7 @@ async fn save_work(
         unchanged_count: count("unchanged"),
         error_count: count("error"),
         results,
-    }))
+    })
 }
 
 /// Find the asset's checklist for a STIG, creating it when absent. A
@@ -482,6 +514,16 @@ mod tests {
             finding_details: details.into(),
             comments: comments.into(),
         }
+    }
+
+    #[test]
+    fn set_origin_tags_event_detail_and_direct_does_not() {
+        let d = json!({ "created": true });
+        assert_eq!(SaveOrigin::Direct.tag(d.clone()), d);
+        assert_eq!(
+            SaveOrigin::Set { set_id: "s1" }.tag(d),
+            json!({ "created": true, "via": "checklist_set", "setId": "s1" })
+        );
     }
 
     #[test]

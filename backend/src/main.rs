@@ -7,6 +7,7 @@ mod db_audit;
 mod db_notice;
 mod db_assets;
 mod db_attachments;
+mod db_checklist_sets;
 mod db_checklists;
 mod db_drafts;
 mod parser;
@@ -138,6 +139,13 @@ use api::{
     report::report_handler as asset_report_handler,
     rule_bulk_import::bulk_import_handler as rule_bulk_import_handler,
     checklist_save::save_handler as checklist_save_handler,
+    checklist_sets::{
+        add_stig_handler as add_checklist_set_stig_handler, autosave_handler as autosave_checklist_set_handler,
+        create_handler as create_checklist_set_handler, delete_handler as delete_checklist_set_handler,
+        get_handler as get_checklist_set_handler, list_handler as list_checklist_sets_handler,
+        patch_handler as patch_checklist_set_handler, remove_stig_handler as remove_checklist_set_stig_handler,
+        save_to_system_handler as save_checklist_set_to_system_handler,
+    },
     rule_bulk_status::bulk_status_handler as rule_bulk_status_handler,
     rule_comments::{
         add_reaction_handler as add_comment_reaction_handler,
@@ -201,6 +209,12 @@ const BULK_STATUS_BODY_LIMIT: usize = 256 * 1024;
 /// real checklist averages a few KiB per rule across 300-1000 rules, so 4 MiB
 /// fits any realistic STIG while keeping the worst-case write fan-out small.
 const SAVE_TO_SYSTEM_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Checklist-set autosave: up to 2000 rule changes with capped text fields.
+const CHECKLIST_SET_AUTOSAVE_BODY_LIMIT: usize = 1024 * 1024;
+
+/// The other mutating checklist-set routes carry only a name, ids and a revision.
+const CHECKLIST_SET_SMALL_BODY_LIMIT: usize = 16 * 1024;
 /// `/api/sign` takes base64 JSON of up to 100 MiB of content (the handler
 /// enforces the decoded size); base64 inflates that by 4/3.
 const SIGN_BODY_LIMIT: usize = 140 * 1024 * 1024;
@@ -381,6 +395,35 @@ async fn main() -> Result<()> {
         .route(
             "/api/assets/:id/checklists/save",
             post(checklist_save_handler.layer(DefaultBodyLimit::max(SAVE_TO_SYSTEM_BODY_LIMIT))),
+        )
+        .route(
+            "/api/checklist-sets",
+            get(list_checklist_sets_handler)
+                .post(create_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
+        )
+        .route(
+            "/api/checklist-sets/:id",
+            get(get_checklist_set_handler)
+                .patch(patch_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT)))
+                .delete(delete_checklist_set_handler),
+        )
+        .route(
+            "/api/checklist-sets/:id/stigs",
+            post(add_checklist_set_stig_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
+        )
+        .route(
+            "/api/checklist-sets/:id/stigs/:stig_id",
+            axum::routing::delete(remove_checklist_set_stig_handler),
+        )
+        .route(
+            "/api/checklist-sets/:id/rules",
+            axum::routing::patch(
+                autosave_checklist_set_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_AUTOSAVE_BODY_LIMIT)),
+            ),
+        )
+        .route(
+            "/api/checklist-sets/:id/save-to-system",
+            post(save_checklist_set_to_system_handler.layer(DefaultBodyLimit::max(CHECKLIST_SET_SMALL_BODY_LIMIT))),
         )
         .route(
             "/api/asset-groups",

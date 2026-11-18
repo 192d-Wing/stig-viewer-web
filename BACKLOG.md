@@ -30,7 +30,7 @@ SAML `InResponseTo` check added in PR #49.
 - [x] Remove `AuthState` and the `finish_*` helpers.
 - [x] Delete consumed ack rows once they are more than 10 minutes old.
 - [x] `e2e-rs` is deprecated; the acknowledge-step coverage lives in the Playwright spec `01-auth-gate`.
-- [ ] **Migration number:** `main` now uses up to `040_audit_guard.sql`. This change and checklist sets (item 5) both need a new number from `041` on. Whichever merges second takes the next free one.
+- [x] **Migration number:** AC-8 (PR #56) took `041_login_ack_binding.sql`; checklist sets took `042`.
 
 ## 3. Add exclusive XML canonicalisation for SAML
 
@@ -64,10 +64,10 @@ These are named, multi-STIG checklists. They are stored on the server for each u
 
 Before merging:
 
-- [ ] Rebase onto `main`. The branch is now 40 commits behind.
-- [ ] Renumber `038_checklist_sets.sql`. `main` already uses `038`, `039` and `040` (see item 2).
-- [ ] Run e2e spec 82 and the specs it touches (81, 66, 06, 07, 08 and 80) on the rebased branch. Spec 81 passes on `main` again, so use `main` as the baseline. Spec 66 needs #54.
-- [ ] Push and open the PR. Fetch `main` first.
+- [x] Rebase onto `main`.
+- [x] Renumber `038_checklist_sets.sql` to `042_checklist_sets.sql`.
+- [x] Run e2e spec 82 and the specs it touches (81, 66, 06, 07, 08 and 80) on the rebased branch.
+- [x] Push and open the PR.
 
 Product decisions. Each is the current default and can be changed:
 
@@ -119,7 +119,7 @@ None of these has an issue yet. File each one before starting work on it.
 - [ ] DISA STIG downloads aren't checked against a checksum. Find out whether DISA publishes one, and pin or verify it if so.
 - [ ] `notice.rs`: correct the wording about whether the notice file is overwritten or appended to.
 - [ ] Deployment notes:
-  - apply migrations `037` to `040`;
+  - apply migrations `037` to `042`;
   - mount the STIG data as a named volume; the seed is read from `STIG_SEED_DIR`;
   - set `STIG_SYNC_ON_START` and `STIG_SYNC_INTERVAL_HOURS` as wanted;
   - with `SIGNING_KEY_HEX` set, a restore needs a signed backup unless `BACKUP_REQUIRE_SIGNATURE=false`;

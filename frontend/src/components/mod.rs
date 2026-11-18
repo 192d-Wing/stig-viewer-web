@@ -10,6 +10,7 @@ pub mod checklist_view;
 pub mod dashboard;
 pub mod diff_view;
 pub mod drop_zone;
+pub mod my_checklists;
 pub mod my_findings;
 pub mod poam_export_modal;
 pub mod rule_detail;
