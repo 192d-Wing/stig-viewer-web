@@ -1021,7 +1021,9 @@ mod callback_flow_tests {
     };
 
     const ISS: &str = "https://idp.test/realms/x";
-    const NONCE: &str = "n-1";
+    /// Per-run random nonce, so no fixed value stands in for one.
+    static NONCE: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
     fn jwks() -> CoreJsonWebKeySet {
         let pk = key().1.to_public_key();
@@ -1114,7 +1116,7 @@ mod callback_flow_tests {
         insert_ack(pool, &id, "v1", "", "", 300).await.unwrap();
         let b = LoginBinding::Oidc {
             state: "st",
-            nonce: NONCE,
+            nonce: &NONCE,
             pkce_verifier: "pv",
         };
         assert!(consume_ack(pool, &id, "v1", &b).await.unwrap());
@@ -1167,7 +1169,8 @@ mod callback_flow_tests {
         step("id_token");
 
         // Bad signature, then wrong nonce (the claims-validation site).
-        for tok in [id_token(NONCE, true), id_token("other", false)] {
+        let other = uuid::Uuid::new_v4().to_string();
+        for tok in [id_token(&NONCE, true), id_token(&other, false)] {
             let a = stub(200, token_resp(Some(tok))).await;
             let c = claim(&pool).await;
             cap.clear();
@@ -1181,7 +1184,7 @@ mod callback_flow_tests {
         assert_eq!(n, 0);
 
         // Valid, signed token: session, success line with the user id, audit row.
-        let a = stub(200, token_resp(Some(id_token(NONCE, false)))).await;
+        let a = stub(200, token_resp(Some(id_token(&NONCE, false)))).await;
         let c = claim(&pool).await;
         cap.clear();
         let cookie = run(a, c).await.unwrap();
