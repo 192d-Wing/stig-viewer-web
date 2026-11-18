@@ -1,7 +1,7 @@
 //! Dev-only seeding of the STIG data directory.
 //!
 //! `STIG_SEED_DIR` names a read-only directory of parsed STIG JSON (the
-//! tracked `backend/data/stigs`). At start, every file there that the data
+//! tracked `backend/seed/stigs`). At start, every file there that the data
 //! directory does not already hold is copied in; an existing file is never
 //! overwritten, so synced or uploaded data survives restarts. Seeded files
 //! that have no catalog row are indexed so a fresh database lists them.

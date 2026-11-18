@@ -48,6 +48,8 @@ category = "Linux"
 url      = "https://dl.dod.cyber.mil/wp-content/uploads/stigs/zip/U_RHEL_9_V2R10_STIG.zip"
 
 [[stigs]]
+# Sync-only: there is no seed file for this id, so a fresh dev stack has no
+# Ubuntu 20.04 entry until the first sync downloads it.
 id       = "can-ubuntu-20-04-lts"
 title    = "Canonical Ubuntu 20.04 LTS STIG"
 category = "Linux"

@@ -634,6 +634,144 @@ mod tests {
         assert_eq!(r.check_text, "first check");
     }
 
+    /// The seeded catalog is data, not code, so it can rot silently: files
+    /// written by an older parser carried "DPMS Target ..." as rule titles and
+    /// non-CCI idents in `cciIds`. Every tracked file must parse as `StigData`
+    /// and hold real titles and CCI ids.
+    #[test]
+    fn seeded_catalog_has_real_titles_and_cci_ids() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed/stigs");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read seed/stigs") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.display().to_string();
+            let bytes = std::fs::read(&path).expect("read catalog file");
+            let stig: StigData = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("{name} does not parse as StigData: {e}"));
+            for r in &stig.rules {
+                assert!(
+                    !r.title.starts_with("DPMS Target"),
+                    "{name}: rule {} has the DPMS Target title {:?}",
+                    r.id,
+                    r.title
+                );
+                for c in &r.cci_ids {
+                    assert!(c.starts_with("CCI-"), "{name}: rule {} has non-CCI id {c:?}", r.id);
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no catalog files found in {}", dir.display());
+    }
+
+    /// The seed is committed to a public repository, so it must not hold CUI:
+    /// no marking in any string, none of the withheld `CUI_` products, and no
+    /// repeated rule ids. `seed/stigs.allowlist` pins the exact set of ids, so
+    /// every added or dropped file is a deliberate, reviewable change.
+    #[test]
+    fn seeded_catalog_holds_no_cui_and_has_unique_rule_ids() {
+        fn strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match v {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+                serde_json::Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+                _ => {}
+            }
+        }
+        // Title patterns for the withheld products (lower-case).
+        const CUI_TITLES: &[&str] = &[
+            "trellix ens",
+            "ens 10",
+            "ess agent handler",
+            "ess epo",
+            "epo 5",
+            "policy auditor",
+            "ess remote console",
+            "rogue sensor",
+            "ess staging server",
+            "ess trellix agent",
+            "tie-dxl",
+            "tie dxl",
+            "joint regional security stack",
+        ];
+        // Exact hyphen-separated id sequences of the withheld products.
+        const CUI_ID_SEQUENCES: &[&[&str]] = &[
+            &["policy", "auditor"],
+            &["rogue", "sensor"],
+            &["staging", "server"],
+            &["mcafee", "ens"],
+            &["trellix", "agent"],
+        ];
+        let seed = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("seed");
+        let dir = seed.join("stigs");
+        let allow: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(seed.join("stigs.allowlist"))
+                .expect("read seed/stigs.allowlist")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+        let mut present = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&dir).expect("read seed/stigs") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.display().to_string();
+            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+            let bytes = std::fs::read(&path).expect("read catalog file");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            let stig: StigData = serde_json::from_value(value.clone())
+                .unwrap_or_else(|e| panic!("{name} does not parse as StigData: {e}"));
+
+            let mut all = Vec::new();
+            strings(&value, &mut all);
+            for s in all {
+                let l = s.to_lowercase();
+                let t = l.trim();
+                assert!(
+                    !l.contains("cui//")
+                        && !l.contains("controlled unclassified")
+                        && t != "cui"
+                        && t != "(cui)",
+                    "{name}: a string carries a CUI marking"
+                );
+            }
+
+            let title = stig.title.to_lowercase();
+            let id_words: Vec<&str> = id.split('-').collect();
+            assert!(
+                !CUI_TITLES.iter().any(|p| title.contains(p))
+                    && !id.contains("trellix-ens")
+                    && !id.contains("tie-dxl")
+                    && !id.contains("joint-regional")
+                    && !id_words.iter().any(|w| {
+                        ["ess", "epo", "jrss", "staging-server"].contains(w)
+                    })
+                    && !CUI_ID_SEQUENCES.iter().any(|seq| {
+                        let n = seq.len();
+                        id_words.windows(n).any(|win| win == *seq)
+                    }),
+                "{name}: id or title matches a withheld CUI product ({:?})",
+                stig.title
+            );
+
+            let mut seen = std::collections::HashSet::new();
+            for r in &stig.rules {
+                assert!(seen.insert(r.id.as_str()), "{name}: duplicate rule id {}", r.id);
+            }
+            present.insert(id);
+        }
+        let unlisted: Vec<_> = present.difference(&allow).collect();
+        let missing: Vec<_> = allow.difference(&present).collect();
+        assert!(unlisted.is_empty(), "seed files not on seed/stigs.allowlist: {unlisted:?}");
+        assert!(missing.is_empty(), "allowlisted ids with no seed file: {missing:?}");
+    }
+
     fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write;
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
