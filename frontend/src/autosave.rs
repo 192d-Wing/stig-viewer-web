@@ -473,27 +473,7 @@ impl Autosave {
         let mut sent = false;
         loop {
             // Tabs of a conflicted set wait for the user's choice; the rest go on.
-            let (dirty_tabs, blocked) = {
-                let i = self.inner.borrow();
-                if i.stopped {
-                    return Err("Signed out".into());
-                }
-                let (mut ready, mut blocked) = (Vec::new(), false);
-                for t in i.tracker.dirty_tabs() {
-                    let set = i
-                        .tabs
-                        .iter()
-                        .find(|x| x.id == t)
-                        .and_then(|x| x.set_id.clone())
-                        .or_else(|| i.created.get(&t).cloned());
-                    if set.is_some_and(|s| i.paused.contains(&s)) {
-                        blocked = true;
-                    } else {
-                        ready.push(t);
-                    }
-                }
-                (ready, blocked)
-            };
+            let (dirty_tabs, blocked) = self.ready_tabs()?;
             if dirty_tabs.is_empty() {
                 if blocked {
                     self.set_status(SaveStatus::Conflict);
@@ -511,34 +491,10 @@ impl Autosave {
             }
             self.set_status(SaveStatus::Saving);
 
-            // Group dirty tabs by set, creating a set for tabs that have none.
-            let mut by_set: Vec<(String, Vec<String>)> = Vec::new();
-            for tab_id in dirty_tabs {
-                let (tab, known) = {
-                    let i = self.inner.borrow();
-                    let tab = i.tabs.iter().find(|t| t.id == tab_id).cloned();
-                    let known = tab
-                        .as_ref()
-                        .and_then(|t| t.set_id.clone())
-                        .or_else(|| i.created.get(&tab_id).cloned());
-                    (tab, known)
-                };
-                let Some(tab) = tab else {
-                    self.inner.borrow_mut().tracker.forget_tab(&tab_id);
-                    continue;
-                };
-                let set_id = match known {
-                    Some(id) => id,
-                    None => match self.create_set(&tab).await {
-                        Ok(id) => id,
-                        Err(f) => return self.fail(f),
-                    },
-                };
-                match by_set.iter_mut().find(|(s, _)| *s == set_id) {
-                    Some((_, tabs)) => tabs.push(tab_id),
-                    None => by_set.push((set_id, vec![tab_id])),
-                }
-            }
+            let by_set = match self.group_by_set(dirty_tabs).await {
+                Ok(g) => g,
+                Err(f) => return self.fail(f),
+            };
             for (set_id, tab_ids) in by_set {
                 match self.send_set(&set_id, &tab_ids).await {
                     Ok(()) => sent = true,
@@ -550,6 +506,62 @@ impl Autosave {
             // Go around: edits may have arrived while saving, and the top of
             // the loop reports a conflict or success.
         }
+    }
+
+    /// Dirty tabs that can be sent now, and whether any wait on a conflicted
+    /// set. `Err` once autosave has stopped (signed out).
+    fn ready_tabs(&self) -> Result<(Vec<String>, bool), String> {
+        let i = self.inner.borrow();
+        if i.stopped {
+            return Err("Signed out".into());
+        }
+        let (mut ready, mut blocked) = (Vec::new(), false);
+        for t in i.tracker.dirty_tabs() {
+            let set = i
+                .tabs
+                .iter()
+                .find(|x| x.id == t)
+                .and_then(|x| x.set_id.clone())
+                .or_else(|| i.created.get(&t).cloned());
+            if set.is_some_and(|s| i.paused.contains(&s)) {
+                blocked = true;
+            } else {
+                ready.push(t);
+            }
+        }
+        Ok((ready, blocked))
+    }
+
+    /// Group dirty tabs by set, creating a set for tabs that have none.
+    async fn group_by_set(
+        &self,
+        dirty_tabs: Vec<String>,
+    ) -> Result<Vec<(String, Vec<String>)>, Failure> {
+        let mut by_set: Vec<(String, Vec<String>)> = Vec::new();
+        for tab_id in dirty_tabs {
+            let (tab, known) = {
+                let i = self.inner.borrow();
+                let tab = i.tabs.iter().find(|t| t.id == tab_id).cloned();
+                let known = tab
+                    .as_ref()
+                    .and_then(|t| t.set_id.clone())
+                    .or_else(|| i.created.get(&tab_id).cloned());
+                (tab, known)
+            };
+            let Some(tab) = tab else {
+                self.inner.borrow_mut().tracker.forget_tab(&tab_id);
+                continue;
+            };
+            let set_id = match known {
+                Some(id) => id,
+                None => self.create_set(&tab).await?,
+            };
+            match by_set.iter_mut().find(|(s, _)| *s == set_id) {
+                Some((_, tabs)) => tabs.push(tab_id),
+                None => by_set.push((set_id, vec![tab_id])),
+            }
+        }
+        Ok(by_set)
     }
 
     fn fail(&self, f: Failure) -> Result<(), String> {

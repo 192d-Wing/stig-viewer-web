@@ -9,7 +9,10 @@ use yew::prelude::*;
 use crate::api::{api_get, api_send};
 use crate::autosave::{create_named_set, delete_set, fetch_set};
 use crate::model::{ChecklistSet, Stig};
-use crate::ui::*;
+use crate::ui::{
+    Alert, Button, Column, Container, FormField, Header, Input, Modal, Multiselect, SelectOption,
+    SpaceBetween, Table, UiBox,
+};
 use crate::util::{confirm, encode_uri_component, spawn_local, to_locale_string};
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
