@@ -7,6 +7,8 @@ pub mod asset_import;
 pub mod assets;
 pub mod attachments;
 pub mod audit;
+#[cfg(test)]
+pub(crate) mod audit_capture;
 pub mod auth;
 pub mod backup;
 pub mod baselines;
