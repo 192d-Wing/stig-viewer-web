@@ -3,8 +3,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
 };
-use chrono::Utc;
-use printpdf::{BuiltinFont, Mm, PdfDocument, PdfDocumentReference, PdfLayerReference};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -14,6 +13,7 @@ use crate::config::Config;
 use crate::db_assets;
 use crate::db_attachments;
 use crate::db_checklists;
+use crate::pdf::{Face, TextDoc};
 use crate::severity::weighted_score;
 use crate::AppState;
 
@@ -242,60 +242,50 @@ fn render_pdf(
     owner_name: &str,
     sections: &[ChecklistSection],
 ) -> anyhow::Result<Vec<u8>> {
-    let (doc, page, layer) = PdfDocument::new(
-        format!("STIG report — {}", asset.name),
-        Mm(PAGE_W),
-        Mm(PAGE_H),
-        "Layer 1",
-    );
-    let font_regular = doc.add_builtin_font(BuiltinFont::Helvetica)?;
-    let font_bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
-    let font_italic = doc.add_builtin_font(BuiltinFont::HelveticaOblique)?;
+    Ok(layout_report(asset, owner_name, sections, Utc::now()).finish())
+}
 
-    let fonts = Fonts {
-        regular: font_regular,
-        bold: font_bold,
-        italic: font_italic,
-    };
-
-    // Inner scope so `state` drops (releasing the borrow on `doc`) before
-    // we call save_to_bytes(self).
+fn layout_report(
+    asset: &db_assets::AssetRow,
+    owner_name: &str,
+    sections: &[ChecklistSection],
+    generated_at: DateTime<Utc>,
+) -> TextDoc {
+    let mut doc = TextDoc::new(format!("STIG report — {}", asset.name), PAGE_W, PAGE_H);
     {
         let mut state = PageState {
-            layer: doc.get_page(page).get_layer(layer),
+            doc: &mut doc,
             y: PAGE_H - MARGIN_T,
-            doc: &doc,
         };
 
         // ── Cover ───────────────────────────────────────────────────────────
-        state.text("STIG Compliance Report", SIZE_TITLE, &fonts.bold);
+        state.text("STIG Compliance Report", SIZE_TITLE, Face::Bold);
         state.advance(8.0);
-        state.text(&asset.name, SIZE_H2, &fonts.bold);
+        state.text(&asset.name, SIZE_H2, Face::Bold);
         state.advance(LH_BODY);
 
-        state.kv("Hostname", if asset.hostname.is_empty() { "—" } else { &asset.hostname }, &fonts);
-        state.kv("Classification", &asset.classification, &fonts);
-        state.kv("Owner", owner_name, &fonts);
+        state.kv("Hostname", if asset.hostname.is_empty() { "—" } else { &asset.hostname });
+        state.kv("Classification", &asset.classification);
+        state.kv("Owner", owner_name);
         state.kv(
             "Generated",
-            &Utc::now().format("%Y-%m-%d %H:%M UTC").to_string(),
-            &fonts,
+            &generated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
         );
         if !asset.description.is_empty() {
             state.advance(LH_BODY);
-            state.text("Description", SIZE_SMALL, &fonts.bold);
+            state.text("Description", SIZE_SMALL, Face::Bold);
             state.advance(LH_BODY * 0.6);
-            state.wrapped(&asset.description, SIZE_BODY, &fonts.regular, 95);
+            state.wrapped(&asset.description, SIZE_BODY, Face::Regular, 95);
         }
 
         if sections.is_empty() {
             state.advance(8.0);
-            state.text("No STIGs applied to this system.", SIZE_BODY, &fonts.italic);
+            state.text("No STIGs applied to this system.", SIZE_BODY, Face::Italic);
         } else {
             for section in sections {
-                state.ensure_room(20.0, &fonts);
+                state.ensure_room(20.0);
                 state.advance(8.0);
-                state.text(&section.stig_title, SIZE_H2, &fonts.bold);
+                state.text(&section.stig_title, SIZE_H2, Face::Bold);
                 state.advance(LH_BODY * 0.6);
                 state.text(
                     &format!(
@@ -303,7 +293,7 @@ fn render_pdf(
                         section.total, section.open, section.naf, section.na, section.not_reviewed,
                     ),
                     SIZE_SMALL,
-                    &fonts.italic,
+                    Face::Italic,
                 );
                 state.advance(LH_BODY);
 
@@ -317,12 +307,12 @@ fn render_pdf(
                         } else {
                             LH_BODY * 2.0
                         };
-                    state.ensure_room(needed, &fonts);
+                    state.ensure_room(needed);
 
                     state.text(
                         &format!("{} — {}", rule.id, status_label(&rule.status)),
                         SIZE_BODY,
-                        &fonts.bold,
+                        Face::Bold,
                     );
                     state.advance(LH_BODY * 0.7);
                     state.text(
@@ -331,84 +321,60 @@ fn render_pdf(
                             rule.severity, rule.weighted_score
                         ),
                         SIZE_SMALL,
-                        &fonts.regular,
+                        Face::Regular,
                     );
                     state.advance(LH_BODY * 0.7);
                     if rule.attachments > 0 {
                         state.text(
                             &format!("Attachments: {}", rule.attachments),
                             SIZE_SMALL,
-                            &fonts.regular,
+                            Face::Regular,
                         );
                         state.advance(LH_BODY * 0.7);
                     }
                     if !rule.title.is_empty() {
-                        state.wrapped(&rule.title, SIZE_BODY, &fonts.regular, 95);
+                        state.wrapped(&rule.title, SIZE_BODY, Face::Regular, 95);
                     }
                     if !rule.finding_details.is_empty() {
                         state.advance(LH_BODY * 0.4);
-                        state.text("Finding details:", SIZE_SMALL, &fonts.bold);
+                        state.text("Finding details:", SIZE_SMALL, Face::Bold);
                         state.advance(LH_BODY * 0.5);
                         let truncated = truncate(&rule.finding_details, 200);
-                        state.wrapped(&truncated, SIZE_SMALL, &fonts.italic, 100);
+                        state.wrapped(&truncated, SIZE_SMALL, Face::Italic, 100);
                     }
                     state.advance(LH_BODY * 0.6);
                 }
             }
         }
     }
-
-    Ok(doc.save_to_bytes()?)
-}
-
-struct Fonts {
-    regular: printpdf::IndirectFontRef,
-    bold: printpdf::IndirectFontRef,
-    italic: printpdf::IndirectFontRef,
+    doc
 }
 
 struct PageState<'a> {
-    layer: PdfLayerReference,
+    doc: &'a mut TextDoc,
     y: f32,
-    doc: &'a PdfDocumentReference,
 }
 
-impl<'a> PageState<'a> {
-    fn text(&self, s: &str, size: f32, font: &printpdf::IndirectFontRef) {
-        self.layer.use_text(s, size, Mm(MARGIN_L), Mm(self.y), font);
+impl PageState<'_> {
+    fn text(&mut self, s: &str, size: f32, face: Face) {
+        self.doc.text(s, size, MARGIN_L, self.y, face);
     }
 
     fn advance(&mut self, dy: f32) {
         self.y -= dy;
     }
 
-    fn kv(&mut self, key: &str, value: &str, fonts: &Fonts) {
-        self.layer.use_text(
-            format!("{key}: "),
-            SIZE_BODY,
-            Mm(MARGIN_L),
-            Mm(self.y),
-            &fonts.bold,
-        );
-        self.layer.use_text(
-            value,
-            SIZE_BODY,
-            Mm(MARGIN_L + 28.0),
-            Mm(self.y),
-            &fonts.regular,
-        );
+    fn kv(&mut self, key: &str, value: &str) {
+        self.doc
+            .text(format!("{key}: "), SIZE_BODY, MARGIN_L, self.y, Face::Bold);
+        self.doc
+            .text(value, SIZE_BODY, MARGIN_L + 28.0, self.y, Face::Regular);
         self.advance(LH_BODY);
     }
 
     /// Wrap text at approximately `max_chars` characters per line.
     /// Imperfect (Helvetica is proportional) but adequate for body text.
-    fn wrapped(
-        &mut self,
-        text: &str,
-        size: f32,
-        font: &printpdf::IndirectFontRef,
-        max_chars: usize,
-    ) {
+    fn wrapped(&mut self, text: &str, size: f32, face: Face, max_chars: usize) {
         let mut line = String::new();
         for word in text.split_whitespace() {
             if line.is_empty() {
@@ -417,26 +383,21 @@ impl<'a> PageState<'a> {
                 line.push(' ');
                 line.push_str(word);
             } else {
-                self.layer
-                    .use_text(&line, size, Mm(MARGIN_L), Mm(self.y), font);
+                self.doc.text(&line, size, MARGIN_L, self.y, face);
                 self.advance(LH_BODY * 0.85);
                 line.clear();
                 line.push_str(word);
             }
         }
         if !line.is_empty() {
-            self.layer
-                .use_text(&line, size, Mm(MARGIN_L), Mm(self.y), font);
+            self.doc.text(&line, size, MARGIN_L, self.y, face);
             self.advance(LH_BODY * 0.85);
         }
     }
 
-    fn ensure_room(&mut self, needed: f32, _fonts: &Fonts) {
+    fn ensure_room(&mut self, needed: f32) {
         if self.y - needed < MARGIN_B {
-            let (page, layer) = self
-                .doc
-                .add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
-            self.layer = self.doc.get_page(page).get_layer(layer);
+            self.doc.add_page();
             self.y = PAGE_H - MARGIN_T;
         }
     }
@@ -484,5 +445,88 @@ mod id_tests {
         for id in bad_ids() {
             assert!(load_stig_json_from_dir(&state.config.data_dir, &id).await.is_none(), "{id:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset() -> db_assets::AssetRow {
+        let now = Utc::now();
+        db_assets::AssetRow {
+            id: "a1".into(),
+            name: "web-01".into(),
+            hostname: String::new(),
+            description: String::new(),
+            classification: "U".into(),
+            owner_id: "u1".into(),
+            created_at: now,
+            updated_at: now,
+            tags: vec![],
+            requires_approval: false,
+            email_cadence: "off".into(),
+            email_last_sent_at: None,
+            runbook: String::new(),
+        }
+    }
+
+    fn all_text(doc: &TextDoc) -> String {
+        (0..doc.page_count())
+            .flat_map(|p| doc.page_runs(p).iter().map(|r| r.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn empty_report_layout() {
+        let doc = layout_report(&asset(), "Owner", &[], Utc::now());
+        let t = all_text(&doc);
+        assert!(t.contains("STIG Compliance Report"));
+        assert!(t.contains("web-01"));
+        assert!(t.contains("No STIGs applied to this system."));
+        assert_eq!(doc.page_count(), 1);
+    }
+
+    #[test]
+    fn long_section_paginates_within_margins() {
+        let rules: Vec<RuleSummary> = (0..200)
+            .map(|i| RuleSummary {
+                id: format!("SV-{i}r1_rule"),
+                title: "A rule title that is reasonably long ".repeat(4),
+                severity: "high".into(),
+                status: "open".into(),
+                finding_details: "details ".repeat(20),
+                attachments: 1,
+                weighted_score: 10.0,
+            })
+            .collect();
+        let section = ChecklistSection {
+            stig_id: "S".into(),
+            stig_title: "Some STIG".into(),
+            total: 200,
+            open: 200,
+            naf: 0,
+            na: 0,
+            not_reviewed: 0,
+            rules,
+        };
+        let doc = layout_report(&asset(), "Owner", &[section], Utc::now());
+        assert!(doc.page_count() > 1);
+        for p in 0..doc.page_count() {
+            for r in doc.page_runs(p) {
+                assert!(r.y_mm >= MARGIN_B && r.y_mm <= PAGE_H - MARGIN_T, "{}", r.y_mm);
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_asset_name_is_escaped_in_output() {
+        let mut a = asset();
+        a.name = "a) Tj ET (b\\".into();
+        let doc = layout_report(&a, "Owner", &[], Utc::now());
+        assert!(doc.page_runs(0).iter().any(|r| r.text == a.name));
+        let bytes = render_pdf(&a, "Owner", &[]).unwrap();
+        assert!(!bytes.windows(12).any(|w| w == b"a) Tj ET (b\\"));
     }
 }
