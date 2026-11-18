@@ -11,6 +11,7 @@ mod db_checklist_sets;
 mod db_checklists;
 mod db_drafts;
 mod parser;
+mod pdf;
 mod scheduler_log;
 mod seed;
 mod severity;

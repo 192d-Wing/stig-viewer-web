@@ -25,12 +25,12 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use printpdf::{BuiltinFont, Mm, PdfDocument};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::pdf::{Face, TextDoc};
 use crate::AppState;
 
 // ── Page geometry (mirrors backend/src/api/report.rs) ───────────────────────
@@ -251,41 +251,41 @@ fn render_pdf(
     top_rules: &[TopRuleLine],
     range_days: i32,
 ) -> Result<Vec<u8>> {
-    let (doc, page, layer) = PdfDocument::new(
-        "Fleet Compliance Report",
-        Mm(PAGE_W),
-        Mm(PAGE_H),
-        "Layer 1",
-    );
-    let f_reg = doc.add_builtin_font(BuiltinFont::Helvetica)?;
-    let f_bold = doc.add_builtin_font(BuiltinFont::HelveticaBold)?;
-    let f_italic = doc.add_builtin_font(BuiltinFont::HelveticaOblique)?;
+    Ok(layout_report(summary, assets, top_rules, range_days, Utc::now()).finish())
+}
 
-    let mut layer_ref = doc.get_page(page).get_layer(layer);
+fn layout_report(
+    summary: &ReportSummary,
+    assets: &[AssetLine],
+    top_rules: &[TopRuleLine],
+    range_days: i32,
+    generated_at: DateTime<Utc>,
+) -> TextDoc {
+    let mut doc = TextDoc::new("Fleet Compliance Report", PAGE_W, PAGE_H);
     let mut y = PAGE_H - MARGIN_T;
 
     // Cover
-    layer_ref.use_text("Fleet Compliance Report", SIZE_TITLE, Mm(MARGIN_L), Mm(y), &f_bold);
+    doc.text("Fleet Compliance Report", SIZE_TITLE, MARGIN_L, y, Face::Bold);
     y -= LH * 1.6;
-    layer_ref.use_text(
-        Utc::now().format("Generated %Y-%m-%d %H:%M UTC").to_string(),
+    doc.text(
+        generated_at.format("Generated %Y-%m-%d %H:%M UTC").to_string(),
         SIZE_BODY,
-        Mm(MARGIN_L),
-        Mm(y),
-        &f_italic,
+        MARGIN_L,
+        y,
+        Face::Italic,
     );
     y -= LH * 0.8;
-    layer_ref.use_text(
+    doc.text(
         format!("Window: last {range_days} days"),
         SIZE_SMALL,
-        Mm(MARGIN_L),
-        Mm(y),
-        &f_italic,
+        MARGIN_L,
+        y,
+        Face::Italic,
     );
     y -= LH * 2.0;
 
     // Fleet KPIs
-    layer_ref.use_text("Fleet snapshot", SIZE_H2, Mm(MARGIN_L), Mm(y), &f_bold);
+    doc.text("Fleet snapshot", SIZE_H2, MARGIN_L, y, Face::Bold);
     y -= LH * 1.4;
     let kpis = [
         ("Assets", summary.assets.to_string()),
@@ -302,66 +302,65 @@ fn render_pdf(
         ),
     ];
     for (k, v) in &kpis {
-        layer_ref.use_text(format!("{k}:"), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_bold);
-        layer_ref.use_text(v, SIZE_BODY, Mm(MARGIN_L + 32.0), Mm(y), &f_reg);
+        doc.text(format!("{k}:"), SIZE_BODY, MARGIN_L, y, Face::Bold);
+        doc.text(v, SIZE_BODY, MARGIN_L + 32.0, y, Face::Regular);
         y -= LH;
     }
     y -= LH;
 
     // Per-asset table
-    layer_ref.use_text(
+    doc.text(
         "Per-system summary (top 20 by open count)",
         SIZE_H2,
-        Mm(MARGIN_L),
-        Mm(y),
-        &f_bold,
+        MARGIN_L,
+        y,
+        Face::Bold,
     );
     y -= LH * 1.4;
-    layer_ref.use_text("System", SIZE_SMALL, Mm(MARGIN_L), Mm(y), &f_bold);
-    layer_ref.use_text("Classification", SIZE_SMALL, Mm(MARGIN_L + 55.0), Mm(y), &f_bold);
-    layer_ref.use_text("Owner", SIZE_SMALL, Mm(MARGIN_L + 95.0), Mm(y), &f_bold);
-    layer_ref.use_text("Compl.", SIZE_SMALL, Mm(MARGIN_L + 130.0), Mm(y), &f_bold);
-    layer_ref.use_text("Open", SIZE_SMALL, Mm(MARGIN_L + 160.0), Mm(y), &f_bold);
+    doc.text("System", SIZE_SMALL, MARGIN_L, y, Face::Bold);
+    doc.text("Classification", SIZE_SMALL, MARGIN_L + 55.0, y, Face::Bold);
+    doc.text("Owner", SIZE_SMALL, MARGIN_L + 95.0, y, Face::Bold);
+    doc.text("Compl.", SIZE_SMALL, MARGIN_L + 130.0, y, Face::Bold);
+    doc.text("Open", SIZE_SMALL, MARGIN_L + 160.0, y, Face::Bold);
     y -= LH;
 
     if assets.is_empty() {
-        layer_ref.use_text("No systems yet.", SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_italic);
+        doc.text("No systems yet.", SIZE_BODY, MARGIN_L, y, Face::Italic);
         y -= LH;
     } else {
         for a in assets {
             if y < MARGIN_B + LH * 4.0 {
-                let (np, nl) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
-                layer_ref = doc.get_page(np).get_layer(nl);
+                doc.add_page();
                 y = PAGE_H - MARGIN_T;
             }
-            layer_ref.use_text(truncate(&a.name, 28), SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_reg);
-            layer_ref.use_text(
+            doc.text(truncate(&a.name, 28), SIZE_BODY, MARGIN_L, y, Face::Regular);
+            doc.text(
                 &a.classification,
                 SIZE_BODY,
-                Mm(MARGIN_L + 55.0),
-                Mm(y),
-                &f_reg,
+                MARGIN_L + 55.0,
+                y,
+                Face::Regular,
             );
-            layer_ref.use_text(
+            doc.text(
                 truncate(&a.owner_name, 16),
                 SIZE_BODY,
-                Mm(MARGIN_L + 95.0),
-                Mm(y),
-                &f_reg,
+                MARGIN_L + 95.0,
+                y,
+                Face::Regular,
             );
-            layer_ref.use_text(
+            doc.text(
                 format!("{:.1}%", a.compliance_score),
                 SIZE_BODY,
-                Mm(MARGIN_L + 130.0),
-                Mm(y),
-                &f_reg,
+                MARGIN_L + 130.0,
+                y,
+                Face::Regular,
             );
-            layer_ref.use_text(
+            doc.text(
                 a.open_count.to_string(),
                 SIZE_BODY,
-                Mm(MARGIN_L + 160.0),
-                Mm(y),
-                &f_reg,
+                MARGIN_L + 160.0,
+                y,
+                Face::Regular,
             );
             y -= LH;
         }
@@ -370,35 +369,34 @@ fn render_pdf(
 
     // Top open rules
     if y < MARGIN_B + LH * 6.0 {
-        let (np, nl) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), "Layer");
-        layer_ref = doc.get_page(np).get_layer(nl);
+        doc.add_page();
         y = PAGE_H - MARGIN_T;
     }
-    layer_ref.use_text(
+    doc.text(
         "Top open rules across the fleet",
         SIZE_H2,
-        Mm(MARGIN_L),
-        Mm(y),
-        &f_bold,
+        MARGIN_L,
+        y,
+        Face::Bold,
     );
     y -= LH * 1.4;
     if top_rules.is_empty() {
-        layer_ref.use_text("No open findings.", SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_italic);
+        doc.text("No open findings.", SIZE_BODY, MARGIN_L, y, Face::Italic);
     } else {
         for r in top_rules {
-            layer_ref.use_text(&r.rule_id, SIZE_BODY, Mm(MARGIN_L), Mm(y), &f_reg);
-            layer_ref.use_text(
+            doc.text(&r.rule_id, SIZE_BODY, MARGIN_L, y, Face::Regular);
+            doc.text(
                 format!("{} affected", r.affected),
                 SIZE_BODY,
-                Mm(MARGIN_L + 80.0),
-                Mm(y),
-                &f_reg,
+                MARGIN_L + 80.0,
+                y,
+                Face::Regular,
             );
             y -= LH;
         }
     }
 
-    Ok(doc.save_to_bytes()?)
+    doc
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -464,4 +462,57 @@ pub async fn download_handler(
         )
         .body(bytes.into())
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary() -> ReportSummary {
+        ReportSummary {
+            assets: 0,
+            checklists: 0,
+            compliance_score: 0.0,
+            open_findings: 0,
+            overdue_findings: 0,
+            top_asset_name: None,
+            top_asset_score: None,
+        }
+    }
+
+    fn all_text(doc: &TextDoc) -> Vec<String> {
+        (0..doc.page_count())
+            .flat_map(|p| doc.page_runs(p).iter().map(|r| r.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn empty_fleet_layout() {
+        let doc = layout_report(&summary(), &[], &[], 30, Utc::now());
+        let t = all_text(&doc);
+        assert!(t.iter().any(|s| s == "No systems yet."));
+        assert!(t.iter().any(|s| s == "No open findings."));
+        assert_eq!(doc.page_count(), 1);
+        let runs = doc.page_runs(0);
+        let k = runs.iter().find(|r| r.text == "Assets:").unwrap();
+        assert_eq!((k.face, k.x_mm), (Face::Bold, MARGIN_L));
+        let v = runs.iter().find(|r| r.text == "0").unwrap();
+        assert_eq!((v.face, v.x_mm), (Face::Regular, MARGIN_L + 32.0));
+    }
+
+    #[test]
+    fn many_assets_overflow_to_second_page() {
+        let assets: Vec<AssetLine> = (0..80)
+            .map(|i| AssetLine {
+                name: format!("asset-{i}"),
+                classification: "U".into(),
+                owner_name: "Owner".into(),
+                open_count: i,
+                compliance_score: 50.0,
+            })
+            .collect();
+        let doc = layout_report(&summary(), &assets, &[], 30, Utc::now());
+        assert!(doc.page_count() >= 2);
+        assert!(all_text(&doc).iter().any(|s| s == "Classification"));
+    }
 }

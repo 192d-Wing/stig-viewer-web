@@ -8,7 +8,6 @@ Do #37 and #38 together, restore first.
 
 - [ ] #37: cap the decompressed size of ZIP entries in uploads, library import and restore.
 - [ ] #38: opt into zip's header-consistency checks. Do restore first.
-- [ ] #39: `lopdf` 0.31, pulled in by `printpdf` (Dependabot alert #11, GHSA-6fj4-rcr3-r7rr).
 - [ ] #32: crypto agility. The remaining items are in item 3.
 
 ## 2. Add exclusive XML canonicalisation for SAML
@@ -108,7 +107,8 @@ None of these has an issue yet. File each one before starting work on it.
 - **Dependencies:**
   - #36 moved to zip 9.6.1 and rand 0.8.8, replacing Dependabot #13 and #16;
   - #42 moved Keycloak to 26.8;
-  - #40 gave the CI workflow token least privilege and pinned the compose images by digest.
+  - #40 gave the CI workflow token least privilege and pinned the compose images by digest;
+  - #39 replaced `printpdf` with `pdf-writer`, removing `lopdf` (Dependabot #11, GHSA-6fj4-rcr3-r7rr).
 - **IDs and paths:** #43 validates STIG ids wherever they're created or read and closes the draft-fork path traversal (issue #31).
 - **Auth:**
   - #49 fixed SAML signature wrapping;
