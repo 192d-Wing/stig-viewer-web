@@ -199,7 +199,7 @@ function crc32(buf) {
     crc32._t = table;
   }
   let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ table[(crc ^ buf[i]) & 0xff];
+  for (const byte of buf) crc = (crc >>> 8) ^ table[(crc ^ byte) & 0xff];
   return (crc ^ 0xffffffff) >>> 0;
 }
 

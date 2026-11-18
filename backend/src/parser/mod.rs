@@ -623,30 +623,10 @@ fn extract_all_from_library_with(
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
-        // Read each ZIP entry name + bytes (separate scope to appease borrow checker)
-        let (raw_name, inner_bytes) = {
-            let mut file = match archive.by_index(i) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let Ok(raw_name) = file.name().map(|n| n.into_owned()) else { continue };
-
-            // Only process STIG ZIPs; skip SRGs, READMEs, manifests, etc.
-            if !raw_name.to_lowercase().ends_with("_stig.zip") {
-                continue;
-            }
-
-            match read_entry(&mut file, limits.nested_zip, &mut budget) {
-                Ok(bytes) => (raw_name, bytes),
-                Err(e @ ZipReadError::BudgetExceeded { .. }) => return Err(e),
-                Err(e) => {
-                    errors.push((
-                        filename_to_id(&raw_name),
-                        format!("failed to read ZIP entry: {e}"),
-                    ));
-                    continue;
-                }
-            }
+        let Some((raw_name, inner_bytes)) =
+            read_library_stig_zip(&mut archive, i, limits, &mut budget, &mut errors)?
+        else {
+            continue;
         };
 
         let outer_id = filename_to_id(&raw_name);
@@ -671,47 +651,90 @@ fn extract_all_from_library_with(
         // each XCCDF file name, so they no longer overwrite each other.
         let multi = docs.len() > 1;
         for (xccdf_name, xccdf) in docs {
-            let mut id = if multi { xccdf_name_to_id(&xccdf_name) } else { outer_id.clone() };
-            if id.is_empty() {
-                id = outer_id.clone();
+            if let Some(entry) =
+                library_entry(&xccdf_name, &xccdf, &outer_id, multi, &mut seen_ids, &mut errors)
+            {
+                entries.push(entry);
             }
-            if id.is_empty() {
-                errors.push((xccdf_name.chars().take(64).collect(), "could not derive a valid id from the file name; skipped".into()));
-                continue;
-            }
-            if !seen_ids.insert(id.clone()) {
-                let base = id.clone();
-                let mut n = 2;
-                while !seen_ids.insert(format!("{base}-{n}")) {
-                    n += 1;
-                }
-                id = format!("{base}-{n}");
-            }
-
-            // Defensive: `filename_to_id` already yields lower-case ASCII, so
-            // in practice this only fires for an over-long id.
-            if !crate::stig_id::is_valid_new(&id) {
-                errors.push((
-                    id.chars().take(64).collect(),
-                    format!("derived id is not a valid STIG id (max {} bytes); skipped", crate::stig_id::MAX_BYTES),
-                ));
-                continue;
-            }
-
-            let stig = match parse_xccdf(&xccdf) {
-                Ok(s) => s,
-                Err(e) => {
-                    errors.push((id, format!("XCCDF parse failed: {e}")));
-                    continue;
-                }
-            };
-
-            let category = infer_category(&stig.title).to_string();
-            entries.push(LibraryEntry { id, category, stig });
         }
     }
 
     Ok((entries, errors, None))
+}
+
+/// Read the library's entry `i` when it is a `_STIG.zip`. `Ok(None)` skips it
+/// (not a STIG ZIP, unreadable, or over its cap, recorded in `errors`); only an
+/// exhausted budget is an `Err`.
+fn read_library_stig_zip(
+    archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>,
+    i: usize,
+    limits: &ZipLimits,
+    budget: &mut ReadBudget,
+    errors: &mut Vec<(String, String)>,
+) -> Result<Option<(String, Vec<u8>)>, ZipReadError> {
+    let Ok(mut file) = archive.by_index(i) else { return Ok(None) };
+    let Ok(raw_name) = file.name().map(|n| n.into_owned()) else { return Ok(None) };
+    // Only process STIG ZIPs; skip SRGs, READMEs, manifests, etc.
+    if !raw_name.to_lowercase().ends_with("_stig.zip") {
+        return Ok(None);
+    }
+    match read_entry(&mut file, limits.nested_zip, budget) {
+        Ok(bytes) => Ok(Some((raw_name, bytes))),
+        Err(e @ ZipReadError::BudgetExceeded { .. }) => Err(e),
+        Err(e) => {
+            errors.push((filename_to_id(&raw_name), format!("failed to read ZIP entry: {e}")));
+            Ok(None)
+        }
+    }
+}
+
+/// Turn one XCCDF from a library entry into a [`LibraryEntry`], giving it a
+/// unique, valid id. Problems are recorded in `errors` and yield `None`.
+fn library_entry(
+    xccdf_name: &str,
+    xccdf: &str,
+    outer_id: &str,
+    multi: bool,
+    seen_ids: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<(String, String)>,
+) -> Option<LibraryEntry> {
+    let mut id = if multi { xccdf_name_to_id(xccdf_name) } else { outer_id.to_string() };
+    if id.is_empty() {
+        id = outer_id.to_string();
+    }
+    if id.is_empty() {
+        errors.push((xccdf_name.chars().take(64).collect(), "could not derive a valid id from the file name; skipped".into()));
+        return None;
+    }
+    if !seen_ids.insert(id.clone()) {
+        let base = id.clone();
+        let mut n = 2;
+        while !seen_ids.insert(format!("{base}-{n}")) {
+            n += 1;
+        }
+        id = format!("{base}-{n}");
+    }
+
+    // Defensive: `filename_to_id` already yields lower-case ASCII, so
+    // in practice this only fires for an over-long id.
+    if !crate::stig_id::is_valid_new(&id) {
+        errors.push((
+            id.chars().take(64).collect(),
+            format!("derived id is not a valid STIG id (max {} bytes); skipped", crate::stig_id::MAX_BYTES),
+        ));
+        return None;
+    }
+
+    let stig = match parse_xccdf(xccdf) {
+        Ok(s) => s,
+        Err(e) => {
+            errors.push((id, format!("XCCDF parse failed: {e}")));
+            return None;
+        }
+    };
+
+    let category = infer_category(&stig.title).to_string();
+    Some(LibraryEntry { id, category, stig })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
