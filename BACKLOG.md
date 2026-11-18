@@ -1,38 +1,17 @@
 # Backlog
 
-Last updated: 2026-11-17. This list is in priority order. Each item ships as its own PR.
+Last updated: 2026-11-18. This list is in priority order. Each item ships as its own PR. Don't run Playwright against the local dev stack on :5173; `resetDb` wipes its data. Use an isolated stack (`podman compose -p stig-e2e`).
 
-## 1. Get `main` green again
+## 1. Open issues
 
-PR #48 fixed the 8 e2e failures that were listed here: the SAML login test in
-spec 01, and the catalog-diff and save-to-system specs 62 and 81. `main` was
-green at `8c72fb5`.
+Do #37 and #38 together, restore first.
 
-One new failure came in with #44 (`baf173a`). In spec 66, "restore of a backup
-with a corrupted entry returns 400", the restore does return 400. The check
-that the users are unchanged then fails, but only on alice's `lastLogin`,
-which every authenticated request updates.
+- [ ] #37: cap the decompressed size of ZIP entries in uploads, library import and restore.
+- [ ] #38: opt into zip's header-consistency checks. Do restore first.
+- [ ] #39: `lopdf` 0.31, pulled in by `printpdf` (Dependabot alert #11, GHSA-6fj4-rcr3-r7rr).
+- [ ] #32: crypto agility. The remaining items are in item 3.
 
-- [ ] Merge PR #54, which leaves `lastLogin` out of that comparison. It is e2e-only.
-- [ ] Confirm that `CI / e2e` passes on `main` after #53 (`d950934`) and #54.
-- [ ] Don't run Playwright against the local dev stack on :5173. `resetDb` wipes its data.
-
-## 2. Finish binding AC-8 to the login callbacks
-
-This plan is approved, and the decisions below are settled. It builds on the
-SAML `InResponseTo` check added in PR #49.
-
-- [x] Add a migration that adds the columns `oidc_state`, `oidc_nonce` and `oidc_pkce_verifier` to `login_notice_acks`.
-- [x] Store only the ack id in the `stig_oidc_state` cookie. Claim it with `claim_oidc`, which runs `DELETE … RETURNING` and only matches rows less than 10 minutes old.
-- [x] Add a new `stig_saml_req` cookie with path `/auth/saml`. Set `SameSite=None; Secure` in production and `Lax` in dev.
-- [x] Add `claim_saml`, which must match the response's `InResponseTo`. Refuse unsolicited, IdP-initiated responses, with no flag to allow them. Record refusals only as audit log lines.
-- [x] Add a `LoginBinding` enum and change `consume_ack` to take a binding.
-- [x] Remove `AuthState` and the `finish_*` helpers.
-- [x] Delete consumed ack rows once they are more than 10 minutes old.
-- [x] `e2e-rs` is deprecated; the acknowledge-step coverage lives in the Playwright spec `01-auth-gate`.
-- [x] **Migration number:** AC-8 (PR #56) took `041_login_ack_binding.sql`; checklist sets took `042`.
-
-## 3. Add exclusive XML canonicalisation for SAML
+## 2. Add exclusive XML canonicalisation for SAML
 
 PR #49 only accepts SAML responses that are already canonical as sent.
 Responses from real IdPs therefore fail closed until this is done. The
@@ -41,7 +20,7 @@ priority is low because production uses OIDC only.
 - [ ] Implement exclusive c14n in-house, as approved.
 - [ ] Add a SAML replay cache.
 
-## 4. Post-quantum cryptography and FIPS
+## 3. Post-quantum cryptography and FIPS
 
 The plan is approved, and these choices are made: aws-lc-rs 1.19 (FIPS 4.x),
 ML-DSA-87 hybrid signing, X25519MLKEM768, CNSA 2.0, and FIPS 140-3 required.
@@ -58,16 +37,9 @@ integrity items for `/api/sign`, audit archive segments and backups.
 - [ ] Add a CI job that builds and tests in FIPS mode.
 - [ ] Add a production Dockerfile.
 
-## 5. Ship checklist sets ("My checklists")
+## 4. Checklist sets: decisions and follow-ups
 
-These are named, multi-STIG checklists. They are stored on the server for each user, autosave as you edit, and can be saved to a system again and again. The work is on branch `feat/checklist-sets` as one local commit, `a8212fe`. It hasn't been pushed. All reviewers approved it except QA, whose remaining items are minor.
-
-Before merging:
-
-- [x] Rebase onto `main`.
-- [x] Renumber `038_checklist_sets.sql` to `042_checklist_sets.sql`.
-- [x] Run e2e spec 82 and the specs it touches (81, 66, 06, 07, 08 and 80) on the rebased branch.
-- [x] Push and open the PR.
+Checklist sets shipped in #57. These are what is left from its review.
 
 Product decisions. Each is the current default and can be changed:
 
@@ -94,14 +66,16 @@ Test gaps:
   - handling of a 401 during autosave;
   - a possible spurious conflict after a page is restored from the back/forward cache.
 
-## 6. Open issues
+## 5. AC-8 binding follow-ups
 
-- [ ] #37: cap the decompressed size of ZIP entries in uploads, library import and restore.
-- [ ] #38: opt into zip's header-consistency checks. Do restore first.
-- [ ] #39: `lopdf` 0.31, pulled in by `printpdf` (Dependabot alert #11, GHSA-6fj4-rcr3-r7rr).
-- [ ] #32: crypto agility. The remaining items are in item 4.
+From the #56 review. All minor.
 
-## 7. Audit follow-ups from the #44 and #52 reviews
+- [ ] **Stored login secrets.** `oidc_state`, `oidc_nonce` and `oidc_pkce_verifier` sit in plaintext for up to 10 minutes. Store a hash of the state, or make `login_notice_acks` `UNLOGGED`, or document it in the SSP.
+- [ ] **Prune failures.** The 60-second `prune_acks` loop only logs an error when it fails. Add a metric or show it on health, so repeated failures are noticed.
+- [ ] **Spec 01.** After a callback is refused for having no cookie, assert that the ack row is untouched.
+- [ ] **SIEM rules.** `auth.notice_ack`/`missing` is no longer emitted. Check that no SIEM rule depends on it.
+
+## 6. Audit follow-ups from the #44 and #52 reviews
 
 None of these has an issue yet. File each one before starting work on it.
 
@@ -125,7 +99,8 @@ None of these has an issue yet. File each one before starting work on it.
   - with `SIGNING_KEY_HEX` set, a restore needs a signed backup unless `BACKUP_REQUIRE_SIGNATURE=false`;
   - if the app runs behind a proxy, set `STIG_TRUST_PROXY_HEADERS` and `STIG_TRUSTED_PROXY_HOPS`.
 - [ ] Shrink `frontend/public/brand/org-emblem.png`, which is about 1.5 MB.
-- [ ] Remove the scratchpad worktrees left over from this round of PRs (`git worktree list`).
+- [ ] `frontend/src/app.rs`: the root `App` component has a cognitive complexity of 58 (SonarCloud rust:S3776, limit 30). Split it into smaller components or hooks.
+- [ ] Clear the `cargo fmt --check` drift in the backend (it fails on `main`, mostly `main.rs` and `api/mod.rs`), then add it to CI.
 
 ## Done
 
@@ -149,4 +124,8 @@ None of these has an issue yet. File each one before starting work on it.
   - #52 signs audit archive segments and makes them immutable, and verifies a backup's signature before restoring it;
   - #50 adds the v2 signing envelope and a reference verifier.
 - **XSS:** #51 escapes search snippet text on every path.
-- **CI and e2e:** #48 fixed the e2e failures on `main`. #33 (dev and CI housekeeping) is closed.
+- **CI and e2e:** #48 fixed the e2e failures on `main`, and #54 left `lastLogin` out of spec 66's comparison. #33 (dev and CI housekeeping) is closed.
+- **AC-8:** #56 binds the notice acknowledgement to the OIDC and SAML login callbacks (migration `041`). `e2e-rs` is deprecated; the coverage lives in Playwright spec `01-auth-gate`.
+- **Checklist sets:** #57 ships "My checklists": named multi-STIG checklists with autosave and save-to-system (migration `042`).
+- **Docs:** #55 added this backlog.
+- **Housekeeping:** the leftover worktrees and merged local branches are removed.
