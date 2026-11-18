@@ -14,7 +14,8 @@
 -- injected SQL can turn `test` mode on. NOT guaranteed before the separate
 -- owner role (#84): while the app role owns the tables and this function it can
 -- still CREATE OR REPLACE the guard or disable the triggers.
--- The function body is otherwise identical to migration 040.
+-- The function body otherwise behaves exactly as in migration 040; the
+-- repeated column-name literals are now the constants c_repeat and c_last.
 CREATE OR REPLACE FUNCTION audit_tables_guard() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -23,6 +24,8 @@ AS $$
 -- rule_audit, which has no repeat_count / last_occurred_at.
 DECLARE
     mode TEXT := COALESCE(current_setting('stig.audit_maintenance', true), '');
+    c_repeat CONSTANT TEXT := 'repeat_count';
+    c_last CONSTANT TEXT := 'last_occurred_at';
 BEGIN
     IF mode = 'test' AND NOT EXISTS (
         SELECT 1 FROM pg_catalog.pg_db_role_setting s
@@ -45,15 +48,15 @@ BEGIN
         END IF;
         IF TG_TABLE_NAME = 'audit_events'
            AND to_jsonb(OLD)->>'outcome' IN ('denied', 'rejected')
-           AND (to_jsonb(NEW) - 'repeat_count' - 'last_occurred_at')
-               IS NOT DISTINCT FROM (to_jsonb(OLD) - 'repeat_count' - 'last_occurred_at')
-           AND (to_jsonb(NEW)->>'repeat_count')::int = (to_jsonb(OLD)->>'repeat_count')::int + 1
-           AND to_jsonb(NEW)->>'last_occurred_at' IS NOT NULL
-           AND (to_jsonb(NEW)->>'last_occurred_at') NOT IN ('infinity', '-infinity')
-           AND (to_jsonb(NEW)->>'last_occurred_at')::timestamptz
-               >= COALESCE((to_jsonb(OLD)->>'last_occurred_at')::timestamptz,
+           AND (to_jsonb(NEW) - c_repeat - c_last)
+               IS NOT DISTINCT FROM (to_jsonb(OLD) - c_repeat - c_last)
+           AND (to_jsonb(NEW)->>c_repeat)::int = (to_jsonb(OLD)->>c_repeat)::int + 1
+           AND to_jsonb(NEW)->>c_last IS NOT NULL
+           AND (to_jsonb(NEW)->>c_last) NOT IN ('infinity', '-infinity')
+           AND (to_jsonb(NEW)->>c_last)::timestamptz
+               >= COALESCE((to_jsonb(OLD)->>c_last)::timestamptz,
                            (to_jsonb(OLD)->>'occurred_at')::timestamptz)
-           AND (to_jsonb(NEW)->>'last_occurred_at')::timestamptz <= pg_catalog.now() + INTERVAL '1 minute'
+           AND (to_jsonb(NEW)->>c_last)::timestamptz <= pg_catalog.now() + INTERVAL '1 minute'
         THEN
             RETURN NEW;
         END IF;
