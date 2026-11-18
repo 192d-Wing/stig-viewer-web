@@ -662,6 +662,32 @@ only.
   (FIPS 204); because manifests carry a signer list in the signed bytes, that
   means adding a signer, and verifiers must then require every signer.
 
+## Deployment notes
+
+Things to check when deploying or upgrading outside the dev compose stack.
+
+- **Migrations.** The backend applies pending migrations from
+  `backend/migrations` when it starts (`sqlx::migrate!`), so an upgrade needs
+  `037` to `042` (login notice acknowledgements through checklist sets) to be
+  applied. Check the backend log on the first start after upgrading.
+- **STIG data volume.** Mount a persistent volume (a named volume in compose)
+  at `DATA_DIR`; it holds synced and uploaded STIGs, drafts, attachments and
+  archives. `STIG_SEED_DIR` is the dev-only seed that compose points at
+  `/app/seed/stigs`: the backend copies seed files missing from
+  `DATA_DIR/stigs` and never overwrites existing ones. It must stay unset when
+  `STIG_ENV=production`, or the backend refuses to start.
+- **DISA sync.** `STIG_SYNC_ON_START` (default `true`) runs the first sync at
+  boot; `false` delays it by one interval. `STIG_SYNC_INTERVAL_HOURS` (default
+  `24`) is the number of hours between runs.
+- **Restoring backups.** With `SIGNING_KEY_HEX` set, a restore requires a
+  verified signed backup. Set `BACKUP_REQUIRE_SIGNATURE=false` to allow
+  unsigned backups anyway (`true` forces the check even without a key).
+- **Behind a reverse proxy.** Set `STIG_TRUST_PROXY_HEADERS=true` so client IPs
+  come from `X-Forwarded-For`, and `STIG_TRUSTED_PROXY_HOPS` (default `1`) to
+  the number of trusted proxies in front of the app. Only do so behind a proxy
+  that overwrites `X-Forwarded-For`; otherwise all clients share one rate-limit
+  bucket keyed on the proxy address.
+
 ## Repository layout
 
 ```
