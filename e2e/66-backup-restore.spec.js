@@ -382,12 +382,17 @@ test.describe("Backup + restore — API", () => {
     );
     expect(restoreRes.status()).toBe(400);
 
-    // The data is untouched: same users before and after.
+    // The data is untouched: same users before and after. `lastLogin` is
+    // left out because every authenticated request updates it.
     const stillThere = await request.get(`${BACKEND}/api/admin/users`, {
       headers: { "X-User-Id": "alice" },
     });
     expect(stillThere.ok()).toBe(true);
-    expect(await stillThere.json()).toEqual(usersBefore);
+    const withoutLastLogin = (users) =>
+      users.map(({ lastLogin, ...rest }) => rest);
+    expect(withoutLastLogin(await stillThere.json())).toEqual(
+      withoutLastLogin(usersBefore),
+    );
   });
 
   test("restore with mismatched schemaMigration returns 400", async ({
