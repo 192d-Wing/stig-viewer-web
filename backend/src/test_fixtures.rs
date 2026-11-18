@@ -3,6 +3,11 @@
 //! Each such test gets a fresh database with `./migrations` applied; they are
 //! `#[ignore]`d so a plain `cargo test` needs no Postgres. Run them with
 //! `DATABASE_URL=... cargo test -- --include-ignored` (see `task test:db`).
+//!
+//! [`allow_audit_test_mode`] / [`disallow_audit_test_mode`] run `ALTER DATABASE
+//! ... SET`, so the test role must be a superuser (or hold `GRANT SET ON
+//! PARAMETER stig.audit_allow_test_mode`); it already must be able to
+//! `CREATE DATABASE`, and CI and `task test:db` use the image superuser.
 
 use std::sync::Arc;
 
@@ -15,6 +20,24 @@ use crate::AppState;
 /// Rule ids in the fixture STIG written by [`app_state`].
 pub const STIG_ID: &str = "TEST-STIG";
 pub const RULES: [&str; 3] = ["SV-1r1_rule", "SV-2r1_rule", "SV-3r1_rule"];
+
+/// Flag this test's database for audit `test` maintenance mode (migration 043).
+pub async fn allow_audit_test_mode(pool: &PgPool) {
+    crate::db_audit::allow_test_maintenance(pool)
+        .await
+        .expect("allow audit test mode");
+}
+
+/// Remove the flag set by [`allow_audit_test_mode`].
+pub async fn disallow_audit_test_mode(pool: &PgPool) {
+    sqlx::query(
+        "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I RESET stig.audit_allow_test_mode', \
+         current_database()); END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("disallow audit test mode");
+}
 
 pub async fn seed_user(pool: &PgPool, id: &str) {
     sqlx::query("INSERT INTO users (id, display_name, email, role, sub, provider) VALUES ($1, $1, '', 'author', $1, 'test')")

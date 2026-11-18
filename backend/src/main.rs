@@ -263,6 +263,7 @@ async fn main() -> Result<()> {
 
     let pool = Arc::new(init_pool(&config.database_url).await?);
     info!("Database connected and migrations applied");
+    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
     let _ = stig_id::warn_non_conforming(&pool).await;
 
     if let Some(seed_dir) = &config.seed_dir {

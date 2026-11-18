@@ -1506,6 +1506,7 @@ mod tests {
             .await,
             1
         );
+        crate::test_fixtures::allow_audit_test_mode(&pool).await;
         // The audit guard (migration 040) allows clearing the audit tables
         // only by TRUNCATE in `test` maintenance mode.
         let mut tx = pool.begin().await.unwrap();
