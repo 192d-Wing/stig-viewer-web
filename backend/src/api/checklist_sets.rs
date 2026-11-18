@@ -26,6 +26,7 @@ use crate::api::checklist_save::{
     save_to_asset, SaveOrigin, SaveRequest, SaveResponse, SaveRule, MAX_TEXT_BYTES,
 };
 use crate::api::checklists::is_valid_stig_id;
+use crate::api::request_ctx::RequestCtx;
 use crate::api::rule_bulk_status::{has_nul, MAX_RULES, MAX_RULE_ID_BYTES, VALID_STATUSES};
 use crate::db_assets;
 use crate::db_audit::{self, NewAuditEvent};
@@ -214,6 +215,7 @@ fn clean_name(raw: &str) -> Option<String> {
 
 fn event<'a>(
     user: &'a AuthUser,
+    ctx: &'a RequestCtx,
     action: &'static str,
     outcome: &'static str,
     stig_id: Option<&'a str>,
@@ -221,6 +223,7 @@ fn event<'a>(
 ) -> NewAuditEvent<'a> {
     NewAuditEvent {
         user_id: &user.id,
+        ctx: Some(ctx),
         action,
         outcome,
         asset_id: None,
@@ -335,6 +338,7 @@ pub async fn list_handler(
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<ChecklistSetDetail>)> {
     let pool = state.pool.as_ref();
@@ -372,6 +376,7 @@ pub async fn create_handler(
         pool,
         event(
             &user,
+            &ctx,
             "checklist_set.create",
             "ok",
             None,
@@ -399,6 +404,7 @@ pub async fn get_handler(
 pub async fn patch_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<PatchRequest>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
@@ -428,6 +434,7 @@ pub async fn patch_handler(
             pool,
             event(
                 &user,
+                &ctx,
                 "checklist_set.rename",
                 "ok",
                 None,
@@ -444,6 +451,7 @@ pub async fn patch_handler(
         if let Some(prev) = prev {
             let mut ev = event(
                 &user,
+                &ctx,
                 "checklist_set.unlink",
                 "ok",
                 None,
@@ -460,6 +468,7 @@ pub async fn patch_handler(
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let pool = state.pool.as_ref();
@@ -470,6 +479,7 @@ pub async fn delete_handler(
         pool,
         event(
             &user,
+            &ctx,
             "checklist_set.delete",
             "ok",
             None,
@@ -484,6 +494,7 @@ pub async fn delete_handler(
 pub async fn add_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<AddStigRequest>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
@@ -516,6 +527,7 @@ pub async fn add_stig_handler(
                 pool,
                 event(
                     &user,
+                    &ctx,
                     "checklist_set.stig_add",
                     "ok",
                     Some(&req.stig_id),
@@ -532,6 +544,7 @@ pub async fn add_stig_handler(
 pub async fn remove_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path((id, stig_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
@@ -545,6 +558,7 @@ pub async fn remove_stig_handler(
             pool,
             event(
                 &user,
+                &ctx,
                 "checklist_set.stig_remove",
                 "ok",
                 sid,
@@ -560,6 +574,7 @@ pub async fn remove_stig_handler(
 pub async fn autosave_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<AutosaveRequest>,
 ) -> ApiResult<Json<AutosaveResponse>> {
@@ -568,13 +583,14 @@ pub async fn autosave_handler(
         max_rows: MAX_SET_ROWS,
         max_bytes: MAX_SET_BYTES,
     };
-    autosave_with_budget(state, user, id, req, budget).await
+    autosave_with_budget(state, user, ctx, id, req, budget).await
 }
 
 /// Autosave with explicit size bounds (tests pass small ones).
 async fn autosave_with_budget(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     id: String,
     req: AutosaveRequest,
     budget: SetBudget,
@@ -655,6 +671,7 @@ async fn autosave_with_budget(
                     pool,
                     event(
                         &user,
+                        &ctx,
                         "checklist_set.edit",
                         "ok",
                         None,
@@ -690,10 +707,11 @@ async fn autosave_with_budget(
 pub async fn save_to_system_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<SaveToSystemRequest>,
 ) -> ApiResult<Json<SetSaveResponse>> {
-    tokio::spawn(save_to_system_work(state, user, id, req))
+    tokio::spawn(save_to_system_work(state, user, ctx, id, req))
         .await
         .map_err(|e| {
             tracing::error!("set save task failed: {e}");
@@ -704,6 +722,7 @@ pub async fn save_to_system_handler(
 async fn save_to_system_work(
     state: AppState,
     user: AuthUser,
+    ctx: RequestCtx,
     id: String,
     req: SaveToSystemRequest,
 ) -> ApiResult<Json<SetSaveResponse>> {
@@ -718,6 +737,7 @@ async fn save_to_system_work(
             pool,
             event(
                 &user,
+                &ctx,
                 "checklist_set.save_to_system",
                 "rejected",
                 None,
@@ -746,7 +766,14 @@ async fn save_to_system_work(
         return Err(StatusCode::NOT_FOUND.into());
     };
     let record = |outcome: &'static str, detail: serde_json::Value| {
-        let mut ev = event(&user, "checklist_set.save_to_system", outcome, None, detail);
+        let mut ev = event(
+            &user,
+            &ctx,
+            "checklist_set.save_to_system",
+            outcome,
+            None,
+            detail,
+        );
         ev.asset_id = Some(&asset.id);
         db_audit::record_or_log(pool, ev)
     };
@@ -782,7 +809,7 @@ async fn save_to_system_work(
         };
         let origin = SaveOrigin::Set { set_id: &id };
         results.push(
-            match save_to_asset(&state, &user, &asset, &save_req, origin).await {
+            match save_to_asset(&state, &user, &ctx, &asset, &save_req, origin).await {
                 Ok(save) => SetStigResult {
                     stig_id: s.stig_id,
                     ok: true,
@@ -904,6 +931,10 @@ mod tests {
         (state, dir)
     }
 
+    fn cx() -> Extension<RequestCtx> {
+        Extension(crate::test_fixtures::ctx())
+    }
+
     fn st(state: &AppState) -> State<AppState> {
         State(state.clone())
     }
@@ -914,7 +945,7 @@ mod tests {
             stig_ids: ids.iter().map(|s| s.to_string()).collect(),
         };
         let Ok((code, Json(d))) =
-            create_handler(st(state), Extension(auth(who, "author")), Json(req)).await
+            create_handler(st(state), Extension(auth(who, "author")), cx(), Json(req)).await
         else {
             panic!("create failed");
         };
@@ -948,6 +979,7 @@ mod tests {
         autosave_handler(
             st(state),
             Extension(auth(who, "author")),
+            cx(),
             Path(id.into()),
             Json(AutosaveRequest { revision, changes }),
         )
@@ -966,6 +998,7 @@ mod tests {
         save_to_system_handler(
             st(state),
             Extension(auth(who, "author")),
+            cx(),
             Path(id.into()),
             Json(SaveToSystemRequest {
                 revision,
@@ -998,19 +1031,19 @@ mod tests {
                 asset_id: None,
             };
             assert_eq!(
-                code(patch_handler(st(&state), u(), id(), Json(p)).await),
+                code(patch_handler(st(&state), u(), cx(), id(), Json(p)).await),
                 Some(StatusCode::NOT_FOUND)
             );
             let add = AddStigRequest {
                 stig_id: STIG2.into(),
             };
             assert_eq!(
-                code(add_stig_handler(st(&state), u(), id(), Json(add)).await),
+                code(add_stig_handler(st(&state), u(), cx(), id(), Json(add)).await),
                 Some(StatusCode::NOT_FOUND)
             );
             let rm = Path((set.id.clone(), STIG_ID.to_string()));
             assert_eq!(
-                code(remove_stig_handler(st(&state), u(), rm).await),
+                code(remove_stig_handler(st(&state), u(), cx(), rm).await),
                 Some(StatusCode::NOT_FOUND)
             );
             let a = AutosaveRequest {
@@ -1018,7 +1051,7 @@ mod tests {
                 changes: vec![],
             };
             assert_eq!(
-                code(autosave_handler(st(&state), u(), id(), Json(a)).await),
+                code(autosave_handler(st(&state), u(), cx(), id(), Json(a)).await),
                 Some(StatusCode::NOT_FOUND)
             );
             let s = SaveToSystemRequest {
@@ -1026,11 +1059,11 @@ mod tests {
                 asset_id: Some("a1".into()),
             };
             assert_eq!(
-                code(save_to_system_handler(st(&state), u(), id(), Json(s)).await),
+                code(save_to_system_handler(st(&state), u(), cx(), id(), Json(s)).await),
                 Some(StatusCode::NOT_FOUND)
             );
             assert_eq!(
-                code(delete_handler(st(&state), u(), id()).await),
+                code(delete_handler(st(&state), u(), cx(), id()).await),
                 Some(StatusCode::NOT_FOUND)
             );
             let Json(list) = list_handler(st(&state), u()).await.ok().unwrap();
@@ -1060,7 +1093,7 @@ mod tests {
             (0..21).map(|i| format!("S{i}")).collect(),
         ] {
             assert_eq!(
-                code(create_handler(st(&state), u(), Json(bad(ids))).await),
+                code(create_handler(st(&state), u(), cx(), Json(bad(ids))).await),
                 Some(StatusCode::BAD_REQUEST)
             );
         }
@@ -1069,7 +1102,7 @@ mod tests {
             stig_ids: vec![STIG_ID.into()],
         };
         assert_eq!(
-            code(create_handler(st(&state), u(), Json(named)).await),
+            code(create_handler(st(&state), u(), cx(), Json(named)).await),
             Some(StatusCode::BAD_REQUEST)
         );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
@@ -1086,7 +1119,13 @@ mod tests {
             name: None,
             stig_ids: vec![STIG_ID.into()],
         };
-        let r = create_handler(st(&state), Extension(auth("owner", "author")), Json(req)).await;
+        let r = create_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Json(req),
+        )
+        .await;
         assert_eq!(code(r), Some(StatusCode::CONFLICT));
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_sets").await,
@@ -1231,6 +1270,7 @@ mod tests {
             autosave_with_budget(
                 state.clone(),
                 auth("owner", "author"),
+                crate::test_fixtures::ctx(),
                 set.id.clone(),
                 AutosaveRequest { revision, changes },
                 b,
@@ -1379,18 +1419,18 @@ mod tests {
         let set = make(&state, "owner", &[STIG_ID]).await;
         let u = || Extension(auth("owner", "author"));
         let add = |id: &str| Json(AddStigRequest { stig_id: id.into() });
-        let Json(d) = add_stig_handler(st(&state), u(), Path(set.id.clone()), add(STIG2))
+        let Json(d) = add_stig_handler(st(&state), u(), cx(), Path(set.id.clone()), add(STIG2))
             .await
             .ok()
             .unwrap();
         assert_eq!(d.stigs.len(), 2);
-        let Json(d) = add_stig_handler(st(&state), u(), Path(set.id.clone()), add(STIG2))
+        let Json(d) = add_stig_handler(st(&state), u(), cx(), Path(set.id.clone()), add(STIG2))
             .await
             .ok()
             .unwrap();
         assert_eq!(d.stigs.len(), 2, "idempotent");
         assert_eq!(
-            code(add_stig_handler(st(&state), u(), Path(set.id.clone()), add("NOPE")).await),
+            code(add_stig_handler(st(&state), u(), cx(), Path(set.id.clone()), add("NOPE")).await),
             Some(StatusCode::BAD_REQUEST)
         );
         autosave(
@@ -1402,10 +1442,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let Json(d) = remove_stig_handler(st(&state), u(), Path((set.id.clone(), STIG2.into())))
-            .await
-            .ok()
-            .unwrap();
+        let Json(d) =
+            remove_stig_handler(st(&state), u(), cx(), Path((set.id.clone(), STIG2.into())))
+                .await
+                .ok()
+                .unwrap();
         assert_eq!((d.stigs.len(), d.revision), (1, 2));
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
@@ -1416,14 +1457,16 @@ mod tests {
             let id = format!("EXTRA-{i}");
             seed_catalog(&pool, &id).await;
             assert!(
-                add_stig_handler(st(&state), u(), Path(set.id.clone()), add(&id))
+                add_stig_handler(st(&state), u(), cx(), Path(set.id.clone()), add(&id))
                     .await
                     .is_ok()
             );
         }
         seed_catalog(&pool, "EXTRA-X").await;
         assert_eq!(
-            code(add_stig_handler(st(&state), u(), Path(set.id.clone()), add("EXTRA-X")).await),
+            code(
+                add_stig_handler(st(&state), u(), cx(), Path(set.id.clone()), add("EXTRA-X")).await
+            ),
             Some(StatusCode::BAD_REQUEST)
         );
     }
@@ -1463,16 +1506,25 @@ mod tests {
             .await,
             1
         );
-        for t in ["rule_audit", "audit_events", "checklists"] {
-            sqlx::query(&format!("DELETE FROM {t}"))
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-        sqlx::query("DELETE FROM users WHERE id = 'owner'")
-            .execute(&pool)
+        // The audit guard (migration 040) allows clearing the audit tables
+        // only by TRUNCATE in `test` maintenance mode.
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "test")
             .await
             .unwrap();
+        sqlx::query("TRUNCATE rule_audit, audit_events")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM checklists")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = 'owner'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         for t in [
             "checklist_sets",
             "checklist_set_stigs",
@@ -1555,6 +1607,7 @@ mod tests {
         let Json(d) = patch_handler(
             st(&state),
             Extension(auth("owner", "author")),
+            cx(),
             Path(set.id.clone()),
             Json(p),
         )

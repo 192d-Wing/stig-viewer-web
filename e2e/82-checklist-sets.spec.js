@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
+import { loginAs, openEdgeFromLibrary, resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 /**
  * Checklist sets: named, owner-private working checklists with autosave.
@@ -36,8 +36,7 @@ async function seedAsset(request, name = "set-host", owner = "alice") {
 }
 
 async function openEdge(page) {
-  await page.goto("/");
-  await page.getByText(/Microsoft Edge Security Technical/).first().click();
+  await openEdgeFromLibrary(page);
   const listbox = page.getByRole("listbox", { name: "Rules" });
   await expect(listbox.getByRole("option").first()).toBeVisible({ timeout: 15_000 });
   return listbox;

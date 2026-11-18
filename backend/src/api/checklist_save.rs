@@ -148,7 +148,7 @@ async fn save_work(
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    save_to_asset(&state, &user, &asset, &req, SaveOrigin::Direct).await.map(Json)
+    save_to_asset(&state, &user, &ctx, &asset, &req, SaveOrigin::Direct).await.map(Json)
 }
 
 /// Where a save came from. A checklist set only adds `via` / `setId` to the
@@ -175,6 +175,7 @@ impl SaveOrigin<'_> {
 pub(crate) async fn save_to_asset(
     state: &AppState,
     user: &AuthUser,
+    ctx: &RequestCtx,
     asset: &db_assets::AssetRow,
     req: &SaveRequest,
     origin: SaveOrigin<'_>,
@@ -187,7 +188,7 @@ pub(crate) async fn save_to_asset(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
-                ctx: Some(&ctx),
+                ctx: Some(ctx),
                 action: "checklist.save",
                 outcome,
                 asset_id: Some(&asset.id),
@@ -247,7 +248,7 @@ pub(crate) async fn save_to_asset(
             pool,
             NewAuditEvent {
                 user_id: &user.id,
-                ctx: Some(&ctx),
+                ctx: Some(ctx),
                 action: "checklist.create",
                 outcome: "ok",
                 asset_id: Some(&asset.id),
@@ -299,7 +300,7 @@ pub(crate) async fn save_to_asset(
         pool,
         NewAuditEvent {
             user_id: &user.id,
-            ctx: Some(&ctx),
+            ctx: Some(ctx),
             action: "checklist.save",
             outcome: if count("error") > 0 { "partial" } else { "ok" },
             asset_id: Some(&asset.id),
