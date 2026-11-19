@@ -752,6 +752,31 @@ mod tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_rule_audit_works_as_the_restricted_app_role(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        for (rule, age) in [("old", "10 days"), ("new", "0 days")] {
+            sqlx::query(&format!(
+                "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+                 VALUES ('u1', 'c', $1, 'status', NOW() - INTERVAL '{age}')"
+            ))
+            .bind(rule)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        }
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(run_prune(&app.pool, &dir, 5, true, None).await.unwrap(), 1);
+        let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, ["new"]);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_events_keys_on_the_last_repeat_and_archives_the_counter(pool: PgPool) {
         seed_user(&pool, "u1").await;
         // Both rows were first seen 10 days ago; only one was repeated recently.

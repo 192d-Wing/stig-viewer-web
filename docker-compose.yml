@@ -40,6 +40,33 @@ services:
       timeout: 2s
       retries: 30
 
+  # One-shot, idempotent: creates the restricted application role the backend
+  # connects as (#84). `stig` stays the owner of every schema object and runs
+  # the migrations (DATABASE_MIGRATION_URL); `stig_app` gets only the DML
+  # grants the backend applies after migrating. Dev-only password.
+  db-roles:
+    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    restart: "no"
+    environment:
+      PGPASSWORD: stig_local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # podman-compose ignores depends_on conditions, so wait for postgres here.
+    command:
+      - sh
+      - -c
+      - |
+        until pg_isready -h postgres -U stig -d stig_viewer; do sleep 1; done
+        psql -h postgres -U stig -d stig_viewer -v ON_ERROR_STOP=1 <<'SQL'
+        DO $$do$$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stig_app') THEN
+            CREATE ROLE stig_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'stig_local';
+          END IF;
+        END $$do$$;
+        ALTER ROLE stig_app PASSWORD 'stig_local';
+        SQL
+
   backend:
     build:
       context: ./backend
@@ -50,7 +77,14 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgres://stig:stig_local@postgres:5432/stig_viewer
+      # The backend runs as the restricted `stig_app` role; the owner role
+      # `stig` migrates at startup and applies the grants (see README, Database).
+      # Dev-only: both roles share the local password, supplied through
+      # PGPASSWORD (sqlx uses it when a URL carries none) so no URL embeds a
+      # credential.
+      DATABASE_URL: postgres://stig_app@postgres:5432/stig_viewer
+      DATABASE_MIGRATION_URL: postgres://stig@postgres:5432/stig_viewer
+      PGPASSWORD: stig_local
       PORT: "8080"
       RUST_LOG: info
       STIG_ENV: development
@@ -90,8 +124,9 @@ services:
       #   ALLOW_TEST_AUTH_HEADER  — accept X-User-Id in place of a session.
       #   STIG_ENABLE_TEST_ROUTES — mount the unauthenticated /api/test/*
       #                             routes (DB reset, role changes, ...).
-      #                             Also flags the DB for audit `test` mode: the DB
-      #                             role must be a superuser or hold GRANT SET ON
+      #                             Also flags the DB for audit `test` mode: the owner
+      #                             role (DATABASE_MIGRATION_URL) sets the flag and must be a
+      #                             superuser or hold GRANT SET ON
       #                             PARAMETER stig.audit_allow_test_mode (PG 15+).
       #                             The flag persists; with routes off the backend
       #                             refuses to start until ALTER DATABASE <db>
@@ -109,9 +144,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-roles:
+        condition: service_completed_successfully
       keycloak:
         condition: service_healthy
-    command: cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
+    # podman-compose does not wait for db-roles to finish, so retry the owner
+    # step (`migrate`: migrations + grants) until the stig_app role exists.
+    command:
+      - sh
+      - -c
+      - |
+        n=0
+        until cargo run -- migrate; do
+          n=$$((n + 1))
+          if [ "$$n" -ge 30 ]; then echo "migrate failed 30 times; giving up" >&2; exit 1; fi
+          echo "waiting for db-roles / postgres (attempt $$n)"; sleep 2
+        done
+        exec cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
 
   frontend:
     build:

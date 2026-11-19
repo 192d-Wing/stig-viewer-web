@@ -82,13 +82,45 @@ const TABLES: &[&str] = &[
     "saved_searches",
 ];
 
-/// Tables with a BIGSERIAL pk where we need to bump the sequence after
-/// restore so subsequent INSERTs don't collide with restored ids.
-const SERIAL_TABLES: &[(&str, &str)] = &[
-    ("rule_audit", "id"),
-    ("audit_events", "id"),
-    ("webhook_deliveries", "id"),
-];
+/// Every serial/identity column of the [`TABLES`], as `(table, column)`.
+/// Found from the catalog so a new BIGSERIAL table cannot be forgotten.
+async fn serial_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let tables: Vec<String> = TABLES.iter().map(ToString::to_string).collect();
+    sqlx::query_as(
+        "SELECT t.name, a.attname::text \
+         FROM unnest($1::text[]) AS t(name) \
+         JOIN pg_attribute a ON a.attrelid = to_regclass(quote_ident(t.name)) \
+         WHERE a.attnum > 0 AND NOT a.attisdropped \
+           AND pg_get_serial_sequence(quote_ident(t.name), a.attname::text) IS NOT NULL \
+         ORDER BY t.name, a.attnum",
+    )
+    .bind(&tables)
+    .fetch_all(&mut **tx)
+    .await
+}
+
+/// Point every serial sequence at the restored data so future inserts don't
+/// collide: next id is MAX + 1, or 1 for an empty table. Uses `setval` only
+/// (needs UPDATE on the sequence), not `TRUNCATE ... RESTART IDENTITY`, which
+/// requires owning the sequences.
+async fn reset_serial_sequences(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    for (table, col) in serial_columns(tx).await? {
+        let sql = format!(
+            "SELECT setval(pg_get_serial_sequence(quote_ident($1), $2), \
+             COALESCE(MAX(\"{col}\"), 1), MAX(\"{col}\") IS NOT NULL) FROM \"{table}\""
+        );
+        sqlx::query(&sql)
+            .bind(&table)
+            .bind(&col)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
 
 fn ensure_admin(user: &AuthUser) -> Result<(), StatusCode> {
     if user.role == "admin" {
@@ -529,7 +561,7 @@ pub async fn restore_handler(
             .map(|t| format!("\"{t}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("TRUNCATE {list} RESTART IDENTITY CASCADE");
+        let sql = format!("TRUNCATE {list} CASCADE");
         sqlx::query(&sql).execute(&mut *tx).await.map_err(|e| {
             tracing::error!("restore truncate: {e:#}");
             err_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to truncate")
@@ -561,16 +593,14 @@ pub async fn restore_handler(
         restored.insert(t.to_string(), res.rows_affected() as i64);
     }
 
-    // Bump BIGSERIAL sequences so future inserts don't collide.
-    for (table, col) in SERIAL_TABLES {
-        let sql = format!(
-            "SELECT setval(pg_get_serial_sequence('{table}', '{col}'), \
-             COALESCE((SELECT MAX({col}) FROM \"{table}\"), 1))"
-        );
-        if let Err(e) = sqlx::query(&sql).execute(&mut *tx).await {
-            tracing::warn!("restore setval {table}.{col}: {e:#}");
-        }
-    }
+    // Reset the serial sequences so future inserts don't collide.
+    reset_serial_sequences(&mut tx).await.map_err(|e| {
+        tracing::error!("restore sequence reset: {e:#}");
+        err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to reset sequences",
+        )
+    })?;
 
     // Record the restore inside the transaction: if the record cannot be
     // written, the restore is rolled back rather than committed unrecorded.
@@ -1719,6 +1749,72 @@ mod restore_integrity_db_tests {
                 .await
                 .unwrap();
         assert_eq!(detail["signatureStatus"], "unsigned");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn forced_restore_works_as_the_restricted_app_role(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('admin1','c','r1','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        let (state, _dir) = app_state(app.pool.clone());
+        let base = serve(state.clone()).await;
+        let zip = backup_of(&state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        // The sequence continues after the restored row.
+        let next: i64 = sqlx::query_scalar(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) \
+             VALUES ('admin1','c','r2','status') RETURNING id",
+        )
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+        let max_before: i64 =
+            sqlx::query_scalar("SELECT MAX(id) FROM rule_audit WHERE rule_id = 'r1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(next, max_before + 1);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn every_serial_column_is_found_and_reset_to_the_next_free_id(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        let cols = serial_columns(&mut tx).await.unwrap();
+        let expected = ["audit_events", "rule_audit", "webhook_deliveries"];
+        let tables: Vec<&str> = cols.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(tables, expected, "{cols:?}");
+        // Advance every sequence, then reset: empty tables restart at 1.
+        for (t, c) in &cols {
+            sqlx::query("SELECT setval(pg_get_serial_sequence(quote_ident($1), $2), 500)")
+                .bind(t)
+                .bind(c)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        reset_serial_sequences(&mut tx).await.unwrap();
+        for (t, c) in &cols {
+            let next: i64 =
+                sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence(quote_ident($1), $2))")
+                    .bind(t)
+                    .bind(c)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert_eq!(next, 1, "{t}.{c}");
+        }
+        tx.rollback().await.unwrap();
     }
 
     #[sqlx::test]

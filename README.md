@@ -315,13 +315,85 @@ by `(algorithm, keyId)`.
 
 ### Database
 
-Postgres data lives in a named volume (`postgres_data`). Migrations apply on
-backend start. To reset:
+Postgres data lives in a named volume (`postgres_data`). To reset:
 
 ```bash
 docker compose down -v   # drops the volume
 docker compose up
 ```
+
+#### Two database roles (#84)
+
+The server uses two roles so that the application role cannot tamper with the
+audit guard (see "Database guard on the audit tables"):
+
+- the **owner** role owns every table, sequence, the guard function and the
+  schema, and runs migrations. Its URL is `DATABASE_MIGRATION_URL`.
+- the **application** role (`DATABASE_URL`) gets only DML: `SELECT`, `INSERT`,
+  `UPDATE`, `DELETE`, `TRUNCATE` on tables and `USAGE, SELECT, UPDATE` on
+  sequences, `SELECT`/`INSERT`/`DELETE`/`TRUNCATE` plus
+  `UPDATE (repeat_count, last_occurred_at)` on the two audit tables, and
+  `SELECT` only on `_sqlx_migrations`. It has no `TRIGGER`, `REFERENCES` or
+  `CREATE`, so it cannot drop or disable the triggers, replace
+  `audit_tables_guard()`, drop or alter the audit tables, or set
+  `stig.audit_allow_test_mode`. It must not be a superuser, hold `CREATEROLE`,
+  be a member of the owner role, or (PostgreSQL 15+) own the database.
+
+With `DATABASE_MIGRATION_URL` set, the server migrates as the owner, re-applies
+the application role's grants (after every migration run; the grant routine is
+the single authority) and connects as the application role. The same can be
+done out of band, which is preferred in production because it keeps the owner
+credential out of the server's environment (anything that executes code in the
+server process could otherwise read it; NIST CM-5):
+
+```bash
+DATABASE_URL=postgres://stig_app@db/stig DATABASE_MIGRATION_URL=postgres://stig_owner@db/stig \
+  stig-viewer-backend migrate
+```
+
+Without `DATABASE_MIGRATION_URL` the server behaves as before when its role
+owns the schema (migrates itself; this single-role mode is for development
+only, and production refuses it), and otherwise only verifies that all
+migrations are applied with matching checksums, refusing to start on pending or
+modified ones. At startup the server checks that its role cannot reach the
+guard (superuser, `CREATEROLE`, membership of an owner role, `TRIGGER` on an
+audit table, table-level `UPDATE` on an audit table outside test mode). With
+`STIG_ENV=production` it refuses to start if any of these hold; otherwise it
+logs a warning. Neither URL is ever logged; if the URLs omit passwords,
+`PGPASSWORD` applies to both.
+
+Provisioning (as a superuser, once):
+
+```sql
+CREATE ROLE stig_owner LOGIN PASSWORD '...' NOSUPERUSER;
+CREATE ROLE stig_app   LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+CREATE DATABASE stig OWNER stig_owner;
+REVOKE ALL ON DATABASE stig FROM PUBLIC;
+GRANT CONNECT ON DATABASE stig TO stig_app;
+\c stig
+-- PostgreSQL < 15 only: PUBLIC may create objects in the public schema.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+Upgrading an existing deployment: today's single role owns every object. Keep it
+as the owner (`DATABASE_MIGRATION_URL`), create a new restricted login role
+like `stig_app` above, and point `DATABASE_URL` at it. The first migrate run
+grants it what it needs. If the application role's name must stay, a superuser
+can move ownership instead (manual, never done automatically):
+
+```sql
+CREATE ROLE stig_owner LOGIN PASSWORD '...' NOSUPERUSER;
+REASSIGN OWNED BY stig TO stig_owner;   -- run in the application database
+ALTER DATABASE stig OWNER TO stig_owner;
+ALTER ROLE stig NOSUPERUSER NOCREATEROLE;
+```
+
+then set `DATABASE_MIGRATION_URL` to `stig_owner` and run `migrate`.
+
+The dev and CI compose stack does this: a one-shot `db-roles` service creates
+`stig_app` (dev password only), the backend connects as `stig_app` and migrates
+as `stig`. With `STIG_ENABLE_TEST_ROUTES` the owner role sets the audit test
+flag, so it must be a superuser or hold the parameter grant.
 
 ### Frontend-only development
 
@@ -408,7 +480,7 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
   trigger reads the flag from `pg_db_role_setting`, so a session `SET` cannot
   spoof it, and only a superuser (or a holder of `GRANT SET ON PARAMETER
   stig.audit_allow_test_mode`) can set it. At startup the backend sets the flag
-  only when `STIG_ENABLE_TEST_ROUTES` is on; the database role must then be a
+  only when `STIG_ENABLE_TEST_ROUTES` is on, as the owner role, which must then be a
   superuser or hold `GRANT SET ON PARAMETER stig.audit_allow_test_mode`
   (PostgreSQL 15+; on older versions only a superuser). The flag persists
   after test routes are turned off, and with test routes off the backend
@@ -434,22 +506,23 @@ fails with 42501. A data migration must first run
 `SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
 transaction (UPDATE only). Never use `test` mode in production code.
 
-Limit: this is a guard, not a full privilege boundary. With a non-superuser
-application role, neither the application nor injected SQL can turn `test` mode
-on (the flag needs superuser). Until a separate owner role exists (#84), the
-application role still owns the tables and the guard function, so code that can
-run SQL as it can set the `retention`, `restore` and `migration` modes,
-`CREATE OR REPLACE` the guard, or disable the triggers, and a DBA or table
-owner can do the same. With a superuser application role (the dev and CI
-stacks) there is no boundary at all. In production, run the application as a
-non-superuser role (NIST AC-6); for hardening, run migrations and the
-retention/restore jobs under a separate role that owns the tables, give the
-application role only `SELECT` and `INSERT` on the audit tables (plus
-`UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and ship audit
-rows to an external append-only store.
+Limit: with the owner/application role split (see "Two database roles") the
+application role cannot drop, disable or replace the guard, drop or alter the
+audit tables, or set the `test` flag; the owner step also makes the
+`migration` mode unusable by the application. What remains: the application can
+still declare the `retention` and `restore` modes (DELETE and TRUNCATE of audit
+rows), because the retention sweep and forced restore run in the server with
+that role. Code that can run SQL as the application role can therefore delete
+or truncate audit rows, insert new ones in their place (rewriting the trail)
+and `setval` the audit sequences. A superuser or the owner role can always bypass
+the guard, and with a superuser application role (a single-role setup, or
+`cargo run` against the dev superuser) there is no boundary at all; production
+refuses to start in that state. Ship audit rows to an external append-only store
+for stronger guarantees.
 
 The database-backed tests (`task test:db`) need a superuser test role (or the
-parameter grant) because they flag each test database with `ALTER DATABASE`.
+parameter grant) because they flag each test database with `ALTER DATABASE`
+and create and `SET ROLE` to restricted roles.
 
 ### Integrity of audit archives and backups
 

@@ -17,16 +17,18 @@ pub struct CatalogEntry {
     pub last_updated: DateTime<Utc>,
 }
 
-/// Create a connection pool and run pending migrations.
-pub async fn init_pool(database_url: &str) -> Result<PgPool> {
-    let pool = PgPoolOptions::new()
+/// Connect the application pool without touching the schema.
+pub async fn connect_pool(database_url: &str) -> Result<PgPool> {
+    Ok(PgPoolOptions::new()
         .max_connections(5)
         .connect(database_url)
-        .await?;
+        .await?)
+}
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
-
-    Ok(pool)
+/// Run pending migrations on `pool` (the role must own the schema objects).
+pub async fn run_migrations(pool: &PgPool) -> Result<()> {
+    sqlx::migrate!("./migrations").run(pool).await?;
+    Ok(())
 }
 
 /// Return all catalog entries, optionally filtered by category.

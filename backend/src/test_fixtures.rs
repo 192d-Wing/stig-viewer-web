@@ -8,6 +8,8 @@
 //! ... SET`, so the test role must be a superuser (or hold `GRANT SET ON
 //! PARAMETER stig.audit_allow_test_mode`); it already must be able to
 //! `CREATE DATABASE`, and CI and `task test:db` use the image superuser.
+//! [`app_role_pool`] additionally needs `CREATE ROLE` and `SET ROLE` to run a
+//! test as the restricted application role (see `db_roles`).
 
 use std::sync::Arc;
 
@@ -37,6 +39,62 @@ pub async fn disallow_audit_test_mode(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("disallow audit test mode");
+}
+
+/// A restricted application role for one test database, as the owner step in
+/// production would provision it: DML grants only, assumed with `SET ROLE` on
+/// every connection. Needs the superuser test connection (`CREATE ROLE`,
+/// `SET ROLE`).
+pub struct AppRole {
+    pub pool: PgPool,
+    pub name: String,
+}
+
+impl AppRole {
+    /// Best-effort removal of the cluster-global role (assertions that fail
+    /// earlier leave it behind; the name is random).
+    pub async fn cleanup(self, admin: &PgPool) {
+        self.pool.close().await;
+        let q = format!("\"{}\"", self.name);
+        let _ = sqlx::query(&format!("DROP OWNED BY {q}"))
+            .execute(admin)
+            .await;
+        let _ = sqlx::query(&format!("DROP ROLE {q}")).execute(admin).await;
+    }
+}
+
+/// Create a random `NOLOGIN` role, grant it with
+/// [`crate::db_roles::apply_app_grants`] and return a pool whose connections
+/// all `SET ROLE` to it.
+pub async fn app_role_pool(admin: &PgPool, test_routes: bool) -> AppRole {
+    let name: String =
+        sqlx::query_scalar("SELECT 'stig_t_' || replace(gen_random_uuid()::text, '-', '')")
+            .fetch_one(admin)
+            .await
+            .expect("role name");
+    sqlx::query(&format!("CREATE ROLE \"{name}\" NOLOGIN"))
+        .execute(admin)
+        .await
+        .expect("create app role");
+    let mut conn = admin.acquire().await.expect("acquire");
+    crate::db_roles::apply_app_grants(&mut conn, &name, test_routes)
+        .await
+        .expect("apply grants");
+    drop(conn);
+    let set_role = format!("SET ROLE \"{name}\"");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .after_connect(move |conn, _| {
+            let set_role = set_role.clone();
+            Box::pin(async move {
+                sqlx::query(&set_role).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with((*admin.connect_options()).clone())
+        .await
+        .expect("app role pool");
+    AppRole { pool, name }
 }
 
 pub async fn seed_user(pool: &PgPool, id: &str) {
@@ -232,6 +290,7 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
         config: Arc::new(Config {
             port: 0,
             database_url: String::new(),
+            database_migration_url: None,
             data_dir: dir,
             sync_interval_hours: 100_000,
             backup_require_signature: None,
@@ -278,6 +337,7 @@ pub fn lazy_state() -> (AppState, StigDir) {
         config: Arc::new(Config {
             port: 0,
             database_url: String::new(),
+            database_migration_url: None,
             data_dir: dir.clone(),
             sync_interval_hours: 100_000,
             backup_require_signature: None,

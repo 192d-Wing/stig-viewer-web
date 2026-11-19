@@ -9,6 +9,7 @@ mod db_checklist_sets;
 mod db_checklists;
 mod db_drafts;
 mod db_notice;
+mod db_roles;
 mod integrity;
 mod parser;
 mod pdf;
@@ -184,7 +185,7 @@ use api::{
     },
 };
 use config::{load_sources, Config, TestHooks};
-use db::init_pool;
+use db::{connect_pool, run_migrations};
 
 /// Request-body cap for every route that doesn't set its own. Covers JSON
 /// payloads, CSV imports and STIG JSON lint uploads.
@@ -219,20 +220,43 @@ pub struct AppState {
     pub signing: Option<api::signing::SigningState>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
+/// Connect the application pool and make sure the schema is current.
+/// With `DATABASE_MIGRATION_URL` the owner role migrates first; otherwise a
+/// role that owns the schema migrates itself (legacy single-role setup, for
+/// development only) and any other role only verifies that migrations were
+/// applied externally.
+async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> {
+    let has_owner_url = config.database_migration_url.is_some();
+    if let Some(owner_url) = config.database_migration_url.as_deref() {
+        db_roles::migrate_as_owner(
+            owner_url,
+            &config.database_url,
+            hooks.enable_test_routes,
+            hooks.production,
         )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+        .await?;
+    }
+    let pool = connect_pool(&config.database_url).await?;
+    let can_migrate = !has_owner_url && db_roles::can_migrate(&pool).await?;
+    match db_roles::startup_path(has_owner_url, || can_migrate) {
+        db_roles::StartupPath::OwnerMigrates => {
+            db_roles::verify_migrations(&pool).await?;
+            info!("Database connected; migrations applied by the owner role");
+        }
+        db_roles::StartupPath::SelfMigrate => {
+            run_migrations(&pool).await?;
+            info!("Database connected and migrations applied");
+        }
+        db_roles::StartupPath::VerifyOnly => {
+            db_roles::verify_migrations(&pool).await?;
+            info!("Database connected; migrations verified (applied externally)");
+        }
+    }
+    Ok(pool)
+}
 
-    // Test-only hooks are opt-in, and a production deployment that has one
-    // enabled refuses to start — before touching the DB or binding a port.
-    let test_hooks = TestHooks::from_env();
-    test_hooks.validate()?;
+/// Log a loud warning for each test-only hook that is switched on.
+fn warn_enabled_test_hooks(test_hooks: &TestHooks) {
     if test_hooks.enable_test_routes {
         tracing::warn!(
             "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted. \
@@ -245,6 +269,63 @@ async fn main() -> Result<()> {
              X-User-Id. Never enable this on a reachable deployment."
         );
     }
+}
+
+/// Connect (migrating as the owner if configured), apply the audit test-mode
+/// policy, and enforce the owner/app role boundary before anything is served.
+async fn open_database(config: &Config, test_hooks: &TestHooks) -> Result<sqlx::PgPool> {
+    if test_hooks.production && config.database_migration_url.is_some() {
+        tracing::warn!(
+            "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
+             could read the owner credential. Prefer running `migrate` as a separate job."
+        );
+    }
+    let pool = connect_database(config, test_hooks).await?;
+    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
+    let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
+    db_roles::boundary_policy(test_hooks.production, &violations)?;
+    Ok(pool)
+}
+
+/// The `migrate` subcommand: validate the test hooks, run migrations and the
+/// application-role grants as the owner role, then return.
+async fn run_migrate_command() -> Result<()> {
+    let hooks = TestHooks::from_env();
+    let config = Config::from_env()?;
+    let owner_url =
+        db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref())?;
+    db_roles::migrate_as_owner(
+        owner_url,
+        &config.database_url,
+        hooks.enable_test_routes,
+        hooks.production,
+    )
+    .await?;
+    info!("Migrations applied and application role grants updated");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // `migrate`: run migrations and grants as the owner role, then exit.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
+        return run_migrate_command().await;
+    }
+
+    // Test-only hooks are opt-in, and a production deployment that has one
+    // enabled refuses to start — before touching the DB or binding a port.
+    let test_hooks = TestHooks::from_env();
+    test_hooks.validate()?;
+    warn_enabled_test_hooks(&test_hooks);
 
     let config = Arc::new(Config::from_env()?);
     config::validate_seed_dir(
@@ -261,9 +342,7 @@ async fn main() -> Result<()> {
 
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
-    let pool = Arc::new(init_pool(&config.database_url).await?);
-    info!("Database connected and migrations applied");
-    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
+    let pool = Arc::new(open_database(&config, &test_hooks).await?);
     let _ = stig_id::warn_non_conforming(&pool).await;
 
     if let Some(seed_dir) = &config.seed_dir {
