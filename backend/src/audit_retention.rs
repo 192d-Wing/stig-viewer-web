@@ -637,7 +637,7 @@ async fn prune_rules_locked(
 struct EventRow {
     id: i64,
     occurred_at: DateTime<Utc>,
-    user_id: String,
+    user_id: Option<String>,
     action: String,
     outcome: String,
     asset_id: Option<String>,
@@ -988,6 +988,36 @@ mod tests {
             1
         );
         assert!(!dir2.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_events_archives_a_system_event_with_a_null_user(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO audit_events (user_id, user_role, action, outcome, occurred_at, detail) \
+             VALUES (NULL, 'system', 'catalog.sync', 'rejected', NOW() - INTERVAL '400 days', \
+                     '{\"reasonCode\":\"download_too_large\"}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let n = run_prune_events(&pool, &dir, 365, true, None)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let mut archived = String::new();
+        for entry in std::fs::read_dir(dir.join("audit_archive")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "jsonl") {
+                archived.push_str(&std::fs::read_to_string(path).unwrap());
+            }
+        }
+        let line: serde_json::Value = serde_json::from_str(archived.trim()).unwrap();
+        assert!(line["user_id"].is_null(), "{line}");
+        assert_eq!(line["user_role"], "system");
+        assert_eq!(line["action"], "catalog.sync");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

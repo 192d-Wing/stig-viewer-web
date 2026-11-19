@@ -196,8 +196,31 @@ duplicate or overlapping entries) is refused too. Over a limit,
 over-limit or inconsistent entry inside a library is skipped and listed in
 `errorDetail`. Every rejection is recorded as a `catalog.upload` or
 `catalog.import_library` audit event with `outcome = 'rejected'` and
-`detail = {reasonCode, reason, bytesCompressed}`. A downloaded sync source is
-cut off at the 500 MB upload limit.
+`detail = {reasonCode, reason, bytesCompressed}`. The response body for a
+refused ZIP is a fixed message per `reasonCode` (`entry_too_large`,
+`budget_exceeded`, `header_inconsistency`, `no_xccdf`, `malformed`); entry
+names, limits and parser text stay in the server log and the audit `reason`.
+
+In a library import, each `errorDetail` item is
+`{"id", "reasonCode", "error"}` with the same fixed message (library entries
+can also fail with `invalid_id` or `xccdf_parse_failed`; database errors keep
+their `{"id", "error"}` shape). The first 100 skipped entries are each logged
+(followed by one "N more" line) and get their own `catalog.import_library_entry` audit row
+(`outcome = 'rejected'`, `stig_id` = entry id, `detail = {reasonCode, entry}`).
+Identical entry rows (same entry id and `reasonCode`, for example several bad
+files inside one `_STIG.zip`, or the same upload repeated within 300 s) collapse
+into one row whose `repeat_count` carries the rest. Entry rows stop after a
+15 s overall deadline if the database stalls. Whenever anything was skipped,
+one `catalog.import_library` summary row
+(`outcome` `partial`, or `rejected` when nothing was imported) records
+`{reasonCode: "entries_skipped", skipped, skippedAudited, skippedTruncated,
+byReason, parsed, bytesCompressed}`.
+
+A downloaded sync source is cut off at the 500 MB upload limit. That stop is
+recorded as a `catalog.sync` audit event with `outcome = 'rejected'`,
+`stig_id` = the source id and `detail = {reasonCode: "download_too_large",
+limitBytes, declaredBytes}`. It has no acting user: `user_id` is NULL,
+`user_role` is `system`, and the audit view shows it as "system".
 
 ### Signing envelope (v2)
 

@@ -6,6 +6,10 @@
 //! (truncated) rule ids; never finding details, comments or other free text
 //! from the request. The one exception is `auth.notice_ack`, whose `detail`
 //! carries the sanitized, truncated User-Agent and client IP of the acknowledgement.
+//!
+//! System-originated events (no acting user, for example a scheduled DISA
+//! download stopped by its size cap) are written by [`record_system_or_log`]
+//! with a NULL `user_id` and `user_role = 'system'` (migration 045).
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -20,6 +24,7 @@ pub const MAX_REJECTED_LISTED: usize = 100;
 pub struct NewAuditEvent<'a> {
     pub user_id: &'a str,
     /// "rules.bulk_status" | "rules.bulk_import" | "checklist.save" | "checklist.create" | "auth.notice_ack"
+    /// | "catalog.upload" | "catalog.import_library" | "catalog.import_library_entry" | "catalog.sync"
     pub action: &'static str,
     /// "ok" | "partial" | "denied" | "rejected"
     pub outcome: &'static str,
@@ -29,6 +34,16 @@ pub struct NewAuditEvent<'a> {
     pub detail: Value,
     /// Request context (source IP, request id, role). `None` outside a request.
     pub ctx: Option<&'a RequestCtx>,
+}
+
+/// An event with no acting user: written with a NULL `user_id` and
+/// `user_role = 'system'`. Never collapsed with earlier rows.
+pub struct NewSystemEvent<'a> {
+    pub action: &'static str,
+    /// "ok" | "partial" | "denied" | "rejected"
+    pub outcome: &'static str,
+    pub stig_id: Option<&'a str>,
+    pub detail: Value,
 }
 
 /// Declare an audit maintenance mode (`retention`, `restore`, `migration` or `test`) for the
@@ -151,7 +166,8 @@ pub(crate) fn check_test_maintenance_flag(test_routes: bool, flag_set: bool) -> 
 /// Startup policy. Test routes on: flag the database (needs a superuser or
 /// GRANT SET ON PARAMETER stig.audit_allow_test_mode, PostgreSQL 15+). Test
 /// routes off: refuse to start if the database is flagged. No audit_events row
-/// is written: that table requires a real user (FK), and there is no system user.
+/// is written: startup has no request and no acting user (system events go
+/// through [`record_system_or_log`], which needs the migrated schema).
 pub(crate) async fn apply_test_maintenance_policy(
     pool: &PgPool,
     enable_test_routes: bool,
@@ -214,12 +230,31 @@ async fn insert<'e, E: sqlx::PgExecutor<'e>>(
     ids: &BoundedIds,
     detail: &Value,
 ) -> Result<()> {
+    insert_row(
+        pool,
+        Some(ev.user_id),
+        ev.ctx.map(|c| bound_id(&c.role)),
+        ev,
+        ids,
+        detail,
+    )
+    .await
+}
+
+async fn insert_row<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
+    user_id: Option<&str>,
+    role: Option<String>,
+    ev: &NewAuditEvent<'_>,
+    ids: &BoundedIds,
+    detail: &Value,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO audit_events (user_id, action, outcome, asset_id, checklist_id, stig_id, detail, \
                                   source_ip, request_id, user_role) \
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)",
     )
-    .bind(ev.user_id)
+    .bind(user_id)
     .bind(ev.action)
     .bind(ev.outcome)
     .bind(&ids.asset_id)
@@ -228,7 +263,7 @@ async fn insert<'e, E: sqlx::PgExecutor<'e>>(
     .bind(detail.to_string())
     .bind(ev.ctx.and_then(|c| c.source_ip.as_deref()))
     .bind(ev.ctx.map(|c| c.request_id.as_str()))
-    .bind(ev.ctx.map(|c| bound_id(&c.role)))
+    .bind(role)
     .execute(pool)
     .await?;
     Ok(())
@@ -311,6 +346,58 @@ async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
 /// jsonb rejects) can suppress the row. Both attempts share [`WRITE_TIMEOUT`].
 pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
     record_counted(pool, ev, &AUDIT_WRITES).await;
+}
+
+/// Record a system-originated event without ever failing the caller. Same
+/// guarantees as [`record_or_log`] (bounded by [`WRITE_TIMEOUT`], counted in
+/// [`AUDIT_WRITES`], retried once without `detail`) but no collapse: every
+/// call is its own row.
+pub async fn record_system_or_log(pool: &PgPool, ev: NewSystemEvent<'_>) {
+    record_system_counted(pool, ev, &AUDIT_WRITES).await;
+}
+
+async fn record_system_counted(pool: &PgPool, ev: NewSystemEvent<'_>, counter: &FailureCounter) {
+    debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
+    // Reuse the column bounding and insert of user events; user_id is unused.
+    let shell = NewAuditEvent {
+        user_id: "",
+        action: ev.action,
+        outcome: ev.outcome,
+        asset_id: None,
+        checklist_id: None,
+        stig_id: ev.stig_id,
+        detail: ev.detail,
+        ctx: None,
+    };
+    let ids = bounded(&shell);
+    let role = || Some("system".to_string());
+    let attempt = async {
+        if let Err(first) = insert_row(pool, None, role(), &shell, &ids, &shell.detail).await {
+            tracing::warn!(target: "audit", action = shell.action, "system audit event insert failed, retrying without detail: {first:#}");
+            insert_row(
+                pool,
+                None,
+                role(),
+                &shell,
+                &ids,
+                &json!({ "detailDropped": true }),
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let Some(failure) = bounded_attempt(attempt, counter, WRITE_TIMEOUT).await else {
+        return;
+    };
+    tracing::error!(
+        target: "audit",
+        user_id = "system",
+        action = shell.action,
+        outcome = shell.outcome,
+        stig_id = ids.stig_id.as_deref(),
+        "failed to write audit event: {failure}"
+    );
+    counter.record_failure();
 }
 
 /// Await `attempt` for at most `limit`. Success resets `counter`'s failure
@@ -1169,6 +1256,52 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_system_event_has_a_null_user_and_role_system(pool: PgPool) {
+        let c = FailureCounter::new();
+        let mk = || NewSystemEvent {
+            action: "catalog.sync",
+            outcome: "rejected",
+            stig_id: Some("src-1"),
+            detail: json!({"reasonCode": "download_too_large"}),
+        };
+        record_system_counted(&pool, mk(), &c).await;
+        record_system_counted(&pool, mk(), &c).await;
+        assert_eq!(c.snapshot().total, 0);
+        let rows: Vec<(Option<String>, Option<String>, i32)> = sqlx::query_as(
+            "SELECT user_id, user_role, repeat_count FROM audit_events WHERE action = 'catalog.sync'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // Not collapsed: two rows, each with repeat_count 1.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (u, r, n) in rows {
+            assert_eq!((u, r.as_deref(), n), (None, Some("system"), 1));
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_null_user_without_role_system_violates_the_check(pool: PgPool) {
+        for role in [None, Some("admin")] {
+            let e = sqlx::query(
+                "INSERT INTO audit_events (user_id, action, outcome, user_role) \
+                 VALUES (NULL, 'catalog.sync', 'ok', $1)",
+            )
+            .bind(role)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+            assert_eq!(
+                e.as_database_error().and_then(|d| d.code()).as_deref(),
+                Some("23514"),
+                "{e}"
+            );
         }
     }
 }
