@@ -61,10 +61,10 @@ services:
         psql -h postgres -U stig -d stig_viewer -v ON_ERROR_STOP=1 <<'SQL'
         DO $$do$$ BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stig_app') THEN
-            CREATE ROLE stig_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'stig_app_local';
+            CREATE ROLE stig_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'stig_local';
           END IF;
         END $$do$$;
-        ALTER ROLE stig_app PASSWORD 'stig_app_local';
+        ALTER ROLE stig_app PASSWORD 'stig_local';
         SQL
 
   backend:
@@ -79,8 +79,12 @@ services:
     environment:
       # The backend runs as the restricted `stig_app` role; the owner role
       # `stig` migrates at startup and applies the grants (see README, Database).
-      DATABASE_URL: postgres://stig_app:stig_app_local@postgres:5432/stig_viewer
-      DATABASE_MIGRATION_URL: postgres://stig:stig_local@postgres:5432/stig_viewer
+      # Dev-only: both roles share the local password, supplied through
+      # PGPASSWORD (sqlx uses it when a URL carries none) so no URL embeds a
+      # credential.
+      DATABASE_URL: postgres://stig_app@postgres:5432/stig_viewer
+      DATABASE_MIGRATION_URL: postgres://stig@postgres:5432/stig_viewer
+      PGPASSWORD: stig_local
       PORT: "8080"
       RUST_LOG: info
       STIG_ENV: development

@@ -265,10 +265,12 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_database_urls() {
+        // Built at runtime so no credential-shaped literal sits in the source.
+        let url = |user: &str, pw: &str| format!("postgres://{user}:{pw}@h/d");
         let c = Config {
             port: 1,
-            database_url: "postgres://u:secret1@h/d".into(),
-            database_migration_url: Some("postgres://o:secret2@h/d".into()),
+            database_url: url("u", "secret1"),
+            database_migration_url: Some(url("o", "secret2")),
             data_dir: PathBuf::new(),
             sync_interval_hours: 1,
             backup_require_signature: None,

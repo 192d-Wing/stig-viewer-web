@@ -87,7 +87,7 @@ const TABLES: &[&str] = &[
 async fn serial_columns(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
+    let tables: Vec<String> = TABLES.iter().map(ToString::to_string).collect();
     sqlx::query_as(
         "SELECT t.name, a.attname::text \
          FROM unnest($1::text[]) AS t(name) \

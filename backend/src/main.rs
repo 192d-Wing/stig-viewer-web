@@ -255,6 +255,24 @@ async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> 
     Ok(pool)
 }
 
+/// The `migrate` subcommand: validate the test hooks, run migrations and the
+/// application-role grants as the owner role, then return.
+async fn run_migrate_command() -> Result<()> {
+    let hooks = TestHooks::from_env();
+    let config = Config::from_env()?;
+    let owner_url =
+        db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref())?;
+    db_roles::migrate_as_owner(
+        owner_url,
+        &config.database_url,
+        hooks.enable_test_routes,
+        hooks.production,
+    )
+    .await?;
+    info!("Migrations applied and application role grants updated");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -268,19 +286,7 @@ async fn main() -> Result<()> {
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        let hooks = TestHooks::from_env();
-        let config = Config::from_env()?;
-        let owner_url =
-            db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref())?;
-        db_roles::migrate_as_owner(
-            owner_url,
-            &config.database_url,
-            hooks.enable_test_routes,
-            hooks.production,
-        )
-        .await?;
-        info!("Migrations applied and application role grants updated");
-        return Ok(());
+        return run_migrate_command().await;
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one
