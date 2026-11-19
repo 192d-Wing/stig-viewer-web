@@ -13,16 +13,40 @@
 //! * `error` — the DB is unreachable or every recent webhook delivery
 //!   failed; HTTP 503 so the LB pulls the node
 //!
+//! Two further checks read in-process counters (no DB query, so they answer
+//! even when the DB is down), see `failure_counters`:
+//! * `audit` — `degraded` if a swallowed audit-write failure happened in the
+//!   last `AUDIT_FAILURE_WINDOW_MINUTES`.
+//! * `loginAckPrune` — `degraded` after `ACK_PRUNE_DEGRADED_AFTER` consecutive
+//!   failed `prune_acks` ticks; clears on the next successful tick.
+//!
+//! On this unauthenticated endpoint both carry only `{ "status" }`: public
+//! counts and timestamps would confirm to an unauthenticated caller whether
+//! an attempt to suppress audit writes worked. The numbers are on the
+//! admin-only `GET /api/admin/failure-counters` (counts and timestamps only,
+//! never error text, ids or actions; 403 for non-admins like every other
+//! `/api/admin/*` route; not audited, like `scheduler-runs`, since it exposes
+//! operational counters rather than audit records).
+//!
+//! The counters are per replica and since process start, and only ever
+//! report `ok` or `degraded`, never `error`. Alert on the rate of change of
+//! `writeFailures` from the admin endpoint, not only on status (which
+//! self-clears); the authoritative AU-5 signal across replicas and restarts is
+//! the `failed to write audit event` error log line, which needs a log-based
+//! alert. This is not AU-5(1)/(2).
+//!
 //! All queries have a 200ms timeout and the handler aims for ~250ms
 //! end-to-end. The endpoint must stay fast — uptime monitors hit it
 //! every few seconds and it must not become a hotspot.
 
 use std::time::Duration;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
+use crate::api::auth::AuthUser;
+use crate::failure_counters::{FailureSnapshot, ACK_PRUNE, AUDIT_WRITES};
 use crate::AppState;
 
 /// All six background schedulers wired up in `main.rs`. Five of them
@@ -45,6 +69,12 @@ const KNOWN_SCHEDULERS: &[&str] = &[
 /// How fresh a scheduler's last finished tick must be before we flag
 /// the schedulers check as degraded.
 const SCHEDULER_FRESHNESS_HOURS: i64 = 48;
+
+/// A swallowed audit-write failure this recent degrades the `audit` check.
+const AUDIT_FAILURE_WINDOW_MINUTES: i64 = 15;
+
+/// Consecutive failed ack-prune ticks (one per minute) before `degraded`.
+const ACK_PRUNE_DEGRADED_AFTER: u64 = 3;
 
 /// Per-query timeout. The three checks are independent and serially
 /// executed; a single hung query must not block the whole endpoint.
@@ -89,25 +119,112 @@ pub async fn get_health(State(state): State<AppState>) -> (StatusCode, Json<Valu
     let (sched_status, sched_value) = check_schedulers(pool).await;
     let (hook_status, hook_value) = check_webhooks(pool).await;
 
-    let top = db_status.merge(sched_status).merge(hook_status);
+    let (top, checks) = build_checks(
+        (db_status, db_value),
+        (sched_status, sched_value),
+        (hook_status, hook_value),
+        &AUDIT_WRITES.snapshot(),
+        &ACK_PRUNE.snapshot(),
+        Utc::now(),
+    );
 
-    let http = if top == Status::Error {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
-    };
+    let http = http_status(top);
 
     let body = json!({
         "status": top.as_str(),
         "version": env!("CARGO_PKG_VERSION"),
-        "checks": {
-            "db":         db_value,
-            "schedulers": sched_value,
-            "webhooks":   hook_value,
-        }
+        "checks": checks,
     });
 
     (http, Json(body))
+}
+
+fn http_status(top: Status) -> StatusCode {
+    if top == Status::Error {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
+}
+
+/// Assemble the `checks` object and the merged top-level status. The audit
+/// and ack-prune checks are in-process only and public, so they expose
+/// `status` and nothing else.
+fn build_checks(
+    db: (Status, Value),
+    schedulers: (Status, Value),
+    webhooks: (Status, Value),
+    audit: &FailureSnapshot,
+    prune: &FailureSnapshot,
+    now: DateTime<Utc>,
+) -> (Status, Value) {
+    let (audit_status, _) = audit_check(audit, now);
+    let (prune_status, _) = ack_prune_check(prune);
+    let top =
+        db.0.merge(schedulers.0)
+            .merge(webhooks.0)
+            .merge(audit_status)
+            .merge(prune_status);
+    let checks = json!({
+        "db": db.1,
+        "schedulers": schedulers.1,
+        "webhooks": webhooks.1,
+        "audit": { "status": audit_status.as_str() },
+        "loginAckPrune": { "status": prune_status.as_str() },
+    });
+    (top, checks)
+}
+
+/// Body of `GET /api/admin/failure-counters`: counts and timestamps only.
+fn counters_body(audit: &FailureSnapshot, prune: &FailureSnapshot) -> Value {
+    json!({
+        "audit": {
+            "writeFailures": audit.total,
+            "lastWriteFailureAt": rfc3339(audit.last_failure_at),
+        },
+        "loginAckPrune": {
+            "failures": prune.total,
+            "consecutiveFailures": prune.consecutive,
+            "lastFailureAt": rfc3339(prune.last_failure_at),
+            "lastSuccessAt": rfc3339(prune.last_success_at),
+        },
+    })
+}
+
+/// GET /api/admin/failure-counters — admin-only in-process failure counters.
+pub async fn failure_counters_handler(
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Value>, StatusCode> {
+    if user.role != "admin" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(counters_body(
+        &AUDIT_WRITES.snapshot(),
+        &ACK_PRUNE.snapshot(),
+    )))
+}
+
+fn rfc3339(t: Option<DateTime<Utc>>) -> Value {
+    t.map_or(Value::Null, |t| Value::String(t.to_rfc3339()))
+}
+
+/// `degraded` when the last audit-write failure is within the window.
+fn audit_check(s: &FailureSnapshot, now: DateTime<Utc>) -> (Status, Value) {
+    let recent = s.last_failure_at.is_some_and(|t| {
+        now.signed_duration_since(t) < chrono::Duration::minutes(AUDIT_FAILURE_WINDOW_MINUTES)
+    });
+    let status = if recent { Status::Degraded } else { Status::Ok };
+    (status, json!({ "status": status.as_str() }))
+}
+
+/// `degraded` after `ACK_PRUNE_DEGRADED_AFTER` consecutive failed ticks.
+fn ack_prune_check(s: &FailureSnapshot) -> (Status, Value) {
+    let status = if s.consecutive >= ACK_PRUNE_DEGRADED_AFTER {
+        Status::Degraded
+    } else {
+        Status::Ok
+    };
+    (status, json!({ "status": status.as_str() }))
 }
 
 /// `SELECT 1` with a 200ms timeout. Anything other than a clean reply
@@ -288,4 +405,136 @@ async fn check_webhooks(pool: &sqlx::PgPool) -> (Status, Value) {
             "errors24h": errors,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::failure_counters::FailureCounter;
+    use chrono::Duration as D;
+
+    fn snap(total: u64, consecutive: u64, failed_ago: Option<D>) -> FailureSnapshot {
+        let now = Utc::now();
+        FailureSnapshot {
+            total,
+            consecutive,
+            last_failure_at: failed_ago.map(|d| now - d),
+            last_success_at: None,
+        }
+    }
+
+    #[test]
+    fn audit_ok_without_failures() {
+        assert_eq!(audit_check(&snap(0, 0, None), Utc::now()).0, Status::Ok);
+    }
+
+    #[test]
+    fn audit_degraded_for_a_recent_failure_and_recovers() {
+        let now = Utc::now();
+        let recent = FailureSnapshot {
+            last_failure_at: Some(now - D::minutes(1)),
+            ..snap(1, 1, None)
+        };
+        assert_eq!(audit_check(&recent, now).0, Status::Degraded);
+        let old = FailureSnapshot {
+            last_failure_at: Some(now - D::minutes(16)),
+            ..snap(1, 1, None)
+        };
+        assert_eq!(audit_check(&old, now).0, Status::Ok);
+    }
+
+    #[test]
+    fn ack_prune_degrades_at_three_and_clears_on_success() {
+        assert_eq!(ack_prune_check(&snap(2, 2, Some(D::zero()))).0, Status::Ok);
+        assert_eq!(
+            ack_prune_check(&snap(3, 3, Some(D::zero()))).0,
+            Status::Degraded
+        );
+        let c = FailureCounter::new();
+        for _ in 0..3 {
+            c.record_failure();
+        }
+        c.record_success();
+        assert_eq!(ack_prune_check(&c.snapshot()).0, Status::Ok);
+    }
+
+    fn keys(v: &Value) -> Vec<String> {
+        let mut k: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    fn ok() -> (Status, Value) {
+        (Status::Ok, json!({ "status": "ok" }))
+    }
+
+    #[test]
+    fn public_checks_carry_status_only_and_a_recent_failure_degrades_the_top_level() {
+        let now = Utc::now();
+        let (top, checks) =
+            build_checks(ok(), ok(), ok(), &snap(0, 0, None), &snap(0, 0, None), now);
+        assert_eq!(top, Status::Ok);
+        assert_eq!(checks["audit"], json!({ "status": "ok" }));
+        assert_eq!(checks["loginAckPrune"], json!({ "status": "ok" }));
+
+        let (top, checks) = build_checks(
+            ok(),
+            ok(),
+            ok(),
+            &snap(1, 1, Some(D::minutes(1))),
+            &snap(0, 0, None),
+            now,
+        );
+        assert_eq!(top, Status::Degraded);
+        assert_eq!(checks["audit"], json!({ "status": "degraded" }));
+        assert_eq!(keys(&checks["audit"]), ["status"]);
+        assert_eq!(keys(&checks["loginAckPrune"]), ["status"]);
+    }
+
+    #[tokio::test]
+    async fn health_checks_with_a_recent_audit_failure_are_degraded_with_http_200() {
+        // The handler itself needs a database; this exercises the same
+        // assembly and status mapping it uses.
+        let (top, _) = build_checks(
+            ok(),
+            ok(),
+            ok(),
+            &snap(1, 1, Some(D::zero())),
+            &snap(0, 0, None),
+            Utc::now(),
+        );
+        assert_eq!((top, http_status(top)), (Status::Degraded, StatusCode::OK));
+    }
+
+    #[test]
+    fn counters_body_holds_exactly_the_documented_keys() {
+        let s = snap(1, 1, Some(D::zero()));
+        let b = counters_body(&s, &s);
+        assert_eq!(keys(&b), ["audit", "loginAckPrune"]);
+        assert_eq!(keys(&b["audit"]), ["lastWriteFailureAt", "writeFailures"]);
+        assert_eq!(
+            keys(&b["loginAckPrune"]),
+            [
+                "consecutiveFailures",
+                "failures",
+                "lastFailureAt",
+                "lastSuccessAt"
+            ]
+        );
+        assert_eq!(b["audit"]["writeFailures"], 1);
+        assert!(b["loginAckPrune"]["lastSuccessAt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn failure_counters_endpoint_refuses_non_admins_and_serves_admins() {
+        for role in ["viewer", "author", "reviewer"] {
+            let r =
+                failure_counters_handler(Extension(crate::test_fixtures::auth("u", role))).await;
+            assert_eq!(r.err(), Some(StatusCode::FORBIDDEN), "{role}");
+        }
+        let Json(v) = failure_counters_handler(Extension(crate::test_fixtures::auth("a", "admin")))
+            .await
+            .unwrap();
+        assert_eq!(keys(&v), ["audit", "loginAckPrune"]);
+    }
 }

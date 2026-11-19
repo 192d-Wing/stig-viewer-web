@@ -86,6 +86,47 @@ test.describe("Deep /api/health", () => {
     expect(typeof body.checks.webhooks.status).toBe("string");
     expect(typeof body.checks.webhooks.deliveries24h).toBe("number");
     expect(typeof body.checks.webhooks.errors24h).toBe("number");
+
+    // In-process failure counters: public status only. Counts and
+    // timestamps are admin-only (see the admin test below).
+    expect(["ok", "degraded"]).toContain(body.checks.audit.status);
+    expect(["ok", "degraded"]).toContain(body.checks.loginAckPrune.status);
+    expect(Object.keys(body.checks.audit)).toEqual(["status"]);
+    expect(Object.keys(body.checks.loginAckPrune)).toEqual(["status"]);
+  });
+
+  test("API: failure counters are admin-only and carry the numbers", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await ensureUser(request, "bob");
+    await setUserRole("alice", "admin");
+    await setUserRole("bob", "author");
+
+    const denied = await request.get(`${BACKEND}/api/admin/failure-counters`, {
+      headers: { "X-User-Id": "bob" },
+    });
+    expect(denied.status()).toBe(403);
+
+    const res = await request.get(`${BACKEND}/api/admin/failure-counters`, {
+      headers: { "X-User-Id": "alice" },
+    });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(typeof body.audit.writeFailures).toBe("number");
+    expect(typeof body.loginAckPrune.failures).toBe("number");
+    expect(typeof body.loginAckPrune.consecutiveFailures).toBe("number");
+
+    // The prune loop ticks at startup; poll to avoid a startup race. This
+    // assumes a healthy e2e database (a failing tick never records success).
+    await expect
+      .poll(async () => {
+        const r = await request.get(`${BACKEND}/api/admin/failure-counters`, {
+          headers: { "X-User-Id": "alice" },
+        });
+        return typeof (await r.json()).loginAckPrune.lastSuccessAt;
+      })
+      .toBe("string");
   });
 
   test("API: works with no auth headers at all (public endpoint)", async ({

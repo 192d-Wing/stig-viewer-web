@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use crate::api::request_ctx::RequestCtx;
+use crate::failure_counters::{FailureCounter, AUDIT_WRITES};
 
 /// At most this many rejected rules are listed in an event's `detail`.
 pub const MAX_REJECTED_LISTED: usize = 100;
@@ -302,12 +303,35 @@ async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
 }
 
 /// Record an event without ever failing the caller. The request has already
-/// been (or is about to be) answered, so a failure is logged at error level
-/// and otherwise ignored; the structured `tracing` line stays as the fallback
-/// record. If the insert fails, it is retried once with the same columns and a
-/// constant `detail`, so no content-dependent failure (for example text that
+/// been (or is about to be) answered, so a failure is logged at error level,
+/// counted in [`AUDIT_WRITES`] (status on `/api/health`, numbers on the
+/// admin-only `/api/admin/failure-counters`) and otherwise ignored; the
+/// structured `tracing` line stays as the fallback record. If the insert
+/// fails, it is retried once with the same columns and a constant `detail`, so no content-dependent failure (for example text that
 /// jsonb rejects) can suppress the row. Both attempts share [`WRITE_TIMEOUT`].
 pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
+    record_counted(pool, ev, &AUDIT_WRITES).await;
+}
+
+/// Await `attempt` for at most `limit`. Success resets `counter`'s failure
+/// streak and returns `None`; a failure or timeout returns its description
+/// (the caller logs it, then calls `counter.record_failure()`).
+async fn bounded_attempt(
+    attempt: impl std::future::Future<Output = Result<()>>,
+    counter: &FailureCounter,
+    limit: std::time::Duration,
+) -> Option<String> {
+    match tokio::time::timeout(limit, attempt).await {
+        Ok(Ok(())) => {
+            counter.record_success();
+            None
+        }
+        Ok(Err(e)) => Some(format!("{e:#}")),
+        Err(_) => Some(format!("timed out after {limit:?}")),
+    }
+}
+
+async fn record_counted(pool: &PgPool, ev: NewAuditEvent<'_>, counter: &FailureCounter) {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
     if let Some(ctx) = ev.ctx {
         ctx.audited
@@ -328,10 +352,8 @@ pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
         }
         Ok::<(), anyhow::Error>(())
     };
-    let failure = match tokio::time::timeout(WRITE_TIMEOUT, attempt).await {
-        Ok(Ok(())) => return,
-        Ok(Err(e)) => format!("{e:#}"),
-        Err(_) => format!("timed out after {WRITE_TIMEOUT:?}"),
+    let Some(failure) = bounded_attempt(attempt, counter, WRITE_TIMEOUT).await else {
+        return;
     };
     // Ids only: enough to reconstruct the record, no detail content.
     tracing::error!(
@@ -345,6 +367,7 @@ pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
         stig_id = ids.stig_id.as_deref(),
         "failed to write audit event: {failure}"
     );
+    counter.record_failure();
 }
 
 /// A rule id made safe for an audit `detail`: truncated to 64 characters and
@@ -835,6 +858,52 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
         assert!(record_event(&pool, &ev("ok", json!({}))).await.is_err());
+        // Wiring check only: `record_or_log` feeds the shared static (other
+        // tests add to it too, so no exact value).
+        assert!(AUDIT_WRITES.snapshot().total >= 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn record_counted_counts_failure_then_resets_streak_on_success(pool: PgPool) {
+        let c = FailureCounter::new();
+        record_counted(&pool, ev("ok", json!({})), &c).await;
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
+        seed_user(&pool, "u1").await;
+        record_counted(&pool, ev("ok", json!({})), &c).await;
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn bounded_attempt_resets_streak_on_success_and_reports_failures() {
+        let c = FailureCounter::new();
+        let limit = std::time::Duration::from_millis(50);
+        c.record_failure();
+        c.record_failure();
+        assert!(bounded_attempt(async { Ok(()) }, &c, limit).await.is_none());
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (2, 0));
+        assert!(s.last_success_at.is_some());
+        let err = bounded_attempt(async { Err(anyhow::anyhow!("boom")) }, &c, limit).await;
+        assert_eq!(err.as_deref(), Some("boom"));
+        let hung = bounded_attempt(std::future::pending::<Result<()>>(), &c, limit).await;
+        assert!(hung.is_some_and(|m| m.starts_with("timed out")));
+        // The caller, not the helper, records failures.
+        assert_eq!(c.snapshot().total, 2);
+    }
+
+    #[tokio::test]
+    async fn record_counted_counts_an_unreachable_database() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy(&format!("postgres://{}@127.0.0.1:1/x", "u"))
+            .expect("lazy pool");
+        let c = FailureCounter::new();
+        record_counted(&pool, ev("ok", json!({})), &c).await;
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
     }
 
     #[test]
