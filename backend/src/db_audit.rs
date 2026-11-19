@@ -579,7 +579,9 @@ impl WriteQueue {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
         // Plain counters: a poisoned lock still holds a usable state.
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Reserve a slot against every cap at once, or say which cap refused.
