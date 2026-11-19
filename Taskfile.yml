@@ -151,6 +151,8 @@ tasks:
       DB_IMAGE: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
     cmds:
       - defer: '{{.ENGINE}} rm -f {{.DB_NAME}} >/dev/null 2>&1 || true'
+      # The tests need the superuser (ALTER DATABASE flag, CREATE ROLE and
+      # SET ROLE for the restricted-role tests), so keep the image superuser here.
       # Never point this at the dev database: sqlx::test creates and drops
       # _sqlx_test_* databases on whatever server DATABASE_URL names. The
       # container is ephemeral, test-only and loopback-only, and gets a password

@@ -24,6 +24,9 @@ pub struct Config {
     pub port: u16,
     /// PostgreSQL connection URL.
     pub database_url: String,
+    /// `DATABASE_MIGRATION_URL`: optional owner-role URL used only to run
+    /// migrations and apply the app role's grants. Never logged.
+    pub database_migration_url: Option<String>,
     /// Root directory for parsed STIG JSON files.
     pub data_dir: PathBuf,
     /// How often the sync scheduler runs (hours).
@@ -49,6 +52,9 @@ impl Config {
                 .context("PORT must be a valid port number")?,
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://stig:stig_local@localhost:5432/stig_viewer".into()),
+            database_migration_url: parse_migration_url(
+                std::env::var("DATABASE_MIGRATION_URL").ok().as_deref(),
+            ),
             data_dir: PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "data".into())),
             sync_interval_hours: std::env::var("STIG_SYNC_INTERVAL_HOURS")
                 .unwrap_or_else(|_| "24".into())
@@ -63,6 +69,13 @@ impl Config {
             seed_dir: parse_seed_dir(std::env::var("STIG_SEED_DIR").ok().as_deref()),
         })
     }
+}
+
+/// `DATABASE_MIGRATION_URL`: unset, empty or whitespace is `None`.
+pub fn parse_migration_url(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// `BACKUP_REQUIRE_SIGNATURE`: `true`/`1`/`yes`, `false`/`0`/`no` (trimmed,
@@ -229,6 +242,17 @@ mod tests {
         }
         // The e2e suite reads these two from the seed.
         assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    #[test]
+    fn migration_url_empty_or_blank_is_none() {
+        assert_eq!(parse_migration_url(None), None);
+        assert_eq!(parse_migration_url(Some("")), None);
+        assert_eq!(parse_migration_url(Some("  \t")), None);
+        assert_eq!(
+            parse_migration_url(Some(" postgres://o@h/d ")),
+            Some("postgres://o@h/d".to_string())
+        );
     }
 
     #[test]
