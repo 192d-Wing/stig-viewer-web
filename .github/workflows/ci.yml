@@ -100,8 +100,42 @@ jobs:
       # tests against the server started above.
       - run: cargo test --locked -- --ignored
 
+  # Decides whether a pull request touches anything e2e exercises. Pushes to
+  # main always run e2e, whatever changed.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.diff.outputs.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Paths whose changes can affect the e2e suite.
+          pattern='^(frontend/|backend/|e2e/|dev/|testdata/|docker-compose\.yml$|Dockerfile\.dev$|playwright\.config\.js$|package(-lock)?\.json$|\.github/workflows/ci\.yml$)'
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -Eq "$pattern"; then
+            echo "app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "app=false" >> "$GITHUB_OUTPUT"
+            echo "No app changes; e2e will be skipped."
+          fi
+
   e2e:
-    needs: [lint-and-build, backend]
+    needs: [lint-and-build, backend, changes]
+    # `changes` is skipped on pushes, so `!cancelled()` stops that skip from
+    # skipping e2e; the build jobs must still have succeeded.
+    if: >-
+      !cancelled()
+      && needs.lint-and-build.result == 'success'
+      && needs.backend.result == 'success'
+      && (github.event_name == 'push' || needs.changes.outputs.app == 'true')
     runs-on: ubuntu-latest
 
     env:
