@@ -19,9 +19,18 @@
 //!   which detects corruption but not deliberate alteration.
 //!
 //! Segments are written to a temp file, fsynced and renamed; a failed write
-//! leaves no partial segment. Archiving is idempotent by row id: ids already
-//! present in that date's verified segments are skipped, so a
-//! retry after a failed delete never duplicates a row.
+//! leaves no partial segment. The sidecar is published BEFORE the segment, so
+//! a visible `.jsonl` always has its complete sidecar and a concurrent scan
+//! can never see it as "sidecar missing". A crash between the two leaves an
+//! orphan `*.manifest.json`, which the scan ignores and the name pick steps
+//! over. Sweeps are also serialized per database by an advisory lock
+//! ([`crate::db_audit::lock_retention_sweep`]); a sweep that cannot get the
+//! lock within five minutes fails and retries on the next tick. If the segment
+//! write fails, the just-written sidecar is removed again.
+//!
+//! Archiving is idempotent by row id: ids already present in that date's
+//! verified segments are skipped, so a retry after a failed delete never
+//! duplicates a row.
 //!
 //! Only a segment that VERIFIES (sidecar present, digest, row count and id
 //! range correct, and a verified signature when a key is configured) counts
@@ -273,6 +282,19 @@ fn write_segment(
     group: &[&ArchiveLine],
     key: Option<&SigningState>,
 ) -> Result<()> {
+    write_segment_with(dir, stream, date, group, key, &|| Ok(()))
+}
+
+/// Sidecar first, then segment; `between` runs after the sidecar is durable
+/// and before the segment is published (test hook).
+fn write_segment_with(
+    dir: &Path,
+    stream: &str,
+    date: &str,
+    group: &[&ArchiveLine],
+    key: Option<&SigningState>,
+    between: &dyn Fn() -> Result<()>,
+) -> Result<()> {
     let (Some(first), Some(last)) = (group.first(), group.last()) else {
         return Ok(());
     };
@@ -289,7 +311,6 @@ fn write_segment(
         n += 1;
         name = format!("{stream}-{date}.{}-{}.r{n}.jsonl", first.id, last.id);
     }
-    write_atomic(dir, &name, &body)?;
     let manifest = SegmentManifest {
         kind: integrity::ARCHIVE_TYPE.into(),
         version: 1,
@@ -311,11 +332,15 @@ fn write_segment(
         &payload,
         key,
     );
-    write_atomic(
-        dir,
-        &format!("{name}.manifest.json"),
-        &serde_json::to_vec_pretty(&envelope)?,
-    )
+    let sidecar = format!("{name}.manifest.json");
+    write_atomic(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?)?;
+    // A failure from here on would leave the sidecar we just published as an
+    // orphan; remove it (safe: we hold the sweep lock and the name is ours).
+    let published = between().and_then(|()| write_atomic(dir, &name, &body));
+    if published.is_err() {
+        let _ = std::fs::remove_file(dir.join(&sidecar));
+    }
+    published
 }
 
 /// Verified archived lines (id -> line digest) per UTC date, for one sweep.
@@ -492,12 +517,59 @@ fn segment_range_any(name: &str) -> Option<(i64, i64)> {
 /// will be archived on the next sweep. We intentionally pin the
 /// DELETE to the exact id set we just read so we never delete a row
 /// we didn't archive.
+///
+/// Sweeps are serialized per database by an advisory lock held for the whole
+/// call (a second sweep waits), so one sweep never scans a segment another is
+/// writing. Segments are written sidecar-first, so even without the lock a
+/// live segment is never seen as missing its sidecar.
 pub async fn run_prune(
     pool: &PgPool,
     data_dir: &Path,
     retain_days: i64,
     archive: bool,
     signing: Option<&SigningState>,
+) -> Result<usize> {
+    run_prune_with(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        signing,
+        crate::db_audit::RETENTION_LOCK_WAIT,
+    )
+    .await
+}
+
+/// Roll back the lock transaction (releasing the lock); a failure is logged.
+async fn release_lock(lock: sqlx::Transaction<'static, sqlx::Postgres>) {
+    if let Err(e) = lock.rollback().await {
+        tracing::warn!(target: "audit", "retention sweep lock rollback failed: {e:#}");
+    }
+}
+
+async fn run_prune_with(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    signing: Option<&SigningState>,
+    lock_wait: std::time::Duration,
+) -> Result<usize> {
+    let mut lock = crate::db_audit::lock_retention_sweep(pool, lock_wait)
+        .await
+        .context("take retention sweep lock")?;
+    let result = prune_rules_locked(pool, data_dir, retain_days, archive, signing, &mut lock).await;
+    release_lock(lock).await;
+    result
+}
+
+async fn prune_rules_locked(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    signing: Option<&SigningState>,
+    lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<usize> {
     // Build the cutoff in Rust rather than embedding `retain_days` in
     // SQL — Postgres rejects negative INTERVAL composed via string
@@ -531,6 +603,7 @@ pub async fn run_prune(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        crate::db_audit::retention_lock_alive(lock).await?;
         archive_rows(
             data_dir,
             STREAM_RULES,
@@ -543,6 +616,7 @@ pub async fn run_prune(
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    crate::db_audit::retention_lock_alive(lock).await?;
     let mut tx = pool.begin().await.context("begin rule_audit prune tx")?;
     crate::db_audit::set_maintenance(&mut tx, "retention")
         .await
@@ -604,6 +678,10 @@ pub async fn run_prune_events(
     .await
 }
 
+/// Test hook run after each committed batch (with the batch number).
+type AfterBatch<'a> =
+    &'a (dyn Fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Sync);
+
 async fn run_prune_events_batched(
     pool: &PgPool,
     data_dir: &Path,
@@ -611,6 +689,57 @@ async fn run_prune_events_batched(
     archive: bool,
     batch: i64,
     signing: Option<&SigningState>,
+) -> Result<usize> {
+    run_prune_events_with(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        batch,
+        signing,
+        &|_| Box::pin(async {}),
+    )
+    .await
+}
+
+async fn run_prune_events_with(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    batch: i64,
+    signing: Option<&SigningState>,
+    after_batch: AfterBatch<'_>,
+) -> Result<usize> {
+    let mut lock =
+        crate::db_audit::lock_retention_sweep(pool, crate::db_audit::RETENTION_LOCK_WAIT)
+            .await
+            .context("take retention sweep lock")?;
+    let result = prune_events_locked(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        batch,
+        signing,
+        &mut lock,
+        after_batch,
+    )
+    .await;
+    release_lock(lock).await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prune_events_locked(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    batch: i64,
+    signing: Option<&SigningState>,
+    lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    after_batch: AfterBatch<'_>,
 ) -> Result<usize> {
     let mut total = 0usize;
     let mut cache = SeenCache::new();
@@ -639,12 +768,14 @@ async fn run_prune_events_batched(
 
         if archive {
             let lines = rows.iter().map(event_line).collect::<Result<Vec<_>>>()?;
+            crate::db_audit::retention_lock_alive(lock).await?;
             archive_rows(data_dir, STREAM_EVENTS, lines, signing, &mut cache)
                 .await
                 .context("write audit events archive segment")?;
         }
 
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        crate::db_audit::retention_lock_alive(lock).await?;
         let mut tx = pool.begin().await.context("begin audit_events prune tx")?;
         crate::db_audit::set_maintenance(&mut tx, "retention")
             .await
@@ -657,6 +788,7 @@ async fn run_prune_events_batched(
             .rows_affected() as usize;
         tx.commit().await.context("commit audit_events prune")?;
         total += deleted;
+        after_batch(total).await;
         if deleted == 0 || (rows.len() as i64) < batch {
             return Ok(total);
         }
@@ -1601,6 +1733,275 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scan_between_sidecar_and_segment_quarantines_nothing() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01"), line(2, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, Some(&k), &|| {
+            archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
+            assert!(rejected(&dir).is_empty());
+            Ok(())
+        })
+        .unwrap();
+        assert!(rejected(&dir).is_empty());
+        let seen = archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
+        assert!(seen.contains_key(&1) && seen.contains_key(&2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_orphan_sidecar_is_ignored_and_the_next_write_takes_an_r_name() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let orphan = ad.join("rules-2024-01-01.1-2.jsonl.manifest.json");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
+            Some(&k),
+            &mut SeenCache::new(),
+        )
+        .unwrap();
+        assert!(rejected(&dir).is_empty());
+        assert_eq!(std::fs::read(&orphan).unwrap(), b"orphan");
+        assert_eq!(segments(&dir), ["rules-2024-01-01.1-2.r1.jsonl"]);
+        assert!(verify_segment(&ad, "rules-2024-01-01.1-2.r1.jsonl", Some(&k)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_sweep_waits_for_the_lock_and_touches_nothing_until_it_is_free(pool: PgPool) {
+        use crate::test_fixtures::app_role_pool;
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'old', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = app_role_pool(&pool, false).await;
+        let k = test_key(1);
+        let dir = temp_dir();
+        let lock =
+            crate::db_audit::lock_retention_sweep(&app.pool, crate::db_audit::RETENTION_LOCK_WAIT)
+                .await
+                .unwrap();
+        let task = {
+            let (p, d, k) = (app.pool.clone(), dir.clone(), k.clone());
+            tokio::spawn(async move { run_prune(&p, &d, 5, true, Some(&k)).await })
+        };
+        let mut waiting = 0i64;
+        for _ in 0..600 {
+            waiting = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            waiting, 1,
+            "the sweep never queued on the advisory lock within 30 s"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(!dir.join("audit_archive").exists());
+        lock.rollback().await.unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        assert!(rejected(&dir).is_empty());
+        for s in segments(&dir) {
+            assert!(verify_segment(&dir.join("audit_archive"), &s, Some(&k)).is_ok());
+        }
+        assert_eq!(segments(&dir).len(), 1);
+        app.cleanup(&pool).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_event_sweeps_lose_no_row_and_reject_no_segment(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for _ in 0..25 {
+            seed_expired_event(&pool, 10).await;
+        }
+        let seeded: Vec<i64> = sqlx::query_scalar("SELECT id FROM audit_events ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        // Serialization itself is shown by the lock-wait test; this one covers
+        // the outcome: no duplicate, no lost row, no quarantined segment.
+        let k = test_key(1);
+        let dir = temp_dir();
+        let (a, b) = tokio::join!(
+            run_prune_events_batched(&pool, &dir, 5, true, 4, Some(&k)),
+            run_prune_events_batched(&pool, &dir, 5, true, 4, Some(&k)),
+        );
+        assert_eq!(a.unwrap() + b.unwrap(), 25);
+        assert!(rejected(&dir).is_empty());
+        let ad = dir.join("audit_archive");
+        let mut ids = Vec::new();
+        for s in segments(&dir) {
+            let v = verify_segment(&ad, &s, Some(&k)).unwrap();
+            assert_eq!(v.status, SignatureStatus::Verified);
+            ids.extend(lines_in(&v.body).unwrap().into_iter().map(|(id, _)| id));
+        }
+        ids.sort();
+        assert_eq!(ids, seeded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_segment_write_removes_the_sidecar_it_just_published() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        let err = write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, None, &|| {
+            assert!(ad.join("rules-2024-01-01.1-1.jsonl.manifest.json").exists());
+            anyhow::bail!("injected write failure")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("injected"));
+        assert!(rejected(&dir).is_empty());
+        assert_eq!(std::fs::read_dir(&ad).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_sweep_gives_up_on_a_held_lock_and_deletes_nothing(pool: PgPool) {
+        use crate::test_fixtures::app_role_pool;
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'old', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = app_role_pool(&pool, false).await;
+        let dir = temp_dir();
+        let lock =
+            crate::db_audit::lock_retention_sweep(&app.pool, crate::db_audit::RETENTION_LOCK_WAIT)
+                .await
+                .unwrap();
+        let err = run_prune_with(
+            &app.pool,
+            &dir,
+            5,
+            true,
+            None,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("another retention sweep holds the lock"),
+            "{err:#}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(!dir.join("audit_archive").exists());
+        lock.rollback().await.unwrap();
+        app.cleanup(&pool).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_lost_lock_stops_the_sweep_with_every_deleted_row_already_archived(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for _ in 0..25 {
+            seed_expired_event(&pool, 10).await;
+        }
+        let seeded: Vec<i64> = sqlx::query_scalar("SELECT id FROM audit_events ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let k = test_key(1);
+        let dir = temp_dir();
+        // After the first committed batch, kill the backend holding the lock.
+        let admin = pool.clone();
+        let hook = move |batch_total: usize| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let admin = admin.clone();
+            Box::pin(async move {
+                if batch_total != 4 {
+                    return;
+                }
+                let pid: i32 = sqlx::query_scalar(
+                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
+                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                )
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                sqlx::query("SELECT pg_terminate_backend($1)")
+                    .bind(pid)
+                    .execute(&admin)
+                    .await
+                    .unwrap();
+                for _ in 0..200 {
+                    let alive: i64 =
+                        sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+                            .bind(pid)
+                            .fetch_one(&admin)
+                            .await
+                            .unwrap();
+                    if alive == 0 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("lock backend {pid} did not terminate");
+            })
+        };
+        let err = run_prune_events_with(&pool, &dir, 5, true, 4, Some(&k), &hook)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("retention sweep lock lost"),
+            "{err:#}"
+        );
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM audit_events ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 21, "only the first batch may be deleted");
+        assert!(rejected(&dir).is_empty());
+        let ad = dir.join("audit_archive");
+        let mut archived = Vec::new();
+        for s in segments(&dir) {
+            let v = verify_segment(&ad, &s, Some(&k)).unwrap();
+            assert_eq!(v.status, SignatureStatus::Verified);
+            archived.extend(lines_in(&v.body).unwrap().into_iter().map(|(id, _)| id));
+        }
+        for id in seeded.iter().filter(|id| !remaining.contains(id)) {
+            assert!(archived.contains(id), "deleted id {id} is not archived");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

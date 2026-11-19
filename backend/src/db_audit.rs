@@ -46,6 +46,64 @@ pub(crate) async fn set_maintenance(
     Ok(())
 }
 
+/// Advisory-lock key serializing audit retention sweeps (ASCII "stigretn").
+/// Per-database; never reuse this value for another lock.
+pub(crate) const RETENTION_SWEEP_LOCK: i64 = 0x7374_6967_7265_746E;
+
+/// How long a sweep waits for the lock before failing (and retrying on the
+/// next scheduler tick).
+pub(crate) const RETENTION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Take the retention-sweep lock, waiting up to `wait` if another sweep holds
+/// it, then failing with "another retention sweep holds the lock". The lock
+/// is transaction-level: it is released when the returned transaction is
+/// committed, rolled back or dropped, or its connection is lost.
+///
+/// Pool budget: the holder pins one of the pool's connections for the whole
+/// sweep and every waiter pins one more while it waits. Never let many sweeps
+/// queue in one process (relevant if a "run now" endpoint is ever added).
+pub(crate) async fn lock_retention_sweep(
+    pool: &PgPool,
+    wait: std::time::Duration,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL idle_in_transaction_session_timeout = 0")
+        .execute(&mut *tx)
+        .await?;
+    // SET cannot take bind parameters; the value is an integer we format.
+    let ms = wait.as_millis().max(1);
+    sqlx::query(&format!("SET LOCAL lock_timeout = {ms}"))
+        .execute(&mut *tx)
+        .await?;
+    if let Err(e) = sqlx::query("SELECT pg_catalog.pg_advisory_xact_lock($1)")
+        .bind(RETENTION_SWEEP_LOCK)
+        .execute(&mut *tx)
+        .await
+    {
+        let timed_out = e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .is_some_and(|c| c == "55P03");
+        if timed_out {
+            anyhow::bail!("another retention sweep holds the lock");
+        }
+        return Err(e.into());
+    }
+    Ok(tx)
+}
+
+/// Confirm the lock transaction's connection is still alive.
+pub(crate) async fn retention_lock_alive(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    use anyhow::Context;
+    sqlx::query("SELECT 1")
+        .execute(&mut **tx)
+        .await
+        .context("retention sweep lock lost")?;
+    Ok(())
+}
+
 /// True when the current database carries `stig.audit_allow_test_mode=on`.
 /// Same predicate as the guard trigger in migration 043; keep them in sync.
 const TEST_FLAG_SQL: &str = "SELECT EXISTS ( \
