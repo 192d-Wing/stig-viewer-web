@@ -13,12 +13,22 @@
 //! `failed to write audit event` error log line (target `audit`), which needs
 //! a log-based alert; these counters are an in-process aid, not AU-5(1)/(2).
 //!
+//! Counting rule for audit writes (`db_audit`): each write runs as a detached
+//! task, so it is counted whether or not the request that submitted it is
+//! cancelled. A success is a success even when it lands after the caller's
+//! 5 s wait (it also adds one to `lateWrites` on the admin endpoint). A
+//! failure is a confirmed error after the retry, the 30 s hard cap, or a
+//! write shed because 64 were already pending. The hard cap is the one case
+//! where a counted failure may still have committed. Alert on the rate of
+//! `writeFailures`; `lateWrites` and `pendingWrites` are early warnings of a
+//! slow pool and do not degrade the public status.
+//!
 //! Limits: counters are per replica and reset on restart; the `tracing` lines
-//! remain the cross-replica signal. A loss that never reaches the counting
-//! point (task aborted before `record_or_log` finishes, process crash) is not
-//! counted. Atomics use `Relaxed` ordering and a snapshot does not read the
-//! fields atomically as a group, so concurrent updates may be observed
-//! slightly out of step with each other.
+//! remain the cross-replica signal. A process crash or kill inside the
+//! shutdown drain window loses pending writes uncounted. Atomics use
+//! `Relaxed` ordering and a snapshot does not read the fields atomically as a
+//! group, so concurrent updates may be observed slightly out of step with each
+//! other.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 

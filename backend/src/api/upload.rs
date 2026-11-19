@@ -114,10 +114,11 @@ fn more_skips_line(total: usize) -> Option<String> {
 /// Entry rows go through `record_or_log`, which collapses identical denied or
 /// rejected rows (same user, entry id, reason code) seen within 300 s into one
 /// row with a larger `repeat_count`. The summary row's `skipped` is the true
-/// count; `skippedAudited` is the number of entry writes attempted before the
-/// cap or `deadline` stopped them (so it may be below the cap). A write
-/// cancelled by the deadline is not counted there; it is counted as a failed
-/// audit write in `AUDIT_WRITES`.
+/// count; `skippedAudited` is the number of entry writes queued (not shed) before the
+/// cap or `deadline` stopped them (so it may be below the cap). Writes are
+/// detached: when the deadline passes, the write in flight is not cancelled
+/// (it finishes and is counted on its own) and no further entry rows are
+/// submitted.
 async fn audit_library_skips(
     state: &AppState,
     user: &AuthUser,
@@ -153,7 +154,7 @@ async fn audit_library_skips(
     let deadline = tokio::time::Instant::now() + deadline;
     let mut attempted = 0usize;
     for skip in skips.iter().take(MAX_SKIPPED_ENTRIES_AUDITED) {
-        let write = crate::db_audit::record_or_log(
+        let write = crate::db_audit::record_or_log_reporting(
             state.pool.as_ref(),
             crate::db_audit::NewAuditEvent {
                 user_id: &user.id,
@@ -169,12 +170,18 @@ async fn audit_library_skips(
                 }),
             },
         );
-        if tokio::time::timeout_at(deadline, write).await.is_err() {
+        // `write` submits on its first poll, so a queued row is in flight
+        // even when the deadline has already passed.
+        let Ok(submission) = tokio::time::timeout_at(deadline, write).await else {
+            // Elapsed, so the write was queued and is still running.
+            attempted += 1;
             tracing::error!(target: "audit", "entry audit deadline reached; stopping entry rows");
-            crate::failure_counters::AUDIT_WRITES.record_failure();
             break;
+        };
+        // A shed write (queue over a cap) wrote no row and is not counted.
+        if submission == crate::db_audit::Submission::Submitted {
+            attempted += 1;
         }
-        attempted += 1;
     }
     let n = skips.len();
     crate::db_audit::record_or_log(
@@ -943,7 +950,6 @@ mod tests {
             })
             .collect();
         let refs: Vec<&LibrarySkip> = skips.iter().collect();
-        let before = crate::failure_counters::AUDIT_WRITES.snapshot().total;
         audit_library_skips(
             &state,
             &user,
@@ -954,6 +960,8 @@ mod tests {
             std::time::Duration::ZERO,
         )
         .await;
+        // The write in flight at the deadline is detached; wait for it.
+        crate::db_audit::drain().await;
         let entries = rows_of(&pool, "catalog.import_library_entry").await;
         assert!(entries.len() < 5, "{}", entries.len());
         let summary = rows_of(&pool, "catalog.import_library").await;
@@ -961,7 +969,6 @@ mod tests {
         let d = &summary[0].2;
         assert_eq!(d["skipped"], 5);
         assert!(d["skippedAudited"].as_u64().unwrap() < 5, "{d}");
-        assert!(crate::failure_counters::AUDIT_WRITES.snapshot().total > before);
     }
 
     #[sqlx::test]

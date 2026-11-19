@@ -298,6 +298,7 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
             seed_dir: None,
         }),
         signing: None,
+        tasks: crate::detached::Tracker::new(),
     };
     (state, guard)
 }
@@ -345,6 +346,7 @@ pub fn lazy_state() -> (AppState, StigDir) {
             seed_dir: None,
         }),
         signing: None,
+        tasks: crate::detached::Tracker::new(),
     };
     (state, StigDir(dir))
 }

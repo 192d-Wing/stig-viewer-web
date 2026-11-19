@@ -114,6 +114,9 @@ test.describe("Deep /api/health", () => {
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(typeof body.audit.writeFailures).toBe("number");
+    expect(typeof body.audit.lateWrites).toBe("number");
+    expect(typeof body.audit.pendingWrites).toBe("number");
+    expect(typeof body.audit.shedWrites).toBe("number");
     expect(typeof body.loginAckPrune.failures).toBe("number");
     expect(typeof body.loginAckPrune.consecutiveFailures).toBe("number");
 

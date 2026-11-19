@@ -10,10 +10,30 @@
 //! System-originated events (no acting user, for example a scheduled DISA
 //! download stopped by its size cap) are written by [`record_system_or_log`]
 //! with a NULL `user_id` and `user_role = 'system'` (migration 045).
+//!
+//! Writes are detached tasks in a bounded queue ([`WriteQueue`]): at most
+//! [`MAX_PENDING_WRITES`] (64) pending in all, of which at most
+//! [`MAX_DENIED_PENDING`] (16) `denied`/`rejected` events (so a flood of
+//! denials sheds first and cannot take slots from other events, which always
+//! have at least 48), and at most [`MAX_USER_DENIED_PENDING`] (4)
+//! denied/rejected ones per acting user. Other events have no per-user cap, so
+//! a user inside the request rate limit never loses its own events. A write over
+//! a cap is shed and no row is written. There are three shed reasons: total
+//! and shared denied share (each logs an ids-only error line and counts as a
+//! failure), and the per-user denied sub-cap (counted in `shedWrites` only, not
+//! a failure: one account must not be able to degrade public health; it logs at
+//! most once per user per 60 s, with a summary of the held-back ones). Every
+//! shed counts in `shedWrites`. Alert on the `shedWrites` rate and the
+//! failure counter, not only on the public status. The caps are checked and
+//! taken atomically.
+
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::Notify;
 
 use crate::api::request_ctx::RequestCtx;
 use crate::failure_counters::{FailureCounter, AUDIT_WRITES};
@@ -182,9 +202,15 @@ pub(crate) async fn apply_test_maintenance_policy(
     check_test_maintenance_flag(false, test_maintenance_allowed(pool).await?)
 }
 
-/// Upper bound on one audit write (both attempts of [`record_or_log`]), so a
-/// busy pool cannot hold the response for the pool's acquire timeout.
+/// How long a caller waits for its audit write (see [`submit`]), so a busy
+/// pool cannot hold the response for the pool's acquire timeout. The write
+/// itself is not cancelled at this point; it continues up to
+/// [`HARD_WRITE_TIMEOUT`].
 pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on the write task itself (both attempts of [`record_or_log`]).
+/// Longer than the shutdown drain (`SHUTDOWN_DRAIN` in `main.rs`) on purpose.
+pub const HARD_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest id kept in an id column (and its log lines).
 pub const MAX_ID_CHARS: usize = 128;
@@ -293,8 +319,8 @@ pub const COLLAPSE_WINDOW_SECS: i64 = 300;
 /// request's `request_id`, `source_ip` and `detail`. Returns whether a row was
 /// updated. Not atomic with the insert that follows a miss: a race yields at
 /// worst two rows.
-async fn collapse(
-    pool: &PgPool,
+async fn collapse<'e, E: sqlx::PgExecutor<'e>>(
+    pool: E,
     ev: &NewAuditEvent<'_>,
     ids: &BoundedIds,
     detail: &Value,
@@ -343,22 +369,550 @@ async fn record_event(pool: &PgPool, ev: &NewAuditEvent<'_>) -> Result<()> {
 /// admin-only `/api/admin/failure-counters`) and otherwise ignored; the
 /// structured `tracing` line stays as the fallback record. If the insert
 /// fails, it is retried once with the same columns and a constant `detail`, so no content-dependent failure (for example text that
-/// jsonb rejects) can suppress the row. Both attempts share [`WRITE_TIMEOUT`].
+/// jsonb rejects) can suppress the row. Both attempts share [`HARD_WRITE_TIMEOUT`].
+///
+/// The write runs as a detached task (see [`submit`]): the caller waits for it
+/// at most [`WRITE_TIMEOUT`], and dropping the caller's future (client abort)
+/// does not cancel it.
 pub async fn record_or_log(pool: &PgPool, ev: NewAuditEvent<'_>) {
-    record_counted(pool, ev, &AUDIT_WRITES).await;
+    record_counted(pool, ev, &GLOBAL_QUEUE, LIMITS).await;
+}
+
+/// [`record_or_log`], reporting whether the write was queued or shed.
+pub async fn record_or_log_reporting(pool: &PgPool, ev: NewAuditEvent<'_>) -> Submission {
+    record_counted(pool, ev, &GLOBAL_QUEUE, LIMITS).await
 }
 
 /// Record a system-originated event without ever failing the caller. Same
-/// guarantees as [`record_or_log`] (bounded by [`WRITE_TIMEOUT`], counted in
-/// [`AUDIT_WRITES`], retried once without `detail`) but no collapse: every
-/// call is its own row.
+/// guarantees as [`record_or_log`] (detached, caller waits at most
+/// [`WRITE_TIMEOUT`], counted in [`AUDIT_WRITES`], retried once without
+/// `detail`) but no collapse: every call is its own row.
 pub async fn record_system_or_log(pool: &PgPool, ev: NewSystemEvent<'_>) {
-    record_system_counted(pool, ev, &AUDIT_WRITES).await;
+    record_system_counted(pool, ev, &GLOBAL_QUEUE, LIMITS).await;
 }
 
-async fn record_system_counted(pool: &PgPool, ev: NewSystemEvent<'_>, counter: &FailureCounter) {
+/// Pending audit writes at which new ones are shed instead of queued. The
+/// pool has at most 5 connections (`db.rs`); waiting tasks hold none.
+pub const MAX_PENDING_WRITES: u32 = 64;
+
+/// Of those, how many may be `denied`/`rejected` events (a client can trigger
+/// these at will, so they shed first).
+pub const MAX_DENIED_PENDING: u32 = 16;
+
+/// `denied`/`rejected` pending writes allowed for one acting user, so one
+/// account cannot fill the shared denied share alone. Other events have no
+/// per-user cap.
+pub const MAX_USER_DENIED_PENDING: u32 = 4;
+
+/// Bound on getting a pooled connection inside the write task, shorter than
+/// the pool's own 30 s acquire timeout so slots recycle faster when the pool
+/// is stalled.
+pub const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The two waits around one detached audit write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// How long the caller waits for the write before moving on.
+    pub wait: std::time::Duration,
+    /// Hard cap on the write itself (both attempts).
+    pub hard: std::time::Duration,
+}
+
+const LIMITS: Limits = Limits {
+    wait: WRITE_TIMEOUT,
+    hard: HARD_WRITE_TIMEOUT,
+};
+
+/// Bounded queue of detached audit writes plus the counters they report to.
+///
+/// Counting rule: a write that succeeds is a success, even when it finishes
+/// after the caller stopped waiting (that also adds one to `late`). A failure
+/// is a confirmed error after the retry, the [`HARD_WRITE_TIMEOUT`] cap, or a
+/// write shed because [`MAX_PENDING_WRITES`] were already pending. A caller
+/// that is dropped has no effect on counting.
+pub(crate) struct WriteQueue {
+    counter: &'static FailureCounter,
+    late: AtomicU64,
+    shed: AtomicU64,
+    state: Mutex<QueueState>,
+    idle: Notify,
+    cap: u32,
+    denied_cap: u32,
+    user_denied_cap: u32,
+}
+
+/// Pending counts, all behind one lock so a reservation checks and takes
+/// every cap atomically.
+struct QueueState {
+    pending: u32,
+    denied: u32,
+    /// Pending counts per acting user (at most `cap` entries).
+    users: Vec<UserPending>,
+    /// Log rate-limit state for per-user restricted sheds (at most
+    /// [`MAX_NOISY_USERS`] entries, oldest evicted).
+    noisy: Vec<Noisy>,
+}
+
+struct UserPending {
+    user: String,
+    /// Restricted (`denied`/`rejected`) pending writes (against `user_denied_cap`).
+    denied: u32,
+}
+
+struct Noisy {
+    user: String,
+    last_logged: std::time::Instant,
+    suppressed: u64,
+}
+
+/// Distinct users tracked for shed-log rate limiting.
+const MAX_NOISY_USERS: usize = 32;
+
+/// At most one per-user restricted-shed log line per user per this window.
+const SHED_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl QueueState {
+    /// Decide whether a per-user restricted shed for `user` logs now.
+    /// `Some(n)`: log it, plus a summary if `n > 0` earlier ones were held
+    /// back. `None`: held back (counted in the next summary).
+    fn shed_log_due(&mut self, user: &str, now: std::time::Instant) -> Option<u64> {
+        if let Some(n) = self.noisy.iter_mut().find(|n| n.user == user) {
+            if now.saturating_duration_since(n.last_logged) >= SHED_LOG_WINDOW {
+                n.last_logged = now;
+                return Some(std::mem::take(&mut n.suppressed));
+            }
+            n.suppressed += 1;
+            return None;
+        }
+        if self.noisy.len() >= MAX_NOISY_USERS {
+            self.noisy.remove(0);
+        }
+        self.noisy.push(Noisy {
+            user: user.to_owned(),
+            last_logged: now,
+            suppressed: 0,
+        });
+        Some(0)
+    }
+}
+
+/// What a write counts against besides the total.
+struct Reserve {
+    /// Acting user; `None` (system events) is exempt from the per-user denied sub-cap.
+    user: Option<String>,
+    /// A `denied`/`rejected` event, subject to the denied sub-cap.
+    restricted: bool,
+}
+
+/// Why a write was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShedReason {
+    Full,
+    DeniedShare,
+    /// One user's `denied`/`rejected` sub-cap: counted in `shedWrites` only.
+    UserDenied,
+}
+
+/// Result of [`record_or_log_reporting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submission {
+    /// The write was queued (it may still have failed or be late).
+    Submitted,
+    /// A cap was hit: no row will be written.
+    Shed,
+}
+
+/// One pending slot in a [`WriteQueue`], released when dropped.
+struct Slot {
+    queue: &'static WriteQueue,
+    reserve: Reserve,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let empty = {
+            let mut st = self.queue.lock();
+            st.pending = st.pending.saturating_sub(1);
+            if self.reserve.restricted {
+                st.denied = st.denied.saturating_sub(1);
+            }
+            if let (true, Some(u)) = (self.reserve.restricted, &self.reserve.user) {
+                if let Some(i) = st.users.iter().position(|e| &e.user == u) {
+                    let e = &mut st.users[i];
+                    e.denied = e.denied.saturating_sub(1);
+                    if e.denied == 0 {
+                        st.users.swap_remove(i);
+                    }
+                }
+            }
+            st.pending == 0
+        };
+        if empty {
+            self.queue.idle.notify_waiters();
+        }
+    }
+}
+
+impl WriteQueue {
+    pub(crate) const fn new(
+        counter: &'static FailureCounter,
+        cap: u32,
+        denied_cap: u32,
+        user_denied_cap: u32,
+    ) -> Self {
+        Self {
+            counter,
+            late: AtomicU64::new(0),
+            shed: AtomicU64::new(0),
+            state: Mutex::new(QueueState {
+                pending: 0,
+                denied: 0,
+                users: Vec::new(),
+                noisy: Vec::new(),
+            }),
+            idle: Notify::const_new(),
+            cap,
+            denied_cap,
+            user_denied_cap,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        // Plain counters: a poisoned lock still holds a usable state.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Reserve a slot against every cap at once, or say which cap refused.
+    fn try_reserve(&'static self, reserve: Reserve) -> Result<Slot, ShedReason> {
+        let mut st = self.lock();
+        if st.pending >= self.cap {
+            return Err(ShedReason::Full);
+        }
+        if reserve.restricted {
+            let idx = reserve
+                .user
+                .as_ref()
+                .and_then(|u| st.users.iter().position(|e| &e.user == u));
+            let denied = idx.map_or(0, |i| st.users[i].denied);
+            // Own sub-cap first: a flooder is shed by its own limit.
+            if reserve.user.is_some() && denied >= self.user_denied_cap {
+                return Err(ShedReason::UserDenied);
+            }
+            if st.denied >= self.denied_cap {
+                return Err(ShedReason::DeniedShare);
+            }
+            if let Some(u) = &reserve.user {
+                match idx {
+                    Some(i) => st.users[i].denied += 1,
+                    None => st.users.push(UserPending {
+                        user: u.clone(),
+                        denied: 1,
+                    }),
+                }
+            }
+        }
+        st.pending += 1;
+        if reserve.restricted {
+            st.denied += 1;
+        }
+        drop(st);
+        Ok(Slot {
+            queue: self,
+            reserve,
+        })
+    }
+
+    /// Writes that finished successfully after their caller stopped waiting.
+    pub(crate) fn late_writes(&self) -> u64 {
+        self.late.load(Ordering::Relaxed)
+    }
+
+    /// Writes refused because a cap was reached (also counted as failures).
+    pub(crate) fn shed_writes(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
+    /// Writes submitted and not yet finished.
+    pub(crate) fn pending(&self) -> u64 {
+        u64::from(self.lock().pending)
+    }
+
+    /// Wait until no write is pending (and so every one has been counted).
+    /// Does not block new submissions.
+    pub(crate) async fn drain(&self) {
+        loop {
+            // Register before checking so a wakeup between the two is kept.
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pending() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+static GLOBAL_QUEUE: WriteQueue = WriteQueue::new(
+    &AUDIT_WRITES,
+    MAX_PENDING_WRITES,
+    MAX_DENIED_PENDING,
+    MAX_USER_DENIED_PENDING,
+);
+
+/// Wait for every pending audit write (shutdown).
+pub(crate) async fn drain() {
+    GLOBAL_QUEUE.drain().await;
+}
+
+/// `(lateWrites, pendingWrites, shedWrites)` of the process-wide audit queue.
+pub(crate) fn write_stats() -> (u64, u64, u64) {
+    (
+        GLOBAL_QUEUE.late_writes(),
+        GLOBAL_QUEUE.pending(),
+        GLOBAL_QUEUE.shed_writes(),
+    )
+}
+
+/// Owned, ids-only fields for log lines about one write.
+struct LogFields {
+    user_id: String,
+    action: &'static str,
+    outcome: &'static str,
+    request_id: Option<String>,
+    asset_id: Option<String>,
+    checklist_id: Option<String>,
+    stig_id: Option<String>,
+}
+
+impl LogFields {
+    fn error(&self, what: &str) {
+        tracing::error!(
+            target: "audit",
+            user_id = self.user_id,
+            action = self.action,
+            outcome = self.outcome,
+            request_id = self.request_id.as_deref(),
+            asset_id = self.asset_id.as_deref(),
+            checklist_id = self.checklist_id.as_deref(),
+            stig_id = self.stig_id.as_deref(),
+            "failed to write audit event: {what}"
+        );
+    }
+
+    fn warn_late(&self, wait: std::time::Duration) {
+        tracing::warn!(
+            target: "audit",
+            user_id = self.user_id,
+            action = self.action,
+            outcome = self.outcome,
+            request_id = self.request_id.as_deref(),
+            asset_id = self.asset_id.as_deref(),
+            checklist_id = self.checklist_id.as_deref(),
+            stig_id = self.stig_id.as_deref(),
+            "audit write still pending after {wait:?}; caller stopped waiting, write continues"
+        );
+    }
+}
+
+/// Counts a failure if the write task ends without reporting an outcome
+/// (a panic, or the runtime shutting down).
+struct OutcomeGuard<'a> {
+    queue: &'static WriteQueue,
+    log: &'a LogFields,
+    reported: bool,
+}
+
+impl Drop for OutcomeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.log.error("write task ended without finishing");
+            self.queue.counter.record_failure();
+        }
+    }
+}
+
+/// Run `write` as a task the caller cannot cancel, and wait for it at most
+/// `limits.wait`.
+///
+/// Before its first await this function either sheds (a cap is reached: ids-only error line, one failure and one
+/// shed counted, nothing spawned) or spawns the task. So `x.await` and `timeout_at(deadline, x)` both
+/// submit the write on first poll, before any point where the caller can be
+/// cancelled. Callers must poll it at least once; dropping the future after
+/// that leaves the write running.
+///
+/// Outcomes, all counted by the task itself: success is a success (plus
+/// `late` when the caller had already stopped waiting); an error after the
+/// retry, or `limits.hard` elapsing, is a failure. The hard cap is the one
+/// case where a counted failure may still have committed: dropping an
+/// in-flight sqlx query does not cancel it server-side.
+///
+/// Ordering: a late row is stamped by the database at insert, so
+/// `occurred_at` can trail the request by up to the hard cap.
+async fn submit(
+    queue: &'static WriteQueue,
+    limits: Limits,
+    log: LogFields,
+    reserve: Reserve,
+    write: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> Submission {
+    let slot = match queue.try_reserve(reserve) {
+        Ok(slot) => slot,
+        Err(why) => {
+            let what = match why {
+                ShedReason::Full => format!("shed: {} audit writes already pending", queue.cap),
+                ShedReason::DeniedShare => format!(
+                    "shed: {} denied/rejected audit writes already pending",
+                    queue.denied_cap
+                ),
+                ShedReason::UserDenied => format!(
+                    "shed: {} denied/rejected audit writes already pending for this user",
+                    queue.user_denied_cap
+                ),
+            };
+            queue.shed.fetch_add(1, Ordering::Relaxed);
+            if why == ShedReason::UserDenied {
+                // Not a failure: one account must not be able to degrade
+                // public health. Logs are rate limited per user.
+                let due = queue
+                    .lock()
+                    .shed_log_due(&log.user_id, std::time::Instant::now());
+                if let Some(held_back) = due {
+                    log.error(&what);
+                    if held_back > 0 {
+                        tracing::error!(
+                            target: "audit",
+                            user_id = log.user_id,
+                            "{held_back} more denied events shed for this user"
+                        );
+                    }
+                }
+            } else {
+                log.error(&what);
+                queue.counter.record_failure();
+            }
+            return Submission::Shed;
+        }
+    };
+    let log = Arc::new(log);
+    let task_log = Arc::clone(&log);
+    // Exactly one side decides on-time vs late, by compare_exchange from WAITING.
+    let state = Arc::new(AtomicU8::new(WAITING));
+    let task_state = Arc::clone(&state);
+    let hard = limits.hard;
+    let handle = tokio::spawn(async move {
+        let _slot = slot;
+        let mut guard = OutcomeGuard {
+            queue,
+            log: &task_log,
+            reported: false,
+        };
+        match tokio::time::timeout(hard, write).await {
+            Ok(Ok(())) => {
+                queue.counter.record_success();
+                if task_state
+                    .compare_exchange(WAITING, ON_TIME, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    queue.late.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(Err(e)) => {
+                task_log.error(&format!("{e:#}"));
+                queue.counter.record_failure();
+            }
+            Err(_) => {
+                task_log.error(&format!("timed out after {hard:?}"));
+                queue.counter.record_failure();
+            }
+        }
+        guard.reported = true;
+    });
+    if tokio::time::timeout(limits.wait, handle).await.is_err()
+        && state
+            .compare_exchange(WAITING, LATE, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        log.warn_late(limits.wait);
+    }
+    Submission::Submitted
+}
+
+const WAITING: u8 = 0;
+const ON_TIME: u8 = 1;
+const LATE: u8 = 2;
+
+/// An audit event with every borrowed field owned, so it can move into a
+/// detached task.
+struct OwnedEvent {
+    user_id: String,
+    action: &'static str,
+    outcome: &'static str,
+    asset_id: Option<String>,
+    checklist_id: Option<String>,
+    stig_id: Option<String>,
+    detail: Value,
+    ctx: Option<RequestCtx>,
+}
+
+impl OwnedEvent {
+    fn from(ev: NewAuditEvent<'_>) -> Self {
+        Self {
+            user_id: ev.user_id.to_owned(),
+            action: ev.action,
+            outcome: ev.outcome,
+            asset_id: ev.asset_id.map(str::to_owned),
+            checklist_id: ev.checklist_id.map(str::to_owned),
+            stig_id: ev.stig_id.map(str::to_owned),
+            detail: ev.detail,
+            ctx: ev.ctx.cloned(),
+        }
+    }
+}
+
+/// A pooled connection within [`ACQUIRE_TIMEOUT`].
+async fn acquire(pool: &PgPool) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    match tokio::time::timeout(ACQUIRE_TIMEOUT, pool.acquire()).await {
+        Ok(conn) => Ok(conn?),
+        Err(_) => anyhow::bail!("no database connection after {ACQUIRE_TIMEOUT:?}"),
+    }
+}
+
+/// Collapse, insert and the `detailDropped` retry for one user event.
+async fn write_user_event(pool: &PgPool, owned: &OwnedEvent, ids: &BoundedIds) -> Result<()> {
+    let mut conn = acquire(pool).await?;
+    let ev = NewAuditEvent {
+        user_id: &owned.user_id,
+        action: owned.action,
+        outcome: owned.outcome,
+        asset_id: owned.asset_id.as_deref(),
+        checklist_id: owned.checklist_id.as_deref(),
+        stig_id: owned.stig_id.as_deref(),
+        detail: Value::Null,
+        ctx: owned.ctx.as_ref(),
+    };
+    match collapse(&mut *conn, &ev, ids, &owned.detail).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(target: "audit", action = ev.action, "audit event collapse failed, inserting: {e:#}")
+        }
+    }
+    if let Err(first) = insert(&mut *conn, &ev, ids, &owned.detail).await {
+        tracing::warn!(target: "audit", action = ev.action, "audit event insert failed, retrying without detail: {first:#}");
+        insert(&mut *conn, &ev, ids, &json!({ "detailDropped": true })).await?;
+    }
+    Ok(())
+}
+
+async fn record_system_counted(
+    pool: &PgPool,
+    ev: NewSystemEvent<'_>,
+    queue: &'static WriteQueue,
+    limits: Limits,
+) {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
-    // Reuse the column bounding and insert of user events; user_id is unused.
+    // Reuse the column bounding of user events; user_id is unused.
     let shell = NewAuditEvent {
         user_id: "",
         action: ev.action,
@@ -366,16 +920,38 @@ async fn record_system_counted(pool: &PgPool, ev: NewSystemEvent<'_>, counter: &
         asset_id: None,
         checklist_id: None,
         stig_id: ev.stig_id,
-        detail: ev.detail,
+        detail: Value::Null,
         ctx: None,
     };
     let ids = bounded(&shell);
-    let role = || Some("system".to_string());
-    let attempt = async {
-        if let Err(first) = insert_row(pool, None, role(), &shell, &ids, &shell.detail).await {
-            tracing::warn!(target: "audit", action = shell.action, "system audit event insert failed, retrying without detail: {first:#}");
+    let log = LogFields {
+        user_id: "system".to_owned(),
+        action: ev.action,
+        outcome: ev.outcome,
+        request_id: None,
+        asset_id: None,
+        checklist_id: None,
+        stig_id: ids.stig_id.clone(),
+    };
+    let (action, outcome, detail) = (ev.action, ev.outcome, ev.detail);
+    let pool = pool.clone();
+    let write = async move {
+        let shell = NewAuditEvent {
+            user_id: "",
+            action,
+            outcome,
+            asset_id: None,
+            checklist_id: None,
+            stig_id: ids.stig_id.as_deref(),
+            detail: Value::Null,
+            ctx: None,
+        };
+        let role = || Some("system".to_string());
+        let mut conn = acquire(&pool).await?;
+        if let Err(first) = insert_row(&mut *conn, None, role(), &shell, &ids, &detail).await {
+            tracing::warn!(target: "audit", action, "system audit event insert failed, retrying without detail: {first:#}");
             insert_row(
-                pool,
+                &mut *conn,
                 None,
                 role(),
                 &shell,
@@ -386,75 +962,46 @@ async fn record_system_counted(pool: &PgPool, ev: NewSystemEvent<'_>, counter: &
         }
         Ok::<(), anyhow::Error>(())
     };
-    let Some(failure) = bounded_attempt(attempt, counter, WRITE_TIMEOUT).await else {
-        return;
+    let reserve = Reserve {
+        user: None,
+        restricted: false,
     };
-    tracing::error!(
-        target: "audit",
-        user_id = "system",
-        action = shell.action,
-        outcome = shell.outcome,
-        stig_id = ids.stig_id.as_deref(),
-        "failed to write audit event: {failure}"
-    );
-    counter.record_failure();
+    submit(queue, limits, log, reserve, write).await;
 }
 
-/// Await `attempt` for at most `limit`. Success resets `counter`'s failure
-/// streak and returns `None`; a failure or timeout returns its description
-/// (the caller logs it, then calls `counter.record_failure()`).
-async fn bounded_attempt(
-    attempt: impl std::future::Future<Output = Result<()>>,
-    counter: &FailureCounter,
-    limit: std::time::Duration,
-) -> Option<String> {
-    match tokio::time::timeout(limit, attempt).await {
-        Ok(Ok(())) => {
-            counter.record_success();
-            None
-        }
-        Ok(Err(e)) => Some(format!("{e:#}")),
-        Err(_) => Some(format!("timed out after {limit:?}")),
-    }
-}
-
-async fn record_counted(pool: &PgPool, ev: NewAuditEvent<'_>, counter: &FailureCounter) {
+async fn record_counted(
+    pool: &PgPool,
+    ev: NewAuditEvent<'_>,
+    queue: &'static WriteQueue,
+    limits: Limits,
+) -> Submission {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
+    // Synchronous, before any await: `authz_audit` reads this flag.
     if let Some(ctx) = ev.ctx {
         ctx.audited
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let ids = bounded(&ev);
-    let attempt = async {
-        match collapse(pool, &ev, &ids, &ev.detail).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(target: "audit", action = ev.action, "audit event collapse failed, inserting: {e:#}")
-            }
-        }
-        if let Err(first) = insert(pool, &ev, &ids, &ev.detail).await {
-            tracing::warn!(target: "audit", action = ev.action, "audit event insert failed, retrying without detail: {first:#}");
-            insert(pool, &ev, &ids, &json!({ "detailDropped": true })).await?;
-        }
-        Ok::<(), anyhow::Error>(())
+    // Ids only in logs: enough to reconstruct the record, no detail content.
+    let log = LogFields {
+        user_id: ev.user_id.to_owned(),
+        action: ev.action,
+        outcome: ev.outcome,
+        request_id: ev.ctx.map(|c| c.request_id.clone()),
+        asset_id: ids.asset_id.clone(),
+        checklist_id: ids.checklist_id.clone(),
+        stig_id: ids.stig_id.clone(),
     };
-    let Some(failure) = bounded_attempt(attempt, counter, WRITE_TIMEOUT).await else {
-        return;
+    let reserve = Reserve {
+        user: Some(ev.user_id.to_owned()),
+        restricted: matches!(ev.outcome, "denied" | "rejected"),
     };
-    // Ids only: enough to reconstruct the record, no detail content.
-    tracing::error!(
-        target: "audit",
-        user_id = ev.user_id,
-        action = ev.action,
-        outcome = ev.outcome,
-        request_id = ev.ctx.map(|c| c.request_id.as_str()),
-        asset_id = ids.asset_id.as_deref(),
-        checklist_id = ids.checklist_id.as_deref(),
-        stig_id = ids.stig_id.as_deref(),
-        "failed to write audit event: {failure}"
-    );
-    counter.record_failure();
+    let owned = OwnedEvent::from(ev);
+    let pool = pool.clone();
+    submit(queue, limits, log, reserve, async move {
+        write_user_event(&pool, &owned, &ids).await
+    })
+    .await
 }
 
 /// A rule id made safe for an audit `detail`: truncated to 64 characters and
@@ -479,6 +1026,7 @@ pub fn rejected_detail(rejected: &[(String, String)]) -> (Value, bool) {
 mod tests {
     use super::*;
     use crate::test_fixtures::{allow_audit_test_mode, disallow_audit_test_mode, seed_user};
+    use std::sync::atomic::AtomicBool;
 
     /// Run one statement in a transaction with the given audit maintenance mode.
     async fn in_mode(pool: &PgPool, mode: &str, sql: &str) -> Result<()> {
@@ -950,46 +1498,432 @@ mod tests {
         assert!(AUDIT_WRITES.snapshot().total >= 1);
     }
 
-    #[sqlx::test]
-    #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn record_counted_counts_failure_then_resets_streak_on_success(pool: PgPool) {
-        let c = FailureCounter::new();
-        record_counted(&pool, ev("ok", json!({})), &c).await;
-        let s = c.snapshot();
-        assert_eq!((s.total, s.consecutive), (1, 1));
-        seed_user(&pool, "u1").await;
-        record_counted(&pool, ev("ok", json!({})), &c).await;
-        let s = c.snapshot();
-        assert_eq!((s.total, s.consecutive), (1, 0));
+    /// A queue over its own counter, so exact values are not disturbed by
+    /// other tests writing to the process-wide one. Usage:
+    /// `queue!(C, Q, 64);` declares statics `C` (counter) and `Q` (queue).
+    macro_rules! queue {
+        ($c:ident, $q:ident, $cap:expr) => {
+            queue!($c, $q, $cap, $cap, $cap);
+        };
+        ($c:ident, $q:ident, $cap:expr, $denied:expr, $udenied:expr) => {
+            static $c: FailureCounter = FailureCounter::new();
+            static $q: WriteQueue = WriteQueue::new(&$c, $cap, $denied, $udenied);
+        };
+    }
+
+    /// A reservation for `user`, restricted for denied/rejected events.
+    fn rsv(user: &str, restricted: bool) -> Reserve {
+        Reserve {
+            user: Some(user.to_owned()),
+            restricted,
+        }
+    }
+
+    const SECS: fn(u64) -> std::time::Duration = std::time::Duration::from_secs;
+    const MILLIS: fn(u64) -> std::time::Duration = std::time::Duration::from_millis;
+
+    fn log_fields() -> LogFields {
+        LogFields {
+            user_id: "u1".into(),
+            action: "checklist.save",
+            outcome: "ok",
+            request_id: Some("req-1".into()),
+            asset_id: None,
+            checklist_id: None,
+            stig_id: None,
+        }
+    }
+
+    /// Poll `f` once and report whether it is still pending. Submission
+    /// happens on that first poll.
+    async fn poll_once<F: std::future::Future + ?Sized>(f: &mut std::pin::Pin<Box<F>>) -> bool {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// A write that waits for `gate`, then returns `result`; `ran` is set
+    /// once it has produced its result.
+    async fn gated_write(
+        gate: tokio::sync::oneshot::Receiver<()>,
+        ran: Arc<AtomicBool>,
+        ok: bool,
+    ) -> Result<()> {
+        let _ = gate.await;
+        ran.store(true, Ordering::SeqCst);
+        if ok {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("boom"))
+        }
+    }
+
+    const LONG: Limits = Limits {
+        wait: std::time::Duration::from_secs(60),
+        hard: std::time::Duration::from_secs(60),
+    };
+
+    #[tokio::test]
+    async fn a_cancelled_caller_still_gets_its_write_done_and_counted() {
+        queue!(C, Q, 64);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        C.record_failure();
+        {
+            let mut call = Box::pin(submit(
+                &Q,
+                LONG,
+                log_fields(),
+                rsv("u1", false),
+                gated_write(gate, ran.clone(), true),
+            ));
+            assert!(poll_once(&mut call).await, "waiting on the gate");
+        } // the caller is dropped before the write finished
+        assert_eq!(Q.pending(), 1);
+        let _ = open.send(());
+        Q.drain().await;
+        assert!(ran.load(Ordering::SeqCst));
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 0), "success reset the streak");
+        assert!(s.last_success_at.is_some());
+        assert_eq!((Q.late_writes(), Q.pending()), (0, 0));
     }
 
     #[tokio::test]
-    async fn bounded_attempt_resets_streak_on_success_and_reports_failures() {
-        let c = FailureCounter::new();
-        let limit = std::time::Duration::from_millis(50);
-        c.record_failure();
-        c.record_failure();
-        assert!(bounded_attempt(async { Ok(()) }, &c, limit).await.is_none());
-        let s = c.snapshot();
-        assert_eq!((s.total, s.consecutive), (2, 0));
+    async fn a_cancelled_caller_whose_write_fails_is_counted_as_a_failure() {
+        queue!(C, Q, 64);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        {
+            let mut call = Box::pin(submit(
+                &Q,
+                LONG,
+                log_fields(),
+                rsv("u1", false),
+                gated_write(gate, ran.clone(), false),
+            ));
+            assert!(poll_once(&mut call).await);
+        }
+        let _ = open.send(());
+        Q.drain().await;
+        assert!(ran.load(Ordering::SeqCst));
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
+        assert_eq!(Q.late_writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_finishing_after_the_callers_wait_is_a_late_success_not_a_failure() {
+        queue!(C, Q, 64);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let limits = Limits {
+            wait: MILLIS(20),
+            hard: SECS(5),
+        };
+        submit(
+            &Q,
+            limits,
+            log_fields(),
+            rsv("u1", false),
+            gated_write(gate, ran.clone(), true),
+        )
+        .await;
+        // The caller gave up; the write is still in flight and not a failure.
+        let s = C.snapshot();
+        assert_eq!(s.total, 0);
+        assert_eq!(Q.pending(), 1);
+        assert!(!ran.load(Ordering::SeqCst));
+        let _ = open.send(());
+        Q.drain().await;
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (0, 0));
         assert!(s.last_success_at.is_some());
-        let err = bounded_attempt(async { Err(anyhow::anyhow!("boom")) }, &c, limit).await;
-        assert_eq!(err.as_deref(), Some("boom"));
-        let hung = bounded_attempt(std::future::pending::<Result<()>>(), &c, limit).await;
-        assert!(hung.is_some_and(|m| m.starts_with("timed out")));
-        // The caller, not the helper, records failures.
-        assert_eq!(c.snapshot().total, 2);
+        assert_eq!((Q.late_writes(), Q.pending()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn the_hard_cap_counts_a_failure() {
+        queue!(C, Q, 64);
+        let limits = Limits {
+            wait: MILLIS(10),
+            hard: MILLIS(30),
+        };
+        submit(
+            &Q,
+            limits,
+            log_fields(),
+            rsv("u1", false),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        Q.drain().await;
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
+        assert_eq!(Q.late_writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_sheds_without_spawning_or_waiting() {
+        queue!(C, Q, 1);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut first = Box::pin(submit(
+            &Q,
+            LONG,
+            log_fields(),
+            rsv("u1", false),
+            gated_write(gate, ran.clone(), true),
+        ));
+        assert!(poll_once(&mut first).await);
+        assert_eq!(Q.pending(), 1);
+
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let flag = second_ran.clone();
+        // Completes on its first poll: no await on the shed path.
+        let mut second = Box::pin(submit(
+            &Q,
+            LONG,
+            log_fields(),
+            rsv("u1", false),
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        assert!(!poll_once(&mut second).await, "shed returns at once");
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
+        assert_eq!((Q.pending(), Q.shed_writes()), (1, 1));
+
+        let _ = open.send(());
+        first.await;
+        Q.drain().await;
+        assert!(
+            !second_ran.load(Ordering::SeqCst),
+            "the shed write never ran"
+        );
+        assert!(ran.load(Ordering::SeqCst));
+        // The first write's success reset the streak; the shed failure stays in the total.
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 0));
+    }
+
+    /// Submit a gated write for `user`; returns its open-gate sender and the
+    /// still-pending caller future (polled once, so the slot is taken).
+    type BoxCall = std::pin::Pin<Box<dyn std::future::Future<Output = Submission> + Send>>;
+
+    /// Like [`gated_submit`], but `None` when the write was shed.
+    async fn try_gated(
+        q: &'static WriteQueue,
+        user: &str,
+        restricted: bool,
+    ) -> Option<(tokio::sync::oneshot::Sender<()>, BoxCall)> {
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut call: BoxCall = Box::pin(submit(
+            q,
+            LONG,
+            log_fields(),
+            rsv(user, restricted),
+            gated_write(gate, ran, true),
+        ));
+        poll_once(&mut call).await.then_some((open, call))
+    }
+
+    async fn gated_submit(
+        q: &'static WriteQueue,
+        user: &str,
+        restricted: bool,
+    ) -> (tokio::sync::oneshot::Sender<()>, BoxCall) {
+        try_gated(q, user, restricted)
+            .await
+            .expect("queued and waiting")
+    }
+
+    #[tokio::test]
+    async fn denied_events_shed_at_their_share_and_leave_slots_for_other_events() {
+        // 8 slots, 2 of them for denied/rejected, no per-user limit in play.
+        queue!(C, Q, 8, 2, 8);
+        let mut held = Vec::new();
+        for user in ["a", "b"] {
+            held.push(gated_submit(&Q, user, true).await);
+        }
+        assert_eq!(Q.pending(), 2);
+        // A third denial is shed at once, though 6 slots are free.
+        let mut third = Box::pin(submit(
+            &Q,
+            LONG,
+            log_fields(),
+            rsv("c", true),
+            std::future::pending::<Result<()>>(),
+        ));
+        assert!(!poll_once(&mut third).await);
+        assert_eq!(
+            (Q.pending(), Q.shed_writes(), C.snapshot().total),
+            (2, 1, 1)
+        );
+        // An ok event still gets a slot.
+        held.push(gated_submit(&Q, "c", false).await);
+        assert_eq!((Q.pending(), Q.shed_writes()), (3, 1));
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert_eq!(Q.pending(), 0);
+        // A freed share is usable again.
+        held = vec![gated_submit(&Q, "a", true).await];
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+    }
+
+    #[tokio::test]
+    async fn one_users_non_restricted_events_are_bounded_only_by_the_total() {
+        queue!(C, Q, 64, 16, 4);
+        let mut held = Vec::new();
+        for i in 0..20 {
+            let h = try_gated(&Q, "busy", false).await;
+            assert!(h.is_some(), "write {i} must be queued, not shed");
+            held.extend(h);
+        }
+        assert_eq!((Q.shed_writes(), C.snapshot().total), (0, 0));
+        // Up to the total, still the same user.
+        for i in 20..64 {
+            let h = try_gated(&Q, "busy", false).await;
+            assert!(h.is_some(), "write {i} must be queued, not shed");
+            held.extend(h);
+        }
+        assert_eq!((Q.pending(), Q.shed_writes()), (64, 0));
+        // The 65th sheds as the total and counts a failure.
+        assert!(try_gated(&Q, "busy", false).await.is_none());
+        assert_eq!((Q.shed_writes(), C.snapshot().total), (1, 1));
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert_eq!(Q.pending(), 0);
+    }
+
+    /// True when a write for `user` is shed (returns at once, never runs).
+    async fn is_shed(q: &'static WriteQueue, user: &str, restricted: bool) -> bool {
+        let mut call = Box::pin(submit(
+            q,
+            LONG,
+            log_fields(),
+            rsv(user, restricted),
+            std::future::pending::<Result<()>>(),
+        ));
+        !poll_once(&mut call).await
+    }
+
+    #[tokio::test]
+    async fn one_users_denials_stop_at_their_subcap_and_leave_room_for_others() {
+        // Total 64, denied share 16, per-user denied sub-cap 4.
+        queue!(C, Q, 64, 16, 4);
+        let mut held = Vec::new();
+        // Real flood: queue gated denials until the sub-cap, shed the rest.
+        let mut shed = 0;
+        for _ in 0..20 {
+            match try_gated(&Q, "flood", true).await {
+                Some(h) => held.push(h),
+                None => shed += 1,
+            }
+        }
+        assert_eq!((held.len(), shed), (4, 16));
+        assert_eq!((Q.pending(), Q.shed_writes()), (4, 16));
+        // Per-user denied sheds are not failures.
+        assert_eq!(C.snapshot().total, 0);
+        // Another user's denial still queues, and the flooder's own ok event too.
+        let own_ok = try_gated(&Q, "flood", false).await;
+        assert!(own_ok.is_some(), "the flooder's own ok event is queued");
+        held.extend(own_ok);
+        held.push(gated_submit(&Q, "other", true).await);
+        assert_eq!(Q.pending(), 6);
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert_eq!((Q.pending(), C.snapshot().total), (0, 0));
+        // The shared share still sheds as a failure.
+        queue!(C2, Q2, 64, 1, 4);
+        let first = gated_submit(&Q2, "a", true).await;
+        assert!(is_shed(&Q2, "b", true).await);
+        assert_eq!((Q2.shed_writes(), C2.snapshot().total), (1, 1));
+        let (open, call) = first;
+        let _ = open.send(());
+        call.await;
+        Q2.drain().await;
+    }
+
+    #[test]
+    fn shed_logs_are_rate_limited_per_user_and_bounded() {
+        let mut st = QueueState {
+            pending: 0,
+            denied: 0,
+            users: Vec::new(),
+            noisy: Vec::new(),
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(st.shed_log_due("a", t0), Some(0));
+        assert_eq!(st.shed_log_due("a", t0 + SECS(1)), None);
+        assert_eq!(st.shed_log_due("a", t0 + SECS(59)), None);
+        // Another user has its own window.
+        assert_eq!(st.shed_log_due("b", t0 + SECS(2)), Some(0));
+        // After the window: log again, reporting the two held back.
+        assert_eq!(st.shed_log_due("a", t0 + SECS(60)), Some(2));
+        assert_eq!(st.shed_log_due("a", t0 + SECS(61)), None);
+        // Bounded memory under many distinct users.
+        for i in 0..1000 {
+            st.shed_log_due(&format!("u{i}"), t0);
+        }
+        assert!(st.noisy.len() <= MAX_NOISY_USERS);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn record_counted_counts_failure_then_resets_streak_on_success(pool: PgPool) {
+        queue!(C, Q, 64);
+        record_counted(&pool, ev("ok", json!({})), &Q, LIMITS).await;
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
+        seed_user(&pool, "u1").await;
+        record_counted(&pool, ev("ok", json!({})), &Q, LIMITS).await;
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 0));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_record_counted_future_dropped_after_one_poll_still_writes_the_row(pool: PgPool) {
+        // Current-thread runtime: the spawned write cannot run before the
+        // caller yields, so the single poll below returns Pending.
+        queue!(C, Q, 64);
+        seed_user(&pool, "u1").await;
+        {
+            let mut call = Box::pin(record_counted(&pool, ev("ok", json!({})), &Q, LIMITS));
+            assert!(poll_once(&mut call).await);
+        }
+        Q.drain().await;
+        assert_eq!(rows(&pool).await.len(), 1);
+        let s = C.snapshot();
+        assert_eq!((s.total, s.consecutive), (0, 0));
+        assert!(s.last_success_at.is_some());
     }
 
     #[tokio::test]
     async fn record_counted_counts_an_unreachable_database() {
+        queue!(C, Q, 64);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(100))
             .connect_lazy(&format!("postgres://{}@127.0.0.1:1/x", "u"))
             .expect("lazy pool");
-        let c = FailureCounter::new();
-        record_counted(&pool, ev("ok", json!({})), &c).await;
-        let s = c.snapshot();
+        record_counted(&pool, ev("ok", json!({})), &Q, LIMITS).await;
+        Q.drain().await;
+        let s = C.snapshot();
         assert_eq!((s.total, s.consecutive), (1, 1));
     }
 
@@ -1262,16 +2196,17 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_system_event_has_a_null_user_and_role_system(pool: PgPool) {
-        let c = FailureCounter::new();
+        queue!(C, Q, 64);
         let mk = || NewSystemEvent {
             action: "catalog.sync",
             outcome: "rejected",
             stig_id: Some("src-1"),
             detail: json!({"reasonCode": "download_too_large"}),
         };
-        record_system_counted(&pool, mk(), &c).await;
-        record_system_counted(&pool, mk(), &c).await;
-        assert_eq!(c.snapshot().total, 0);
+        record_system_counted(&pool, mk(), &Q, LIMITS).await;
+        record_system_counted(&pool, mk(), &Q, LIMITS).await;
+        Q.drain().await;
+        assert_eq!(C.snapshot().total, 0);
         let rows: Vec<(Option<String>, Option<String>, i32)> = sqlx::query_as(
             "SELECT user_id, user_role, repeat_count FROM audit_events WHERE action = 'catalog.sync'",
         )

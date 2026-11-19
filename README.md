@@ -456,6 +456,21 @@ cd backend && cargo clippy -- -D warnings
   `failed to write audit event`, with the user, action, outcome and ids. Alert
   on that line, and ship the application logs to a retained store, since it is
   the only record of an event that missed the database (AU-5).
+- Audit writes run as detached tasks, so a client that disconnects does not
+  lose its event. A caller waits at most 5 s; a write still running then
+  finishes on its own (counted as `lateWrites` on
+  `/api/admin/failure-counters`) with a 30 s hard cap. At most 64 writes are
+  pending, of which at most 16 are `denied`/`rejected` events and at most 4
+  belong to one user (other events have no per-user cap); a write over a
+  cap is shed and no row is written. A shed counts in `shedWrites` and logs the
+  same `failed to write audit event` line (message starting `shed:`) and counts
+  as a failure, except one caused by a user's own denied/rejected limit: that
+  counts only in `shedWrites` (a user can trigger it at will, so it must not
+  degrade the public health status) and logs at most once a minute per user
+  with a summary of the held-back ones. Alert on the `shedWrites` rate and the
+  failure counter, not only on the public status. On SIGTERM or Ctrl-C the
+  backend waits up to 8 s for open requests and pending writes; keep the
+  container stop grace period above that.
 - `source_ip` is the same client IP the login notice uses: the socket peer
   address, or, with `STIG_TRUST_PROXY_HEADERS=true`, the
   `STIG_TRUSTED_PROXY_HOPS`-th hop from the right of `X-Forwarded-For`. It is

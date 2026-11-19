@@ -35,6 +35,19 @@
 //! the `failed to write audit event` error log line, which needs a log-based
 //! alert. This is not AU-5(1)/(2).
 //!
+//! Audit writes are detached tasks (`db_audit`): a write that finishes after
+//! the caller's 5 s wait still counts as a success and adds to `lateWrites`;
+//! a failure is a confirmed error, the 30 s hard cap, or a write shed with 64
+//! already pending. A shed
+//! means a missing row: `shedWrites` (admin endpoint only) counts them
+//! separately. A shed is also a failure (reasons: 64 pending in all, or the 16
+//! shared denied/rejected slots full), except one caused by a single user's
+//! own denied/rejected sub-cap (4) (a user can trigger those at will, so they must
+//! not be able to degrade this status); that one counts only in `shedWrites`
+//! and logs at most once a minute per user. Alert on the `shedWrites` rate and
+//! on `writeFailures`, not only on the public status. `lateWrites` and `pendingWrites`
+//! are early warnings of a slow pool; they do not degrade the public status.
+//!
 //! All queries have a 200ms timeout and the handler aims for ~250ms
 //! end-to-end. The endpoint must stay fast — uptime monitors hit it
 //! every few seconds and it must not become a hotspot.
@@ -176,11 +189,18 @@ fn build_checks(
 }
 
 /// Body of `GET /api/admin/failure-counters`: counts and timestamps only.
-fn counters_body(audit: &FailureSnapshot, prune: &FailureSnapshot) -> Value {
+fn counters_body(
+    audit: &FailureSnapshot,
+    audit_queue: (u64, u64, u64),
+    prune: &FailureSnapshot,
+) -> Value {
     json!({
         "audit": {
             "writeFailures": audit.total,
             "lastWriteFailureAt": rfc3339(audit.last_failure_at),
+            "lateWrites": audit_queue.0,
+            "pendingWrites": audit_queue.1,
+            "shedWrites": audit_queue.2,
         },
         "loginAckPrune": {
             "failures": prune.total,
@@ -200,6 +220,7 @@ pub async fn failure_counters_handler(
     }
     Ok(Json(counters_body(
         &AUDIT_WRITES.snapshot(),
+        crate::db_audit::write_stats(),
         &ACK_PRUNE.snapshot(),
     )))
 }
@@ -509,9 +530,21 @@ mod tests {
     #[test]
     fn counters_body_holds_exactly_the_documented_keys() {
         let s = snap(1, 1, Some(D::zero()));
-        let b = counters_body(&s, &s);
+        let b = counters_body(&s, (3, 2, 4), &s);
         assert_eq!(keys(&b), ["audit", "loginAckPrune"]);
-        assert_eq!(keys(&b["audit"]), ["lastWriteFailureAt", "writeFailures"]);
+        assert_eq!(
+            keys(&b["audit"]),
+            [
+                "lastWriteFailureAt",
+                "lateWrites",
+                "pendingWrites",
+                "shedWrites",
+                "writeFailures"
+            ]
+        );
+        assert_eq!(b["audit"]["lateWrites"], 3);
+        assert_eq!(b["audit"]["pendingWrites"], 2);
+        assert_eq!(b["audit"]["shedWrites"], 4);
         assert_eq!(
             keys(&b["loginAckPrune"]),
             [

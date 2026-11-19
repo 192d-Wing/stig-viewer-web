@@ -10,6 +10,7 @@ mod db_checklists;
 mod db_drafts;
 mod db_notice;
 mod db_roles;
+mod detached;
 mod failure_counters;
 mod integrity;
 mod parser;
@@ -219,6 +220,9 @@ pub struct AppState {
     /// `Some` when `SIGNING_KEY_HEX` is configured. Both `/api/sign` and
     /// `/api/signing/pubkey` return 503 when this is `None`.
     pub signing: Option<api::signing::SigningState>,
+    /// Detached request work (change plus its audit event); awaited at
+    /// shutdown. See [`detached`].
+    pub tasks: Arc<detached::Tracker>,
 }
 
 /// Connect the application pool and make sure the schema is current.
@@ -397,6 +401,7 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         config: config.clone(),
         signing: signing.clone(),
+        tasks: detached::Tracker::new(),
     };
 
     // Auth flow routes — public, do not require an existing session.
@@ -1025,19 +1030,83 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on http://{addr}");
 
-    axum::serve(
+    // The drain budget starts at the shutdown signal and covers both the
+    // server's graceful phase (which waits for open connections) and the wait
+    // for detached work and audit writes.
+    let (signalled_tx, mut signalled_rx) = tokio::sync::oneshot::channel();
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = signalled_tx.send(tokio::time::Instant::now());
+    });
+    let mut serve = Box::pin(std::future::IntoFuture::into_future(serve));
+    let signalled_at = tokio::select! {
+        r = &mut serve => {
+            // The server stopped without a signal (an accept error).
+            r?;
+            None
+        }
+        Ok(at) = &mut signalled_rx => Some(at),
+    };
+    if let Some(at) = signalled_at {
+        let drained = tokio::time::timeout_at(at + SHUTDOWN_DRAIN, async {
+            let served = (&mut serve).await;
+            state.tasks.idle().await;
+            db_audit::drain().await;
+            served
+        })
+        .await;
+        match drained {
+            Ok(served) => served?,
+            Err(_) => {
+                let (_, pending, _) = db_audit::write_stats();
+                tracing::error!(
+                    target: "audit",
+                    in_flight = state.tasks.in_flight(),
+                    pending_audit_writes = pending,
+                    "shutdown budget of {SHUTDOWN_DRAIN:?} from the signal expired; \
+                     open requests and pending work are lost"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
 
+/// Total shutdown budget, measured from the signal: the server's graceful
+/// phase plus detached work and audit writes. The dev
+/// containers set no `STOPSIGNAL` or `stop_grace_period`, so docker/podman send
+/// SIGTERM and SIGKILL after their default 10 s; stay below that, leaving room
+/// for the HTTP server's own graceful shutdown. A write still running at the
+/// expiry is logged here and lost (the 30 s hard write cap is longer on purpose:
+/// it bounds a hung database, not a normal stop).
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
+
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler: never resolve on this branch.
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = term => {},
+    }
     info!("Shutting down…");
 }
