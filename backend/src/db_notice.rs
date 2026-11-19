@@ -408,12 +408,13 @@ mod tests {
             Some(state_digest("distinct-state-value").as_str())
         );
         let json = serde_json::to_string(&probes).unwrap();
-        for secret in [
-            "distinct-state-value",
-            "distinct-nonce-value",
-            "distinct-verifier-value",
+        // The message names the field, never the value.
+        for (field, value) in [
+            ("state", "distinct-state-value"),
+            ("nonce", "distinct-nonce-value"),
+            ("pkce verifier", "distinct-verifier-value"),
         ] {
-            assert!(!json.contains(secret), "{secret} leaked");
+            assert!(!json.contains(value), "the probe leaked the {field}");
         }
         assert!(json.contains("hasNonce") && json.contains("oidcStateSha256"));
     }
