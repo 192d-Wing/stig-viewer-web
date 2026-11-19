@@ -547,6 +547,21 @@ pub async fn inject_scheduler_error_handler(
     StatusCode::NO_CONTENT
 }
 
+/// GET /api/test/login-acks — read-only metadata of the AC-8 acknowledgement
+/// rows (ids, timestamps, method, state digest, whether nonce/verifier are
+/// set). Deliberately omits the nonce and PKCE verifier values.
+pub async fn login_acks_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::db_notice::AckProbe>>, StatusCode> {
+    crate::db_notice::list_ack_probes(state.pool.as_ref())
+        .await
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("Test login-acks read failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

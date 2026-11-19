@@ -117,6 +117,15 @@ export async function setUserRole(userName, role) {
   }
 }
 
+/** Non-secret metadata of the AC-8 acknowledgement rows (no nonce/verifier values). */
+export async function loginAcks() {
+  const res = await fetch(`${BACKEND}/api/test/login-acks`);
+  if (res.status !== 200) {
+    throw new Error(`loginAcks failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Log in and load the built-in demo STIG.
  * The demo button is under the "Open Local File" tab in the library.

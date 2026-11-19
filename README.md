@@ -141,7 +141,8 @@ for local work. The ones you may want to change:
   can act as any user). Off unless set to `true`/`1`; the compose file turns it
   on for local dev and the E2E suite.
 - `STIG_ENABLE_TEST_ROUTES` — mounts the unauthenticated `/api/test/*` routes
-  the E2E suite uses (database reset, role changes, session minting). Off
+  the E2E suite uses (database reset, role changes, session minting, reading login
+  acknowledgement metadata). Off
   unless set to `true`/`1`; the compose file turns it on.
 
 Both test hooks must stay unset in production. The backend refuses to start if
@@ -843,6 +844,36 @@ Secure` over https, `Lax` over plain http). IdP-initiated SAML responses (no
 `InResponseTo`) are refused unconditionally. In plain-http dev, SAML therefore
 works only with an IdP that is same-site with the API, or behind https.
 Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored.
+
+What is stored for an in-flight OIDC login, on its `login_notice_acks` row and
+for at most 10 minutes: the `state` as a SHA-256 hash (it is only compared, never
+read back), and the `nonce` and PKCE verifier in plaintext (the callback needs
+them). The table is `UNLOGGED`, so those values never reach the WAL, replicas or
+point-in-time recovery; the cost is that a crash or failover empties it and
+in-flight users must acknowledge again (it fails closed; the durable record is
+the `auth.notice_ack` audit event). It is not part of the application backup;
+if you dump the database by hand, pass `--no-unlogged-table-data` to `pg_dump`.
+The residual exposure is the plaintext nonce and verifier in the live table for
+up to 10 minutes, which are of no use without an intercepted authorization code.
+
+Auth audit events:
+
+- Stored in `audit_events`: `auth.notice_ack`, outcome `ok` only, written when a
+  login completes.
+- Log-only (`target: "audit"`, not stored): `auth.notice_ack` / `issued`;
+  `auth.login_start` / `denied` (reasons `rate_limited`, `missing`, `malformed`,
+  `invalid`, `error`); `auth.oidc_callback` / `success` or `denied` (reasons
+  `rate_limited`, `no_state_cookie`, `malformed_state_cookie`, `ack_not_claimed`,
+  `claim_error`, `token_exchange`, `id_token`); `auth.saml_acs` / `success` or
+  `denied` (reasons `rate_limited`, `decode`, `unsolicited`,
+  `no_request_cookie`, `ack_not_claimed`, `claim_error`, plus the fixed
+  validation codes of the SAML response checks).
+- Removed: `auth.notice_ack` with outcome `missing` was written by the first AC-8
+  release (f0b65f9) and removed by PR #56 (e0a0c9d). A login without the
+  acknowledgement is now refused and appears as an `auth.oidc_callback` or
+  `auth.saml_acs` `denied` line. Old `missing` rows remain in `audit_events`. A
+  SIEM rule keyed on `outcome = 'missing'` will never fire again and should move
+  to those `denied` lines.
 
 The `stig_notice_ack` cookie is `SameSite=Strict`, so the frontend and the API
 must be same-site (for example `app.example.mil` and `api.example.mil`), or

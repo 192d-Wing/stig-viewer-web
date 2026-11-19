@@ -3,6 +3,7 @@ import {
   acknowledgeNotice,
   BACKEND,
   FRONTEND,
+  loginAcks,
   NOTICE_VERSION,
   loginAs,
   resetDb,
@@ -357,6 +358,38 @@ test.describe("AC-8 server-side gate", () => {
     const cookies = res.headersArray().filter((h) => h.name.toLowerCase() === "set-cookie");
     expect(cookies.some((h) => h.value.startsWith("stig_session="))).toBe(false);
     await ctx.dispose();
+  });
+
+  test("cookie-less callback with the real state leaves the ack row untouched", async () => {
+    const ctxA = await pwRequest.newContext();
+    expect((await ack(ctxA)).status()).toBe(204);
+    const login = await ctxA.get(`${BACKEND}/auth/login`, { maxRedirects: 0 });
+    expect(login.status()).toBe(303);
+    const state = new URL(login.headers()["location"]).searchParams.get("state");
+    expect(state).toBeTruthy();
+
+    const before = await loginAcks();
+    expect(before).toHaveLength(1);
+    expect(before[0].consumedAt).toBeTruthy();
+    expect(before[0].method).toBe("oidc");
+    expect(before[0].hasNonce).toBe(true);
+    expect(before[0].hasPkceVerifier).toBe(true);
+    // The state is stored only as its SHA-256 digest.
+    expect(before[0].oidcStateSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(before[0].oidcStateSha256).not.toBe(state);
+
+    const ctxB = await pwRequest.newContext();
+    const res = await ctxB.get(
+      `${BACKEND}/auth/callback?code=x&state=${encodeURIComponent(state)}`,
+      { maxRedirects: 0 },
+    );
+    expect(res.status()).toBe(400);
+    const cookies = res.headersArray().filter((h) => h.name.toLowerCase() === "set-cookie");
+    expect(cookies.some((h) => h.value.startsWith("stig_session="))).toBe(false);
+
+    expect(await loginAcks()).toEqual(before);
+    await ctxA.dispose();
+    await ctxB.dispose();
   });
 
   test("acknowledge, sign in with Keycloak, and the login is audited", async ({ page, request }) => {
