@@ -1,7 +1,10 @@
 //! "Save to system": push the tab's evaluated rules (status, finding details,
 //! comments) into a system's server-side checklist for the catalog STIG.
 
-use crate::api::{api_fetch_json, api_get, api_send};
+use crate::api::{
+    api_fetch_json, api_get, api_request_timed, set_send, FetchFailure, SET_REQUEST_TIMEOUT_MS,
+    SET_SAVE_TO_SYSTEM_TIMEOUT_MS,
+};
 use crate::autosave::Autosave;
 use crate::model::{ChecklistSet, Stig, StigTab};
 use crate::ui::*;
@@ -277,16 +280,27 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
                                 asset_id: &asset.id,
                             };
                             let path = format!("/api/checklist-sets/{}/save-to-system", set.id);
-                            match api_fetch_json("POST", &path, &body).await {
+                            let json = serde_json::to_string(&body).map_err(|e| e.to_string());
+                            let sent = match &json {
+                                Ok(j) => api_request_timed("POST", &path, Some(j), SET_SAVE_TO_SYSTEM_TIMEOUT_MS)
+                                    .await
+                                    .map_err(|f| match f {
+                                        FetchFailure::Timeout => "The request timed out. The save may still have completed: close this dialog and check the checklist's system.".to_string(),
+                                        other => other.message(),
+                                    }),
+                                Err(e) => Err(e.clone()),
+                            };
+                            match sent {
                                 Ok(res) if res.ok() => {
-                                    res.json::<SetSaveResponse>().await.map_err(|e| format!("Unexpected response: {e}"))
+                                    res.json::<SetSaveResponse>().map_err(|e| format!("Unexpected response: {e}"))
                                 }
-                                Ok(res) => Err(match res.status() {
+                                Ok(res) => Err(match res.status {
                                     409 => "This checklist changed in another tab or device. Close this dialog, then choose Reload latest or Keep my edits.".to_string(),
                                     403 => "You do not have write access to this system.".to_string(),
                                     404 => "This checklist or system no longer exists on the server.".to_string(),
                                     400 => "This checklist is linked to a different system. Unlink it first.".to_string(),
-                                    _ => res.text().await.unwrap_or_else(|_| "Save failed.".into()),
+                                    _ if res.body.is_empty() => "Save failed.".to_string(),
+                                    _ => res.body,
                                 }),
                                 Err(e) => Err(e),
                             }
@@ -376,10 +390,11 @@ pub fn SaveToSystemModal(p: &SaveToSystemModalProps) -> Html {
             let (selected, error, on_linked) = (selected.clone(), error.clone(), on_linked.clone());
             spawn_local(async move {
                 let body = serde_json::json!({ "assetId": null });
-                match api_send(
-                    &format!("/api/checklist-sets/{}", set.id),
+                match set_send(
                     "PATCH",
+                    &format!("/api/checklist-sets/{}", set.id),
                     Some(&body),
+                    SET_REQUEST_TIMEOUT_MS,
                 )
                 .await
                 {

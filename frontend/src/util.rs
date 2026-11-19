@@ -177,9 +177,35 @@ pub fn issue_lines<'a>(
     (lines, more)
 }
 
+/// Format 16 random bytes as a UUID v4 (version and variant bits set).
+pub fn uuid_v4_from_bytes(mut b: [u8; 16]) -> String {
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h =
+        |r: std::ops::Range<usize>| -> String { b[r].iter().map(|x| format!("{x:02x}")).collect() };
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(0..4),
+        h(4..6),
+        h(6..8),
+        h(8..10),
+        h(10..16)
+    )
+}
+
+/// A fresh UUID v4 from `crypto.getRandomValues` (which, unlike
+/// `randomUUID`, works outside secure contexts). `None` when the browser has
+/// no usable crypto, in which case callers send no token.
+pub fn new_request_id() -> Option<String> {
+    let crypto = window().crypto().ok()?;
+    let mut bytes = [0u8; 16];
+    crypto.get_random_values_with_u8_array(&mut bytes).ok()?;
+    Some(uuid_v4_from_bytes(bytes))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::issue_lines;
+    use super::{issue_lines, uuid_v4_from_bytes};
 
     #[test]
     fn issue_lines_skips_rows_without_text() {
@@ -217,5 +243,20 @@ mod tests {
         let (lines, more) = issue_lines(std::iter::empty(), 10);
         assert!(lines.is_empty());
         assert_eq!(more, 0);
+    }
+
+    #[test]
+    fn uuid_v4_sets_version_and_variant_bits() {
+        assert_eq!(
+            uuid_v4_from_bytes([0xff; 16]),
+            "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        );
+        assert_eq!(
+            uuid_v4_from_bytes([0; 16]),
+            "00000000-0000-4000-8000-000000000000"
+        );
+        let id = uuid_v4_from_bytes([0x12; 16]);
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.matches('-').count(), 4);
     }
 }

@@ -20,7 +20,7 @@ console_error_panic_hook = "0.1"
 [dependencies.web-sys]
 version = "0.3"
 features = [
-  "AbortController", "AbortSignal", "Blob", "BlobPropertyBag", "Clipboard", "DataTransfer",
+  "AbortController", "AbortSignal", "Blob", "BlobPropertyBag", "Clipboard", "Crypto", "DataTransfer",
   "Document", "DomRect", "DomStringList", "DragEvent", "Element", "Event", "EventTarget", "File", "FileList",
   "FocusEvent", "FormData", "Headers", "History", "HtmlAnchorElement", "HtmlElement",
   "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement", "InputEvent", "KeyboardEvent",
