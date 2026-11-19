@@ -324,10 +324,7 @@ async fn main() -> Result<()> {
     let pool = Arc::new(connect_database(&config, &test_hooks).await?);
     db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
     let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
-    db_roles::boundary_policy(
-        config::is_production(std::env::var("STIG_ENV").ok().as_deref()),
-        &violations,
-    )?;
+    db_roles::boundary_policy(test_hooks.production, &violations)?;
     let _ = stig_id::warn_non_conforming(&pool).await;
 
     if let Some(seed_dir) = &config.seed_dir {

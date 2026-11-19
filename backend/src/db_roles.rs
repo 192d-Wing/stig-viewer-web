@@ -105,15 +105,25 @@ pub async fn migrate_as_owner(
     let app_role = app_role_from_url(app_database_url)?;
     let owner_opts = PgConnectOptions::from_str(owner_url)
         .map_err(|_| anyhow::anyhow!("DATABASE_MIGRATION_URL is not a valid PostgreSQL URL"))?;
-    check_distinct_roles(owner_opts.get_username(), &app_role)?;
+    migrate_with(owner_opts, &app_role, test_routes).await
+}
 
+/// [`migrate_as_owner`] with parsed options (the tests pass their own).
+async fn migrate_with(
+    owner_opts: PgConnectOptions,
+    app_role: &str,
+    test_routes: bool,
+) -> Result<()> {
+    check_distinct_roles(owner_opts.get_username(), app_role)?;
     let owner_pool = PgPoolOptions::new()
         .max_connections(1)
         // Do not let a role- or database-level search_path setting decide
-        // which schema the migrations and grants act on.
+        // which schema the migrations and grants act on. `pg_catalog` is then
+        // searched first implicitly, so nothing in `public` can shadow a
+        // built-in that the migrator or this module calls unqualified.
         .after_connect(|conn, _| {
             Box::pin(async move {
-                sqlx::query("SET search_path = public, pg_catalog")
+                sqlx::query("SET search_path = public")
                     .execute(conn)
                     .await?;
                 Ok(())
@@ -123,9 +133,14 @@ pub async fn migrate_as_owner(
         .await
         .context("connecting with DATABASE_MIGRATION_URL")?;
     let result = async {
+        // Close the schema to the application role and refuse pre-planted
+        // objects before anything unqualified runs as the owner.
+        let mut conn = owner_pool.acquire().await?;
+        prepare_owner_schema(&mut conn, app_role).await?;
+        drop(conn);
         sqlx::migrate!("./migrations").run(&owner_pool).await?;
         let mut conn = owner_pool.acquire().await?;
-        apply_app_grants(&mut conn, &app_role, test_routes).await?;
+        apply_app_grants(&mut conn, app_role, test_routes).await?;
         drop(conn);
         if test_routes {
             crate::db_audit::allow_test_maintenance(&owner_pool).await?;
@@ -137,22 +152,25 @@ pub async fn migrate_as_owner(
     result
 }
 
-/// Grant `app_role` the DML it needs and nothing more, in one transaction.
-/// Never `GRANT ALL`, never `TRIGGER` or `REFERENCES`. Idempotent: the audit
-/// tables and `_sqlx_migrations` are revoked first, so the state converges.
-/// `test_routes` adds table-level `UPDATE` on the audit tables (the E2E
-/// backdate hook updates `rule_audit.occurred_at`); with it off, it is revoked.
-pub async fn apply_app_grants(
-    conn: &mut PgConnection,
-    app_role: &str,
-    test_routes: bool,
-) -> Result<()> {
-    let owner: String = sqlx::query_scalar("SELECT current_user::text")
+/// A schema as `(raw name, server-quoted identifier)`.
+struct Schema {
+    raw: String,
+    quoted: String,
+}
+
+/// Before migrating: check the application role exists, that the owner may
+/// revoke on the schema, revoke `CREATE` on it from PUBLIC and the application
+/// role, and refuse to continue if the schema already holds a function,
+/// operator, type or relation owned by a role other than the schema owner, the
+/// owner role or a superuser (an object planted while the application role
+/// could still `CREATE`). Only `pg_catalog`-qualified names are used.
+async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result<Schema> {
+    let owner: String = sqlx::query_scalar("SELECT current_user::pg_catalog.text")
         .fetch_one(&mut *conn)
         .await?;
     check_distinct_roles(&owner, app_role)?;
     let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)")
             .bind(app_role)
             .fetch_one(&mut *conn)
             .await?;
@@ -160,35 +178,122 @@ pub async fn apply_app_grants(
         bail!("application role {app_role:?} does not exist; create it before migrating");
     }
 
-    // Identifiers are quoted by the server, never concatenated raw.
-    let role: String = sqlx::query_scalar("SELECT quote_ident($1)")
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT pg_catalog.current_schema()::pg_catalog.text, \
+                pg_catalog.quote_ident(pg_catalog.current_schema())",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let (Some(raw), Some(quoted)) = row.unwrap_or_default() else {
+        bail!("the owner connection has no current schema (is the `public` schema missing?)");
+    };
+    let schema = Schema { raw, quoted };
+    let role: String = sqlx::query_scalar("SELECT pg_catalog.quote_ident($1)")
         .bind(app_role)
         .fetch_one(&mut *conn)
         .await?;
-    let schema: String = sqlx::query_scalar("SELECT quote_ident(current_schema())")
+
+    // REVOKE by a role that does not own the schema is a silent no-op, so
+    // check. USAGE (not MEMBER): a NOINHERIT member cannot revoke.
+    let may_revoke: bool = sqlx::query_scalar(
+        "SELECT r.rolsuper OR pg_catalog.pg_has_role(current_user, n.nspowner, 'USAGE') \
+         FROM pg_catalog.pg_namespace n, pg_catalog.pg_roles r \
+         WHERE n.nspname = $1 AND r.rolname = current_user",
+    )
+    .bind(&schema.raw)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !may_revoke {
+        bail!(
+            "the owner role must own schema {} (or be a superuser) to revoke CREATE \
+             on it from PUBLIC and the application role",
+            schema.quoted
+        );
+    }
+    for target in ["PUBLIC", role.as_str()] {
+        sqlx::query(&format!(
+            "REVOKE CREATE ON SCHEMA {} FROM {target}",
+            schema.quoted
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    let planted: Vec<String> = sqlx::query_scalar(
+        "WITH s AS (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $1), \
+         objs AS ( \
+           SELECT 'function ' || p.proname::pg_catalog.text AS what, p.proowner AS o \
+             FROM pg_catalog.pg_proc p WHERE p.pronamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'operator ' || x.oprname::pg_catalog.text, x.oprowner \
+             FROM pg_catalog.pg_operator x WHERE x.oprnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'type ' || t.typname::pg_catalog.text, t.typowner \
+             FROM pg_catalog.pg_type t WHERE t.typnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'relation ' || c.relname::pg_catalog.text, c.relowner \
+             FROM pg_catalog.pg_class c WHERE c.relnamespace = (SELECT oid FROM s)) \
+         SELECT objs.what || ' (owner ' || r.rolname::pg_catalog.text || ')' \
+         FROM objs JOIN pg_catalog.pg_roles r ON r.oid = objs.o \
+         WHERE NOT r.rolsuper \
+           AND r.rolname <> current_user \
+           AND objs.o <> (SELECT nspowner FROM pg_catalog.pg_namespace WHERE nspname = $1) \
+         ORDER BY 1 LIMIT 10",
+    )
+    .bind(&schema.raw)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !planted.is_empty() {
+        bail!(
+            "schema {} holds objects owned by other roles (pre-planted?): {}; inspect them, \
+             then drop them or reassign ownership before migrating",
+            schema.quoted,
+            planted.join(", ")
+        );
+    }
+    Ok(schema)
+}
+
+/// Grant `app_role` the DML it needs and nothing more, in one transaction.
+/// Never `GRANT ALL`, never `TRIGGER` or `REFERENCES`. Idempotent: the audit
+/// tables and `_sqlx_migrations` are revoked first, so the state converges.
+/// `test_routes` adds table-level `UPDATE` on the audit tables (the E2E
+/// backdate hook updates `rule_audit.occurred_at`); with it off, it is revoked.
+/// The schema the grants act on is the one that holds `rule_audit`.
+pub async fn apply_app_grants(
+    conn: &mut PgConnection,
+    app_role: &str,
+    test_routes: bool,
+) -> Result<()> {
+    let prepared = prepare_owner_schema(conn, app_role).await?;
+
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT n.nspname::pg_catalog.text, pg_catalog.quote_ident(n.nspname) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = pg_catalog.to_regclass('rule_audit')",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((raw, quoted)) = row else {
+        bail!("table rule_audit not found; run the migrations first");
+    };
+    if raw != prepared.raw {
+        bail!(
+            "rule_audit lives in schema {quoted}, not in the owner step's schema {}",
+            prepared.quoted
+        );
+    }
+    let schema = quoted;
+    // Identifiers are quoted by the server, never concatenated raw.
+    let role: String = sqlx::query_scalar("SELECT pg_catalog.quote_ident($1)")
+        .bind(app_role)
         .fetch_one(&mut *conn)
         .await?;
     let audit = AUDIT_TABLES.map(|t| format!("{schema}.{t}")).join(", ");
     let migrations = format!("{schema}._sqlx_migrations");
 
-    // REVOKE by a role that does not own the schema is a silent no-op, so check.
-    let may_revoke: bool = sqlx::query_scalar(
-        "SELECT r.rolsuper OR pg_has_role(current_user, n.nspowner, 'MEMBER') \
-         FROM pg_namespace n, pg_roles r \
-         WHERE n.nspname = current_schema() AND r.rolname = current_user",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    if !may_revoke {
-        bail!(
-            "the owner role must own schema {schema} (or be a superuser) to revoke CREATE \
-             on it from PUBLIC and the application role"
-        );
-    }
-
     let mut stmts = vec![
-        format!("REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC"),
-        format!("REVOKE CREATE ON SCHEMA {schema} FROM {role}"),
         format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
         format!(
             "GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA {schema} TO {role}"
@@ -211,6 +316,16 @@ pub async fn apply_app_grants(
         sqlx::query(stmt).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+
+    let can_create: bool =
+        sqlx::query_scalar("SELECT pg_catalog.has_schema_privilege($1, $2, 'CREATE')")
+            .bind(app_role)
+            .bind(&raw)
+            .fetch_one(&mut *conn)
+            .await?;
+    if can_create {
+        bail!("application role {app_role:?} can still CREATE in schema {schema} (inherited from another role?)");
+    }
     Ok(())
 }
 
@@ -279,86 +394,141 @@ pub async fn can_migrate(pool: &PgPool) -> Result<bool> {
     .await?)
 }
 
+/// The guard triggers migration 040 creates: `(table, trigger, tgtype)`.
+/// `tgtype`: ROW=1, BEFORE=2, DELETE=8, UPDATE=16, TRUNCATE=32. A migration
+/// that changes the guard updates this one place.
+const GUARD_TRIGGERS: [(&str, &str, i16); 4] = [
+    ("rule_audit", "rule_audit_guard_row", 1 | 2 | 8 | 16),
+    ("rule_audit", "rule_audit_guard_truncate", 2 | 32),
+    ("audit_events", "audit_events_guard_row", 1 | 2 | 8 | 16),
+    ("audit_events", "audit_events_guard_truncate", 2 | 32),
+];
+
 /// Ways in which `current_user` can still tamper with the audit guard.
-/// Empty means the boundary holds.
+/// Empty means the boundary holds. Every schema-scoped check uses the schema
+/// that holds `rule_audit`.
 pub async fn boundary_violations(pool: &PgPool, test_routes: bool) -> Result<Vec<String>> {
     let mut rows: Vec<String> = sqlx::query_scalar(
-        "SELECT 'role is a superuser' FROM pg_roles WHERE rolname = current_user AND rolsuper \
+        "WITH s AS (SELECT c.relnamespace AS ns FROM pg_catalog.pg_class c \
+                    WHERE c.oid = pg_catalog.to_regclass('rule_audit')) \
+         SELECT 'role is a superuser' FROM pg_catalog.pg_roles \
+           WHERE rolname = current_user AND rolsuper \
          UNION ALL \
-         SELECT 'role has CREATEROLE' FROM pg_roles WHERE rolname = current_user AND rolcreaterole \
+         SELECT 'role has CREATEROLE' FROM pg_catalog.pg_roles \
+           WHERE rolname = current_user AND rolcreaterole \
          UNION ALL \
-         SELECT 'role is a member of ' || r.rolname FROM pg_roles r \
+         SELECT 'role is a member of ' || r.rolname FROM pg_catalog.pg_roles r \
          WHERE r.rolname IN ('pg_execute_server_program', 'pg_write_server_files', \
                              'pg_read_server_files') \
-           AND pg_has_role(current_user, r.oid, 'MEMBER') \
+           AND pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER') \
          UNION ALL \
          SELECT 'role is a member of the owner of ' || c.relname \
-         FROM pg_class c \
-         WHERE c.oid = ANY (ARRAY['rule_audit'::regclass, 'audit_events'::regclass, \
-                                  '_sqlx_migrations'::regclass]) \
-           AND pg_has_role(current_user, c.relowner, 'MEMBER') \
+         FROM pg_catalog.pg_class c \
+         WHERE c.relnamespace = (SELECT ns FROM s) \
+           AND c.relname IN ('rule_audit', 'audit_events', '_sqlx_migrations') \
+           AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER') \
          UNION ALL \
          SELECT 'role is a member of the owner of ' || count(*) || ' other relations in the schema' \
-         FROM pg_class c \
-         WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) \
+         FROM pg_catalog.pg_class c \
+         WHERE c.relnamespace = (SELECT ns FROM s) \
            AND c.relkind IN ('r', 'p', 'S', 'v', 'm') \
            AND c.relname NOT IN ('rule_audit', 'audit_events', '_sqlx_migrations') \
-           AND pg_has_role(current_user, c.relowner, 'MEMBER') \
+           AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER') \
          HAVING count(*) > 0 \
          UNION ALL \
          SELECT 'role is a member of the owner of ' || count(*) || ' functions in the schema' \
-         FROM pg_proc p \
-         WHERE p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) \
-           AND pg_has_role(current_user, p.proowner, 'MEMBER') \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.pronamespace = (SELECT ns FROM s) \
+           AND pg_catalog.pg_has_role(current_user, p.proowner, 'MEMBER') \
          HAVING count(*) > 0 \
          UNION ALL \
          SELECT 'role is a member of the owner of schema ' || n.nspname \
-         FROM pg_namespace n \
-         WHERE n.nspname = current_schema() AND pg_has_role(current_user, n.nspowner, 'MEMBER') \
+         FROM pg_catalog.pg_namespace n \
+         WHERE n.oid = (SELECT ns FROM s) \
+           AND pg_catalog.pg_has_role(current_user, n.nspowner, 'MEMBER') \
          UNION ALL \
          SELECT 'role is a member of the owner of database ' || d.datname \
-         FROM pg_database d \
-         WHERE d.datname = current_database() AND pg_has_role(current_user, d.datdba, 'MEMBER') \
+         FROM pg_catalog.pg_database d \
+         WHERE d.datname = pg_catalog.current_database() \
+           AND pg_catalog.pg_has_role(current_user, d.datdba, 'MEMBER') \
          UNION ALL \
-         SELECT 'role can CREATE in schema ' || current_schema() \
-         WHERE has_schema_privilege(current_user, current_schema(), 'CREATE') \
+         SELECT 'role can CREATE in schema ' || n.nspname \
+         FROM pg_catalog.pg_namespace n \
+         WHERE n.oid = (SELECT ns FROM s) \
+           AND pg_catalog.has_schema_privilege(current_user, n.oid, 'CREATE') \
          UNION ALL \
-         SELECT 'role can CREATE in database ' || current_database() \
-         WHERE has_database_privilege(current_user, current_database(), 'CREATE') \
+         SELECT 'role can CREATE in database ' || pg_catalog.current_database() \
+         WHERE pg_catalog.has_database_privilege(current_user, pg_catalog.current_database(), 'CREATE') \
          UNION ALL \
          SELECT 'role holds TRIGGER on ' || t \
          FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
-         WHERE has_table_privilege(current_user, t, 'TRIGGER') \
+         WHERE pg_catalog.has_table_privilege(current_user, t, 'TRIGGER') \
          UNION ALL \
          SELECT 'role holds table-level UPDATE on ' || t || ' with test routes off' \
          FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
-         WHERE NOT $1 AND has_table_privilege(current_user, t, 'UPDATE') \
+         WHERE NOT $1 AND pg_catalog.has_table_privilege(current_user, t, 'UPDATE') \
          UNION ALL \
-         SELECT 'audit guard triggers are missing or not enabled (found ' || n || ' of 4)' \
-         FROM (SELECT count(*) AS n FROM pg_trigger \
-               WHERE tgrelid IN ('rule_audit'::regclass, 'audit_events'::regclass) \
-                 AND tgfoid = 'audit_tables_guard()'::regprocedure \
-                 AND tgenabled = 'A' AND NOT tgisinternal) g \
-         WHERE n <> 4",
+         SELECT 'audit_tables_guard() does not pin search_path to pg_catalog, pg_temp' \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.oid = 'audit_tables_guard()'::pg_catalog.regprocedure \
+           AND NOT ('search_path=pg_catalog, pg_temp' = ANY (COALESCE(p.proconfig, '{}')))",
     )
     .bind(test_routes)
     .fetch_all(pool)
+    .await
+    .context("checking the audit guard boundary (is the schema migrated?)")?;
+
+    // The trigger set must be exactly the expected one: per table, the
+    // expected triggers, bound to the guard function, enabled ALWAYS.
+    let actual: Vec<(String, String, i16, String, bool)> = sqlx::query_as(
+        "SELECT c.relname::pg_catalog.text, t.tgname::pg_catalog.text, t.tgtype, \
+                t.tgenabled::pg_catalog.text, \
+                t.tgfoid = 'audit_tables_guard()'::pg_catalog.regprocedure \
+         FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgrelid IN ('rule_audit'::pg_catalog.regclass, 'audit_events'::pg_catalog.regclass) \
+           AND NOT t.tgisinternal \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(pool)
     .await?;
+    for table in AUDIT_TABLES {
+        let mut want: Vec<(&str, i16)> = GUARD_TRIGGERS
+            .iter()
+            .filter(|(t, _, _)| *t == table)
+            .map(|(_, name, ty)| (*name, *ty))
+            .collect();
+        want.sort_unstable();
+        let mut got: Vec<(&str, i16)> = actual
+            .iter()
+            .filter(|(t, _, _, enabled, guard)| t == table && enabled == "A" && *guard)
+            .map(|(_, name, ty, _, _)| (name.as_str(), *ty))
+            .collect();
+        got.sort_unstable();
+        let total = actual.iter().filter(|(t, ..)| t == table).count();
+        if got != want || total != want.len() {
+            rows.push(format!(
+                "audit guard triggers on {table} are missing, altered, disabled or extra \
+                 (expected {} bound to audit_tables_guard(), enabled ALWAYS)",
+                want.len()
+            ));
+        }
+    }
 
     // PostgreSQL 15+ only: SET privilege on the audit test flag parameter.
-    // Skipped on older servers, and if the check itself errors.
-    let pg15: bool =
-        sqlx::query_scalar("SELECT current_setting('server_version_num')::int >= 150000")
-            .fetch_one(pool)
-            .await?;
+    // Skipped on older servers; on 15+ a failing query fails closed.
+    let pg15: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.current_setting('server_version_num')::pg_catalog.int4 >= 150000",
+    )
+    .fetch_one(pool)
+    .await?;
     if pg15 {
-        let can_set: Option<bool> = sqlx::query_scalar(
-            "SELECT has_parameter_privilege(current_user, 'stig.audit_allow_test_mode', 'SET')",
+        let can_set: bool = sqlx::query_scalar(
+            "SELECT pg_catalog.has_parameter_privilege(current_user, 'stig.audit_allow_test_mode', 'SET')",
         )
         .fetch_one(pool)
         .await
-        .ok();
-        if can_set == Some(true) {
+        .context("checking SET privilege on stig.audit_allow_test_mode")?;
+        if can_set {
             rows.push("role can SET stig.audit_allow_test_mode".to_string());
         }
     }
@@ -799,11 +969,7 @@ mod tests {
             has(&v, "role is a member of the owner of rule_audit"),
             "{v:?}"
         );
-        assert!(
-            has(&v, "role is a member of the owner of audit_tables_guard()")
-                || has(&v, "functions in the schema"),
-            "{v:?}"
-        );
+        assert!(has(&v, "functions in the schema"), "{v:?}");
         exec(&pool, &format!("REVOKE \"{owner}\" FROM {q}")).await;
 
         // Escalation roles.
@@ -874,9 +1040,10 @@ mod tests {
         )
         .await;
         let v = boundary_violations(&app.pool, false).await.unwrap();
-        assert_eq!(
-            v,
-            ["audit guard triggers are missing or not enabled (found 3 of 4)"]
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(
+            v[0].starts_with("audit guard triggers on rule_audit are missing"),
+            "{v:?}"
         );
         exec(
             &pool,
@@ -889,7 +1056,120 @@ mod tests {
             .is_empty());
         exec(&pool, "DROP TRIGGER audit_events_guard_row ON audit_events").await;
         let v = boundary_violations(&app.pool, false).await.unwrap();
-        assert!(has(&v, "found 3 of 4"), "{v:?}");
+        assert!(
+            has(&v, "audit guard triggers on audit_events are missing"),
+            "{v:?}"
+        );
+        // An extra trigger on an audit table is also a deviation.
+        exec(
+            &pool,
+            "CREATE TRIGGER audit_events_guard_row BEFORE UPDATE OR DELETE ON audit_events \
+             FOR EACH ROW EXECUTE FUNCTION audit_tables_guard()",
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "audit guard triggers on audit_events"), "{v:?}"); // not ENABLE ALWAYS
+        exec(
+            &pool,
+            "ALTER TABLE audit_events ENABLE ALWAYS TRIGGER audit_events_guard_row",
+        )
+        .await;
+        assert!(boundary_violations(&app.pool, false)
+            .await
+            .unwrap()
+            .is_empty());
+        exec(
+            &pool,
+            "CREATE TRIGGER extra BEFORE INSERT ON audit_events \
+             FOR EACH ROW EXECUTE FUNCTION audit_tables_guard()",
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "audit guard triggers on audit_events"), "{v:?}");
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn set_privilege_on_the_test_flag_parameter_is_a_violation(pool: PgPool) {
+        let ver: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if ver < 150000 {
+            return; // GRANT ... ON PARAMETER does not exist before PostgreSQL 15
+        }
+        let app = app_role_pool(&pool, false).await;
+        let q = format!("\"{}\"", app.name);
+        exec(
+            &pool,
+            &format!("GRANT SET ON PARAMETER stig.audit_allow_test_mode TO {q}"),
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert_eq!(v, ["role can SET stig.audit_allow_test_mode"]);
+        exec(
+            &pool,
+            &format!("REVOKE SET ON PARAMETER stig.audit_allow_test_mode FROM {q}"),
+        )
+        .await;
+        assert!(boundary_violations(&app.pool, false)
+            .await
+            .unwrap()
+            .is_empty());
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_objects_planted_by_the_app_role(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        // An old ACL: PUBLIC may create in public. The app role plants built-in
+        // look-alikes that the migrator and this module would otherwise call.
+        exec(&pool, "GRANT CREATE ON SCHEMA public TO PUBLIC").await;
+        exec(&pool, "CREATE TABLE planted_log (called text)").await;
+        exec(&pool, "GRANT INSERT ON planted_log TO PUBLIC").await;
+        exec(
+            &app.pool,
+            "CREATE FUNCTION public.quote_ident(text) RETURNS text LANGUAGE sql \
+             AS 'INSERT INTO public.planted_log VALUES (''quote_ident''); SELECT $1' ",
+        )
+        .await;
+        let _ = sqlx::query(
+            "CREATE FUNCTION public.pg_advisory_lock(bigint) RETURNS void LANGUAGE sql \
+             AS 'INSERT INTO public.planted_log VALUES (''advisory''); SELECT NULL::void'",
+        )
+        .execute(&app.pool)
+        .await;
+
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by other roles"), "{err}");
+        assert!(err.contains("quote_ident"), "{err}");
+        let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM planted_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(calls, 0, "a planted function ran");
+        // The schema was closed before the check.
+        let create: bool =
+            sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+                .bind(&app.name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!create);
+        exec(&pool, "DROP FUNCTION public.quote_ident(text)").await;
+        let _ = sqlx::query("DROP FUNCTION public.pg_advisory_lock(bigint)")
+            .execute(&pool)
+            .await;
+        exec(&pool, "DROP TABLE planted_log").await;
+        // With the plants gone the owner step succeeds.
+        migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap();
         app.cleanup(&pool).await;
     }
 
