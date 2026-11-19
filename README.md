@@ -352,7 +352,8 @@ DATABASE_URL=postgres://stig_app@db/stig DATABASE_MIGRATION_URL=postgres://stig_
 ```
 
 Without `DATABASE_MIGRATION_URL` the server behaves as before when its role
-owns the schema (migrates itself), and otherwise only verifies that all
+owns the schema (migrates itself; this single-role mode is for development
+only, and production refuses it), and otherwise only verifies that all
 migrations are applied with matching checksums, refusing to start on pending or
 modified ones. At startup the server checks that its role cannot reach the
 guard (superuser, `CREATEROLE`, membership of an owner role, `TRIGGER` on an
@@ -511,8 +512,9 @@ audit tables, or set the `test` flag; the owner step also makes the
 `migration` mode unusable by the application. What remains: the application can
 still declare the `retention` and `restore` modes (DELETE and TRUNCATE of audit
 rows), because the retention sweep and forced restore run in the server with
-that role. Code that can run SQL as the application role can therefore still
-delete or truncate audit rows. A superuser or the owner role can always bypass
+that role. Code that can run SQL as the application role can therefore delete
+or truncate audit rows, insert new ones in their place (rewriting the trail)
+and `setval` the audit sequences. A superuser or the owner role can always bypass
 the guard, and with a superuser application role (a single-role setup, or
 `cargo run` against the dev superuser) there is no boundary at all; production
 refuses to start in that state. Ship audit rows to an external append-only store

@@ -594,9 +594,13 @@ pub async fn restore_handler(
     }
 
     // Reset the serial sequences so future inserts don't collide.
-    if let Err(e) = reset_serial_sequences(&mut tx).await {
-        tracing::warn!("restore sequence reset: {e:#}");
-    }
+    reset_serial_sequences(&mut tx).await.map_err(|e| {
+        tracing::error!("restore sequence reset: {e:#}");
+        err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to reset sequences",
+        )
+    })?;
 
     // Record the restore inside the transaction: if the record cannot be
     // written, the restore is rolled back rather than committed unrecorded.

@@ -222,23 +222,35 @@ pub struct AppState {
 
 /// Connect the application pool and make sure the schema is current.
 /// With `DATABASE_MIGRATION_URL` the owner role migrates first; otherwise a
-/// role that owns the schema migrates itself (legacy single-role setup) and
-/// any other role only verifies that migrations were applied externally.
-async fn connect_database(config: &Config, test_routes: bool) -> Result<PgPool> {
+/// role that owns the schema migrates itself (legacy single-role setup, for
+/// development only) and any other role only verifies that migrations were
+/// applied externally.
+async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> {
+    let has_owner_url = config.database_migration_url.is_some();
     if let Some(owner_url) = config.database_migration_url.as_deref() {
-        db_roles::migrate_as_owner(owner_url, &config.database_url, test_routes).await?;
-        let pool = connect_pool(&config.database_url).await?;
-        db_roles::verify_migrations(&pool).await?;
-        info!("Database connected; migrations applied by the owner role");
-        return Ok(pool);
+        db_roles::migrate_as_owner(
+            owner_url,
+            &config.database_url,
+            hooks.enable_test_routes,
+            hooks.production,
+        )
+        .await?;
     }
     let pool = connect_pool(&config.database_url).await?;
-    if db_roles::can_migrate(&pool).await? {
-        run_migrations(&pool).await?;
-        info!("Database connected and migrations applied");
-    } else {
-        db_roles::verify_migrations(&pool).await?;
-        info!("Database connected; migrations verified (applied externally)");
+    let can_migrate = !has_owner_url && db_roles::can_migrate(&pool).await?;
+    match db_roles::startup_path(has_owner_url, || can_migrate) {
+        db_roles::StartupPath::OwnerMigrates => {
+            db_roles::verify_migrations(&pool).await?;
+            info!("Database connected; migrations applied by the owner role");
+        }
+        db_roles::StartupPath::SelfMigrate => {
+            run_migrations(&pool).await?;
+            info!("Database connected and migrations applied");
+        }
+        db_roles::StartupPath::VerifyOnly => {
+            db_roles::verify_migrations(&pool).await?;
+            info!("Database connected; migrations verified (applied externally)");
+        }
     }
     Ok(pool)
 }
@@ -254,25 +266,21 @@ async fn main() -> Result<()> {
         .init();
 
     // `migrate`: run migrations and grants as the owner role, then exit.
-    // Any other argument is an error.
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        None => {}
-        Some("migrate") if args.next().is_none() => {
-            let config = Config::from_env()?;
-            let Some(owner_url) = config.database_migration_url.as_deref() else {
-                anyhow::bail!("`migrate` needs DATABASE_MIGRATION_URL");
-            };
-            db_roles::migrate_as_owner(
-                owner_url,
-                &config.database_url,
-                TestHooks::from_env().enable_test_routes,
-            )
-            .await?;
-            info!("Migrations applied and application role grants updated");
-            return Ok(());
-        }
-        Some(_) => anyhow::bail!("unknown argument; the only subcommand is `migrate`"),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
+        let hooks = TestHooks::from_env();
+        let config = Config::from_env()?;
+        let owner_url =
+            db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref())?;
+        db_roles::migrate_as_owner(
+            owner_url,
+            &config.database_url,
+            hooks.enable_test_routes,
+            hooks.production,
+        )
+        .await?;
+        info!("Migrations applied and application role grants updated");
+        return Ok(());
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one
@@ -307,7 +315,13 @@ async fn main() -> Result<()> {
 
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
-    let pool = Arc::new(connect_database(&config, test_hooks.enable_test_routes).await?);
+    if test_hooks.production && config.database_migration_url.is_some() {
+        tracing::warn!(
+            "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
+             could read the owner credential. Prefer running `migrate` as a separate job."
+        );
+    }
+    let pool = Arc::new(connect_database(&config, &test_hooks).await?);
     db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
     let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
     db_roles::boundary_policy(

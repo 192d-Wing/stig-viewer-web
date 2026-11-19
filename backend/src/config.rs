@@ -18,7 +18,7 @@ struct SourcesFile {
 }
 
 /// Runtime configuration assembled from env vars and the sources manifest.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// TCP port the Axum server binds to.
     pub port: u16,
@@ -41,6 +41,25 @@ pub struct Config {
     /// Missing files are copied into `data_dir/stigs` at start; unset in
     /// production.
     pub seed_dir: Option<PathBuf>,
+}
+
+/// Debug never prints the connection URLs (they can carry passwords).
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("database_url", &"<redacted>")
+            .field(
+                "database_migration_url",
+                &self.database_migration_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("data_dir", &self.data_dir)
+            .field("sync_interval_hours", &self.sync_interval_hours)
+            .field("backup_require_signature", &self.backup_require_signature)
+            .field("sync_on_start", &self.sync_on_start)
+            .field("seed_dir", &self.seed_dir)
+            .finish()
+    }
 }
 
 impl Config {
@@ -242,6 +261,22 @@ mod tests {
         }
         // The e2e suite reads these two from the seed.
         assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    #[test]
+    fn config_debug_redacts_database_urls() {
+        let c = Config {
+            port: 1,
+            database_url: "postgres://u:secret1@h/d".into(),
+            database_migration_url: Some("postgres://o:secret2@h/d".into()),
+            data_dir: PathBuf::new(),
+            sync_interval_hours: 1,
+            backup_require_signature: None,
+            sync_on_start: false,
+            seed_dir: None,
+        };
+        let d = format!("{c:?}");
+        assert!(!d.contains("secret1") && !d.contains("secret2"), "{d}");
     }
 
     #[test]
