@@ -73,6 +73,22 @@ fn is_unchanged(existing: Option<&[u8]>, new: &[u8]) -> bool {
 /// Largest STIG ZIP download accepted from DISA (matches the upload limit).
 const MAX_DISA_DOWNLOAD_BYTES: usize = 500 * 1024 * 1024;
 
+/// A download stopped by the size cap. A typed error so the caller can audit it.
+#[derive(Debug)]
+struct DownloadTooLarge {
+    limit: usize,
+    /// The `Content-Length` DISA declared, when the pre-check tripped.
+    declared: Option<u64>,
+}
+
+impl std::fmt::Display for DownloadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "response body is larger than {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for DownloadTooLarge {}
+
 /// Read a response body, refusing more than `limit` bytes. A declared
 /// `Content-Length` over the limit is refused before any body is read; a
 /// body without one (or lying about it) is cut off as it streams.
@@ -99,12 +115,16 @@ async fn read_capped_chunks(
     source: &mut impl ChunkSource,
 ) -> Result<Vec<u8>> {
     if declared.is_some_and(|n| n > limit as u64) {
-        anyhow::bail!("response body is larger than {limit} bytes");
+        return Err(DownloadTooLarge { limit, declared }.into());
     }
     let mut body = Vec::new();
     while let Some(chunk) = source.next_chunk().await? {
         if body.len() + chunk.len() > limit {
-            anyhow::bail!("response body is larger than {limit} bytes");
+            return Err(DownloadTooLarge {
+                limit,
+                declared: None,
+            }
+            .into());
         }
         body.extend_from_slice(&chunk);
     }
@@ -117,6 +137,17 @@ async fn sync_one(
     client: &reqwest::Client,
     pool: &PgPool,
     data_dir: &Path,
+) -> Result<Outcome> {
+    sync_one_with(source, client, pool, data_dir, MAX_DISA_DOWNLOAD_BYTES).await
+}
+
+/// [`sync_one`] with an explicit download cap (a seam for tests).
+async fn sync_one_with(
+    source: &StigSource,
+    client: &reqwest::Client,
+    pool: &PgPool,
+    data_dir: &Path,
+    limit: usize,
 ) -> Result<Outcome> {
     validate_source(source)?;
     info!("Syncing STIG '{}' from {}", source.id, source.url);
@@ -140,7 +171,37 @@ async fn sync_one(
         anyhow::bail!("DISA returned HTTP {}", resp.status());
     }
 
-    let zip_bytes = read_capped_body(resp, MAX_DISA_DOWNLOAD_BYTES).await?;
+    let zip_bytes = match read_capped_body(resp, limit).await {
+        Ok(b) => b,
+        Err(e) => {
+            // A download stopped by the cap has no acting user: audit it as a
+            // system event (no URL in the detail).
+            if let Some(t) = e.downcast_ref::<DownloadTooLarge>() {
+                warn!(
+                    target: "audit",
+                    action = "catalog.sync",
+                    reason_code = "download_too_large",
+                    stig_id = %source.id,
+                    "DISA download refused: {t}"
+                );
+                crate::db_audit::record_system_or_log(
+                    pool,
+                    crate::db_audit::NewSystemEvent {
+                        action: "catalog.sync",
+                        outcome: "rejected",
+                        stig_id: Some(&source.id),
+                        detail: serde_json::json!({
+                            "reasonCode": "download_too_large",
+                            "limitBytes": t.limit,
+                            "declaredBytes": t.declared,
+                        }),
+                    },
+                )
+                .await;
+            }
+            return Err(e);
+        }
+    };
 
     // 2. Extract XCCDF XML from ZIP (handles double-zipped STIGs)
     // Both steps are CPU-bound, so they run off the async workers.
@@ -448,6 +509,7 @@ mod id_tests {
         assert!(validate_source(&src("a")).is_ok());
     }
 
+    use sqlx::PgPool;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Serve one HTTP response: `head` (status line + headers) then `body`.
@@ -483,6 +545,8 @@ mod id_tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+        let t = e.downcast_ref::<DownloadTooLarge>().expect("typed error");
+        assert_eq!((t.limit, t.declared), (10, Some(100)));
     }
 
     #[tokio::test]
@@ -495,6 +559,8 @@ mod id_tests {
         .await
         .unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+        let t = e.downcast_ref::<DownloadTooLarge>().expect("typed error");
+        assert_eq!((t.limit, t.declared), (10, None));
     }
 
     #[tokio::test]
@@ -537,5 +603,116 @@ mod id_tests {
         let mut src = Fake(vec![vec![b'x'; 25], vec![b'x'; 25]].into_iter());
         let e = read_capped_chunks(Some(5), 10, &mut src).await.unwrap_err();
         assert!(e.to_string().contains("larger than 10 bytes"), "{e}");
+    }
+
+    // ── Database-backed: a capped download is audited as a system event ──
+
+    fn source_for(id: &str, url: String) -> StigSource {
+        StigSource {
+            id: id.into(),
+            title: "t".into(),
+            category: "Linux".into(),
+            url,
+        }
+    }
+
+    async fn sync_rows(
+        pool: &PgPool,
+    ) -> Vec<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+    )> {
+        sqlx::query_as(
+            "SELECT user_id, user_role, stig_id, detail FROM audit_events WHERE action = 'catalog.sync'",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_download_over_the_cap_is_audited_as_a_system_event(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".into(),
+            vec![b'x'; 100],
+        )
+        .await;
+        let e = sync_one_with(
+            &source_for("big-src", url),
+            &reqwest::Client::new(),
+            &pool,
+            &data_dir,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<DownloadTooLarge>().is_some(), "{e:#}");
+        let rows = sync_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (user, role, stig, detail) = &rows[0];
+        assert_eq!(user, &None);
+        assert_eq!(role.as_deref(), Some("system"));
+        assert_eq!(stig.as_deref(), Some("big-src"));
+        assert_eq!(detail["reasonCode"], "download_too_large");
+        assert_eq!(detail["limitBytes"], 10);
+        assert_eq!(detail["declaredBytes"], 100);
+        assert!(!detail.to_string().contains("127.0.0.1"), "{detail}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_streamed_download_over_the_cap_is_audited_without_a_declared_size(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(),
+            vec![b'x'; 50],
+        )
+        .await;
+        let e = sync_one_with(
+            &source_for("stream-src", url),
+            &reqwest::Client::new(),
+            &pool,
+            &data_dir,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<DownloadTooLarge>().is_some(), "{e:#}");
+        let rows = sync_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, None);
+        assert_eq!(rows[0].2.as_deref(), Some("stream-src"));
+        assert_eq!(rows[0].3["limitBytes"], 10);
+        assert!(rows[0].3["declaredBytes"].is_null(), "{}", rows[0].3);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn other_sync_failures_write_no_audit_row(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        // Under the cap but not a ZIP: fails later, must not be audited.
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n".into(),
+            b"hello".to_vec(),
+        )
+        .await;
+        let e = sync_one_with(
+            &source_for("small-src", url),
+            &reqwest::Client::new(),
+            &pool,
+            &data_dir,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<DownloadTooLarge>().is_none(), "{e:#}");
+        assert!(sync_rows(&pool).await.is_empty());
     }
 }

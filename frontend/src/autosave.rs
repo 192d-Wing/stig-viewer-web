@@ -197,6 +197,11 @@ struct Inner {
 #[derive(Clone, Debug, PartialEq)]
 struct InDoubt {
     body: String,
+    /// The tabs and dirty-tracker high-water mark the body covers, when it
+    /// holds every dirty edit of those tabs (a single-batch save). Once the
+    /// body is confirmed applied those edits are acknowledged, so they are
+    /// not written a second time. `None` for one batch of several.
+    settles: Option<(Vec<String>, u64)>,
 }
 
 /// What an answer to a resent in-doubt body means.
@@ -778,13 +783,18 @@ impl Autosave {
                 let ok = res
                     .json::<AutosaveWire>()
                     .map_err(|e| Failure::Fatal(format!("Unexpected response: {e}")))?;
-                self.inner.borrow_mut().in_doubt.remove(set_id);
-                self.inner
-                    .borrow_mut()
-                    .revisions
-                    .insert(set_id.to_string(), ok.revision);
-                // The edits are still dirty (never acknowledged), so they go
-                // again on this revision.
+                {
+                    let mut i = self.inner.borrow_mut();
+                    i.in_doubt.remove(set_id);
+                    i.revisions.insert(set_id.to_string(), ok.revision);
+                    // The body's edits are now stored. Acknowledge them when
+                    // the body covered them all; edits made since (or in
+                    // other batches) stay dirty and go on this revision.
+                    if let Some((tabs, high_water)) = &d.settles {
+                        let ids: Vec<&str> = tabs.iter().map(String::as_str).collect();
+                        i.tracker.ack(&ids, *high_water);
+                    }
+                }
                 self.emit(SetEvent::Saved {
                     set_id: set_id.to_string(),
                     revision: ok.revision,
@@ -815,7 +825,9 @@ impl Autosave {
         let epoch = self.inner.borrow().epoch;
         let (changes, high_water) = self.collect(&ids);
         let mut revision = self.revision(set_id).unwrap_or(0);
-        for batch in split_batches(changes, BATCH_MAX_CHANGES, BATCH_MAX_BYTES) {
+        let batches = split_batches(changes, BATCH_MAX_CHANGES, BATCH_MAX_BYTES);
+        let settles = (batches.len() == 1).then(|| (tab_ids.to_vec(), high_water));
+        for batch in batches {
             let save_id = new_request_id();
             let json = Self::encode(&RulesBody {
                 revision,
@@ -826,8 +838,13 @@ impl Autosave {
                 let mut i = this.inner.borrow_mut();
                 let transient = matches!(f, Failure::Transient { .. });
                 if stash_allowed(transient, save_id.is_some(), epoch, i.epoch) {
-                    i.in_doubt
-                        .insert(set_id.to_string(), InDoubt { body: json.clone() });
+                    i.in_doubt.insert(
+                        set_id.to_string(),
+                        InDoubt {
+                            body: json.clone(),
+                            settles: settles.clone(),
+                        },
+                    );
                 }
                 f
             };
@@ -957,7 +974,7 @@ impl Autosave {
                 Keepalive::Build => {}
             }
             let ids: Vec<&str> = tabs.iter().map(String::as_str).collect();
-            let (changes, _) = self.collect(&ids);
+            let (changes, high_water) = self.collect(&ids);
             let revision = self.revision(&set_id).unwrap_or(0);
             let save_id = new_request_id();
             if let Ok(body) = serde_json::to_string(&RulesBody {
@@ -968,10 +985,13 @@ impl Autosave {
                 if body.len() <= KEEPALIVE_MAX_BYTES && !changes.is_empty() {
                     // The result is never seen, so treat it as in doubt.
                     if save_id.is_some() {
-                        self.inner
-                            .borrow_mut()
-                            .in_doubt
-                            .insert(set_id.clone(), InDoubt { body: body.clone() });
+                        self.inner.borrow_mut().in_doubt.insert(
+                            set_id.clone(),
+                            InDoubt {
+                                body: body.clone(),
+                                settles: Some((tabs.clone(), high_water)),
+                            },
+                        );
                     }
                     out.push((url, body));
                 }
@@ -1292,8 +1312,20 @@ mod tests {
     #[test]
     fn an_acknowledged_batch_clears_the_stash_for_that_set_only() {
         let mut m = HashMap::new();
-        m.insert("a".to_string(), InDoubt { body: "x".into() });
-        m.insert("b".to_string(), InDoubt { body: "y".into() });
+        m.insert(
+            "a".to_string(),
+            InDoubt {
+                body: "x".into(),
+                settles: None,
+            },
+        );
+        m.insert(
+            "b".to_string(),
+            InDoubt {
+                body: "y".into(),
+                settles: None,
+            },
+        );
         settle_success(&mut m, "a");
         assert!(!m.contains_key("a") && m.contains_key("b"));
     }

@@ -40,7 +40,7 @@ test.describe("Catalog upload — authentication", () => {
     await setUserRole("upload-admin", "admin");
     const res = await uploadStigAs("upload-admin", bogus);
     expect(res.status).toBe(422);
-    expect(await res.text()).toContain("ZIP extraction failed");
+    expect(await res.text()).toBe("The file is not a readable ZIP archive.");
 
     const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
     expect(catalog.map((e) => e.id)).not.toContain(bogus.id);
@@ -76,7 +76,7 @@ test.describe("Catalog upload — authentication", () => {
     expect(bomb.length).toBeLessThan(1024 * 1024);
     const res = await uploadStigAs("upload-admin", { ...bogus, file: bomb, id: "upload-bomb" });
     expect(res.status).toBe(413);
-    expect(await res.text()).toContain("larger than");
+    expect(await res.text()).toBe("An entry in the archive is larger than the allowed uncompressed size.");
 
     const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
     expect(catalog.map((e) => e.id)).not.toContain("upload-bomb");
@@ -87,7 +87,7 @@ test.describe("Catalog upload — authentication", () => {
     const zip = breakCentralName(buildZip([{ name: "a-xccdf.xml", data: "<Benchmark/>" }]));
     const res = await uploadStigAs("upload-admin", { ...bogus, file: zip, id: "upload-mismatch" });
     expect(res.status).toBe(422);
-    expect(await res.text()).toContain("inconsistent ZIP headers");
+    expect(await res.text()).toBe("The archive's ZIP headers are inconsistent.");
 
     const catalog = await request.get(`${BACKEND}/api/catalog`).then((r) => r.json());
     expect(catalog.map((e) => e.id)).not.toContain("upload-mismatch");

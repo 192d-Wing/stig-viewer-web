@@ -533,7 +533,7 @@ pub async fn events_handler(
 
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT e.id, e.occurred_at, \
-                COALESCE(u.display_name, e.user_id) AS by_name, \
+                COALESCE(u.display_name, e.user_id, 'system') AS by_name, \
                 ast.name AS asset_name, \
                 COALESCE(sc.title, e.stig_id) AS stig_title, \
                 e.action, e.outcome, e.detail::text AS detail, \
@@ -686,6 +686,24 @@ mod events_tests {
         q.page = Some(i64::MAX);
         let Json(far) = call(&state, "admin", q).await.unwrap();
         assert!(far.rows.is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_system_event_is_listed_as_system(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO audit_events (user_id, user_role, action, outcome, stig_id, detail) \
+             VALUES (NULL, 'system', 'catalog.sync', 'rejected', 'src-1', '{\"k\":1}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let Json(all) = call(&state, "admin", query(None)).await.unwrap();
+        assert_eq!(all.total_count, 1);
+        assert_eq!(all.rows[0].by_name, "system");
+        assert_eq!(all.rows[0].action, "catalog.sync");
     }
 
     fn search_query() -> AuditSearchQuery {

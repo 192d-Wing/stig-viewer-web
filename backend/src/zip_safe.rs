@@ -69,6 +69,22 @@ impl ZipReadError {
             Self::Zip(_) | Self::Io(_) => "malformed",
         }
     }
+
+    /// Fixed, payload-free text that is safe to return to a client. `Display`
+    /// carries entry names, limits and library error text and stays for logs.
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::EntryTooLarge { .. } => {
+                "An entry in the archive is larger than the allowed uncompressed size."
+            }
+            Self::BudgetExceeded { .. } => {
+                "The archive is larger than the allowed total uncompressed size."
+            }
+            Self::Inconsistent(_) => "The archive's ZIP headers are inconsistent.",
+            Self::NoXccdf => "No XCCDF benchmark (*_xccdf.xml) was found in the archive.",
+            Self::Zip(_) | Self::Io(_) => "The file is not a readable ZIP archive.",
+        }
+    }
 }
 
 impl fmt::Display for ZipReadError {
@@ -258,6 +274,51 @@ mod tests {
         let e = read_capped(&mut ThenErr(40), "e", None, 100, &mut b).unwrap_err();
         assert!(matches!(e, ZipReadError::Io(_)), "{e}");
         assert_eq!(b.used(), 40);
+    }
+
+    #[test]
+    fn client_messages_are_fixed_and_leak_nothing() {
+        let cases: Vec<(ZipReadError, &str, &str)> = vec![
+            (
+                ZipReadError::EntryTooLarge {
+                    name: "SENTINEL".into(),
+                    limit: 12345,
+                },
+                "entry_too_large",
+                "An entry in the archive is larger than the allowed uncompressed size.",
+            ),
+            (
+                ZipReadError::BudgetExceeded { limit: 98765 },
+                "budget_exceeded",
+                "The archive is larger than the allowed total uncompressed size.",
+            ),
+            (
+                ZipReadError::Inconsistent("SENTINEL".into()),
+                "header_inconsistency",
+                "The archive's ZIP headers are inconsistent.",
+            ),
+            (
+                ZipReadError::NoXccdf,
+                "no_xccdf",
+                "No XCCDF benchmark (*_xccdf.xml) was found in the archive.",
+            ),
+            (
+                ZipReadError::Io(std::io::Error::other("SENTINEL")),
+                "malformed",
+                "The file is not a readable ZIP archive.",
+            ),
+            (
+                ZipReadError::Zip(zip::result::ZipError::FileNotFound),
+                "malformed",
+                "The file is not a readable ZIP archive.",
+            ),
+        ];
+        for (e, code, msg) in cases {
+            assert_eq!(e.code(), code);
+            assert_eq!(e.client_message(), msg);
+            assert!(!msg.contains("SENTINEL"));
+            assert!(!msg.chars().any(|c| c.is_ascii_digit()), "{msg}");
+        }
     }
 
     #[test]
