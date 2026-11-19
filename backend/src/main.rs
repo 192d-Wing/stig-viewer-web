@@ -255,6 +255,38 @@ async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> 
     Ok(pool)
 }
 
+/// Log a loud warning for each test-only hook that is switched on.
+fn warn_enabled_test_hooks(test_hooks: &TestHooks) {
+    if test_hooks.enable_test_routes {
+        tracing::warn!(
+            "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted. \
+             Never enable this on a reachable deployment."
+        );
+    }
+    if test_hooks.allow_test_auth_header {
+        tracing::warn!(
+            "ALLOW_TEST_AUTH_HEADER is on: any client can authenticate as any user via \
+             X-User-Id. Never enable this on a reachable deployment."
+        );
+    }
+}
+
+/// Connect (migrating as the owner if configured), apply the audit test-mode
+/// policy, and enforce the owner/app role boundary before anything is served.
+async fn open_database(config: &Config, test_hooks: &TestHooks) -> Result<sqlx::PgPool> {
+    if test_hooks.production && config.database_migration_url.is_some() {
+        tracing::warn!(
+            "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
+             could read the owner credential. Prefer running `migrate` as a separate job."
+        );
+    }
+    let pool = connect_database(config, test_hooks).await?;
+    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
+    let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
+    db_roles::boundary_policy(test_hooks.production, &violations)?;
+    Ok(pool)
+}
+
 /// The `migrate` subcommand: validate the test hooks, run migrations and the
 /// application-role grants as the owner role, then return.
 async fn run_migrate_command() -> Result<()> {
@@ -293,18 +325,7 @@ async fn main() -> Result<()> {
     // enabled refuses to start — before touching the DB or binding a port.
     let test_hooks = TestHooks::from_env();
     test_hooks.validate()?;
-    if test_hooks.enable_test_routes {
-        tracing::warn!(
-            "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted. \
-             Never enable this on a reachable deployment."
-        );
-    }
-    if test_hooks.allow_test_auth_header {
-        tracing::warn!(
-            "ALLOW_TEST_AUTH_HEADER is on: any client can authenticate as any user via \
-             X-User-Id. Never enable this on a reachable deployment."
-        );
-    }
+    warn_enabled_test_hooks(&test_hooks);
 
     let config = Arc::new(Config::from_env()?);
     config::validate_seed_dir(
@@ -321,16 +342,7 @@ async fn main() -> Result<()> {
 
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
-    if test_hooks.production && config.database_migration_url.is_some() {
-        tracing::warn!(
-            "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
-             could read the owner credential. Prefer running `migrate` as a separate job."
-        );
-    }
-    let pool = Arc::new(connect_database(&config, &test_hooks).await?);
-    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
-    let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
-    db_roles::boundary_policy(test_hooks.production, &violations)?;
+    let pool = Arc::new(open_database(&config, &test_hooks).await?);
     let _ = stig_id::warn_non_conforming(&pool).await;
 
     if let Some(seed_dir) = &config.seed_dir {
