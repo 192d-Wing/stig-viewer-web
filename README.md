@@ -530,8 +530,11 @@ With `AUDIT_ARCHIVE_ENABLED` (default on), each retention sweep writes
 immutable segments to `${DATA_DIR}/audit_archive/`:
 `rules-<UTC date>.<firstId>-<lastId>.jsonl` (`rule_audit`) and
 `events-<UTC date>.<firstId>-<lastId>.jsonl` (`audit_events`). A segment is
-written to a temp file, fsynced and renamed, then gets a sidecar
-`<segment>.manifest.json`. Rows are archived before the delete runs, and a
+written to a temp file, fsynced and renamed; its sidecar
+`<segment>.manifest.json` is published first, so a visible segment always has
+its sidecar (an orphan sidecar from a crash is ignored). Sweeps are serialized
+per database by an advisory lock; a sweep that cannot get it within five
+minutes fails (recorded in the scheduler log) and retries on the next tick. Rows are archived before the delete runs, and a
 failed archive write deletes nothing.
 
 Archiving is idempotent by row id, without trusting the directory. A row is
