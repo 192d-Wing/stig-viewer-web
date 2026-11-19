@@ -10,6 +10,7 @@ mod db_checklists;
 mod db_drafts;
 mod db_notice;
 mod db_roles;
+mod failure_counters;
 mod integrity;
 mod parser;
 mod pdf;
@@ -136,7 +137,7 @@ use api::{
     },
     findings::list_handler as list_findings_handler,
     findings_bulk::bulk_handler as bulk_findings_handler,
-    health::get_health,
+    health::{failure_counters_handler, get_health},
     notifications::{
         get_handler as get_notifications_handler,
         get_prefs_handler as get_notification_prefs_handler,
@@ -686,6 +687,7 @@ async fn main() -> Result<()> {
                 "/api/admin/scheduler-runs",
                 get(list_scheduler_runs_handler),
             )
+            .route("/api/admin/failure-counters", get(failure_counters_handler))
             .route("/api/admin/backup", get(admin_backup_download_handler))
             // Backup archives can be as large as the catalog uploads; the
             // handler is admin-only.
@@ -1004,16 +1006,16 @@ async fn main() -> Result<()> {
     }
 
     // AC-8: drop consumed login acknowledgements whose claim window has passed.
-    // Deliberately not registered with `scheduler_log` (not a status-page scheduler).
+    // Deliberately not registered with `scheduler_log` (not a status-page scheduler);
+    // failures are counted: status on `/api/health` (`checks.loginAckPrune`),
+    // numbers on the admin-only `/api/admin/failure-counters`.
     {
         let db = pool.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                if let Err(e) = db_notice::prune_acks(&db).await {
-                    tracing::error!("login ack prune failed: {e:#}");
-                }
+                db_notice::prune_acks_tick(&db, &failure_counters::ACK_PRUNE).await;
             }
         });
     }

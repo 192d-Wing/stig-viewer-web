@@ -6,6 +6,8 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 
+use crate::failure_counters::FailureCounter;
+
 /// What an acknowledgement recorded, returned once at login completion.
 #[derive(Debug, sqlx::FromRow)]
 pub struct AckRecord {
@@ -85,6 +87,24 @@ pub async fn prune_acks(pool: &PgPool) -> Result<u64> {
     .await?
     .rows_affected();
     Ok(n)
+}
+
+/// One background prune tick: run [`prune_acks`], log a failure and record the
+/// outcome on `counter` (status on `/api/health`, numbers on `/api/admin/failure-counters`).
+pub async fn prune_acks_tick(pool: &PgPool, counter: &FailureCounter) {
+    match prune_acks(pool).await {
+        Ok(_) => {
+            let streak = counter.snapshot().consecutive;
+            counter.record_success();
+            if streak > 0 {
+                tracing::info!("login ack prune recovered after {streak} failures");
+            }
+        }
+        Err(e) => {
+            let n = counter.record_failure();
+            tracing::error!(consecutive_failures = n, "login ack prune failed: {e:#}");
+        }
+    }
 }
 
 /// Atomically consume an unused, unexpired acknowledgement for the current
@@ -352,5 +372,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec!["fresh", "new"]);
+    }
+
+    #[tokio::test]
+    async fn prune_tick_counts_failures_on_an_unreachable_database() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy(&format!("postgres://{}@127.0.0.1:1/x", "u"))
+            .expect("lazy pool");
+        let c = FailureCounter::new();
+        for _ in 0..3 {
+            prune_acks_tick(&pool, &c).await;
+        }
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (3, 3));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_tick_records_success_then_failure(pool: PgPool) {
+        let c = FailureCounter::new();
+        prune_acks_tick(&pool, &c).await;
+        let s = c.snapshot();
+        assert!(s.last_success_at.is_some());
+        assert_eq!((s.total, s.consecutive), (0, 0));
+        pool.close().await;
+        prune_acks_tick(&pool, &c).await;
+        let s = c.snapshot();
+        assert_eq!((s.total, s.consecutive), (1, 1));
     }
 }
