@@ -80,7 +80,7 @@ pub async fn api_fetch_json<B: Serialize + ?Sized>(
         .map_err(js_err)
 }
 
-/// Why a request made with `api_fetch_with_timeout` did not complete.
+/// Why a request made with `api_request_timed` did not complete.
 #[derive(Debug, PartialEq)]
 pub enum FetchFailure {
     /// No usable response: offline, DNS, CORS, connection reset.
@@ -91,18 +91,76 @@ pub enum FetchFailure {
     Build(String),
 }
 
-/// Raw request with an optional pre-serialized JSON body that is aborted
-/// after `timeout_ms`, so a hung connection cannot block callers forever.
-/// The timeout covers the wait for response headers.
-pub async fn api_fetch_with_timeout(
+/// A send or body-read error is a timeout when our timer fired the abort,
+/// otherwise a network failure.
+fn abort_failure(timed_out: bool, msg: String) -> FetchFailure {
+    if timed_out {
+        FetchFailure::Timeout
+    } else {
+        FetchFailure::Network(msg)
+    }
+}
+
+/// Shown when a checklist-set request ran out of time.
+pub const TIMEOUT_MSG: &str = "The request timed out. Check your connection and try again.";
+
+impl FetchFailure {
+    /// A message fit for an error banner.
+    pub fn message(&self) -> String {
+        match self {
+            FetchFailure::Timeout => TIMEOUT_MSG.to_string(),
+            FetchFailure::Network(m) | FetchFailure::Build(m) => m.clone(),
+        }
+    }
+}
+
+/// Deadline for every checklist-set request, headers and body together.
+pub const SET_REQUEST_TIMEOUT_MS: u32 = 15_000;
+/// Save to system fans out one write per STIG, so it gets longer.
+pub const SET_SAVE_TO_SYSTEM_TIMEOUT_MS: u32 = 60_000;
+
+/// A response read to the end inside one deadline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedResponse {
+    pub status: u16,
+    pub retry_after: Option<u32>,
+    pub body: String,
+}
+
+impl TimedResponse {
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T, String> {
+        serde_json::from_str(&self.body).map_err(js_err)
+    }
+
+    /// The body when there is one, else a generic status message.
+    fn error_text(&self) -> String {
+        if self.body.is_empty() {
+            format!("Request failed ({})", self.status)
+        } else {
+            self.body.clone()
+        }
+    }
+}
+
+/// Request with an optional pre-serialized JSON body, aborted after
+/// `timeout_ms`. The one deadline covers waiting for headers and reading the
+/// body (aborting the signal also fails the body stream), so a stalled
+/// connection cannot hang the caller at either step. Does not treat non-2xx
+/// as an error.
+pub async fn api_request_timed(
     method: &str,
     path: &str,
     json_body: Option<&str>,
     timeout_ms: u32,
-) -> Result<Response, FetchFailure> {
+) -> Result<TimedResponse, FetchFailure> {
     use std::{cell::Cell, rc::Rc};
     let ctl = web_sys::AbortController::new().map_err(|e| FetchFailure::Build(format!("{e:?}")))?;
     let timed_out = Rc::new(Cell::new(false));
+    // Held until the body is read: dropping it cancels the timer.
     let _timer = {
         let (ctl, timed_out) = (ctl.clone(), timed_out.clone());
         gloo_timers::callback::Timeout::new(timeout_ms, move || {
@@ -118,10 +176,62 @@ pub async fn api_fetch_with_timeout(
             .map_err(|e| FetchFailure::Build(js_err(e)))?,
         None => b.build().map_err(|e| FetchFailure::Build(js_err(e)))?,
     };
-    match req.send().await {
-        Ok(res) => Ok(res),
-        Err(_) if timed_out.get() => Err(FetchFailure::Timeout),
-        Err(e) => Err(FetchFailure::Network(js_err(e))),
+    let failure = |e: gloo_net::Error| abort_failure(timed_out.get(), js_err(e));
+    let res = req.send().await.map_err(failure)?;
+    let status = res.status();
+    let retry_after = res
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.parse().ok());
+    let body = res.text().await.map_err(failure)?;
+    Ok(TimedResponse {
+        status,
+        retry_after,
+        body,
+    })
+}
+
+/// Checklist-set request parsing a JSON response, under `timeout_ms`.
+/// Errors carry the response body text, or the timeout message.
+pub async fn set_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+    method: &str,
+    path: &str,
+    body: Option<&B>,
+    timeout_ms: u32,
+) -> Result<T, String> {
+    let res = set_request(method, path, body, timeout_ms).await?;
+    res.json()
+}
+
+/// Like [`set_json`] for endpoints that answer 204 / an empty body.
+pub async fn set_send<B: Serialize + ?Sized>(
+    method: &str,
+    path: &str,
+    body: Option<&B>,
+    timeout_ms: u32,
+) -> Result<(), String> {
+    set_request(method, path, body, timeout_ms)
+        .await
+        .map(|_| ())
+}
+
+async fn set_request<B: Serialize + ?Sized>(
+    method: &str,
+    path: &str,
+    body: Option<&B>,
+    timeout_ms: u32,
+) -> Result<TimedResponse, String> {
+    let json = match body {
+        Some(b) => Some(serde_json::to_string(b).map_err(js_err)?),
+        None => None,
+    };
+    let res = api_request_timed(method, path, json.as_deref(), timeout_ms)
+        .await
+        .map_err(|f| f.message())?;
+    if res.ok() {
+        Ok(res)
+    } else {
+        Err(res.error_text())
     }
 }
 
@@ -228,4 +338,32 @@ pub fn response_filename(res: &Response) -> Option<String> {
     let idx = cd.find("filename=")?;
     let name = cd[idx + 9..].split(';').next()?.trim().trim_matches('"');
     (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_error_after_our_abort_is_a_timeout_otherwise_a_network_failure() {
+        // The same mapping serves a stalled body read as a stalled send.
+        assert_eq!(abort_failure(true, "aborted".into()), FetchFailure::Timeout);
+        assert_eq!(
+            abort_failure(false, "reset".into()),
+            FetchFailure::Network("reset".into())
+        );
+    }
+
+    #[test]
+    fn timeouts_and_statuses_read_sensibly() {
+        assert_eq!(FetchFailure::Timeout.message(), TIMEOUT_MSG);
+        let r = |status, body: &str| TimedResponse {
+            status,
+            retry_after: None,
+            body: body.into(),
+        };
+        assert!(r(204, "").ok() && !r(409, "").ok());
+        assert_eq!(r(500, "").error_text(), "Request failed (500)");
+        assert_eq!(r(409, "boom").error_text(), "boom");
+    }
 }

@@ -215,6 +215,40 @@ test.describe("Checklist sets — API", () => {
     expect(checklists).toEqual([]);
   });
 
+  test("create with a repeated clientRequestId returns the same set", async ({ request }) => {
+    const data = { stigIds: ["edge"], clientRequestId: "0b9d6f0e-39a4-4d7a-9a0e-5d6a1c2b3e4f" };
+    const first = await request.post(SETS, { headers: JSON_HEADERS("alice"), data });
+    expect(first.status()).toBe(201);
+    const again = await request.post(SETS, { headers: JSON_HEADERS("alice"), data });
+    expect(again.status()).toBe(200);
+    expect((await again.json()).id).toBe((await first.json()).id);
+    const list = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    expect(list).toHaveLength(1);
+    const bad = await request.post(SETS, { headers: JSON_HEADERS("alice"), data: { ...data, clientRequestId: "nope" } });
+    expect(bad.status()).toBe(400);
+  });
+
+  test("an autosave replayed with its saveId is acknowledged; after another write it is a 409", async ({ request }) => {
+    const set = await createSet(request, "alice");
+    const ids = await edgeRuleIds(request);
+    const saveId = "7c1e2f3a-4b5c-4d6e-8f70-91a2b3c4d5e6";
+    const change = [{ stigId: "edge", ruleId: ids[0], status: "open", findingDetails: "", comments: "" }];
+    const send = (revision, id) =>
+      request.patch(`${SETS}/${set.id}/rules`, {
+        headers: JSON_HEADERS("alice"),
+        data: { revision, changes: change, saveId: id },
+      });
+    const first = await send(0, saveId);
+    expect(first.status()).toBe(200);
+    expect((await first.json()).revision).toBe(1);
+    const replay = await send(0, saveId);
+    expect(replay.status()).toBe(200);
+    expect((await replay.json()).revision).toBe(1);
+    // Another write moves the set on; the old request is now a real conflict.
+    expect((await autosave(request, "alice", set.id, 1, [])).status()).toBe(200);
+    expect((await send(0, saveId)).status()).toBe(409);
+  });
+
   test("autosave shares the per-user mutation budget", async ({ request }) => {
     expect((await request.post(`${BACKEND}/api/test/reset-ratelimit`)).status()).toBe(204);
     const set = await createSet(request, "alice");
@@ -414,6 +448,78 @@ test.describe("Checklist sets — UI", () => {
         return sets[0]?.touchedCount ?? 0;
       })
       .toBe(1);
+  });
+
+  test("a save whose response is lost does not raise a conflict", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    await loginAs(page, "alice");
+    const listbox = await openEdge(page);
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+    const [set] = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+
+    // The server applies the next save, but the browser never sees the answer.
+    let patches = 0;
+    await page.route("**/api/checklist-sets/*/rules", async (route) => {
+      patches += 1;
+      if (patches === 1) {
+        await route.fetch();
+        await route.abort();
+        return;
+      }
+      await route.continue();
+    });
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    // The dropped answer shows first, then the retry settles it.
+    await expect(page.getByTestId("autosave-status")).toContainText(/Offline - will retry/, { timeout: 30_000 });
+    await expect.poll(() => patches, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 30_000 });
+    await expect(page.getByTestId("set-conflict")).toHaveCount(0);
+    // Both edits are stored, on revisions 1 and 2 (one write per save).
+    await expect
+      .poll(async () => {
+        const d = await getSet(request, "alice", set.id).then((r) => r.json());
+        return `${d.revision}:${d.stigs[0].rules.length}`;
+      })
+      .toBe("2:2");
+  });
+
+  test("a create whose response is lost makes one set", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    await loginAs(page, "alice");
+    const listbox = await openEdge(page);
+    let posts = 0;
+    await page.route(new RegExp("/api/checklist-sets$"), async (route) => {
+      if (route.request().method() === "POST") {
+        posts += 1;
+        if (posts === 1) {
+          await route.fetch();
+          await route.abort();
+          return;
+        }
+      }
+      await route.continue();
+    });
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect.poll(() => posts, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 40_000 });
+    const sets = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    expect(sets).toHaveLength(1);
+    expect(sets[0].touchedCount).toBe(1);
+  });
+
+  test("My checklists reports a request that never answers", async ({ page }) => {
+    test.setTimeout(45_000);
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.route(new RegExp("/api/checklist-sets$"), () => {
+      // Never fulfil or continue: the request hangs until the client gives up.
+    });
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await expect(page.getByText(/timed out/i).first()).toBeVisible({ timeout: 25_000 });
   });
 
   test("a local file tab is marked as not saved to the account", async ({ page }) => {

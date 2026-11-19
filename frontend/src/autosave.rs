@@ -17,12 +17,15 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
 
-use crate::api::{api_fetch, api_fetch_with_timeout, api_get, user_id, FetchFailure, BACKEND};
+use crate::api::{
+    api_request_timed, set_json, user_id, FetchFailure, TimedResponse, BACKEND,
+    SET_REQUEST_TIMEOUT_MS,
+};
 use crate::model::{
     split_batches, ChecklistSet, DirtyTracker, ServerRule, SetRuleChange, StigTab, BATCH_MAX_BYTES,
     BATCH_MAX_CHANGES,
 };
-use crate::util::{now_ms, spawn_local, window};
+use crate::util::{new_request_id, now_ms, spawn_local, window};
 
 /// Longest an edit may wait before it is sent, however long typing continues.
 const MAX_WAIT_MS: f64 = 15_000.0;
@@ -31,12 +34,9 @@ const BACKOFF_START_MS: u32 = 1_000;
 const BACKOFF_MAX_MS: u32 = 30_000;
 /// Browsers cap `keepalive` request bodies near 64 KiB.
 const KEEPALIVE_MAX_BYTES: usize = 60 * 1024;
-/// A save request that has not answered by then is abandoned and retried, so
-/// one hung connection cannot block sign-out, tab close or Save to system.
-const REQUEST_TIMEOUT_MS: u32 = 15_000;
 const LIMIT_MSG: &str = "You have reached the limit of 50 checklists. Delete one in My checklists.";
 const TOO_LARGE_MSG: &str =
-    "This checklist is too large to save. Remove some notes or start another checklist.";
+    "This checklist is over the 4 MB limit. Shorten or remove some notes, or start another checklist.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SaveStatus {
@@ -113,12 +113,18 @@ struct AutosaveWire {
 struct CreateBody<'a> {
     #[serde(rename = "stigIds")]
     stig_ids: Vec<&'a str>,
+    /// Reused when a create is retried, so the server makes one set.
+    #[serde(rename = "clientRequestId", skip_serializing_if = "Option::is_none")]
+    client_request_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 struct RulesBody<'a> {
     revision: i64,
     changes: &'a [SetRuleChange],
+    /// Names this request so the server can recognise an exact retry.
+    #[serde(rename = "saveId", skip_serializing_if = "Option::is_none")]
+    save_id: Option<&'a str>,
 }
 
 impl SetDetailWire {
@@ -147,10 +153,15 @@ impl SetDetailWire {
 pub async fn fetch_set(
     set_id: &str,
 ) -> Result<(ChecklistSet, Vec<(String, Vec<ServerRule>)>), String> {
-    let wire: SetDetailWire = api_get(&format!(
-        "/api/checklist-sets/{}",
-        crate::util::encode_uri_component(set_id)
-    ))
+    let wire: SetDetailWire = set_json(
+        "GET",
+        &format!(
+            "/api/checklist-sets/{}",
+            crate::util::encode_uri_component(set_id)
+        ),
+        None::<&()>,
+        SET_REQUEST_TIMEOUT_MS,
+    )
     .await?;
     Ok(wire.into_set())
 }
@@ -163,6 +174,15 @@ struct Inner {
     revisions: HashMap<String, i64>,
     /// Sets created for tabs whose `set_id` has not reached a render yet.
     created: HashMap<String, String>,
+    /// Create token per tab, kept across retries of its set creation.
+    create_keys: HashMap<String, String>,
+    /// A save whose outcome is unknown (timeout, dropped connection, 5xx),
+    /// per set. It is resent unchanged before anything newer, so the server
+    /// can recognise it if it already applied.
+    in_doubt: HashMap<String, InDoubt>,
+    /// Bumped whenever in-doubt state is discarded on purpose (server state
+    /// taken, set forgotten), so a save started earlier cannot re-stash.
+    epoch: u32,
     paused: HashSet<String>,
     running: bool,
     stopped: bool,
@@ -170,6 +190,68 @@ struct Inner {
     first_edit_at: Option<f64>,
     backoff_ms: u32,
     last_saved: Option<String>,
+}
+
+/// The exact JSON body (base revision and `saveId` included) of an
+/// unconfirmed save.
+#[derive(Clone, Debug, PartialEq)]
+struct InDoubt {
+    body: String,
+}
+
+/// What an answer to a resent in-doubt body means.
+#[derive(Debug, PartialEq)]
+enum Resend {
+    /// Applied (now or earlier): take the revision and go on.
+    Applied,
+    /// A real conflict: another writer got in between.
+    Conflict,
+    /// Not retryable; forget the body and report the failure.
+    Drop,
+    /// Still unknown; keep the body for the next attempt.
+    Keep,
+}
+
+fn after_resend(status: u16) -> Resend {
+    match status {
+        200..=299 => Resend::Applied,
+        409 => Resend::Conflict,
+        429 | 500..=599 => Resend::Keep,
+        _ => Resend::Drop,
+    }
+}
+
+/// Whether a failed save is remembered as in doubt: only a transient failure
+/// of a request that carried a token, and only if nothing discarded in-doubt
+/// state since the request started.
+fn stash_allowed(transient: bool, has_token: bool, epoch_then: u32, epoch_now: u32) -> bool {
+    transient && has_token && epoch_then == epoch_now
+}
+
+/// What the `pagehide` keepalive does for a set.
+#[derive(Debug, PartialEq)]
+enum Keepalive {
+    /// A save is running or its answer is awaited; it settles the set.
+    Skip,
+    /// Resend the stashed body unchanged.
+    Stashed,
+    /// Build a new body from the dirty rules.
+    Build,
+}
+
+fn keepalive_action(running: bool, stashed: bool) -> Keepalive {
+    if running {
+        Keepalive::Skip
+    } else if stashed {
+        Keepalive::Stashed
+    } else {
+        Keepalive::Build
+    }
+}
+
+/// A batch was acknowledged: whatever was in doubt for the set is settled.
+fn settle_success(in_doubt: &mut HashMap<String, InDoubt>, set_id: &str) {
+    in_doubt.remove(set_id);
 }
 
 type Events = Callback<SetEvent>;
@@ -364,6 +446,8 @@ impl Autosave {
             i.tracker.forget_tab(&gone);
         }
         i.created.retain(|tab_id, _| live.contains(tab_id.as_str()));
+        i.create_keys
+            .retain(|tab_id, _| live.contains(tab_id.as_str()));
     }
 
     /// Start tracking a set opened or created elsewhere.
@@ -388,6 +472,8 @@ impl Autosave {
         }
         i.revisions.remove(set_id);
         i.paused.remove(set_id);
+        i.in_doubt.remove(set_id);
+        i.epoch = i.epoch.wrapping_add(1);
     }
 
     /// Record edits to `rule_ids` of a tab and schedule a save. Only catalog
@@ -583,16 +669,10 @@ impl Autosave {
         Err(o.msg)
     }
 
-    /// One JSON request with a timeout. Serialization problems are fatal;
-    /// network failures and timeouts are retried later.
-    async fn request<B: Serialize + ?Sized>(
-        method: &str,
-        path: &str,
-        body: &B,
-    ) -> Result<gloo_net::http::Response, Failure> {
-        let json = serde_json::to_string(body)
-            .map_err(|e| Failure::Fatal(format!("Could not encode the save: {e}")))?;
-        api_fetch_with_timeout(method, path, Some(&json), REQUEST_TIMEOUT_MS)
+    /// One JSON request under the set deadline, headers and body together.
+    /// Network failures and timeouts are retried later.
+    async fn send_json(method: &str, path: &str, json: &str) -> Result<TimedResponse, Failure> {
+        api_request_timed(method, path, Some(json), SET_REQUEST_TIMEOUT_MS)
             .await
             .map_err(|e| match e {
                 FetchFailure::Build(msg) => Failure::Fatal(msg),
@@ -609,35 +689,46 @@ impl Autosave {
             })
     }
 
+    fn encode<B: Serialize + ?Sized>(body: &B) -> Result<String, Failure> {
+        serde_json::to_string(body)
+            .map_err(|e| Failure::Fatal(format!("Could not encode the save: {e}")))
+    }
+
     async fn create_set(&self, tab: &StigTab) -> Result<String, Failure> {
         let Some(catalog_id) = tab.catalog_id.as_deref() else {
             return Err(Failure::Fatal(
                 "Only library STIGs are saved to your account".into(),
             ));
         };
-        let res = Self::request(
-            "POST",
-            "/api/checklist-sets",
-            &CreateBody {
-                stig_ids: vec![catalog_id],
-            },
-        )
-        .await?;
+        // One token per tab, reused by every retry of this create.
+        let key = {
+            let mut i = self.inner.borrow_mut();
+            match i.create_keys.get(&tab.id) {
+                Some(k) => Some(k.clone()),
+                None => {
+                    let k = new_request_id();
+                    if let Some(k) = &k {
+                        i.create_keys.insert(tab.id.clone(), k.clone());
+                    }
+                    k
+                }
+            }
+        };
+        let json = Self::encode(&CreateBody {
+            stig_ids: vec![catalog_id],
+            client_request_id: key.as_deref(),
+        })?;
+        let res = Self::send_json("POST", "/api/checklist-sets", &json).await?;
         if !res.ok() {
-            let retry = res
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.parse().ok());
-            let text = res.text().await.unwrap_or_default();
-            return Err(classify_create(res.status(), retry, text));
+            return Err(classify_create(res.status, res.retry_after, res.body));
         }
         let wire = res
             .json::<SetDetailWire>()
-            .await
             .map_err(|e| Failure::Fatal(format!("Unexpected response: {e}")))?;
         let (set, _) = wire.into_set();
         {
             let mut i = self.inner.borrow_mut();
+            i.create_keys.remove(&tab.id);
             i.created.insert(tab.id.clone(), set.id.clone());
             i.revisions.insert(set.id.clone(), set.revision);
         }
@@ -673,42 +764,91 @@ impl Autosave {
         (changes, hw)
     }
 
+    /// Resend the set's unconfirmed save, unchanged. `Ok` once it is settled
+    /// (applied, or nothing was in doubt); the server then answers a copy of an
+    /// applied save with the current revision instead of a conflict.
+    async fn resolve_in_doubt(&self, set_id: &str, path: &str) -> Result<(), Failure> {
+        let Some(d) = self.inner.borrow().in_doubt.get(set_id).cloned() else {
+            return Ok(());
+        };
+        // A transient failure here returns early and leaves the body stashed.
+        let res = Self::send_json("PATCH", path, &d.body).await?;
+        match after_resend(res.status) {
+            Resend::Applied => {
+                let ok = res
+                    .json::<AutosaveWire>()
+                    .map_err(|e| Failure::Fatal(format!("Unexpected response: {e}")))?;
+                self.inner.borrow_mut().in_doubt.remove(set_id);
+                self.inner
+                    .borrow_mut()
+                    .revisions
+                    .insert(set_id.to_string(), ok.revision);
+                // The edits are still dirty (never acknowledged), so they go
+                // again on this revision.
+                self.emit(SetEvent::Saved {
+                    set_id: set_id.to_string(),
+                    revision: ok.revision,
+                });
+                Ok(())
+            }
+            Resend::Conflict => {
+                let mut i = self.inner.borrow_mut();
+                i.in_doubt.remove(set_id);
+                i.paused.insert(set_id.to_string());
+                Err(Failure::Conflict)
+            }
+            Resend::Drop => {
+                self.inner.borrow_mut().in_doubt.remove(set_id);
+                Err(classify(res.status, res.retry_after, res.body))
+            }
+            Resend::Keep => Err(classify(res.status, res.retry_after, res.body)),
+        }
+    }
+
     async fn send_set(&self, set_id: &str, tab_ids: &[String]) -> Result<(), Failure> {
-        let ids: Vec<&str> = tab_ids.iter().map(String::as_str).collect();
-        let (changes, high_water) = self.collect(&ids);
         let path = format!(
             "/api/checklist-sets/{}/rules",
             crate::util::encode_uri_component(set_id)
         );
+        self.resolve_in_doubt(set_id, &path).await?;
+        let ids: Vec<&str> = tab_ids.iter().map(String::as_str).collect();
+        let epoch = self.inner.borrow().epoch;
+        let (changes, high_water) = self.collect(&ids);
         let mut revision = self.revision(set_id).unwrap_or(0);
         for batch in split_batches(changes, BATCH_MAX_CHANGES, BATCH_MAX_BYTES) {
-            let body = RulesBody {
+            let save_id = new_request_id();
+            let json = Self::encode(&RulesBody {
                 revision,
                 changes: &batch,
+                save_id: save_id.as_deref(),
+            })?;
+            let failed = |this: &Self, f: Failure| {
+                let mut i = this.inner.borrow_mut();
+                let transient = matches!(f, Failure::Transient { .. });
+                if stash_allowed(transient, save_id.is_some(), epoch, i.epoch) {
+                    i.in_doubt
+                        .insert(set_id.to_string(), InDoubt { body: json.clone() });
+                }
+                f
             };
-            let res = Self::request("PATCH", &path, &body).await?;
+            let res = match Self::send_json("PATCH", &path, &json).await {
+                Ok(r) => r,
+                Err(f) => return Err(failed(self, f)),
+            };
             if !res.ok() {
-                let retry = res
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.parse().ok());
-                let status = res.status();
-                let text = res.text().await.unwrap_or_default();
-                let f = classify(status, retry, text);
+                let f = classify(res.status, res.retry_after, res.body);
                 if f == Failure::Conflict {
                     self.inner.borrow_mut().paused.insert(set_id.to_string());
                 }
-                return Err(f);
+                return Err(failed(self, f));
             }
             let ok = res
                 .json::<AutosaveWire>()
-                .await
                 .map_err(|e| Failure::Fatal(format!("Unexpected response: {e}")))?;
             revision = ok.revision;
-            self.inner
-                .borrow_mut()
-                .revisions
-                .insert(set_id.to_string(), revision);
+            let mut i = self.inner.borrow_mut();
+            i.revisions.insert(set_id.to_string(), revision);
+            settle_success(&mut i.in_doubt, set_id);
         }
         self.inner.borrow_mut().tracker.ack(&ids, high_water);
         self.emit(SetEvent::Saved {
@@ -752,6 +892,8 @@ impl Autosave {
             }
             i.revisions.insert(set_id.to_string(), set.revision);
             i.paused.remove(set_id);
+            i.in_doubt.remove(set_id);
+            i.epoch = i.epoch.wrapping_add(1);
             keep
         };
         self.emit(SetEvent::Replace {
@@ -791,21 +933,47 @@ impl Autosave {
         };
         let mut out = Vec::new();
         for (set_id, tabs) in tabs_by_set {
+            let url = format!(
+                "{BACKEND}/api/checklist-sets/{}/rules",
+                crate::util::encode_uri_component(&set_id)
+            );
+            // An unconfirmed save goes first and unchanged: a page restored
+            // from the back-forward cache resolves it before anything else.
+            let (running, pending) = {
+                let i = self.inner.borrow();
+                (i.running, i.in_doubt.get(&set_id).cloned())
+            };
+            match keepalive_action(running, pending.is_some()) {
+                // A save for this set is already in flight. Sending a second
+                // body could double-apply or conflict; its edits stay dirty
+                // and the `beforeunload` prompt covers a real close.
+                Keepalive::Skip => continue,
+                Keepalive::Stashed => {
+                    if let Some(d) = pending.filter(|d| d.body.len() <= KEEPALIVE_MAX_BYTES) {
+                        out.push((url, d.body));
+                    }
+                    continue;
+                }
+                Keepalive::Build => {}
+            }
             let ids: Vec<&str> = tabs.iter().map(String::as_str).collect();
             let (changes, _) = self.collect(&ids);
             let revision = self.revision(&set_id).unwrap_or(0);
+            let save_id = new_request_id();
             if let Ok(body) = serde_json::to_string(&RulesBody {
                 revision,
                 changes: &changes,
+                save_id: save_id.as_deref(),
             }) {
                 if body.len() <= KEEPALIVE_MAX_BYTES && !changes.is_empty() {
-                    out.push((
-                        format!(
-                            "{BACKEND}/api/checklist-sets/{}/rules",
-                            crate::util::encode_uri_component(&set_id)
-                        ),
-                        body,
-                    ));
+                    // The result is never seen, so treat it as in doubt.
+                    if save_id.is_some() {
+                        self.inner
+                            .borrow_mut()
+                            .in_doubt
+                            .insert(set_id.clone(), InDoubt { body: body.clone() });
+                    }
+                    out.push((url, body));
                 }
             }
         }
@@ -888,35 +1056,47 @@ pub fn use_autosave(on_event: Callback<SetEvent>) -> Autosave {
     autosave
 }
 
-/// Delete a set by id (used when it was deleted from My checklists).
+/// Delete a set by id (used when it was deleted from My checklists). A 404
+/// counts as done, so retrying a delete that already applied is not an error.
 pub async fn delete_set(set_id: &str) -> Result<(), String> {
-    let res = api_fetch(
-        "DELETE",
-        &format!(
-            "/api/checklist-sets/{}",
-            crate::util::encode_uri_component(set_id)
-        ),
-    )
-    .await?;
-    if res.ok() {
+    let path = format!(
+        "/api/checklist-sets/{}",
+        crate::util::encode_uri_component(set_id)
+    );
+    let res = api_request_timed("DELETE", &path, None, SET_REQUEST_TIMEOUT_MS)
+        .await
+        .map_err(|f| f.message())?;
+    if res.ok() || res.status == 404 {
         Ok(())
     } else {
-        Err(format!("Delete failed ({})", res.status()))
+        Err(format!("Delete failed ({})", res.status))
     }
 }
 
 /// Create a set holding `stig_ids`; the server names it when `name` is blank.
-pub async fn create_named_set(name: &str, stig_ids: &[String]) -> Result<ChecklistSet, String> {
+/// `request_id` is reused when the same create is retried.
+pub async fn create_named_set(
+    name: &str,
+    stig_ids: &[String],
+    request_id: Option<&str>,
+) -> Result<ChecklistSet, String> {
     #[derive(Serialize)]
     struct Body<'a> {
         name: &'a str,
         #[serde(rename = "stigIds")]
         stig_ids: &'a [String],
+        #[serde(rename = "clientRequestId", skip_serializing_if = "Option::is_none")]
+        client_request_id: Option<&'a str>,
     }
-    let wire: SetDetailWire = crate::api::api_json(
-        "/api/checklist-sets",
+    let wire: SetDetailWire = set_json(
         "POST",
-        Some(&Body { name, stig_ids }),
+        "/api/checklist-sets",
+        Some(&Body {
+            name,
+            stig_ids,
+            client_request_id: request_id,
+        }),
+        SET_REQUEST_TIMEOUT_MS,
     )
     .await?;
     Ok(wire.into_set().0)
@@ -1056,5 +1236,65 @@ mod tests {
             SaveStatus::Offline.indicator().map(|i| i.1),
             Some("Offline - will retry".into())
         );
+    }
+
+    #[test]
+    fn a_resent_save_is_settled_by_its_status() {
+        assert_eq!(after_resend(200), Resend::Applied);
+        assert_eq!(after_resend(409), Resend::Conflict);
+        assert_eq!(after_resend(503), Resend::Keep);
+        assert_eq!(after_resend(429), Resend::Keep);
+        for s in [400, 401, 404, 413] {
+            assert_eq!(after_resend(s), Resend::Drop);
+        }
+    }
+
+    #[test]
+    fn request_tokens_serialize_in_camel_case_and_are_optional() {
+        let create = serde_json::to_string(&CreateBody {
+            stig_ids: vec!["a"],
+            client_request_id: Some("k"),
+        })
+        .unwrap();
+        assert_eq!(create, r#"{"stigIds":["a"],"clientRequestId":"k"}"#);
+        let bare = serde_json::to_string(&CreateBody {
+            stig_ids: vec!["a"],
+            client_request_id: None,
+        })
+        .unwrap();
+        assert_eq!(bare, r#"{"stigIds":["a"]}"#);
+        let save = serde_json::to_string(&RulesBody {
+            revision: 3,
+            changes: &[],
+            save_id: Some("s"),
+        })
+        .unwrap();
+        assert_eq!(save, r#"{"revision":3,"changes":[],"saveId":"s"}"#);
+    }
+
+    #[test]
+    fn only_a_transient_tokened_save_is_stashed_and_not_after_a_reset() {
+        assert!(stash_allowed(true, true, 3, 3));
+        assert!(!stash_allowed(false, true, 3, 3));
+        assert!(!stash_allowed(true, false, 3, 3));
+        // take_server_state / forget_set ran while the request was in flight.
+        assert!(!stash_allowed(true, true, 3, 4));
+    }
+
+    #[test]
+    fn keepalive_skips_a_running_save_and_resends_a_stash_unchanged() {
+        assert_eq!(keepalive_action(true, false), Keepalive::Skip);
+        assert_eq!(keepalive_action(true, true), Keepalive::Skip);
+        assert_eq!(keepalive_action(false, true), Keepalive::Stashed);
+        assert_eq!(keepalive_action(false, false), Keepalive::Build);
+    }
+
+    #[test]
+    fn an_acknowledged_batch_clears_the_stash_for_that_set_only() {
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), InDoubt { body: "x".into() });
+        m.insert("b".to_string(), InDoubt { body: "y".into() });
+        settle_success(&mut m, "a");
+        assert!(!m.contains_key("a") && m.contains_key("b"));
     }
 }

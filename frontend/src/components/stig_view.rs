@@ -1,4 +1,4 @@
-use crate::api::{api_get, api_send};
+use crate::api::{api_get, set_send, SET_REQUEST_TIMEOUT_MS};
 use crate::auth::use_current_user;
 use crate::autosave::{Autosave, SaveStatus};
 use crate::components::asset_modal::{asset_field, with_asset_field, ASSET_FIELDS};
@@ -164,8 +164,13 @@ fn SetBar(p: &SetBarProps) -> Html {
                     );
                     spawn_local(async move {
                         let body = serde_json::json!({ "name": text });
-                        match api_send(&format!("/api/checklist-sets/{id}"), "PATCH", Some(&body))
-                            .await
+                        match set_send(
+                            "PATCH",
+                            &format!("/api/checklist-sets/{id}"),
+                            Some(&body),
+                            SET_REQUEST_TIMEOUT_MS,
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 on_rename.emit(text.trim().to_string());
@@ -250,7 +255,7 @@ fn SetBar(p: &SetBarProps) -> Html {
                 for id in ids {
                     let body = serde_json::json!({ "stigId": id });
                     let path = format!("/api/checklist-sets/{}/stigs", set.id);
-                    match api_send(&path, "POST", Some(&body)).await {
+                    match set_send("POST", &path, Some(&body), SET_REQUEST_TIMEOUT_MS).await {
                         Ok(()) => on_add.emit(id),
                         Err(e) => {
                             error.set(Some(format!("Could not add {id}: {e}")));

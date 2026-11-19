@@ -6,14 +6,14 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use yew::prelude::*;
 
-use crate::api::{api_get, api_send};
+use crate::api::{api_get, set_json, set_send, SET_REQUEST_TIMEOUT_MS};
 use crate::autosave::{create_named_set, delete_set, fetch_set};
 use crate::model::{ChecklistSet, Stig};
 use crate::ui::{
     Alert, Button, Column, Container, FormField, Header, Input, Modal, Multiselect, SelectOption,
     SpaceBetween, Table, UiBox,
 };
-use crate::util::{confirm, encode_uri_component, spawn_local, to_locale_string};
+use crate::util::{confirm, encode_uri_component, new_request_id, spawn_local, to_locale_string};
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -55,6 +55,16 @@ pub async fn load_opened_set(set_id: &str) -> Result<OpenedSet, String> {
     Ok((set, stigs, unknown))
 }
 
+/// Token of the last failed create, reusable only for the same name and STIGs.
+type CreateAttempt = (String, String, Vec<String>);
+
+fn reusable_key(last: Option<&CreateAttempt>, name: &str, ids: &[String]) -> Option<String> {
+    match last {
+        Some((key, n, i)) if n == name && i == ids => Some(key.clone()),
+        _ => None,
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct MyChecklistsProps {
     pub show: bool,
@@ -75,6 +85,8 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
     let new_name = use_state(String::new);
     let new_stigs = use_state(Vec::<AttrValue>::new);
     let reload = use_state(|| 0u32);
+    // Token of the last create that failed, reused only for the same name and STIGs.
+    let create_attempt = use_mut_ref(|| None::<CreateAttempt>);
 
     {
         let (sets, catalog, loading, error) = (
@@ -88,7 +100,14 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
                 loading.set(true);
                 error.set(None);
                 spawn_local(async move {
-                    match api_get::<Vec<SetSummary>>("/api/checklist-sets").await {
+                    match set_json::<Vec<SetSummary>, ()>(
+                        "GET",
+                        "/api/checklist-sets",
+                        None,
+                        SET_REQUEST_TIMEOUT_MS,
+                    )
+                    .await
+                    {
                         Ok(list) => sets.set(list),
                         Err(e) => error.set(Some(format!("Could not load your checklists: {e}"))),
                     }
@@ -127,12 +146,25 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
             new_stigs.clone(),
         );
         let open_set = open_set.clone();
+        let create_attempt = create_attempt.clone();
         Callback::from(move |_: MouseEvent| {
             let ids: Vec<String> = new_stigs.iter().map(|s| s.to_string()).collect();
             if ids.is_empty() {
                 return;
             }
             let name = (*new_name).clone();
+            let request_id = {
+                let mut last = create_attempt.borrow_mut();
+                match reusable_key(last.as_ref(), &name, &ids) {
+                    Some(key) => Some(key),
+                    None => {
+                        let key = new_request_id();
+                        *last = key.clone().map(|k| (k, name.clone(), ids.clone()));
+                        key
+                    }
+                }
+            };
+            let create_attempt = create_attempt.clone();
             let (busy, error, new_name, new_stigs, open_set) = (
                 busy.clone(),
                 error.clone(),
@@ -143,8 +175,9 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
             busy.set(true);
             error.set(None);
             spawn_local(async move {
-                match create_named_set(&name, &ids).await {
+                match create_named_set(&name, &ids, request_id.as_deref()).await {
                     Ok(set) => {
+                        *create_attempt.borrow_mut() = None;
                         new_name.set(String::new());
                         new_stigs.set(Vec::new());
                         busy.set(false);
@@ -197,13 +230,14 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
                                 let (id, text) = (id.clone(), text.clone());
                                 spawn_local(async move {
                                     let body = serde_json::json!({ "name": text });
-                                    match api_send(
+                                    match set_send(
+                                        "PATCH",
                                         &format!(
                                             "/api/checklist-sets/{}",
                                             encode_uri_component(&id)
                                         ),
-                                        "PATCH",
                                         Some(&body),
+                                        SET_REQUEST_TIMEOUT_MS,
                                     )
                                     .await
                                     {
@@ -374,5 +408,20 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
             </SpaceBetween>
             }
         </Modal>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_create_key_is_reused_only_for_the_same_name_and_stigs() {
+        let last = ("k".to_string(), "n".to_string(), vec!["a".to_string()]);
+        let same = vec!["a".to_string()];
+        assert_eq!(reusable_key(Some(&last), "n", &same), Some("k".into()));
+        assert_eq!(reusable_key(Some(&last), "other", &same), None);
+        assert_eq!(reusable_key(Some(&last), "n", &["b".to_string()]), None);
+        assert_eq!(reusable_key(None, "n", &same), None);
     }
 }
