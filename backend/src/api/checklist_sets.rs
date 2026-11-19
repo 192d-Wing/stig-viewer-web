@@ -2262,6 +2262,37 @@ mod tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_admission_permit_outlives_an_aborted_handler_until_its_task_ends(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let mut c = crate::test_fixtures::ctx();
+        c.permit = Some(state.admission.try_admit("owner").unwrap());
+        start_then_abort(
+            &state.tasks,
+            autosave_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                Extension(c),
+                Path(set.id.clone()),
+                Json(AutosaveRequest {
+                    revision: 0,
+                    changes: vec![change(STIG_ID, RULES[0], "open", "", "")],
+                    save_id: None,
+                }),
+            ),
+        )
+        .await;
+        // The handler is gone; the detached task still holds the permit.
+        assert_eq!(state.admission.in_flight(), 1);
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        state.admission.idle().await;
+        assert_eq!(state.admission.in_flight(), 0);
+        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn autosave_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
         let (state, _dir) = base(&pool).await;
         let set = make(&state, "owner", &[STIG_ID]).await;

@@ -251,6 +251,8 @@ pub async fn rate_limit(
     //    don't want to throttle a dashboard refresh.
     //  - admin role — already trusted to do bulk work (imports, etc.)
     //  - /api/test/* — E2E setup paths.
+    // The audit queue is NOT sized from this burst: admins and reads skip
+    // it, so the cap on audited work is `admission` (which runs after this).
     if is_read_method(&method) || user.role == "admin" || is_exempt_path(&path) {
         return next.run(req).await;
     }

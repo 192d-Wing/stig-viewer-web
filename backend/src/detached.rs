@@ -7,6 +7,10 @@
 //! [`Tracker::idle`].
 //!
 //! Only tasks started through [`run`] are tracked.
+//!
+//! The number of tasks is bounded by the admission permit (`api::admission`)
+//! carried in the `RequestCtx` that each work function takes by value: at most
+//! 32 in all and 4 per user, refused with 429/503 before the task is spawned.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};

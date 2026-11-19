@@ -48,6 +48,10 @@
 //! on `writeFailures`, not only on the public status. `lateWrites` and `pendingWrites`
 //! are early warnings of a slow pool; they do not degrade the public status.
 //!
+//! The admin endpoint also reports `admission` (`inFlight`, `refusedUser`,
+//! `refusedGlobal`, `bodyDeadline`): requests refused by the audited-request cap
+//! (`api::admission`). Refusals never touch the public status.
+//!
 //! All queries have a 200ms timeout and the handler aims for ~250ms
 //! end-to-end. The endpoint must stay fast — uptime monitors hit it
 //! every few seconds and it must not become a hotspot.
@@ -193,6 +197,7 @@ fn counters_body(
     audit: &FailureSnapshot,
     audit_queue: (u64, u64, u64),
     prune: &FailureSnapshot,
+    admission: (u32, u64, u64, u64),
 ) -> Value {
     json!({
         "audit": {
@@ -208,11 +213,18 @@ fn counters_body(
             "lastFailureAt": rfc3339(prune.last_failure_at),
             "lastSuccessAt": rfc3339(prune.last_success_at),
         },
+        "admission": {
+            "inFlight": admission.0,
+            "refusedUser": admission.1,
+            "refusedGlobal": admission.2,
+            "bodyDeadline": admission.3,
+        },
     })
 }
 
 /// GET /api/admin/failure-counters — admin-only in-process failure counters.
 pub async fn failure_counters_handler(
+    State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Value>, StatusCode> {
     if user.role != "admin" {
@@ -222,6 +234,7 @@ pub async fn failure_counters_handler(
         &AUDIT_WRITES.snapshot(),
         crate::db_audit::write_stats(),
         &ACK_PRUNE.snapshot(),
+        state.admission.stats(),
     )))
 }
 
@@ -530,8 +543,13 @@ mod tests {
     #[test]
     fn counters_body_holds_exactly_the_documented_keys() {
         let s = snap(1, 1, Some(D::zero()));
-        let b = counters_body(&s, (3, 2, 4), &s);
-        assert_eq!(keys(&b), ["audit", "loginAckPrune"]);
+        let b = counters_body(&s, (3, 2, 4), &s, (5, 6, 7, 8));
+        assert_eq!(keys(&b), ["admission", "audit", "loginAckPrune"]);
+        assert_eq!(
+            keys(&b["admission"]),
+            ["bodyDeadline", "inFlight", "refusedGlobal", "refusedUser"]
+        );
+        assert_eq!(b["admission"]["refusedUser"], 6);
         assert_eq!(
             keys(&b["audit"]),
             [
@@ -560,14 +578,23 @@ mod tests {
 
     #[tokio::test]
     async fn failure_counters_endpoint_refuses_non_admins_and_serves_admins() {
+        let (state, _dir) = crate::test_fixtures::lazy_state();
         for role in ["viewer", "author", "reviewer"] {
-            let r =
-                failure_counters_handler(Extension(crate::test_fixtures::auth("u", role))).await;
+            let r = failure_counters_handler(
+                State(state.clone()),
+                Extension(crate::test_fixtures::auth("u", role)),
+            )
+            .await;
             assert_eq!(r.err(), Some(StatusCode::FORBIDDEN), "{role}");
         }
-        let Json(v) = failure_counters_handler(Extension(crate::test_fixtures::auth("a", "admin")))
-            .await
-            .unwrap();
-        assert_eq!(keys(&v), ["audit", "loginAckPrune"]);
+        let _permit = state.admission.try_admit("a").unwrap();
+        let Json(v) = failure_counters_handler(
+            State(state.clone()),
+            Extension(crate::test_fixtures::auth("a", "admin")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys(&v), ["admission", "audit", "loginAckPrune"]);
+        assert_eq!(v["admission"]["inFlight"], 1);
     }
 }

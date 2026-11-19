@@ -26,6 +26,16 @@
 //! shed counts in `shedWrites`. Alert on the `shedWrites` rate and the
 //! failure counter, not only on the public status. The caps are checked and
 //! taken atomically.
+//!
+//! The queue is sized against the admission cap (`api::admission`), not
+//! against the rate limit: each admitted request holds a permit until its
+//! writes finish and awaits its writes one at a time, so admitted requests
+//! never have more than `MAX_IN_FLIGHT` (32) non-restricted writes pending,
+//! leaving 16 of the 48 non-restricted slots for permit-less events
+//! (`auth.notice_ack`, system events). A compile-time assert in `admission`
+//! pins this arithmetic; it holds for any `RATE_LIMIT_BURST` and for admins,
+//! who bypass the rate limiter. It is strict only while the pool is healthy:
+//! a stalled insert lets one request leave late writes behind under its permit.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -401,7 +411,8 @@ pub const MAX_DENIED_PENDING: u32 = 16;
 
 /// `denied`/`rejected` pending writes allowed for one acting user, so one
 /// account cannot fill the shared denied share alone. Other events have no
-/// per-user cap.
+/// per-user cap here: `api::admission` bounds them (per-user 4, global 32
+/// in-flight requests).
 pub const MAX_USER_DENIED_PENDING: u32 = 4;
 
 /// Bound on getting a pooled connection inside the write task, shorter than
@@ -1983,7 +1994,49 @@ mod tests {
             source_ip: Some("203.0.113.7".into()),
             role: "author".into(),
             audited: Default::default(),
+            permit: None,
         }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_late_write_keeps_the_admission_permit_until_it_ends(pool: PgPool) {
+        use sqlx::postgres::PgPoolOptions;
+        queue!(C, Q, 64);
+        seed_user(&pool, "u1").await;
+        // A pool whose connections are all held, so the write cannot start.
+        let small = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(small.acquire().await.unwrap());
+        }
+        let adm = crate::api::admission::Admission::new();
+        let mut c = ctx();
+        c.permit = Some(adm.try_admit("u1").unwrap());
+        let mut e = ev("ok", json!({}));
+        e.ctx = Some(&c);
+        let limits = Limits {
+            wait: std::time::Duration::ZERO,
+            hard: HARD_WRITE_TIMEOUT,
+        };
+        record_counted(&small, e, &Q, limits).await;
+        // The caller (and its ctx) is gone; the pending write still holds it.
+        drop(c);
+        assert_eq!(Q.pending(), 1);
+        assert_eq!(adm.in_flight(), 1);
+        drop(held);
+        Q.drain().await;
+        adm.idle().await;
+        assert_eq!(adm.in_flight(), 0);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[sqlx::test]
