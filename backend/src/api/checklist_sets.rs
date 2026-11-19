@@ -33,6 +33,7 @@ use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklist_sets::{
     self as db, AddStig, CreateOutcome, RuleChange, SetBudget, WriteOutcome,
 };
+use crate::detached;
 use crate::AppState;
 
 const MAX_SETS_PER_USER: i64 = 50;
@@ -365,12 +366,10 @@ pub async fn create_handler(
     Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<ChecklistSetDetail>)> {
-    tokio::spawn(create_work(state, user, ctx, req))
+    let tasks = state.tasks.clone();
+    detached::run(&tasks, "set create", create_work(state, user, ctx, req))
         .await
-        .map_err(|e| {
-            tracing::error!("set create task failed: {e}");
-            ApiError(Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
-        })?
+        .map_err(ApiError::from)?
 }
 
 async fn create_work(
@@ -458,12 +457,28 @@ pub async fn get_handler(
 
 /// PATCH /api/checklist-sets/:id — rename, or unlink (`assetId: null`).
 /// Linking happens only through save-to-system.
+///
+/// Runs in a spawned task so a client disconnect cannot land between a
+/// commit and its audit event.
 pub async fn patch_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<PatchRequest>,
+) -> ApiResult<Json<ChecklistSetDetail>> {
+    let tasks = state.tasks.clone();
+    detached::run(&tasks, "set patch", patch_work(state, user, ctx, id, req))
+        .await
+        .map_err(ApiError::from)?
+}
+
+async fn patch_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    id: String,
+    req: PatchRequest,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     if matches!(req.asset_id, Some(Some(_))) {
@@ -522,11 +537,26 @@ pub async fn patch_handler(
 }
 
 /// DELETE /api/checklist-sets/:id
+///
+/// Runs in a spawned task so a client disconnect cannot land between the
+/// commit and its audit event.
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let tasks = state.tasks.clone();
+    detached::run(&tasks, "set delete", delete_work(state, user, ctx, id))
+        .await
+        .map_err(ApiError::from)?
+}
+
+async fn delete_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    id: String,
 ) -> ApiResult<StatusCode> {
     let pool = state.pool.as_ref();
     if !db::delete_set(pool, &user.id, &id).await.map_err(map_db)? {
@@ -548,12 +578,32 @@ pub async fn delete_handler(
 }
 
 /// POST /api/checklist-sets/:id/stigs — idempotent.
+///
+/// Runs in a spawned task so a client disconnect cannot land between the
+/// commit and its audit event.
 pub async fn add_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<AddStigRequest>,
+) -> ApiResult<Json<ChecklistSetDetail>> {
+    let tasks = state.tasks.clone();
+    detached::run(
+        &tasks,
+        "set stig add",
+        add_stig_work(state, user, ctx, id, req),
+    )
+    .await
+    .map_err(ApiError::from)?
+}
+
+async fn add_stig_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    id: String,
+    req: AddStigRequest,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     if db::get_set(pool, &user.id, &id)
@@ -598,11 +648,31 @@ pub async fn add_stig_handler(
 }
 
 /// DELETE /api/checklist-sets/:id/stigs/:stig_id
+///
+/// Runs in a spawned task so a client disconnect cannot land between the
+/// commit and its audit event.
 pub async fn remove_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
     Path((id, stig_id)): Path<(String, String)>,
+) -> ApiResult<Json<ChecklistSetDetail>> {
+    let tasks = state.tasks.clone();
+    detached::run(
+        &tasks,
+        "set stig remove",
+        remove_stig_work(state, user, ctx, id, stig_id),
+    )
+    .await
+    .map_err(ApiError::from)?
+}
+
+async fn remove_stig_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    id: String,
+    stig_id: String,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     let removed = db::remove_stig(pool, &user.id, &id, &stig_id)
@@ -642,12 +712,14 @@ pub async fn autosave_handler(
     };
     // Spawned so a client disconnect cannot land between the commit and the
     // audit event (a retry is acknowledged without a second event).
-    tokio::spawn(autosave_with_budget(state, user, ctx, id, req, budget))
-        .await
-        .map_err(|e| {
-            tracing::error!("set autosave task failed: {e}");
-            ApiError(Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
-        })?
+    let tasks = state.tasks.clone();
+    detached::run(
+        &tasks,
+        "set autosave",
+        autosave_with_budget(state, user, ctx, id, req, budget),
+    )
+    .await
+    .map_err(ApiError::from)?
 }
 
 /// Autosave with explicit size bounds (tests pass small ones).
@@ -801,12 +873,14 @@ pub async fn save_to_system_handler(
     Path(id): Path<String>,
     Json(req): Json<SaveToSystemRequest>,
 ) -> ApiResult<Json<SetSaveResponse>> {
-    tokio::spawn(save_to_system_work(state, user, ctx, id, req))
-        .await
-        .map_err(|e| {
-            tracing::error!("set save task failed: {e}");
-            ApiError(Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response()))
-        })?
+    let tasks = state.tasks.clone();
+    detached::run(
+        &tasks,
+        "set save",
+        save_to_system_work(state, user, ctx, id, req),
+    )
+    .await
+    .map_err(ApiError::from)?
 }
 
 async fn save_to_system_work(
@@ -2133,6 +2207,28 @@ mod tests {
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events WHERE action = 'checklist_set.save_to_system' AND outcome = 'partial'").await, 1);
     }
 
+    /// Poll `f` once, which submits its detached work, assert it is still
+    /// waiting, then drop it: a client abort. The spawned task cannot run
+    /// before the caller yields, which holds on the current-thread runtime
+    /// `#[sqlx::test]` uses.
+    async fn start_then_abort<F: std::future::Future>(tasks: &detached::Tracker, f: F) {
+        let mut f = std::pin::pin!(f);
+        let pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx).is_pending()))
+                .await;
+        assert!(pending, "the handler must still be waiting on its task");
+        // The work runs detached: still counted after the caller is gone.
+        assert_eq!(tasks.in_flight(), 1);
+    }
+
+    async fn audit_count(pool: &PgPool, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = $1")
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn set_save_survives_the_handler_future_being_dropped(pool: PgPool) {
@@ -2147,25 +2243,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let (st2, id) = (state.clone(), set.id.clone());
-        let h = tokio::spawn(async move {
-            let _ = push(&st2, "owner", &id, 1, Some("a1")).await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut done = 0;
-        for _ in 0..200 {
-            done = count(
-                &pool,
-                "SELECT COUNT(*) FROM audit_events WHERE action = 'checklist_set.save_to_system'",
-            )
-            .await;
-            if done >= 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(done, 1);
+        start_then_abort(&state.tasks, push(&state, "owner", &set.id, 1, Some("a1"))).await;
+        state.tasks.idle().await;
+        assert_eq!(audit_count(&pool, "checklist_set.save_to_system").await, 1);
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
             1
@@ -2185,32 +2265,172 @@ mod tests {
     async fn autosave_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
         let (state, _dir) = base(&pool).await;
         let set = make(&state, "owner", &[STIG_ID]).await;
-        let (st2, id) = (state.clone(), set.id.clone());
-        let h = tokio::spawn(async move {
-            let _ = autosave(
-                &st2,
+        start_then_abort(
+            &state.tasks,
+            autosave(
+                &state,
                 "owner",
-                &id,
+                &set.id,
                 0,
                 vec![change(STIG_ID, RULES[0], "open", "", "")],
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut edits = 0;
-        for _ in 0..200 {
-            edits = count(
-                &pool,
-                "SELECT COUNT(*) FROM audit_events WHERE action = 'checklist_set.edit'",
-            )
-            .await;
-            if edits >= 1 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(edits, 1);
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
         assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn rename_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let p = PatchRequest {
+            name: Some("renamed".into()),
+            asset_id: None,
+        };
+        start_then_abort(
+            &state.tasks,
+            patch_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path(set.id.clone()),
+                Json(p),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE name = 'renamed'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.rename").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn unlink_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        push(&state, "owner", &set.id, 1, Some("a1")).await.unwrap();
+        let p = PatchRequest {
+            name: None,
+            asset_id: Some(None),
+        };
+        start_then_abort(
+            &state.tasks,
+            patch_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path(set.id.clone()),
+                Json(p),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE asset_id IS NOT NULL"
+            )
+            .await,
+            0
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.unlink").await, 1);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'checklist_set.unlink' AND asset_id = 'a1'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn delete_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        start_then_abort(
+            &state.tasks,
+            delete_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path(set.id.clone()),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 0);
+        assert_eq!(audit_count(&pool, "checklist_set.delete").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn stig_add_and_its_audit_event_survive_the_handler_future_being_dropped(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        start_then_abort(
+            &state.tasks,
+            add_stig_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path(set.id.clone()),
+                Json(AddStigRequest {
+                    stig_id: STIG2.into(),
+                }),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
+            2
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.stig_add").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn stig_remove_and_its_audit_event_survive_the_handler_future_being_dropped(
+        pool: PgPool,
+    ) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID, STIG2]).await;
+        start_then_abort(
+            &state.tasks,
+            remove_stig_handler(
+                st(&state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path((set.id.clone(), STIG2.to_string())),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
+            1
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.stig_remove").await, 1);
     }
 }

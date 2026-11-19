@@ -68,28 +68,23 @@ pub async fn authz_audit(
     if resp.status() == StatusCode::FORBIDDEN
         && !ctx.audited.load(std::sync::atomic::Ordering::Relaxed)
     {
-        // Detached from the connection: a client that hangs up must not
-        // cancel the write. The handle is awaited so the response still
-        // waits for it (bounded by `WRITE_TIMEOUT` inside `record_or_log`).
-        let pool = state.pool.clone();
-        let (user_id, ctx) = (user.id.clone(), ctx.clone());
+        // `record_or_log` runs the write as a detached task, so a client
+        // that hangs up cannot cancel it; the response waits for it at most
+        // `WRITE_TIMEOUT`.
         let detail = json!({ "method": method, "route": route });
-        let _ = tokio::spawn(async move {
-            record_or_log(
-                pool.as_ref(),
-                NewAuditEvent {
-                    user_id: &user_id,
-                    action: "authz.denied",
-                    outcome: "denied",
-                    asset_id: None,
-                    checklist_id: None,
-                    stig_id: None,
-                    detail,
-                    ctx: Some(&ctx),
-                },
-            )
-            .await
-        })
+        record_or_log(
+            state.pool.as_ref(),
+            NewAuditEvent {
+                user_id: &user.id,
+                action: "authz.denied",
+                outcome: "denied",
+                asset_id: None,
+                checklist_id: None,
+                stig_id: None,
+                detail,
+                ctx: Some(&ctx),
+            },
+        )
         .await;
     }
     resp
