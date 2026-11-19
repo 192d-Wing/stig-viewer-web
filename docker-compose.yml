@@ -64,6 +64,7 @@ services:
             CREATE ROLE stig_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'stig_app_local';
           END IF;
         END $$do$$;
+        ALTER ROLE stig_app PASSWORD 'stig_app_local';
         SQL
 
   backend:
@@ -149,7 +150,12 @@ services:
       - sh
       - -c
       - |
-        until cargo run -- migrate; do echo "waiting for db-roles / postgres"; sleep 2; done
+        n=0
+        until cargo run -- migrate; do
+          n=$$((n + 1))
+          if [ "$$n" -ge 30 ]; then echo "migrate failed 30 times; giving up" >&2; exit 1; fi
+          echo "waiting for db-roles / postgres (attempt $$n)"; sleep 2
+        done
         exec cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
 
   frontend:
