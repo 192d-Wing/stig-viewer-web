@@ -33,6 +33,8 @@ pub struct NewAuditEvent<'a> {
 /// Declare an audit maintenance mode (`retention`, `restore`, `migration` or `test`) for the
 /// rest of this transaction; the guard triggers from migration 040 permit the
 /// matching mutation of `rule_audit` / `audit_events` only while it is set.
+/// `test` works only in a database flagged with `stig.audit_allow_test_mode=on`
+/// (migration 043, see [`allow_test_maintenance`]); elsewhere the guard raises 42501.
 pub(crate) async fn set_maintenance(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     mode: &str,
@@ -42,6 +44,67 @@ pub(crate) async fn set_maintenance(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// True when the current database carries `stig.audit_allow_test_mode=on`.
+/// Same predicate as the guard trigger in migration 043; keep them in sync.
+const TEST_FLAG_SQL: &str = "SELECT EXISTS ( \
+    SELECT 1 FROM pg_catalog.pg_db_role_setting s \
+    JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+    WHERE d.datname = pg_catalog.current_database() \
+      AND s.setrole = 0 \
+      AND 'stig.audit_allow_test_mode=on' = ANY (s.setconfig))";
+
+pub(crate) async fn test_maintenance_allowed(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar(TEST_FLAG_SQL).fetch_one(pool).await?)
+}
+
+/// Flag the current database for audit `test` maintenance mode. Idempotent.
+/// Needs a superuser or `GRANT SET ON PARAMETER stig.audit_allow_test_mode`.
+pub(crate) async fn allow_test_maintenance(pool: &PgPool) -> Result<()> {
+    use anyhow::Context;
+    if test_maintenance_allowed(pool).await? {
+        return Ok(());
+    }
+    sqlx::query(
+        "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET stig.audit_allow_test_mode = %L', \
+         current_database(), 'on'); END $$",
+    )
+    .execute(pool)
+    .await
+    .context("enabling audit test mode needs a superuser or GRANT SET ON PARAMETER stig.audit_allow_test_mode (PostgreSQL 15+; older versions: superuser only)")?;
+    Ok(())
+}
+
+/// Startup rule for the flag: a flagged database with test routes off is
+/// refused in every environment (fail closed).
+pub(crate) fn check_test_maintenance_flag(test_routes: bool, flag_set: bool) -> Result<()> {
+    if !test_routes && flag_set {
+        anyhow::bail!(
+            "refusing to start: database has stig.audit_allow_test_mode=on, which permits \
+             audit UPDATE/TRUNCATE, but test routes are off; run ALTER DATABASE <db> RESET \
+             stig.audit_allow_test_mode, or set STIG_ENABLE_TEST_ROUTES again"
+        );
+    }
+    Ok(())
+}
+
+/// Startup policy. Test routes on: flag the database (needs a superuser or
+/// GRANT SET ON PARAMETER stig.audit_allow_test_mode, PostgreSQL 15+). Test
+/// routes off: refuse to start if the database is flagged. No audit_events row
+/// is written: that table requires a real user (FK), and there is no system user.
+pub(crate) async fn apply_test_maintenance_policy(
+    pool: &PgPool,
+    enable_test_routes: bool,
+) -> Result<()> {
+    if enable_test_routes {
+        allow_test_maintenance(pool).await?;
+        tracing::warn!(
+            "audit `test` maintenance mode is ENABLED for this database (test routes are on)"
+        );
+        return Ok(());
+    }
+    check_test_maintenance_flag(false, test_maintenance_allowed(pool).await?)
 }
 
 /// Upper bound on one audit write (both attempts of [`record_or_log`]), so a
@@ -247,7 +310,7 @@ pub fn rejected_detail(rejected: &[(String, String)]) -> (Value, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::seed_user;
+    use crate::test_fixtures::{allow_audit_test_mode, disallow_audit_test_mode, seed_user};
 
     /// Run one statement in a transaction with the given audit maintenance mode.
     async fn in_mode(pool: &PgPool, mode: &str, sql: &str) -> Result<()> {
@@ -312,6 +375,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn guard_modes_allow_only_their_operations(pool: PgPool) {
+        allow_audit_test_mode(&pool).await;
         seed_both(&pool).await;
         // retention: DELETE only.
         assert!(is_guard_error(
@@ -380,6 +444,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn guard_allows_only_the_collapse_update_without_a_mode(pool: PgPool) {
+        allow_audit_test_mode(&pool).await;
         seed_both(&pool).await;
         let code = |e: sqlx::Error| {
             e.as_database_error()
@@ -459,6 +524,7 @@ mod tests {
     async fn collapse_onto_a_row_whose_last_occurrence_is_slightly_in_the_future_still_collapses(
         pool: PgPool,
     ) {
+        allow_audit_test_mode(&pool).await;
         seed_user(&pool, "u1").await;
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
         in_mode(
@@ -560,6 +626,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_different_reason_asset_user_or_a_late_repeat_is_a_new_row(pool: PgPool) {
+        allow_audit_test_mode(&pool).await;
         seed_user(&pool, "u1").await;
         seed_user(&pool, "u2").await;
         record_or_log(&pool, ev("rejected", json!({ "reason": "a" }))).await;
@@ -669,6 +736,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn the_window_boundary_is_five_minutes(pool: PgPool) {
+        allow_audit_test_mode(&pool).await;
         seed_user(&pool, "u1").await;
         record_or_log(&pool, ev("denied", json!({ "reason": "a" }))).await;
         let age = |secs: i32| {
@@ -824,5 +892,156 @@ mod tests {
             (got.1.as_deref(), got.2.as_deref(), got.3.as_deref()),
             (Some("203.0.113.7"), Some("req-1"), Some("author"))
         );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn test_mode_is_rejected_unless_the_database_allows_it(pool: PgPool) {
+        seed_both(&pool).await;
+        let count = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM rule_audit")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        assert!(!test_maintenance_allowed(&pool).await.unwrap());
+        for sql in [
+            "UPDATE rule_audit SET field = 'x'",
+            "TRUNCATE users CASCADE",
+            "TRUNCATE rule_audit, audit_events",
+        ] {
+            let e = in_mode(&pool, "test", sql).await.unwrap_err();
+            assert!(is_guard_error(&e), "{sql}: {e:#}");
+            assert!(
+                format!("{e:#}").contains("\"test\" is not enabled"),
+                "{e:#}"
+            );
+        }
+        assert_eq!(count(pool.clone()).await, 1);
+
+        // A session-level SET cannot spoof the catalog flag.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('stig.audit_allow_test_mode', 'on', true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        set_maintenance(&mut tx, "test").await.unwrap();
+        let e = sqlx::query("UPDATE rule_audit SET field = 'x'")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("42501")
+        );
+        drop(tx);
+
+        allow_audit_test_mode(&pool).await;
+        assert!(test_maintenance_allowed(&pool).await.unwrap());
+        in_mode(&pool, "test", "UPDATE rule_audit SET field = 'x'")
+            .await
+            .unwrap();
+        assert!(is_guard_error(
+            &in_mode(&pool, "test", "DELETE FROM rule_audit")
+                .await
+                .unwrap_err()
+        ));
+        in_mode(&pool, "test", "TRUNCATE rule_audit, audit_events")
+            .await
+            .unwrap();
+
+        seed_both(&pool).await;
+        disallow_audit_test_mode(&pool).await;
+        assert!(!test_maintenance_allowed(&pool).await.unwrap());
+        assert!(is_guard_error(
+            &in_mode(&pool, "test", "UPDATE rule_audit SET field = 'y'")
+                .await
+                .unwrap_err()
+        ));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn other_modes_do_not_need_the_test_flag(pool: PgPool) {
+        seed_both(&pool).await;
+        in_mode(&pool, "migration", "UPDATE rule_audit SET field = 'x'")
+            .await
+            .unwrap();
+        in_mode(&pool, "retention", "DELETE FROM rule_audit")
+            .await
+            .unwrap();
+        in_mode(&pool, "restore", "TRUNCATE rule_audit, audit_events")
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn allow_test_maintenance_is_idempotent(pool: PgPool) {
+        allow_test_maintenance(&pool).await.unwrap();
+        allow_test_maintenance(&pool).await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_catalog.pg_db_role_setting s \
+             JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+             CROSS JOIN LATERAL unnest(s.setconfig) c \
+             WHERE d.datname = current_database() AND s.setrole = 0 \
+               AND c = 'stig.audit_allow_test_mode=on'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_maintenance_flag_startup_decision() {
+        // (test_routes, flag_set)
+        assert!(check_test_maintenance_flag(false, true).is_err());
+        assert!(check_test_maintenance_flag(false, false).is_ok());
+        assert!(check_test_maintenance_flag(true, true).is_ok());
+        assert!(check_test_maintenance_flag(true, false).is_ok());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn startup_policy_sets_refuses_or_leaves_the_flag(pool: PgPool) {
+        apply_test_maintenance_policy(&pool, false).await.unwrap();
+        assert!(!test_maintenance_allowed(&pool).await.unwrap());
+        apply_test_maintenance_policy(&pool, true).await.unwrap();
+        assert!(test_maintenance_allowed(&pool).await.unwrap());
+        assert!(apply_test_maintenance_policy(&pool, false).await.is_err());
+        disallow_audit_test_mode(&pool).await;
+        apply_test_maintenance_policy(&pool, false).await.unwrap();
+        assert!(!test_maintenance_allowed(&pool).await.unwrap());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn flag_variants_do_not_enable_test_mode(pool: PgPool) {
+        seed_both(&pool).await;
+        for ddl in [
+            "ALTER DATABASE %I SET stig.audit_allow_test_mode = 'true'",
+            "ALTER DATABASE %I SET stig.audit_allow_test_mode = '1'",
+            "ALTER ROLE CURRENT_USER IN DATABASE %I SET stig.audit_allow_test_mode = 'on'",
+        ] {
+            sqlx::query(&format!(
+                "DO $$ BEGIN EXECUTE format($f${ddl}$f$, current_database()); END $$"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(!test_maintenance_allowed(&pool).await.unwrap(), "{ddl}");
+            let e = in_mode(&pool, "test", "UPDATE rule_audit SET field = 'x'")
+                .await
+                .unwrap_err();
+            assert!(is_guard_error(&e), "{ddl}: {e:#}");
+            sqlx::query(
+                "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I RESET stig.audit_allow_test_mode', current_database()); \
+                 EXECUTE format('ALTER ROLE CURRENT_USER IN DATABASE %I RESET stig.audit_allow_test_mode', current_database()); END $$",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
     }
 }

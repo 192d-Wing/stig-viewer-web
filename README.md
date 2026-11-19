@@ -401,7 +401,21 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
 - `restore`: TRUNCATE only (a forced backup restore);
 - `migration`: UPDATE only (a data migration that backfills audit rows);
 - `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
-  which exist only under `STIG_ENABLE_TEST_ROUTES`).
+  which exist only under `STIG_ENABLE_TEST_ROUTES`). Migration
+  `043_audit_test_mode_flag.sql` honours it only in a database a superuser has
+  flagged with `ALTER DATABASE <db> SET stig.audit_allow_test_mode = 'on'`
+  (exactly `on`); otherwise it raises 42501 with a distinct message. The
+  trigger reads the flag from `pg_db_role_setting`, so a session `SET` cannot
+  spoof it, and only a superuser (or a holder of `GRANT SET ON PARAMETER
+  stig.audit_allow_test_mode`) can set it. At startup the backend sets the flag
+  only when `STIG_ENABLE_TEST_ROUTES` is on; the database role must then be a
+  superuser or hold `GRANT SET ON PARAMETER stig.audit_allow_test_mode`
+  (PostgreSQL 15+; on older versions only a superuser). The flag persists
+  after test routes are turned off, and with test routes off the backend
+  refuses to start on a flagged database in every environment until it is
+  cleared with `ALTER DATABASE <db> RESET stig.audit_allow_test_mode` (or test
+  routes are turned back on). The flag travels with `pg_dump --create` and
+  `pg_dumpall`, not with the app's JSON backup/restore.
 
 The one update always allowed is the collapse of a repeated denial: on a
 `denied` or `rejected` `audit_events` row only `repeat_count` (exactly +1) and
@@ -420,15 +434,22 @@ fails with 42501. A data migration must first run
 `SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
 transaction (UPDATE only). Never use `test` mode in production code.
 
-Limit: this is a guard, not a privilege boundary. Any code that can run SQL as
-the application role can set the mode, and a DBA or the table owner can
-disable the triggers. It stops accidents, stray queries and injected
-statements that do not know the mode; it does not stop a compromised
-application or database administrator. For production hardening, run
-migrations and the retention/restore jobs under a separate role that owns the
-tables, give the application role only `SELECT` and `INSERT` on the audit
-tables (plus `UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and
-ship audit rows to an external append-only store.
+Limit: this is a guard, not a full privilege boundary. With a non-superuser
+application role, neither the application nor injected SQL can turn `test` mode
+on (the flag needs superuser). Until a separate owner role exists (#84), the
+application role still owns the tables and the guard function, so code that can
+run SQL as it can set the `retention`, `restore` and `migration` modes,
+`CREATE OR REPLACE` the guard, or disable the triggers, and a DBA or table
+owner can do the same. With a superuser application role (the dev and CI
+stacks) there is no boundary at all. In production, run the application as a
+non-superuser role (NIST AC-6); for hardening, run migrations and the
+retention/restore jobs under a separate role that owns the tables, give the
+application role only `SELECT` and `INSERT` on the audit tables (plus
+`UPDATE (repeat_count, last_occurred_at)` on `audit_events`), and ship audit
+rows to an external append-only store.
+
+The database-backed tests (`task test:db`) need a superuser test role (or the
+parameter grant) because they flag each test database with `ALTER DATABASE`.
 
 ### Integrity of audit archives and backups
 

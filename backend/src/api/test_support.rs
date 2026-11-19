@@ -39,7 +39,8 @@ const VALID_SCHEDULERS: &[&str] = &[
     "compliance_report",
 ];
 
-/// The reset transaction: `TRUNCATE ... CASCADE` in audit `test` mode.
+/// The reset transaction: `TRUNCATE ... CASCADE` in audit `test` mode. Requires the
+/// database flag `stig.audit_allow_test_mode=on` (set at startup when test routes are on).
 pub(crate) async fn reset_db(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     crate::db_audit::set_maintenance(&mut tx, "test").await?;
@@ -53,7 +54,8 @@ pub(crate) async fn reset_db(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The backdate transaction: shift matching `rule_audit` rows into the past.
+/// The backdate transaction: shift matching `rule_audit` rows into the past. Requires the
+/// database flag `stig.audit_allow_test_mode=on` (set at startup when test routes are on).
 pub(crate) async fn backdate_audit(
     pool: &sqlx::PgPool,
     rule_id: &str,
@@ -553,6 +555,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn backdate_and_reset_work_under_the_audit_guard(pool: sqlx::PgPool) {
+        crate::test_fixtures::allow_audit_test_mode(&pool).await;
         seed_user(&pool, "u1").await;
         sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
             .execute(&pool).await.unwrap();
@@ -570,5 +573,29 @@ mod tests {
         let left: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM rule_audit) + (SELECT COUNT(*) FROM audit_events)")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn reset_and_backdate_fail_without_the_database_flag(pool: sqlx::PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&pool).await.unwrap();
+        assert!(backdate_audit(&pool, "r1", 60).await.is_err());
+        assert!(reset_db(&pool).await.is_err());
+        let left: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM users) + (SELECT COUNT(*) FROM rule_audit)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 2);
+        let old: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rule_audit WHERE occurred_at < NOW() - INTERVAL '59 days'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old, 0);
     }
 }

@@ -90,6 +90,12 @@ services:
       #   ALLOW_TEST_AUTH_HEADER  — accept X-User-Id in place of a session.
       #   STIG_ENABLE_TEST_ROUTES — mount the unauthenticated /api/test/*
       #                             routes (DB reset, role changes, ...).
+      #                             Also flags the DB for audit `test` mode: the DB
+      #                             role must be a superuser or hold GRANT SET ON
+      #                             PARAMETER stig.audit_allow_test_mode (PG 15+).
+      #                             The flag persists; with routes off the backend
+      #                             refuses to start until ALTER DATABASE <db>
+      #                             RESET stig.audit_allow_test_mode.
       ALLOW_TEST_AUTH_HEADER: ${ALLOW_TEST_AUTH_HEADER:-true}
       STIG_ENABLE_TEST_ROUTES: ${STIG_ENABLE_TEST_ROUTES:-true}
       CARGO_TARGET_DIR: /target
