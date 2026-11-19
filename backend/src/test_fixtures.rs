@@ -299,6 +299,7 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
         }),
         signing: None,
         tasks: crate::detached::Tracker::new(),
+        admission: crate::api::admission::Admission::new(),
     };
     (state, guard)
 }
@@ -310,6 +311,7 @@ pub fn ctx() -> crate::api::request_ctx::RequestCtx {
         source_ip: Some("198.51.100.4".to_string()),
         role: "author".to_string(),
         audited: Default::default(),
+        permit: None,
     }
 }
 
@@ -347,6 +349,7 @@ pub fn lazy_state() -> (AppState, StigDir) {
         }),
         signing: None,
         tasks: crate::detached::Tracker::new(),
+        admission: crate::api::admission::Admission::new(),
     };
     (state, StigDir(dir))
 }

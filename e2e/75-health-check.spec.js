@@ -117,6 +117,10 @@ test.describe("Deep /api/health", () => {
     expect(typeof body.audit.lateWrites).toBe("number");
     expect(typeof body.audit.pendingWrites).toBe("number");
     expect(typeof body.audit.shedWrites).toBe("number");
+    expect(typeof body.admission.inFlight).toBe("number");
+    expect(typeof body.admission.refusedUser).toBe("number");
+    expect(typeof body.admission.refusedGlobal).toBe("number");
+    expect(typeof body.admission.bodyDeadline).toBe("number");
     expect(typeof body.loginAckPrune.failures).toBe("number");
     expect(typeof body.loginAckPrune.consecutiveFailures).toBe("number");
 

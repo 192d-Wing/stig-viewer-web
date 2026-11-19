@@ -223,6 +223,8 @@ pub struct AppState {
     /// Detached request work (change plus its audit event); awaited at
     /// shutdown. See [`detached`].
     pub tasks: Arc<detached::Tracker>,
+    /// Cap on in-flight audited requests; see [`api::admission`].
+    pub admission: Arc<api::admission::Admission>,
 }
 
 /// Connect the application pool and make sure the schema is current.
@@ -402,6 +404,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         signing: signing.clone(),
         tasks: detached::Tracker::new(),
+        admission: api::admission::Admission::new(),
     };
 
     // Auth flow routes — public, do not require an existing session.
@@ -758,8 +761,8 @@ async fn main() -> Result<()> {
             .route(
                 "/api/upload/library",
                 post(upload_library).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
-            ), // Viewer gate, central authz.denied recorder, request context and
-        // rate limiter (see `authz_audit::protected_stack` for the order).
+            ), // Viewer gate, central authz.denied recorder, request context,
+        // admission cap and rate limiter (see `authz_audit::protected_stack` for the order).
         &state,
     )
     .route_layer(middleware::from_fn_with_state(

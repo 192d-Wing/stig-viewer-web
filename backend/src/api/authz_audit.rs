@@ -24,14 +24,19 @@ use crate::AppState;
 const MAX_ROUTE_CHARS: usize = 128;
 
 /// Apply the protected router's inner layers, innermost first, so the
-/// request order is `rate_limit -> request_ctx -> authz_audit -> viewer_guard
-/// -> handler`. `auth_middleware` (which needs the auth state) is added by the
+/// request order is `rate_limit -> admission -> request_ctx -> authz_audit ->
+/// viewer_guard -> handler` (later-added `route_layer`s run first; pinned by a
+/// test in `admission`). `auth_middleware` (which needs the auth state) is added by the
 /// caller as the outermost layer. Shared by `main` and the tests.
 pub fn protected_stack(router: Router<AppState>, state: &AppState) -> Router<AppState> {
     router
         .route_layer(middleware::from_fn(crate::api::viewer_guard::viewer_guard))
         .route_layer(middleware::from_fn_with_state(state.clone(), authz_audit))
         .route_layer(middleware::from_fn(crate::api::request_ctx::request_ctx))
+        .route_layer(middleware::from_fn_with_state(
+            state.admission.clone(),
+            crate::api::admission::admission,
+        ))
         .route_layer(middleware::from_fn(crate::api::rate_limit::rate_limit))
 }
 

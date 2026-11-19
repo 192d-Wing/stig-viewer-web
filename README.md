@@ -468,7 +468,30 @@ cd backend && cargo clippy -- -D warnings
   counts only in `shedWrites` (a user can trigger it at will, so it must not
   degrade the public health status) and logs at most once a minute per user
   with a summary of the held-back ones. Alert on the `shedWrites` rate and the
-  failure counter, not only on the public status. On SIGTERM or Ctrl-C the
+  failure counter, not only on the public status. Shedding is a backstop: an
+  admission cap (`api::admission`) refuses audited requests before they mutate
+  anything once 4 are in flight for one user (429, admins included) or 32 in
+  all (503, `Retry-After: 1`). Every non-read request and the two audit GETs
+  hold a permit until their audit write and any detached work finish, so the
+  admitted writes fit the 48 non-restricted slots whatever `RATE_LIMIT_BURST`
+  is (16 slots stay free for login acknowledgements and scheduled-sync events).
+  Ordinary accounts can hold at most 28 of the 32 permits; the last 4 are for
+  admins (who are still limited to 4 each). `HEAD` on the audit read routes
+  counts like `GET`. The bound is strict only while the database pool is
+  healthy: a stalled audit insert can leave a request's late writes pending
+  under its permit. A permit is also held while a request body is still being
+  received, so bodies are rate-checked once the handler starts reading them:
+  the first byte must arrive within 5 s, then the body must average at least
+  64 KiB/s after a 10 s grace (a 500 MiB upload is fine at that rate). A body
+  that falls behind is cut off (400, permit released); the handler's work after
+  the body has arrived is not limited. Each cut-off is counted as `bodyDeadline`
+  on `/api/admin/failure-counters` and logged with the user id; 3 cut-offs
+  within 60 s make that user's next requests fail with 429 for 30 s. A slow
+  client behind a buffering reverse proxy never reaches the backend until the
+  proxy has the whole body, which removes this vector entirely; slow links
+  below 64 KiB/s will be cut off.
+  Refusals are counted on `/api/admin/failure-counters` (`admission`) and
+  logged (a global refusal also names the users at their own cap) at most once a minute per reason, not written to the audit table. On SIGTERM or Ctrl-C the
   backend waits up to 8 s for open requests and pending writes; keep the
   container stop grace period above that.
 - `source_ip` is the same client IP the login notice uses: the socket peer

@@ -3,7 +3,8 @@
 //! Sits inside the auth layer (so `AuthUser` is populated). It builds a
 //! [`RequestCtx`] request extension and echoes the generated id in the
 //! `X-Request-Id` response header. An inbound `X-Request-Id` is never trusted:
-//! the id is always a fresh UUID v4.
+//! the id is always a fresh UUID v4. The admission permit, when the `admission`
+//! layer (outside this one) took one, is carried in the ctx.
 
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -17,6 +18,7 @@ use axum::{
 
 use std::net::SocketAddr;
 
+use crate::api::admission::Permit;
 use crate::api::auth::AuthUser;
 use crate::api::notice::notice_ip;
 
@@ -33,6 +35,11 @@ pub struct RequestCtx {
     /// Set by `db_audit::record_or_log` when a handler has recorded its own
     /// event for this request, so a central recorder does not add a second.
     pub audited: Arc<AtomicBool>,
+    /// The admission permit of this request, if it was admitted (see
+    /// `admission`). Cloned into detached audit writes and detached work, so
+    /// the permit is held until they finish. `None` outside the admitted
+    /// routes.
+    pub permit: Option<Arc<Permit>>,
 }
 
 impl RequestCtx {
@@ -42,6 +49,7 @@ impl RequestCtx {
             source_ip: Some(notice_ip(headers, peer)).filter(|ip| !ip.is_empty()),
             role: role.to_string(),
             audited: Arc::new(AtomicBool::new(false)),
+            permit: None,
         }
     }
 }
@@ -52,7 +60,8 @@ pub async fn request_ctx(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let ctx = RequestCtx::new(req.headers(), peer.map(|p| p.0), &user.role);
+    let mut ctx = RequestCtx::new(req.headers(), peer.map(|p| p.0), &user.role);
+    ctx.permit = req.extensions().get::<Arc<Permit>>().cloned();
     let id = ctx.request_id.clone();
     req.extensions_mut().insert(ctx);
     let mut resp = next.run(req).await;
