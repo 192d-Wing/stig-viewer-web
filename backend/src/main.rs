@@ -171,7 +171,7 @@ use api::{
     stig_validator::lint_handler as stig_lint_handler,
     test_support::{
         backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
-        inject_scheduler_error_handler, reset_handler, reset_ratelimit_handler,
+        inject_scheduler_error_handler, login_acks_handler, reset_handler, reset_ratelimit_handler,
         run_asset_email_schedules_handler, run_digest_handler, run_report_handler,
         run_retention_handler, run_scheduler_handler,
         saml_login_handler as test_saml_login_handler, set_role_handler,
@@ -805,6 +805,7 @@ async fn main() -> Result<()> {
             .route("/api/test/saml-login", post(test_saml_login_handler))
             .route("/api/test/seed-archive", post(seed_catalog_archive_handler))
             .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
+            .route("/api/test/login-acks", get(login_acks_handler))
             .with_state(state.clone());
         app = app.merge(test_router);
     }

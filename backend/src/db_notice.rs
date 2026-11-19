@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::failure_counters::FailureCounter;
@@ -37,6 +39,15 @@ impl LoginBinding<'_> {
             LoginBinding::Saml { .. } => "saml",
         }
     }
+}
+
+/// Lowercase hex SHA-256 of an OIDC `state`. Only this digest is stored (in
+/// `oidc_state_sha256`); the state is a 128-bit random value, so an unkeyed
+/// hash suffices. This relies on that entropy: never feed it a low-entropy
+/// or caller-chosen state. Must match the SQL `encode(sha256(convert_to(s,'UTF8')),'hex')`
+/// used by migration 046.
+pub(crate) fn state_digest(state: &str) -> String {
+    hex::encode(Sha256::digest(state.as_bytes()))
 }
 
 /// A login must complete within this long of login start.
@@ -108,7 +119,8 @@ pub async fn prune_acks_tick(pool: &PgPool, counter: &FailureCounter) {
 }
 
 /// Atomically consume an unused, unexpired acknowledgement for the current
-/// notice version and store the login binding on it. True exactly once per row.
+/// notice version and store the login binding on it (the OIDC state as its
+/// SHA-256 digest). True exactly once per row.
 pub async fn consume_ack(
     pool: &PgPool,
     id: &str,
@@ -126,7 +138,7 @@ pub async fn consume_ack(
     let row: Option<String> = sqlx::query_scalar(
         "UPDATE login_notice_acks \
             SET consumed_at = NOW(), method = $3, saml_request_id = $4, \
-                oidc_state = $5, oidc_nonce = $6, oidc_pkce_verifier = $7 \
+                oidc_state_sha256 = $5, oidc_nonce = $6, oidc_pkce_verifier = $7 \
           WHERE id = $1 AND consumed_at IS NULL AND expires_at > NOW() \
             AND notice_version = $2 \
         RETURNING id",
@@ -135,7 +147,7 @@ pub async fn consume_ack(
     .bind(current_version)
     .bind(binding.method())
     .bind(req)
-    .bind(state)
+    .bind(state.map(state_digest))
     .bind(nonce)
     .bind(verifier)
     .fetch_optional(pool)
@@ -161,17 +173,18 @@ struct OidcClaimRow {
     oidc_pkce_verifier: Option<String>,
 }
 
-/// Atomically claim (delete) the OIDC login bound to this ack id and `state`.
-/// None unless the id, method, state and 10-minute window all match.
+/// Atomically claim (delete) the OIDC login bound to this ack id and `state`
+/// (compared by SHA-256 against the stored digest). None unless the id,
+/// method, state and 10-minute window all match.
 pub async fn claim_oidc(pool: &PgPool, id: &str, state: &str) -> Result<Option<OidcClaim>> {
     let row = sqlx::query_as::<_, OidcClaimRow>(
         "DELETE FROM login_notice_acks \
-          WHERE id = $1 AND method = 'oidc' AND oidc_state = $2 \
+          WHERE id = $1 AND method = 'oidc' AND oidc_state_sha256 = $2 \
             AND consumed_at > NOW() - make_interval(mins => $3) \
         RETURNING created_at, ip, user_agent, notice_version, method, oidc_nonce, oidc_pkce_verifier",
     )
     .bind(id)
-    .bind(state)
+    .bind(state_digest(state))
     .bind(CLAIM_WINDOW_MINUTES as i32)
     .fetch_optional(pool)
     .await?;
@@ -210,6 +223,35 @@ pub async fn claim_saml(
     .await?)
 }
 
+/// Non-secret view of one acknowledgement row for the e2e test routes. Never
+/// carries the nonce or PKCE verifier values, only whether they are set.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AckProbe {
+    /// The ack id is the `stig_notice_ack` / `stig_oidc_state` cookie value,
+    /// so this type must only ever be served by the gated test routes.
+    pub id: String,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+    pub method: Option<String>,
+    pub oidc_state_sha256: Option<String>,
+    pub has_nonce: bool,
+    pub has_pkce_verifier: bool,
+    pub saml_request_id: Option<String>,
+}
+
+/// All acknowledgement rows ordered by id, without the secret values.
+pub async fn list_ack_probes(pool: &PgPool) -> Result<Vec<AckProbe>> {
+    Ok(sqlx::query_as::<_, AckProbe>(
+        "SELECT id, consumed_at, expires_at, method, oidc_state_sha256, \
+                oidc_nonce IS NOT NULL AS has_nonce, \
+                oidc_pkce_verifier IS NOT NULL AS has_pkce_verifier, saml_request_id \
+           FROM login_notice_acks ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +265,14 @@ mod tests {
     const SAML: LoginBinding<'static> = LoginBinding::Saml {
         request_id: "_req1",
     };
+
+    #[test]
+    fn state_digest_matches_the_sha256_test_vector() {
+        assert_eq!(
+            state_digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn binding_method_names() {
@@ -246,13 +296,13 @@ mod tests {
             Option<String>,
         );
         let r: Row5 =
-            sqlx::query_as("SELECT method, oidc_state, oidc_nonce, oidc_pkce_verifier, saml_request_id FROM login_notice_acks WHERE id='a1'")
+            sqlx::query_as("SELECT method, oidc_state_sha256, oidc_nonce, oidc_pkce_verifier, saml_request_id FROM login_notice_acks WHERE id='a1'")
                 .fetch_one(&pool).await.unwrap();
         assert_eq!(
             r,
             (
                 Some("oidc".into()),
-                Some("st".into()),
+                Some(state_digest("st")),
                 Some("no".into()),
                 Some("pv".into()),
                 None
@@ -261,7 +311,7 @@ mod tests {
         insert_ack(&pool, "a2", V, "", "", 300).await.unwrap();
         assert!(consume_ack(&pool, "a2", V, &SAML).await.unwrap());
         let r: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT method, saml_request_id, oidc_state FROM login_notice_acks WHERE id='a2'",
+            "SELECT method, saml_request_id, oidc_state_sha256 FROM login_notice_acks WHERE id='a2'",
         )
         .fetch_one(&pool)
         .await
@@ -309,6 +359,63 @@ mod tests {
         sqlx::query("UPDATE login_notice_acks SET consumed_at = NOW() - INTERVAL '11 minutes' WHERE id='a2'")
             .execute(&pool).await.unwrap();
         assert!(claim_oidc(&pool, "a2", "st").await.unwrap().is_none());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn claiming_with_the_stored_hash_as_state_fails(pool: PgPool) {
+        insert_ack(&pool, "a1", V, "", "", 300).await.unwrap();
+        consume_ack(&pool, "a1", V, &OIDC).await.unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT oidc_state_sha256 FROM login_notice_acks WHERE id='a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(stored, "st");
+        assert_eq!(stored, state_digest("st"));
+        assert!(claim_oidc(&pool, "a1", &stored).await.unwrap().is_none());
+        assert!(claim_oidc(&pool, "a1", "st").await.unwrap().is_some());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn ack_table_is_unlogged(pool: PgPool) {
+        let p: String = sqlx::query_scalar(
+            "SELECT relpersistence::text FROM pg_class WHERE oid = 'login_notice_acks'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(p, "u");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn list_ack_probes_omits_secrets(pool: PgPool) {
+        insert_ack(&pool, "a1", V, "", "", 300).await.unwrap();
+        let b = LoginBinding::Oidc {
+            state: "distinct-state-value",
+            nonce: "distinct-nonce-value",
+            pkce_verifier: "distinct-verifier-value",
+        };
+        consume_ack(&pool, "a1", V, &b).await.unwrap();
+        let probes = list_ack_probes(&pool).await.unwrap();
+        assert_eq!(probes.len(), 1);
+        let p = &probes[0];
+        assert!(p.has_nonce && p.has_pkce_verifier && p.consumed_at.is_some());
+        assert_eq!(
+            p.oidc_state_sha256.as_deref(),
+            Some(state_digest("distinct-state-value").as_str())
+        );
+        let json = serde_json::to_string(&probes).unwrap();
+        for secret in [
+            "distinct-state-value",
+            "distinct-nonce-value",
+            "distinct-verifier-value",
+        ] {
+            assert!(!json.contains(secret), "{secret} leaked");
+        }
+        assert!(json.contains("hasNonce") && json.contains("oidcStateSha256"));
     }
 
     #[sqlx::test]
