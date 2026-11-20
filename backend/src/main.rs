@@ -325,7 +325,13 @@ async fn main() -> Result<()> {
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        return run_migrate_command().await;
+        // Distinct exit codes let the dev compose loop retry only transient
+        // failures. Same output shape as anyhow's default; no URL is logged.
+        if let Err(e) = run_migrate_command().await {
+            eprintln!("Error: {e:?}");
+            std::process::exit(db_roles::migrate_exit_code(&e));
+        }
+        return Ok(());
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one

@@ -18,8 +18,11 @@
 //!   list. With `SIGNING_KEY_HEX` unset the sidecar carries the digest only,
 //!   which detects corruption but not deliberate alteration.
 //!
-//! Segments are written to a temp file, fsynced and renamed; a failed write
-//! leaves no partial segment. The sidecar is published BEFORE the segment, so
+//! Segments are written to a temp file, fsynced and renamed, then the
+//! directory is fsynced; a failed write leaves no partial segment. A failed
+//! directory fsync aborts the sweep (nothing is deleted) and unpublishes the
+//! file, except EINVAL/unsupported, which is a static filesystem property and
+//! is tolerated with a warning. The sidecar is published BEFORE the segment, so
 //! a visible `.jsonl` always has its complete sidecar and a concurrent scan
 //! can never see it as "sidecar missing". A crash between the two leaves an
 //! orphan `*.manifest.json`, which the scan ignores and the name pick steps
@@ -255,7 +258,82 @@ fn archived_lines(
     Ok(seen)
 }
 
-/// Temp file, fsync, rename, fsync the directory.
+/// Whether a failed `fsync` of the archive directory must abort the sweep.
+///
+/// EINVAL and "unsupported" from `fsync(dirfd)` are a static property of the
+/// filesystem (some CIFS/SMB and FUSE mounts); failing on them would stall
+/// retention forever with no operator recourse, so they are tolerated. Every
+/// other error (EIO, ENOSPC, EDQUOT, EACCES, ...) is a real durability failure.
+fn dir_sync_is_fatal(e: &std::io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    )
+}
+
+/// Directories whose sync is forced to fail with the given kind (test hook;
+/// keyed on the unique temp dir so parallel tests stay isolated).
+#[cfg(test)]
+static FAIL_DIR_SYNC: std::sync::Mutex<Vec<(std::path::PathBuf, std::io::ErrorKind)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The injected failure for `dir`, if armed. Shared by both `sync_dir` variants.
+#[cfg(test)]
+fn injected_dir_sync_failure(dir: &Path) -> Option<std::io::Error> {
+    let set = FAIL_DIR_SYNC.lock().ok()?;
+    let (_, kind) = set.iter().find(|(p, _)| p == dir)?;
+    Some(std::io::Error::new(
+        *kind,
+        "injected directory sync failure",
+    ))
+}
+
+#[cfg(unix)]
+/// Report a tolerated (unsupported) directory fsync once per process, loudly:
+/// archive durability is degraded on this filesystem.
+fn note_dir_sync_unsupported(dir: &Path, e: &std::io::Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::error!(target: "audit", dir = ?dir, "directory fsync is not supported on this filesystem: audit archive durability is degraded (logged once): {e}");
+    });
+}
+
+/// fsync the directory so a rename in it is durable. A tolerated error is
+/// reported once and then ignored.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let result = (|| {
+        #[cfg(test)]
+        if let Some(e) = injected_dir_sync_failure(dir) {
+            return Err(e);
+        }
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    match result {
+        Err(e) if !dir_sync_is_fatal(&e) => {
+            note_dir_sync_unsupported(dir, &e);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Best effort off unix: opening a directory as a file fails on Windows.
+#[cfg(not(unix))]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = injected_dir_sync_failure(dir) {
+        return Err(e);
+    }
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Temp file, fsync, rename, fsync the directory. A directory sync failure is
+/// an error (the caller aborts before any row is deleted); the just-published
+/// name is removed again so no unsynced file stays visible.
 fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -269,8 +347,10 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result.with_context(|| format!("write {name}"))?;
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    if let Err(e) = sync_dir(dir) {
+        // The name was just picked as non-existent and we hold the sweep lock.
+        let _ = std::fs::remove_file(dir.join(name));
+        return Err(e).with_context(|| format!("sync directory after publishing {name}"));
     }
     Ok(())
 }
@@ -1763,6 +1843,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn arm_dir_sync_failure_kind(dir: &Path, kind: std::io::ErrorKind) {
+        FAIL_DIR_SYNC
+            .lock()
+            .unwrap()
+            .push((dir.to_path_buf(), kind));
+    }
+
+    fn arm_dir_sync_failure(dir: &Path) {
+        arm_dir_sync_failure_kind(dir, std::io::ErrorKind::Other);
+    }
+
+    fn disarm_dir_sync_failure(dir: &Path) {
+        FAIL_DIR_SYNC.lock().unwrap().retain(|(p, _)| p != dir);
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn dir_sync_fatality_truth_table() {
+        use std::io::{Error, ErrorKind};
+        assert!(!dir_sync_is_fatal(&Error::from(ErrorKind::InvalidInput)));
+        assert!(!dir_sync_is_fatal(&Error::from(ErrorKind::Unsupported)));
+        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::Other)));
+        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::StorageFull)));
+    }
+
+    #[test]
+    fn a_sidecar_directory_sync_failure_aborts_and_leaves_nothing() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        arm_dir_sync_failure(&ad);
+        let err = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None).unwrap_err();
+        assert!(format!("{err:#}").contains("sync directory after publishing"));
+        assert!(entries(&ad).is_empty());
+        disarm_dir_sync_failure(&ad);
+        write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None).unwrap();
+        assert_eq!(segments(&dir), ["rules-2024-01-01.1-1.jsonl"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_tolerated_directory_sync_error_still_publishes() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
+        let res = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None);
+        disarm_dir_sync_failure(&ad);
+        res.unwrap();
+        assert_eq!(segments(&dir), ["rules-2024-01-01.1-1.jsonl"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_segment_directory_sync_failure_aborts_and_leaves_nothing() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        let res = write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, None, &|| {
+            arm_dir_sync_failure(&ad);
+            Ok(())
+        });
+        disarm_dir_sync_failure(&ad);
+        assert!(res.is_err());
+        assert!(entries(&ad).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_directory_sync_deletes_nothing(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'a', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        arm_dir_sync_failure(&ad);
+        assert!(run_prune(&pool, &dir, 5, true, None).await.is_err());
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        disarm_dir_sync_failure(&ad);
+        run_prune(&pool, &dir, 5, true, None).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(segments(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
