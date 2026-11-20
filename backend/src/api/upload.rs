@@ -8,7 +8,9 @@ use chrono::Utc;
 use crate::{
     api::{auth::AuthUser, request_ctx::RequestCtx, stig_validator::lint_stig},
     db::{upsert_catalog, CatalogEntry},
-    parser::{extract_all_from_library, extract_xccdf_from_zip, parse_xccdf, LibrarySkip},
+    parser::{
+        extract_all_from_library, extract_xccdf_from_zip, parse_xccdf, LibraryAbort, LibrarySkip,
+    },
     zip_safe::ZipReadError,
     AppState,
 };
@@ -27,6 +29,30 @@ fn ensure_admin(user: &AuthUser) -> Result<(), (StatusCode, String)> {
     }
 }
 
+/// Why a ZIP was refused, with optional skip counts gathered before the abort.
+struct Rejection<'a> {
+    reason_code: &'static str,
+    reason: &'a str,
+    bytes_compressed: usize,
+    /// `(skipped, byReason, parsed)` for a library aborted part-way.
+    tally: Option<(
+        usize,
+        std::collections::BTreeMap<&'static str, usize>,
+        usize,
+    )>,
+}
+
+impl<'a> Rejection<'a> {
+    fn new(reason: (&'static str, &'a str), bytes_compressed: usize) -> Self {
+        Self {
+            reason_code: reason.0,
+            reason: reason.1,
+            bytes_compressed,
+            tally: None,
+        }
+    }
+}
+
 /// Audit a ZIP that was refused (too large, inconsistent headers, malformed).
 /// Recorded outside any transaction: nothing was changed.
 async fn record_zip_rejection(
@@ -35,9 +61,14 @@ async fn record_zip_rejection(
     ctx: &RequestCtx,
     action: &'static str,
     stig_id: Option<&str>,
-    (reason_code, reason): (&'static str, &str),
-    bytes_compressed: usize,
+    rejection: Rejection<'_>,
 ) {
+    let Rejection {
+        reason_code,
+        reason,
+        bytes_compressed,
+        tally,
+    } = rejection;
     let reason: String = reason.chars().take(300).collect();
     tracing::warn!(
         target: "audit",
@@ -46,6 +77,16 @@ async fn record_zip_rejection(
         reason_code,
         "catalog upload rejected: {reason}"
     );
+    let mut detail = serde_json::json!({
+        "reasonCode": reason_code,
+        "reason": reason,
+        "bytesCompressed": bytes_compressed,
+    });
+    if let (Some((skipped, by_reason, parsed)), Some(map)) = (tally, detail.as_object_mut()) {
+        map.insert("skipped".into(), skipped.into());
+        map.insert("byReason".into(), serde_json::json!(by_reason));
+        map.insert("parsed".into(), parsed.into());
+    }
     crate::db_audit::record_or_log(
         state.pool.as_ref(),
         crate::db_audit::NewAuditEvent {
@@ -56,11 +97,7 @@ async fn record_zip_rejection(
             asset_id: None,
             checklist_id: None,
             stig_id,
-            detail: serde_json::json!({
-                "reasonCode": reason_code,
-                "reason": reason,
-                "bytesCompressed": bytes_compressed,
-            }),
+            detail,
         },
     )
     .await;
@@ -106,6 +143,34 @@ fn more_skips_line(total: usize) -> Option<String> {
     })
 }
 
+/// Log each skip (up to the cap) and count them by reason code.
+fn log_and_tally_skips(
+    user: &AuthUser,
+    skips: &[&LibrarySkip],
+) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut by_reason: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for (i, skip) in skips.iter().enumerate() {
+        *by_reason.entry(skip.code).or_default() += 1;
+        if i < MAX_SKIPPED_ENTRIES_AUDITED {
+            // `?` (Debug) keeps any newline in untrusted text escaped.
+            tracing::warn!(
+                target: "audit",
+                actor = %user.id,
+                action = "catalog.import_library_entry",
+                reason_code = skip.code,
+                entry = %crate::db_audit::audit_safe_id(&skip.id),
+                detail = %escaped_detail(&skip.detail),
+                "library entry skipped"
+            );
+        }
+    }
+    if let Some(line) = more_skips_line(skips.len()) {
+        tracing::warn!(target: "audit", actor = %user.id, "{line}");
+    }
+    by_reason
+}
+
 /// Audit the skipped entries of an imported library: one
 /// `catalog.import_library_entry` row per skip up to the cap, plus one
 /// `catalog.import_library` summary row. Every skip is also logged. A skip of
@@ -131,26 +196,7 @@ async fn audit_library_skips(
     if skips.is_empty() {
         return;
     }
-    let mut by_reason: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
-    for (i, skip) in skips.iter().enumerate() {
-        *by_reason.entry(skip.code).or_default() += 1;
-        if i < MAX_SKIPPED_ENTRIES_AUDITED {
-            // `?` (Debug) keeps any newline in untrusted text escaped.
-            tracing::warn!(
-                target: "audit",
-                actor = %user.id,
-                action = "catalog.import_library_entry",
-                reason_code = skip.code,
-                entry = %crate::db_audit::audit_safe_id(&skip.id),
-                detail = %escaped_detail(&skip.detail),
-                "library entry skipped"
-            );
-        }
-    }
-    if let Some(line) = more_skips_line(skips.len()) {
-        tracing::warn!(target: "audit", actor = %user.id, "{line}");
-    }
+    let by_reason = log_and_tally_skips(user, skips);
     let deadline = tokio::time::Instant::now() + deadline;
     let mut attempted = 0usize;
     for skip in skips.iter().take(MAX_SKIPPED_ENTRIES_AUDITED) {
@@ -313,8 +359,7 @@ pub async fn upload_stig(
                 &ctx,
                 "catalog.upload",
                 Some(&id),
-                (e.code(), &e.to_string()),
-                compressed,
+                Rejection::new((e.code(), &e.to_string()), compressed),
             )
             .await;
             return Err(zip_rejection(&e));
@@ -411,6 +456,9 @@ pub async fn upload_stig(
 /// Requires an authenticated session with the `admin` role.
 /// Body limit: `MAX_UPLOAD_BYTES` (set on the route in main.rs).
 ///
+/// Runs in a spawned task so a client disconnect cannot split file writes,
+/// catalog rows and audit rows.
+///
 /// Example:
 ///   curl -X POST http://localhost:8080/api/upload/library \
 ///        -b "stig_session=<admin session cookie>" \
@@ -441,7 +489,32 @@ pub async fn upload_library(
         }
     }
     let zip_bytes = zip_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
+    import_library(state, user, ctx, zip_bytes).await
+}
 
+/// Run the import as a detached task; no await before the spawn.
+pub(crate) async fn import_library(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    zip_bytes: Vec<u8>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tasks = state.tasks.clone();
+    crate::detached::run(
+        &tasks,
+        "library import",
+        import_library_work(state, user, ctx, zip_bytes),
+    )
+    .await
+    .map_err(|code| (code, "internal error".to_string()))?
+}
+
+async fn import_library_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    zip_bytes: Vec<u8>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     tracing::info!(
         "Library bundle received ({} MB), processing…",
         zip_bytes.len() / 1_048_576
@@ -453,21 +526,28 @@ pub async fn upload_library(
         match tokio::task::spawn_blocking(move || extract_all_from_library(&zip_bytes))
             .await
             .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Task panic: {e}"),
-                )
+                tracing::error!("library parse task failed: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             })? {
             Ok(v) => v,
-            Err(e) => {
+            Err(LibraryAbort {
+                error: e,
+                skips,
+                parsed,
+            }) => {
+                let entry_skips: Vec<&LibrarySkip> =
+                    skips.iter().filter(|s| !s.is_outer()).collect();
+                let by_reason = log_and_tally_skips(&user, &entry_skips);
+                let reason = e.to_string();
+                let mut rejection = Rejection::new((e.code(), &reason), compressed);
+                rejection.tally = Some((entry_skips.len(), by_reason, parsed));
                 record_zip_rejection(
                     &state,
                     &user,
                     &ctx,
                     "catalog.import_library",
                     None,
-                    (e.code(), &e.to_string()),
-                    compressed,
+                    rejection,
                 )
                 .await;
                 return Err(zip_rejection(&e));
@@ -483,8 +563,7 @@ pub async fn upload_library(
             &ctx,
             "catalog.import_library",
             None,
-            (outer.code, &outer.detail),
-            compressed,
+            Rejection::new((outer.code, &outer.detail), compressed),
         )
         .await;
     }
@@ -620,13 +699,17 @@ mod tests {
     use std::io::Write;
 
     async fn serve(state: AppState) -> String {
+        serve_as(state, "admin").await
+    }
+
+    async fn serve_as(state: AppState, role: &'static str) -> String {
         let app = Router::new()
             .route("/api/upload", post(upload_stig))
             .route("/api/upload/library", post(upload_library))
             .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
             .route_layer(middleware::from_fn(
-                |mut req: Request, next: Next| async move {
-                    req.extensions_mut().insert(auth("admin1", "admin"));
+                move |mut req: Request, next: Next| async move {
+                    req.extensions_mut().insert(auth("admin1", role));
                     req.extensions_mut().insert(ctx());
                     next.run(req).await
                 },
@@ -732,6 +815,12 @@ mod tests {
         // shared by 33 library entries: 33 x 64 MiB > the 2 GiB budget.
         let inner = zip_of("a-xccdf.xml", &vec![b' '; 64 * 1024 * 1024]);
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        // Two junk entries come first: their skips must reach the rejection row.
+        for name in ["U_JunkA_V1R1_STIG.zip", "U_JunkB_V1R1_STIG.zip"] {
+            w.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(b"not a zip").unwrap();
+        }
         for i in 0..33 {
             w.start_file(
                 format!("U_Big{i}_V1R1_STIG.zip"),
@@ -751,6 +840,17 @@ mod tests {
         let rows = rejected_rows(&pool, "catalog.import_library").await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["reasonCode"], "budget_exceeded");
+        assert_eq!(rows[0]["skipped"], 2, "{:?}", rows[0]);
+        assert_eq!(rows[0]["byReason"]["malformed"], 2, "{:?}", rows[0]);
+        // Entries parsed before the budget ran out; none of them is written.
+        assert!(
+            rows[0]["parsed"].as_u64().is_some_and(|n| n > 0 && n < 33),
+            "{:?}",
+            rows[0]
+        );
+        assert!(rows_of(&pool, "catalog.import_library_entry")
+            .await
+            .is_empty());
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
             .fetch_one(&pool)
             .await
@@ -937,9 +1037,10 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn the_entry_audit_deadline_stops_entry_rows_but_not_the_summary(pool: PgPool) {
-        seed_user(&pool, "admin1").await;
+        seed_user(&pool, "deadline-user").await;
         let (state, _dir) = app_state(pool.clone());
-        let user = auth("admin1", "admin");
+        let user = auth("deadline-user", "admin");
+        let (cap, _g) = crate::api::audit_capture::capture();
         let skips: Vec<LibrarySkip> = (0..5)
             .map(|i| LibrarySkip {
                 id: format!("junk{i}"),
@@ -960,15 +1061,131 @@ mod tests {
             std::time::Duration::ZERO,
         )
         .await;
-        // The write in flight at the deadline is detached; wait for it.
-        crate::db_audit::drain().await;
-        let entries = rows_of(&pool, "catalog.import_library_entry").await;
-        assert!(entries.len() < 5, "{}", entries.len());
+        let deadline_lines = cap
+            .lines()
+            .iter()
+            .filter(|l| {
+                l.values()
+                    .any(|v| v.contains("entry audit deadline reached"))
+            })
+            .count();
+        assert_eq!(deadline_lines, 1);
+
         let summary = rows_of(&pool, "catalog.import_library").await;
         assert_eq!(summary.len(), 1, "{summary:?}");
         let d = &summary[0].2;
         assert_eq!(d["skipped"], 5);
-        assert!(d["skippedAudited"].as_u64().unwrap() < 5, "{d}");
+        let audited = d["skippedAudited"].as_u64().unwrap();
+        assert_eq!(audited, 1, "{d}");
+
+        // The write in flight at the deadline is detached; wait (bounded) for
+        // this test's own database to show it.
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'catalog.import_library_entry'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        while count().await < audited as i64 && tokio::time::Instant::now() < end {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let entries = rows_of(&pool, "catalog.import_library_entry").await;
+        assert_eq!(entries.len() as u64, audited);
+        let repeats: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(repeat_count), 0)::BIGINT FROM audit_events WHERE action = 'catalog.import_library_entry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repeats as u64, audited);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_non_admin_library_upload_is_403_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let base = serve_as(state, "user").await;
+        let good = zip_of(
+            "a-xccdf.xml",
+            br#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>G</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title></Rule></Group></Benchmark>"#,
+        );
+        let lib = lib_of(&[("U_Good_V1R1_STIG.zip".into(), good)]);
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 403, "{body}");
+        crate::db_audit::drain().await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let files: Vec<String> = std::fs::read_dir(data_dir.join("stigs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, [format!("{}.json", crate::test_fixtures::STIG_ID)]);
+        assert!(rows_of(&pool, "catalog.import_library").await.is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn library_import_and_its_audit_rows_survive_the_handler_future_being_dropped(
+        pool: PgPool,
+    ) {
+        seed_user(&pool, "admin1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let tasks = state.tasks.clone();
+        let good = |t: &str| {
+            zip_of(
+                "a-xccdf.xml",
+                format!(
+                    r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>{t}</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title></Rule></Group></Benchmark>"#
+                )
+                .as_bytes(),
+            )
+        };
+        let lib = lib_of(&[
+            ("U_GoodA_V1R1_STIG.zip".into(), good("A")),
+            ("U_GoodB_V1R1_STIG.zip".into(), good("B")),
+            ("U_Junk_V1R1_STIG.zip".into(), b"not a zip".to_vec()),
+        ]);
+        {
+            let call = import_library(state, auth("admin1", "admin"), ctx(), lib);
+            let mut call = std::pin::pin!(call);
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(call.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(pending, "the handler must still be waiting on its task");
+            assert_eq!(tasks.in_flight(), 1);
+        } // caller dropped
+        tasks.idle().await;
+        crate::db_audit::drain().await;
+
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM stigs_catalog ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, ["gooda", "goodb"]);
+        for id in &ids {
+            assert!(data_dir.join(format!("stigs/{id}.json")).exists(), "{id}");
+        }
+        assert_eq!(
+            rows_of(&pool, "catalog.import_library_entry").await.len(),
+            1
+        );
+        let summary = rows_of(&pool, "catalog.import_library").await;
+        assert_eq!(summary.len(), 1, "{summary:?}");
+        assert_eq!(summary[0].0, "partial");
+        assert_eq!(summary[0].2["skipped"], 1);
+        assert_eq!(summary[0].2["parsed"], 2);
     }
 
     #[sqlx::test]

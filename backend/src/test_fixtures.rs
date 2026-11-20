@@ -401,6 +401,7 @@ pub fn auth_state(state: &AppState) -> crate::api::auth::AppAuthState {
             frontend_url: "http://localhost:5173".into(),
             allow_test_auth_header: false,
         },
+        tasks: state.tasks.clone(),
     }
 }
 
@@ -408,6 +409,7 @@ pub fn auth_state(state: &AppState) -> crate::api::auth::AppAuthState {
 pub fn saml_state(state: &AppState) -> crate::api::saml::AppSamlState {
     crate::api::saml::AppSamlState {
         pool: state.pool.clone(),
+        tasks: state.tasks.clone(),
         config: Arc::new(crate::api::saml::SamlConfig {
             idp_sso_url: String::new(),
             idp_entity_id: String::new(),

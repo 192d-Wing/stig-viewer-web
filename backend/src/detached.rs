@@ -11,6 +11,9 @@
 //! The number of tasks is bounded by the admission permit (`api::admission`)
 //! carried in the `RequestCtx` that each work function takes by value: at most
 //! 32 in all and 4 per user, refused with 429/503 before the task is spawned.
+//! Login tasks (pre-auth, no permit) are bounded per IP by the
+//! `PreAuthLimiter`, which `claim_step` and `acs_core` check before the spawn;
+//! there is no global ceiling.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,6 +92,24 @@ pub async fn run<T: Send + 'static>(
         tracing::error!("{what} task failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// Test helper: poll `f` until a task has been spawned on `tracker`, then drop
+/// `f` (the caller going away). Panics if `f` completes first.
+#[cfg(test)]
+pub(crate) async fn abort_once_spawned<F: Future>(tracker: &Tracker, f: F) {
+    let mut f = std::pin::pin!(f);
+    std::future::poll_fn(|cx| {
+        if f.as_mut().poll(cx).is_ready() {
+            panic!("future completed before a task was spawned");
+        }
+        if tracker.in_flight() >= 1 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
