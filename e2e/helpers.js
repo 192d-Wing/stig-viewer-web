@@ -36,6 +36,18 @@ export async function resetDb() {
 }
 
 /**
+ * Write one real system audit event (NULL user, role `system`, action
+ * `catalog.sync`, detail.reasonCode `download_too_large`) through the
+ * production writer. The write is detached, so poll for the row.
+ */
+export async function mintSystemAuditEvent() {
+  const res = await fetch(`${BACKEND}/api/test/system-audit-event`, { method: "POST" });
+  if (res.status !== 204) {
+    throw new Error(`mintSystemAuditEvent failed: ${res.status}`);
+  }
+}
+
+/**
  * Create a draft via the API and return the JSON response.
  * Automatically triggers user auto-creation via the X-User-Id header.
  */
@@ -117,7 +129,7 @@ export async function setUserRole(userName, role) {
   }
 }
 
-/** Non-secret metadata of the AC-8 acknowledgement rows. Rows carry `idSha256` (a digest of the ack id), never the id, nonce or verifier values. */
+/** Non-secret metadata of the AC-8 acknowledgement rows. Rows carry `idSha256` (a digest of the ack id) and `samlRequestIdSha256` (a digest of the SAML request id), never the ids, nonce or verifier values. */
 export async function loginAcks() {
   const res = await fetch(`${BACKEND}/api/test/login-acks`);
   if (res.status !== 200) {
