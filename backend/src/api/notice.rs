@@ -258,6 +258,29 @@ pub(crate) async fn require_ack(
     }
 }
 
+/// Create the session and submit its `auth.notice_ack` row as one detached
+/// task, so a dropped caller cannot leave a session without its ack record.
+/// No await before the spawn.
+pub(crate) async fn session_with_ack(
+    tasks: &std::sync::Arc<crate::detached::Tracker>,
+    pool: std::sync::Arc<PgPool>,
+    user_id: String,
+    ip: String,
+    ua: String,
+    ack: AckRecord,
+) -> Result<String, axum::http::StatusCode> {
+    let made = crate::detached::run(tasks, "login session", async move {
+        let sid = crate::api::auth::create_session(&pool, &user_id, &ip, &ua).await?;
+        record_ack_linked(&pool, &user_id, &sid, ack).await;
+        anyhow::Ok(sid)
+    })
+    .await?;
+    made.map_err(|e| {
+        tracing::error!("create_session failed: {e:#}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 /// Write the durable AU-2 record for a completed login. Never fails the caller.
 pub(crate) async fn record_ack_linked(
     pool: &PgPool,
@@ -539,5 +562,88 @@ mod tests {
         ] {
             assert!(detail.get(k).is_some(), "missing {k}");
         }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_session_returns_500_and_writes_no_ack_row(pool: PgPool) {
+        db_notice::insert_ack(&pool, "a1", USE_NOTICE_VERSION, "1.1.1.1", "ua", 300)
+            .await
+            .unwrap();
+        db_notice::consume_ack(&pool, "a1", USE_NOTICE_VERSION, &TEST_BINDING)
+            .await
+            .unwrap();
+        let ack = db_notice::claim_oidc(&pool, "a1", "s")
+            .await
+            .unwrap()
+            .unwrap()
+            .ack;
+        let tasks = crate::detached::Tracker::new();
+        // No such user: the sessions FK refuses the insert.
+        let r = session_with_ack(
+            &tasks,
+            std::sync::Arc::new(pool.clone()),
+            "no-such-user".into(),
+            "1.1.1.1".into(),
+            "ua".into(),
+            ack,
+        )
+        .await;
+        assert_eq!(r, Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR));
+        tasks.idle().await;
+        crate::db_audit::drain().await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn session_and_ack_survive_a_dropped_caller(pool: PgPool) {
+        sqlx::query("INSERT INTO users (id, display_name, email, sub, provider) VALUES ('u1','U','','s','test')")
+            .execute(&pool).await.unwrap();
+        db_notice::insert_ack(&pool, "a1", USE_NOTICE_VERSION, "1.1.1.1", "ua", 300)
+            .await
+            .unwrap();
+        db_notice::consume_ack(&pool, "a1", USE_NOTICE_VERSION, &TEST_BINDING)
+            .await
+            .unwrap();
+        let ack = db_notice::claim_oidc(&pool, "a1", "s")
+            .await
+            .unwrap()
+            .unwrap()
+            .ack;
+        let tasks = crate::detached::Tracker::new();
+        {
+            let call = session_with_ack(
+                &tasks,
+                std::sync::Arc::new(pool.clone()),
+                "u1".into(),
+                "1.1.1.1".into(),
+                "ua".into(),
+                ack,
+            );
+            let mut call = std::pin::pin!(call);
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(call.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(pending);
+            assert_eq!(tasks.in_flight(), 1);
+        }
+        tasks.idle().await;
+        crate::db_audit::drain().await;
+        let sid: String = sqlx::query_scalar("SELECT id FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let detail: serde_json::Value =
+            sqlx::query_scalar("SELECT detail FROM audit_events WHERE action = 'auth.notice_ack'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(detail["sessionId"], sid);
     }
 }

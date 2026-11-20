@@ -653,7 +653,22 @@ pub fn extract_all_from_library(library_bytes: &[u8]) -> LibraryResult {
     extract_all_from_library_with(library_bytes, &ZIP_LIMITS, LIBRARY_BUDGET)
 }
 
-pub type LibraryResult = Result<(Vec<LibraryEntry>, Vec<LibrarySkip>), ZipReadError>;
+/// A library import aborted by the request-wide budget: the error plus the
+/// skips gathered before it, and how many entries had been parsed.
+#[derive(Debug)]
+pub(crate) struct LibraryAbort {
+    pub(crate) error: ZipReadError,
+    pub(crate) skips: Vec<LibrarySkip>,
+    pub(crate) parsed: usize,
+}
+
+impl std::fmt::Display for LibraryAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+pub type LibraryResult = Result<(Vec<LibraryEntry>, Vec<LibrarySkip>), LibraryAbort>;
 
 fn extract_all_from_library_with(
     library_bytes: &[u8],
@@ -679,17 +694,24 @@ fn extract_all_from_library_with(
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..archive.len() {
-        let Some((raw_name, inner_bytes)) =
-            read_library_stig_zip(&mut archive, i, limits, &mut budget, &mut errors)?
-        else {
+        let read = read_library_stig_zip(&mut archive, i, limits, &mut budget, &mut errors);
+        let Some((raw_name, inner_bytes)) = (match read {
+            Ok(v) => v,
+            Err(error) => {
+                return Err(LibraryAbort {
+                    error,
+                    skips: errors,
+                    parsed: entries.len(),
+                })
+            }
+        }) else {
             continue;
         };
 
         let outer_id = filename_to_id(&raw_name);
 
         let mut skipped = Vec::new();
-        let docs = extract_all_xccdf_from_zip(&inner_bytes, limits, &mut budget, &mut skipped)?;
-        let nothing_found = docs.is_empty();
+        let extracted = extract_all_xccdf_from_zip(&inner_bytes, limits, &mut budget, &mut skipped);
         let nothing_skipped = skipped.is_empty();
         // Report under the library entry's id; the reason names the culprit.
         errors.extend(skipped.into_iter().map(|s| LibrarySkip {
@@ -698,6 +720,17 @@ fn extract_all_from_library_with(
             detail: format!("skipped {:?}: {}", s.id, s.detail),
             ..s
         }));
+        let docs = match extracted {
+            Ok(d) => d,
+            Err(error) => {
+                return Err(LibraryAbort {
+                    error,
+                    skips: errors,
+                    parsed: entries.len(),
+                })
+            }
+        };
+        let nothing_found = docs.is_empty();
         if nothing_found {
             if nothing_skipped {
                 let e = ZipReadError::NoXccdf;
@@ -1454,7 +1487,7 @@ mod tests {
         let e = extract_all_from_library_with(&lib, &TINY, 400)
             .expect_err("a 400-byte budget must abort the import");
         assert!(
-            matches!(e, ZipReadError::BudgetExceeded { limit: 400 }),
+            matches!(e.error, ZipReadError::BudgetExceeded { limit: 400 }),
             "{e}"
         );
     }
@@ -1542,7 +1575,7 @@ mod tests {
         let e = extract_all_from_library_with(&lib, &TINY, 50)
             .expect_err("budget below the entry size must abort");
         assert!(
-            matches!(e, ZipReadError::BudgetExceeded { limit: 50 }),
+            matches!(e.error, ZipReadError::BudgetExceeded { limit: 50 }),
             "{e}"
         );
     }
@@ -1555,7 +1588,7 @@ mod tests {
         let e = extract_all_from_library_with(&lib, &TINY, limit)
             .expect_err("budget below the XCCDF size must abort");
         assert!(
-            matches!(e, ZipReadError::BudgetExceeded { limit: l } if l == limit),
+            matches!(e.error, ZipReadError::BudgetExceeded { limit: l } if l == limit),
             "{e}"
         );
     }
@@ -1572,7 +1605,7 @@ mod tests {
         let e = extract_all_from_library_with(&lib, &TINY, used - 1)
             .expect_err("one byte short must abort");
         assert!(
-            matches!(e, ZipReadError::BudgetExceeded { limit } if limit == used - 1),
+            matches!(e.error, ZipReadError::BudgetExceeded { limit } if limit == used - 1),
             "{e}"
         );
     }
@@ -1701,7 +1734,10 @@ mod tests {
             3000,
         )
         .expect_err("budget must be exhausted");
-        assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
+        assert!(
+            matches!(e.error, ZipReadError::BudgetExceeded { .. }),
+            "{e}"
+        );
 
         // Single-STIG path: bad-CRC XCCDFs in sibling inner zips are skipped
         // one by one, so the budget has to stop them.
@@ -1727,6 +1763,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, ZipReadError::BudgetExceeded { .. }), "{e}");
+    }
+
+    #[test]
+    fn budget_abort_returns_the_skips_gathered_so_far() {
+        let junk = b"not a zip";
+        let good = zip_of(&[("a-xccdf.xml", &benchmark("Good"))]);
+        // Outer-level abort: two junk entries, then one that trips the budget.
+        let lib = zip_of(&[
+            ("U_JunkA_V1R1_STIG.zip", junk),
+            ("U_JunkB_V1R1_STIG.zip", junk),
+            ("U_Big_V1R1_STIG.zip", &good),
+        ]);
+        let budget = junk.len() as u64 * 2 + 1;
+        let e = extract_all_from_library_with(&lib, &TINY, budget)
+            .expect_err("the third entry must exceed the budget");
+        assert!(
+            matches!(e.error, ZipReadError::BudgetExceeded { .. }),
+            "{e}"
+        );
+        assert_eq!(e.skips.len(), 2, "{:?}", e.skips);
+        assert!(
+            e.skips.iter().all(|s| s.code == "malformed"),
+            "{:?}",
+            e.skips
+        );
+        assert_eq!(e.parsed, 0);
+
+        // Inner-zip abort: a skip gathered inside the aborting zip is kept.
+        let inner = zip_of(&[("bad.zip", junk), ("b-xccdf.xml", &big_xccdf(600))]);
+        let lib = zip_of(&[("U_Inner_V1R1_STIG.zip", &inner)]);
+        let limit = inner.len() as u64 + 10;
+        let e = extract_all_from_library_with(&lib, &TINY, limit)
+            .expect_err("the inner XCCDF must exceed the budget");
+        assert!(
+            matches!(e.error, ZipReadError::BudgetExceeded { .. }),
+            "{e}"
+        );
+        assert_eq!(e.parsed, 0);
+        assert!(!e.skips.is_empty());
+        assert_eq!(
+            (e.skips[0].id.as_str(), e.skips[0].code),
+            ("inner", "malformed")
+        );
     }
 
     #[test]

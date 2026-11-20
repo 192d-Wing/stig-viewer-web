@@ -327,7 +327,8 @@ pub struct CallbackParams {
 /// against a stub token endpoint. Errors are already audit-logged.
 pub(crate) async fn finish_callback(
     oidc: &OidcContext,
-    pool: &PgPool,
+    pool: &Arc<PgPool>,
+    tasks: &Arc<crate::detached::Tracker>,
     code: String,
     claim: crate::db_notice::OidcClaim,
     ip: &str,
@@ -393,7 +394,7 @@ pub(crate) async fn finish_callback(
         .unwrap_or_else(|| format!("user-{}", &sub[..8.min(sub.len())]));
 
     // Upsert user (provider='oidc', sub from IdP).
-    let user = upsert_user(pool, "oidc", &sub, &display_name, &email)
+    let user = upsert_user(pool.as_ref(), "oidc", &sub, &display_name, &email)
         .await
         .map_err(|e| {
             tracing::error!("upsert_user failed: {e:#}");
@@ -401,15 +402,19 @@ pub(crate) async fn finish_callback(
         })?;
 
     // Create server-side session, set cookie.
-    let session_id = create_session(pool, &user.id, ip, ua).await.map_err(|e| {
-        tracing::error!("create_session failed: {e:#}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Session and the durable AU-2 record of the claimed AC-8 acknowledgement
+    // are written by one detached task; the ack never fails the login.
+    let session_id = crate::api::notice::session_with_ack(
+        tasks,
+        pool.clone(),
+        user.id.clone(),
+        ip.to_string(),
+        ua.to_string(),
+        claim.ack,
+    )
+    .await?;
 
     oidc_success(&user.id, ip);
-
-    // Durable AU-2 record of the claimed AC-8 acknowledgement; never fails the login.
-    crate::api::notice::record_ack_linked(pool, &user.id, &session_id, claim.ack).await;
 
     Ok(session_cookie(
         SESSION_COOKIE,
@@ -447,7 +452,16 @@ pub async fn callback_handler(
     .await?;
 
     // Everything after the claim; on error the (cookie-cleared) jar is still returned.
-    let rest = finish_callback(oidc, &state.pool, params.code, claim, &ip, &ua).await;
+    let rest = finish_callback(
+        oidc,
+        &state.pool,
+        &state.tasks,
+        params.code,
+        claim,
+        &ip,
+        &ua,
+    )
+    .await;
 
     match rest {
         Ok(c) => Ok((jar.add(c), Redirect::to(&oidc.frontend_url))),
@@ -514,6 +528,7 @@ pub async fn list_users_handler(
 pub struct AppAuthState {
     pub pool: Arc<PgPool>,
     pub oidc: OidcContext,
+    pub tasks: Arc<crate::detached::Tracker>,
 }
 
 /// Auth middleware:
@@ -1137,8 +1152,9 @@ mod callback_flow_tests {
         let (cap, _g) = crate::api::audit_capture::capture();
         let ip = "192.0.2.50";
         let run = |addr, c| {
-            let (pool, ctx) = (pool.clone(), ctx(addr));
-            async move { finish_callback(&ctx, &pool, "code".into(), c, ip, "ua").await }
+            let (pool, ctx) = (Arc::new(pool.clone()), ctx(addr));
+            let tasks = crate::detached::Tracker::new();
+            async move { finish_callback(&ctx, &pool, &tasks, "code".into(), c, ip, "ua").await }
         };
         // Each step starts from an empty capture and must add exactly one line.
         let step = |expect: &str| {
@@ -1207,5 +1223,42 @@ mod callback_flow_tests {
         let ok: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action='auth.notice_ack' AND outcome='ok' AND user_id=$1")
             .bind(&uid).fetch_one(&pool).await.unwrap();
         assert_eq!(ok, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn notice_ack_survives_the_callback_future_being_dropped(pool: PgPool) {
+        let a = stub(200, token_resp(Some(id_token(&NONCE, false)))).await;
+        let c = claim(&pool).await;
+        let ctx = ctx(a);
+        let pool_arc = Arc::new(pool.clone());
+        let tasks = crate::detached::Tracker::new();
+        crate::detached::abort_once_spawned(
+            &tasks,
+            finish_callback(
+                &ctx,
+                &pool_arc,
+                &tasks,
+                "code".into(),
+                c,
+                "192.0.2.50",
+                "ua",
+            ),
+        )
+        .await;
+        tasks.idle().await;
+        crate::db_audit::drain().await;
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
+        let acks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action='auth.notice_ack' AND outcome='ok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(acks, 1);
     }
 }
