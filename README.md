@@ -584,7 +584,10 @@ DELETE` per row, `BEFORE TRUNCATE` per statement, one shared function) raise
 SQLSTATE `42501` unless the transaction declared a maintenance mode with
 `SELECT set_config('stig.audit_maintenance', '<mode>', true)`:
 
-- `retention`: DELETE (the audit retention sweep);
+- `retention`: DELETE (the audit retention sweep), allowed only when the same
+  transaction also sets `stig.audit_retention_protocol` to `2` (migration 047);
+  older server versions never set it, so their sweeps fail with `42501` and
+  delete nothing;
 - `restore`: TRUNCATE only (a forced backup restore);
 - `migration`: UPDATE only (a data migration that backfills audit rows);
 - `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
@@ -625,8 +628,9 @@ Limit: with the owner/application role split (see "Two database roles") the
 application role cannot drop, disable or replace the guard, drop or alter the
 audit tables, or set the `test` flag; the owner step also makes the
 `migration` mode unusable by the application. What remains: the application can
-still declare the `retention` and `restore` modes (DELETE and TRUNCATE of audit
-rows), because the retention sweep and forced restore run in the server with
+still declare the `retention` (and set its protocol marker, a version gate
+rather than a security boundary) and `restore` modes (DELETE and TRUNCATE of
+audit rows), because the retention sweep and forced restore run in the server with
 that role. Code that can run SQL as the application role can therefore delete
 or truncate audit rows, insert new ones in their place (rewriting the trail)
 and `setval` the audit sequences. A superuser or the owner role can always bypass
@@ -645,12 +649,27 @@ With `AUDIT_ARCHIVE_ENABLED` (default on), each retention sweep writes
 immutable segments to `${DATA_DIR}/audit_archive/`:
 `rules-<UTC date>.<firstId>-<lastId>.jsonl` (`rule_audit`) and
 `events-<UTC date>.<firstId>-<lastId>.jsonl` (`audit_events`). A segment is
-written to a temp file, fsynced and renamed; its sidecar
+written to a temp file, fsynced and published with a hard link, which never
+replaces an existing file (the archive filesystem must support hard links,
+otherwise retention fails closed and deletes nothing); its sidecar
 `<segment>.manifest.json` is published first, so a visible segment always has
-its sidecar (an orphan sidecar from a crash is ignored). Sweeps are serialized
+its sidecar (an orphan sidecar from a crash is ignored by the scan). At the start of each
+archiving sweep, a sidecar whose segment is absent and that is at least 24 hours
+old is renamed to `<sidecar>.orphan-<UTC timestamp>` and logged on the `audit`
+target; it is never deleted automatically, because it may be the only record of
+a lost segment. An operator may delete an `.orphan-*` file once its id range is
+still in the table or held by a verified segment; otherwise treat it as a lost
+segment. Sweeps are serialized
 per database by an advisory lock; a sweep that cannot get it within five
 minutes fails (recorded in the scheduler log) and retries on the next tick. Rows are archived before the delete runs, and a
 failed archive write deletes nothing.
+
+Rolling upgrades: run `migrate` first. Once migration 047 is applied, sweeps
+from older replicas fail with `42501` until those replicas are replaced; that is
+expected and visible in the scheduler log. Mixed-version sweeping is
+unsupported: stop pre-#82 replicas before the first new sweep, because they can
+still overwrite archive files (the gate blocks their deletes, not their file
+writes). Rolling a binary back after 047 leaves retention failing closed.
 
 Archiving is idempotent by row id, without trusting the directory. A row is
 skipped only when a segment that verifies holds the IDENTICAL serialized line

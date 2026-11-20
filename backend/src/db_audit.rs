@@ -1112,6 +1112,12 @@ mod tests {
     async fn in_mode(pool: &PgPool, mode: &str, sql: &str) -> Result<()> {
         let mut tx = pool.begin().await?;
         set_maintenance(&mut tx, mode).await?;
+        if mode == "retention" {
+            sqlx::query("SELECT set_config('stig.audit_retention_protocol', $1, true)")
+                .bind(crate::audit_retention::RETENTION_PROTOCOL)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(sql).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())

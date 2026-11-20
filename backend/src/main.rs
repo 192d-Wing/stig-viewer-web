@@ -773,9 +773,11 @@ async fn main() -> Result<()> {
     );
 
     api::notice::log_proxy_trust_config();
+    let tasks = detached::Tracker::new();
     let auth_state = AppAuthState {
         pool: pool.clone(),
         oidc: oidc.clone(),
+        tasks: tasks.clone(),
     };
 
     // CORS — cookie-based auth requires a specific origin (not "*")
@@ -802,7 +804,7 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         config: config.clone(),
         signing: signing.clone(),
-        tasks: detached::Tracker::new(),
+        tasks: tasks.clone(),
         admission: api::admission::Admission::configured(admission_body.into()),
     };
 
@@ -816,6 +818,7 @@ async fn main() -> Result<()> {
     let saml_state = AppSamlState {
         pool: pool.clone(),
         config: saml_config.clone(),
+        tasks: tasks.clone(),
     };
     let app = build_app(state.clone(), auth_state, saml_state, cors, &test_hooks);
 

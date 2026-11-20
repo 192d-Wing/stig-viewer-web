@@ -30,7 +30,7 @@ use crate::api::auth::{
     cookie_secure, create_session, removal_cookie, saml_req_same_site, session_cookie, upsert_user,
     user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
 };
-use crate::api::notice::{record_ack_linked, require_ack};
+use crate::api::notice::require_ack;
 use crate::api::saml_verify::ScopeKind;
 use crate::api::saml_xml::{code_of, reject, tag, SamlDoc, NS_ASSERT, NS_PROTO};
 use crate::db_notice::LoginBinding;
@@ -184,6 +184,7 @@ impl SamlConfig {
 pub struct AppSamlState {
     pub pool: Arc<PgPool>,
     pub config: Arc<SamlConfig>,
+    pub tasks: Arc<crate::detached::Tracker>,
 }
 
 // ── Login: GET /auth/saml/login ─────────────────────────────────────────────
@@ -400,14 +401,20 @@ async fn acs_core(
         .await
         .map_err(|e| internal(&format!("upsert_user failed: {e}")))?;
 
-    let session_id = create_session(state.pool.as_ref(), &user.id, &ip, &ua)
-        .await
-        .map_err(|e| internal(&format!("create_session failed: {e}")))?;
+    // Session and the durable AU-2 ack record: one detached task.
+    let session_id = crate::api::notice::session_with_ack(
+        &state.tasks,
+        state.pool.clone(),
+        user.id.clone(),
+        ip.to_string(),
+        ua.to_string(),
+        ack,
+    )
+    .await
+    .map_err(|c| internal(&format!("login session failed: {c}")))?;
 
     tracing::info!(target: "audit", action = "auth.saml_acs", outcome = "success", user_id = %user.id, assertion_id = assertion.assertion_id.as_deref().unwrap_or(""), ip = %ip);
 
-    // Durable AU-2 record of the claimed AC-8 acknowledgement; never fails the login.
-    record_ack_linked(state.pool.as_ref(), &user.id, &session_id, ack).await;
     let jar = jar.remove(removal_cookie(
         SAML_REQ_COOKIE,
         SAML_REQ_PATH,
@@ -881,6 +888,7 @@ mod tests {
     fn st(pool: PgPool, sso: &str) -> AppSamlState {
         AppSamlState {
             pool: Arc::new(pool),
+            tasks: crate::detached::Tracker::new(),
             config: Arc::new(SamlConfig {
                 idp_sso_url: sso.into(),
                 idp_entity_id: String::new(),
@@ -1225,6 +1233,7 @@ mod tests {
             .unwrap();
         AppSamlState {
             pool: Arc::new(pool),
+            tasks: crate::detached::Tracker::new(),
             config: Arc::new(cfg()),
         }
     }
@@ -1356,6 +1365,7 @@ mod tests {
     fn acs_ready(pool: PgPool) -> AppSamlState {
         AppSamlState {
             pool: Arc::new(pool),
+            tasks: crate::detached::Tracker::new(),
             config: Arc::new(cfg()),
         }
     }
@@ -1516,6 +1526,7 @@ mod tests {
             .unwrap();
         let state = AppSamlState {
             pool: Arc::new(pool),
+            tasks: crate::detached::Tracker::new(),
             config: Arc::new(cfg()),
         };
         let (cap, _g) = crate::api::audit_capture::capture();
@@ -1536,5 +1547,31 @@ mod tests {
         .unwrap();
         assert_eq!(r.0, StatusCode::UNAUTHORIZED);
         assert_eq!(cap.take_one()["reason"], "claim_error");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn notice_ack_survives_the_acs_future_being_dropped(pool: PgPool) {
+        let state = acs_ready(pool.clone());
+        let id = "00000000-0000-4000-8000-0000000000f3";
+        started_login(&pool, id, "_req1").await;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            axum::http::HeaderValue::from_str(&format!("{SAML_REQ_COOKIE}={id}")).unwrap(),
+        );
+        crate::detached::abort_once_spawned(
+            &state.tasks,
+            acs(
+                &state,
+                CookieJar::from_headers(&h),
+                &signed_b64(Some("_req1")),
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        let (sessions, acks, _) = counts(&pool).await;
+        assert_eq!((sessions, acks), (1, 1));
     }
 }
