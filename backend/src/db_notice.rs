@@ -50,6 +50,12 @@ pub(crate) fn state_digest(state: &str) -> String {
     hex::encode(Sha256::digest(state.as_bytes()))
 }
 
+/// Lowercase hex SHA-256 of an ack id; same value `list_ack_probes` computes in SQL.
+#[cfg(test)]
+pub(crate) fn ack_id_digest(id: &str) -> String {
+    state_digest(id)
+}
+
 /// A login must complete within this long of login start.
 pub const CLAIM_WINDOW_MINUTES: i64 = 10;
 
@@ -228,9 +234,12 @@ pub async fn claim_saml(
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct AckProbe {
-    /// The ack id is the `stig_notice_ack` / `stig_oidc_state` cookie value,
-    /// so this type must only ever be served by the gated test routes.
-    pub id: String,
+    /// Lowercase hex SHA-256 of the ack id. The id itself is the
+    /// `stig_notice_ack` / `stig_oidc_state` cookie value (a bearer secret), so
+    /// this type carries a digest of it, never the id. The unkeyed digest is
+    /// non-reversible only because ack ids are random UUIDv4 values (CSPRNG);
+    /// it is an identifier, not a security token.
+    pub id_sha256: String,
     pub consumed_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     pub method: Option<String>,
@@ -240,13 +249,13 @@ pub struct AckProbe {
     pub saml_request_id: Option<String>,
 }
 
-/// All acknowledgement rows ordered by id, without the secret values.
+/// All acknowledgement rows ordered by id digest, without the secret values.
 pub async fn list_ack_probes(pool: &PgPool) -> Result<Vec<AckProbe>> {
     Ok(sqlx::query_as::<_, AckProbe>(
-        "SELECT id, consumed_at, expires_at, method, oidc_state_sha256, \
+        "SELECT encode(sha256(convert_to(id, 'UTF8')), 'hex') AS id_sha256, consumed_at, expires_at, method, oidc_state_sha256, \
                 oidc_nonce IS NOT NULL AS has_nonce, \
                 oidc_pkce_verifier IS NOT NULL AS has_pkce_verifier, saml_request_id \
-           FROM login_notice_acks ORDER BY id",
+           FROM login_notice_acks ORDER BY 1",
     )
     .fetch_all(pool)
     .await?)
@@ -392,17 +401,19 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn list_ack_probes_omits_secrets(pool: PgPool) {
-        insert_ack(&pool, "a1", V, "", "", 300).await.unwrap();
+        let id = "distinct-ack-id-value";
+        insert_ack(&pool, id, V, "", "", 300).await.unwrap();
         let b = LoginBinding::Oidc {
             state: "distinct-state-value",
             nonce: "distinct-nonce-value",
             pkce_verifier: "distinct-verifier-value",
         };
-        consume_ack(&pool, "a1", V, &b).await.unwrap();
+        consume_ack(&pool, id, V, &b).await.unwrap();
         let probes = list_ack_probes(&pool).await.unwrap();
         assert_eq!(probes.len(), 1);
         let p = &probes[0];
         assert!(p.has_nonce && p.has_pkce_verifier && p.consumed_at.is_some());
+        assert_eq!(p.id_sha256, ack_id_digest(id));
         assert_eq!(
             p.oidc_state_sha256.as_deref(),
             Some(state_digest("distinct-state-value").as_str())
@@ -410,6 +421,7 @@ mod tests {
         let json = serde_json::to_string(&probes).unwrap();
         // The message names the field, never the value.
         for (field, value) in [
+            ("ack id", id),
             ("state", "distinct-state-value"),
             ("nonce", "distinct-nonce-value"),
             ("pkce verifier", "distinct-verifier-value"),
@@ -417,6 +429,7 @@ mod tests {
             assert!(!json.contains(value), "the probe leaked the {field}");
         }
         assert!(json.contains("hasNonce") && json.contains("oidcStateSha256"));
+        assert!(json.contains("idSha256") && !json.contains("\"id\":"));
     }
 
     #[sqlx::test]

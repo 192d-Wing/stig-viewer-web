@@ -45,5 +45,7 @@ ed25519-dalek      = "2"
 # Paused clocks for the request-body deadline tests.
 tokio              = { version = "1", features = ["test-util"] }
 rcgen              = "0.13"
+# `oneshot` for router-level tests.
+tower              = { version = "0.5", features = ["util"] }
 # Keep this rsa on the same version as the main [dependencies] rsa.
 rsa                = { version = "0.9", features = ["sha2", "getrandom"] }
