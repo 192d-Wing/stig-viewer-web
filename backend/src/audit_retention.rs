@@ -18,15 +18,23 @@
 //!   list. With `SIGNING_KEY_HEX` unset the sidecar carries the digest only,
 //!   which detects corruption but not deliberate alteration.
 //!
-//! Segments are written to a temp file, fsynced and renamed, then the
-//! directory is fsynced; a failed write leaves no partial segment. A failed
+//! Segments are written to a uuid-named temp file (`create_new`), fsynced and
+//! then published with a hard link, which never replaces an existing name
+//! (the archive filesystem must support hard links, or retention fails
+//! closed); the directory is then fsynced and a failed write leaves no
+//! partial segment. A failed
 //! directory fsync aborts the sweep (nothing is deleted) and unpublishes the
 //! file, except EINVAL/unsupported, which is a static filesystem property and
 //! is tolerated with a warning. The sidecar is published BEFORE the segment, so
 //! a visible `.jsonl` always has its complete sidecar and a concurrent scan
 //! can never see it as "sidecar missing". A crash between the two leaves an
 //! orphan `*.manifest.json`, which the scan ignores and the name pick steps
-//! over. Sweeps are also serialized per database by an advisory lock
+//! over. At the start of each archiving sweep, an orphan sidecar (segment
+//! absent, mtime at least 24 h old) is renamed to `<sidecar>.orphan-<UTC ts>`
+//! and logged, never deleted: it may be the only record of a lost segment.
+//! Retention deletes also require the `stig.audit_retention_protocol` marker
+//! ([`RETENTION_PROTOCOL`], migration 047), so older replicas fail closed.
+//! Sweeps are also serialized per database by an advisory lock
 //! ([`crate::db_audit::lock_retention_sweep`]); a sweep that cannot get the
 //! lock within five minutes fails and retries on the next tick. If the segment
 //! write fails, the just-written sidecar is removed again.
@@ -53,6 +61,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -79,6 +88,22 @@ struct AuditRow {
 }
 
 // ── Archive segments ────────────────────────────────────────────────────────
+
+/// Value of `stig.audit_retention_protocol` the DB guard (migration 047)
+/// requires for a retention DELETE. Older versions never set it.
+pub(crate) const RETENTION_PROTOCOL: &str = "2";
+
+/// Declare retention mode plus the protocol marker for this transaction.
+pub(crate) async fn declare_retention_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    crate::db_audit::set_maintenance(tx, "retention").await?;
+    sqlx::query("SELECT set_config('stig.audit_retention_protocol', $1, true)")
+        .bind(RETENTION_PROTOCOL)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 const STREAM_RULES: &str = "rules";
 const STREAM_EVENTS: &str = "events";
@@ -163,27 +188,99 @@ fn lines_in(bytes: &[u8]) -> Result<Vec<(i64, String)>> {
 /// `<name>.rejected-<UTC timestamp>` so it is kept as evidence and never
 /// counted again.
 fn preserve_rejected(dir: &Path, name: &str) {
-    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
     for file in [name.to_string(), format!("{name}.manifest.json")] {
-        let from = dir.join(&file);
-        if !from.exists() {
+        move_aside(dir, &file, "rejected");
+    }
+}
+
+/// Rename `dir/file` to `<file>.<label>-<UTC ts>` (uuid suffix if that exists).
+/// Returns whether the file was moved; a missing file is not an error.
+fn move_aside(dir: &Path, file: &str, label: &str) -> bool {
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let from = dir.join(file);
+    if !from.exists() {
+        return false;
+    }
+    // Hard link then remove the source: never replaces an existing target.
+    let mut to = dir.join(format!("{file}.{label}-{ts}"));
+    let mut result = std::fs::hard_link(&from, &to);
+    for _ in 0..8 {
+        if !matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists) {
+            break;
+        }
+        to = dir.join(format!(
+            "{file}.{label}-{ts}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        result = std::fs::hard_link(&from, &to);
+    }
+    match result.and_then(|()| std::fs::remove_file(&from)) {
+        Ok(()) => {
+            tracing::warn!(target: "audit", from = ?file, to = ?to.file_name(), "audit archive file preserved as {label}");
+            true
+        }
+        Err(e) => {
+            tracing::error!(target: "audit", file = ?file, "could not preserve {label} audit archive file: {e:#}");
+            false
+        }
+    }
+}
+
+/// Minimum sidecar age before it is treated as an orphan: protects a sweep
+/// that lost its lock and is still between sidecar and segment.
+const ORPHAN_SIDECAR_MIN_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Rename sidecars whose segment is definitely absent and that are at least
+/// `min_age` old to `<sidecar>.orphan-<ts>`. Returns how many were moved.
+fn set_aside_orphan_sidecars(dir: &Path, min_age: Duration) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut moved = 0;
+    for entry in rd.flatten() {
+        let Some(file) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(seg) = file.strip_suffix(".manifest.json") else {
+            continue;
+        };
+        if !seg.ends_with(".jsonl") || segment_range_any(seg).is_none() {
             continue;
         }
-        let mut to = dir.join(format!("{file}.rejected-{ts}"));
-        if to.exists() {
-            to = dir.join(format!(
-                "{file}.rejected-{ts}-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
+        let stream_ok = seg.starts_with("rules-") || seg.starts_with("events-");
+        if !stream_ok {
+            continue;
         }
-        match std::fs::rename(&from, &to) {
-            Ok(()) => {
-                tracing::warn!(target: "audit", from = ?file, to = ?to.file_name(), "audit archive file preserved as rejected")
-            }
-            Err(e) => {
-                tracing::error!(target: "audit", file = ?file, "could not preserve rejected audit archive file: {e:#}")
-            }
+        match std::fs::symlink_metadata(dir.join(seg)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => continue,
         }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough && move_aside(dir, &file, "orphan") {
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// Tidy the archive directory (orphan sidecars) under the sweep lock.
+/// Failures are logged and never fail the sweep.
+async fn tidy_archive(data_dir: &Path) {
+    let dir = data_dir.join("audit_archive");
+    let res = tokio::task::spawn_blocking(move || {
+        if !dir.is_dir() {
+            return 0;
+        }
+        set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE)
+    })
+    .await;
+    if let Err(e) = res {
+        tracing::error!(target: "audit", "audit archive tidy failed: {e:#}");
     }
 }
 
@@ -331,28 +428,56 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Temp file, fsync, rename, fsync the directory. A directory sync failure is
-/// an error (the caller aborts before any row is deleted); the just-published
+/// Outcome of [`publish_new`].
+#[derive(Debug, PartialEq, Eq)]
+enum Publish {
+    Created,
+    Taken,
+}
+
+/// Test hook stages of [`write_segment_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteStage {
+    /// Candidate name chosen, nothing published yet.
+    NamePicked,
+    /// Sidecar durable, segment not yet published.
+    SidecarPublished,
+}
+
+/// Upper bound on `.r<n>` candidates tried per segment.
+const MAX_NAME_ATTEMPTS: u32 = 1000;
+
+/// Write a uuid-named temp file (`create_new`), fsync it, then hard-link it to
+/// `name`: a hard link never replaces an existing file, so a taken name is
+/// reported as `Taken` and left untouched. A directory sync failure is an
+/// error (the caller aborts before any row is deleted); the just-published
 /// name is removed again so no unsynced file stays visible.
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+fn publish_new(dir: &Path, name: &str, bytes: &[u8]) -> Result<Publish> {
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+    let result = (|| -> Result<Publish> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, dir.join(name))?;
-        Ok(())
+        match std::fs::hard_link(&tmp, dir.join(name)) {
+            Ok(()) => Ok(Publish::Created),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Publish::Taken),
+            Err(e) => Err(anyhow::Error::new(e)
+                .context("hard link failed; the audit archive filesystem must support hard links")),
+        }
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let published = result.with_context(|| format!("write {name}"))?;
+    if published == Publish::Created {
+        if let Err(e) = sync_dir(dir) {
+            // The hard link just created this name, so it is ours to remove.
+            let _ = std::fs::remove_file(dir.join(name));
+            return Err(e).with_context(|| format!("sync directory after publishing {name}"));
+        }
     }
-    result.with_context(|| format!("write {name}"))?;
-    if let Err(e) = sync_dir(dir) {
-        // The name was just picked as non-existent and we hold the sweep lock.
-        let _ = std::fs::remove_file(dir.join(name));
-        return Err(e).with_context(|| format!("sync directory after publishing {name}"));
-    }
-    Ok(())
+    Ok(published)
 }
 
 fn write_segment(
@@ -362,18 +487,18 @@ fn write_segment(
     group: &[&ArchiveLine],
     key: Option<&SigningState>,
 ) -> Result<()> {
-    write_segment_with(dir, stream, date, group, key, &|| Ok(()))
+    write_segment_with(dir, stream, date, group, key, &|_, _| Ok(()))
 }
 
-/// Sidecar first, then segment; `between` runs after the sidecar is durable
-/// and before the segment is published (test hook).
+/// Sidecar first, then segment. `hook` is a test hook called at each
+/// [`WriteStage`] with the candidate segment name.
 fn write_segment_with(
     dir: &Path,
     stream: &str,
     date: &str,
     group: &[&ArchiveLine],
     key: Option<&SigningState>,
-    between: &dyn Fn() -> Result<()>,
+    hook: &dyn Fn(WriteStage, &str) -> Result<()>,
 ) -> Result<()> {
     let (Some(first), Some(last)) = (group.first(), group.last()) else {
         return Ok(());
@@ -383,44 +508,64 @@ fn write_segment_with(
         body.extend_from_slice(l.line.as_bytes());
         body.push(b'\n');
     }
-    // Never replace an existing file (a verified segment, or one left in place):
-    // pick `.r<n>` until neither the segment nor its sidecar exists.
-    let mut name = format!("{stream}-{date}.{}-{}.jsonl", first.id, last.id);
-    let mut n = 0u32;
-    while dir.join(&name).exists() || dir.join(format!("{name}.manifest.json")).exists() {
-        n += 1;
-        name = format!("{stream}-{date}.{}-{}.r{n}.jsonl", first.id, last.id);
+    // Never replace an existing file: claim the sidecar name (a hard link
+    // fails if it exists), trying `.r<n>` until one is ours.
+    for n in 0..MAX_NAME_ATTEMPTS {
+        let name = if n == 0 {
+            format!("{stream}-{date}.{}-{}.jsonl", first.id, last.id)
+        } else {
+            format!("{stream}-{date}.{}-{}.r{n}.jsonl", first.id, last.id)
+        };
+        let sidecar = format!("{name}.manifest.json");
+        if dir.join(&name).exists() || dir.join(&sidecar).exists() {
+            continue;
+        }
+        hook(WriteStage::NamePicked, &name)?;
+        // `file` is in the signed payload, so the manifest is built per name.
+        let manifest = SegmentManifest {
+            kind: integrity::ARCHIVE_TYPE.into(),
+            version: 1,
+            stream: stream.into(),
+            file: name.clone(),
+            rows: group.len() as u64,
+            first_id: first.id,
+            last_id: last.id,
+            digest: Digest {
+                algorithm: "sha-512".into(),
+                value: integrity::sha512_hex(&body),
+            },
+            signers: integrity::signers_for(key),
+        };
+        let payload = serde_json::to_vec(&manifest)?;
+        let envelope = integrity::seal(
+            integrity::ARCHIVE_DOMAIN,
+            integrity::ARCHIVE_TYPE,
+            &payload,
+            key,
+        );
+        if publish_new(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?)? == Publish::Taken {
+            continue;
+        }
+        // Once the sidecar name is ours, no cooperating sweep can create this
+        // segment; a file there is foreign, so fail rather than retry. Any
+        // failure removes the sidecar we just published.
+        let published =
+            hook(WriteStage::SidecarPublished, &name).and_then(|()| {
+                match publish_new(dir, &name, &body)? {
+                    Publish::Created => Ok(()),
+                    Publish::Taken => Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "segment name already taken",
+                    ))
+                    .context(format!("segment {name} already exists"))),
+                }
+            });
+        if published.is_err() {
+            let _ = std::fs::remove_file(dir.join(&sidecar));
+        }
+        return published;
     }
-    let manifest = SegmentManifest {
-        kind: integrity::ARCHIVE_TYPE.into(),
-        version: 1,
-        stream: stream.into(),
-        file: name.clone(),
-        rows: group.len() as u64,
-        first_id: first.id,
-        last_id: last.id,
-        digest: Digest {
-            algorithm: "sha-512".into(),
-            value: integrity::sha512_hex(&body),
-        },
-        signers: integrity::signers_for(key),
-    };
-    let payload = serde_json::to_vec(&manifest)?;
-    let envelope = integrity::seal(
-        integrity::ARCHIVE_DOMAIN,
-        integrity::ARCHIVE_TYPE,
-        &payload,
-        key,
-    );
-    let sidecar = format!("{name}.manifest.json");
-    write_atomic(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?)?;
-    // A failure from here on would leave the sidecar we just published as an
-    // orphan; remove it (safe: we hold the sweep lock and the name is ours).
-    let published = between().and_then(|()| write_atomic(dir, &name, &body));
-    if published.is_err() {
-        let _ = std::fs::remove_file(dir.join(&sidecar));
-    }
-    published
+    anyhow::bail!("no free archive segment name after {MAX_NAME_ATTEMPTS} attempts")
 }
 
 /// Verified archived lines (id -> line digest) per UTC date, for one sweep.
@@ -651,6 +796,9 @@ async fn prune_rules_locked(
     signing: Option<&SigningState>,
     lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<usize> {
+    if archive {
+        tidy_archive(data_dir).await;
+    }
     // Build the cutoff in Rust rather than embedding `retain_days` in
     // SQL — Postgres rejects negative INTERVAL composed via string
     // concat in some setups, and this is easier to reason about.
@@ -698,7 +846,7 @@ async fn prune_rules_locked(
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     crate::db_audit::retention_lock_alive(lock).await?;
     let mut tx = pool.begin().await.context("begin rule_audit prune tx")?;
-    crate::db_audit::set_maintenance(&mut tx, "retention")
+    declare_retention_delete(&mut tx)
         .await
         .context("set audit maintenance mode")?;
     let deleted = sqlx::query("DELETE FROM rule_audit WHERE id = ANY($1::bigint[])")
@@ -823,6 +971,9 @@ async fn prune_events_locked(
 ) -> Result<usize> {
     let mut total = 0usize;
     let mut cache = SeenCache::new();
+    if archive {
+        tidy_archive(data_dir).await;
+    }
     loop {
         let rows: Vec<EventRow> = sqlx::query_as::<_, EventRow>(
             r#"
@@ -857,7 +1008,7 @@ async fn prune_events_locked(
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         crate::db_audit::retention_lock_alive(lock).await?;
         let mut tx = pool.begin().await.context("begin audit_events prune tx")?;
-        crate::db_audit::set_maintenance(&mut tx, "retention")
+        declare_retention_delete(&mut tx)
             .await
             .context("set audit maintenance mode")?;
         let deleted = sqlx::query("DELETE FROM audit_events WHERE id = ANY($1::bigint[])")
@@ -1918,10 +2069,19 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         let rows = [line(1, "2024-01-01")];
         let group: Vec<&ArchiveLine> = rows.iter().collect();
-        let res = write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, None, &|| {
-            arm_dir_sync_failure(&ad);
-            Ok(())
-        });
+        let res = write_segment_with(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            &group,
+            None,
+            &|stage, _| {
+                if stage == WriteStage::SidecarPublished {
+                    arm_dir_sync_failure(&ad);
+                }
+                Ok(())
+            },
+        );
         disarm_dir_sync_failure(&ad);
         assert!(res.is_err());
         assert!(entries(&ad).is_empty());
@@ -1968,11 +2128,20 @@ mod tests {
         std::fs::create_dir_all(&ad).unwrap();
         let rows = [line(1, "2024-01-01"), line(2, "2024-01-01")];
         let group: Vec<&ArchiveLine> = rows.iter().collect();
-        write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, Some(&k), &|| {
-            archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
-            assert!(rejected(&dir).is_empty());
-            Ok(())
-        })
+        write_segment_with(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            &group,
+            Some(&k),
+            &|stage, _| {
+                if stage == WriteStage::SidecarPublished {
+                    archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
+                    assert!(rejected(&dir).is_empty());
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(rejected(&dir).is_empty());
         let seen = archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
@@ -2094,24 +2263,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_failed_segment_write_removes_the_sidecar_it_just_published() {
-        let dir = temp_dir();
-        let ad = dir.join("audit_archive");
-        std::fs::create_dir_all(&ad).unwrap();
-        let rows = [line(1, "2024-01-01")];
-        let group: Vec<&ArchiveLine> = rows.iter().collect();
-        let err = write_segment_with(&ad, STREAM_RULES, "2024-01-01", &group, None, &|| {
-            assert!(ad.join("rules-2024-01-01.1-1.jsonl.manifest.json").exists());
-            anyhow::bail!("injected write failure")
-        })
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("injected"));
-        assert!(rejected(&dir).is_empty());
-        assert_eq!(std::fs::read_dir(&ad).unwrap().count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_sweep_gives_up_on_a_held_lock_and_deletes_nothing(pool: PgPool) {
@@ -2176,31 +2327,7 @@ mod tests {
                 if batch_total != 4 {
                     return;
                 }
-                let pid: i32 = sqlx::query_scalar(
-                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
-                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
-                )
-                .fetch_one(&admin)
-                .await
-                .unwrap();
-                sqlx::query("SELECT pg_terminate_backend($1)")
-                    .bind(pid)
-                    .execute(&admin)
-                    .await
-                    .unwrap();
-                for _ in 0..200 {
-                    let alive: i64 =
-                        sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
-                            .bind(pid)
-                            .fetch_one(&admin)
-                            .await
-                            .unwrap();
-                    if alive == 0 {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-                panic!("lock backend {pid} did not terminate");
+                kill_retention_lock_holder(&admin).await;
             })
         };
         let err = run_prune_events_with(&pool, &dir, 5, true, 4, Some(&k), &hook)
@@ -2226,6 +2353,441 @@ mod tests {
         for id in seeded.iter().filter(|id| !remaining.contains(id)) {
             assert!(archived.contains(id), "deleted id {id} is not archived");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Terminate the backend holding the retention sweep advisory lock (found
+    /// by key, in this database) and wait until it is gone.
+    async fn kill_retention_lock_holder(admin: &PgPool) {
+        let pid: i32 = sqlx::query_scalar(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND objsubid = 1 \
+             AND ((classid::bigint << 32) | objid::bigint) = $1 \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .bind(crate::db_audit::RETENTION_SWEEP_LOCK)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .execute(admin)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            let alive: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+                    .bind(pid)
+                    .fetch_one(admin)
+                    .await
+                    .unwrap();
+            if alive == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("lock backend {pid} did not terminate");
+    }
+
+    /// Run a `run_prune` sweep that is blocked on its `SELECT` by an ACCESS
+    /// EXCLUSIVE table lock, kill its lock backend, release the table and
+    /// return the sweep's error text.
+    async fn lose_lock_during_rules_select(
+        pool: &PgPool,
+        archive: bool,
+    ) -> (String, std::path::PathBuf) {
+        seed_user(pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'old', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let dir = temp_dir();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE rule_audit IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let task = {
+            let (p, d) = (pool.clone(), dir.clone());
+            tokio::spawn(async move { run_prune(&p, &d, 5, archive, None).await })
+        };
+        // Wait until the sweep holds the advisory lock and queues on the table.
+        let mut ready = false;
+        for _ in 0..600 {
+            let queued: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'relation' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if queued >= 1 {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ready, "the sweep never blocked on the table lock");
+        kill_retention_lock_holder(pool).await;
+        blocker.commit().await.unwrap();
+        let err = task.await.unwrap().unwrap_err();
+        (format!("{err:#}"), dir)
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_lost_lock_stops_the_rules_sweep_before_anything_is_archived(pool: PgPool) {
+        let (err, dir) = lose_lock_during_rules_select(&pool, true).await;
+        assert!(err.contains("retention sweep lock lost"), "{err}");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(!dir.join("audit_archive").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_lost_lock_stops_the_rules_sweep_before_the_delete(pool: PgPool) {
+        let (err, dir) = lose_lock_during_rules_select(&pool, false).await;
+        assert!(err.contains("retention sweep lock lost"), "{err}");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_rule_sweeps_lose_no_row_and_reject_no_segment(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        for _ in 0..25 {
+            sqlx::query(
+                "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+                 VALUES ('u1', 'c', 'old', 'status', NOW() - INTERVAL '10 days')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let seeded: Vec<i64> = sqlx::query_scalar("SELECT id FROM rule_audit ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let k = test_key(1);
+        let dir = temp_dir();
+        let (a, b) = tokio::join!(
+            run_prune(&pool, &dir, 5, true, Some(&k)),
+            run_prune(&pool, &dir, 5, true, Some(&k)),
+        );
+        assert_eq!(a.unwrap() + b.unwrap(), 25);
+        assert!(rejected(&dir).is_empty());
+        let ad = dir.join("audit_archive");
+        let mut ids = Vec::new();
+        for s in segments(&dir) {
+            let v = verify_segment(&ad, &s, Some(&k)).unwrap();
+            assert_eq!(v.status, SignatureStatus::Verified);
+            ids.extend(lines_in(&v.body).unwrap().into_iter().map(|(id, _)| id));
+        }
+        ids.sort();
+        assert_eq!(ids, seeded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_retention_delete_without_the_protocol_marker_is_refused(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'old', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // An older replica: retention mode but no protocol marker.
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "retention")
+            .await
+            .unwrap();
+        let err = sqlx::query("DELETE FROM rule_audit")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("42501")
+        );
+        drop(tx);
+        let mut tx = pool.begin().await.unwrap();
+        declare_retention_delete(&mut tx).await.unwrap();
+        let n = sqlx::query("DELETE FROM rule_audit")
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        tx.commit().await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    fn one_group_write(
+        dir: &Path,
+        lines: &[ArchiveLine],
+        hook: &dyn Fn(WriteStage, &str) -> Result<()>,
+    ) -> Result<()> {
+        let group: Vec<&ArchiveLine> = lines.iter().collect();
+        write_segment_with(dir, STREAM_RULES, "2024-01-01", &group, None, hook)
+    }
+
+    #[test]
+    fn publishing_an_existing_name_is_refused_and_leaves_it_untouched() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            publish_new(&dir, "a.jsonl", b"first").unwrap(),
+            Publish::Created
+        );
+        assert_eq!(
+            publish_new(&dir, "a.jsonl", b"second").unwrap(),
+            Publish::Taken
+        );
+        assert_eq!(std::fs::read(dir.join("a.jsonl")).unwrap(), b"first");
+        assert_eq!(entries(&dir), ["a.jsonl"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_sweeps_picking_the_same_name_publish_two_intact_pairs() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let a_rows = [line(1, "2024-01-01"), line(2, "2024-01-01")];
+        let mut b_rows = [line(1, "2024-01-01"), line(2, "2024-01-01")];
+        b_rows[0].line.push(' ');
+        let ran = std::cell::Cell::new(false);
+        let a: Vec<&ArchiveLine> = a_rows.iter().collect();
+        let b: Vec<&ArchiveLine> = b_rows.iter().collect();
+        write_segment_with(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            &a,
+            Some(&k),
+            &|stage, _| {
+                if stage == WriteStage::NamePicked && !ran.replace(true) {
+                    write_segment_with(&ad, STREAM_RULES, "2024-01-01", &b, Some(&k), &|_, _| {
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            segments(&dir),
+            [
+                "rules-2024-01-01.1-2.jsonl",
+                "rules-2024-01-01.1-2.r1.jsonl"
+            ]
+        );
+        for s in segments(&dir) {
+            assert!(verify_segment(&ad, &s, Some(&k)).is_ok());
+        }
+        assert!(
+            String::from_utf8(std::fs::read(ad.join("rules-2024-01-01.1-2.jsonl")).unwrap())
+                .unwrap()
+                .contains(" \n")
+        );
+        assert!(rejected(&dir).is_empty());
+        assert!(entries(&ad).iter().all(|n| !n.ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn racing_writers_never_replace_each_other() {
+        let k = test_key(1);
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|sc| {
+            for i in 0..8 {
+                let (ad, k, barrier) = (&ad, &k, &barrier);
+                sc.spawn(move || {
+                    let mut rows = [line(1, "2024-01-01"), line(2, "2024-01-01")];
+                    rows[0].line.push_str(&" ".repeat(i));
+                    let group: Vec<&ArchiveLine> = rows.iter().collect();
+                    barrier.wait();
+                    write_segment(ad, STREAM_RULES, "2024-01-01", &group, Some(k)).unwrap();
+                });
+            }
+        });
+        let segs = segments(&dir);
+        assert_eq!(segs.len(), 8);
+        for s in &segs {
+            assert!(verify_segment(&ad, s, Some(&k)).is_ok());
+        }
+        assert!(rejected(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_segment_write_removes_the_sidecar_it_just_published() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let err = one_group_write(&ad, &rows, &|stage, name| {
+            if stage == WriteStage::SidecarPublished {
+                assert!(ad.join(format!("{name}.manifest.json")).exists());
+                std::fs::write(ad.join(name), b"planted")?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            err.chain()
+                .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                .any(|e| e.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err:#}"
+        );
+        assert_eq!(entries(&ad), ["rules-2024-01-01.1-1.jsonl"]);
+        assert_eq!(
+            std::fs::read(ad.join("rules-2024-01-01.1-1.jsonl")).unwrap(),
+            b"planted"
+        );
+        assert!(rejected(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_orphan_sidecar_is_set_aside_and_its_name_is_free_again() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "rules-2024-01-01.1-2.jsonl.manifest.json";
+        std::fs::write(dir.join(name), b"orphan").unwrap();
+        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO), 1);
+        assert!(!dir.join(name).exists());
+        let left = entries(&dir);
+        assert_eq!(left.len(), 1);
+        assert!(left[0].starts_with(&format!("{name}.orphan-")), "{left:?}");
+        assert_eq!(std::fs::read(dir.join(&left[0])).unwrap(), b"orphan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_orphan_sidecar_is_left_alone() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "events-2024-01-01.1-2.jsonl.manifest.json";
+        std::fs::write(dir.join(name), b"orphan").unwrap();
+        assert_eq!(set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE), 0);
+        assert_eq!(entries(&dir), [name]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sidecar_with_its_segment_and_foreign_files_are_never_set_aside() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in [
+            "rules-2024-01-01.1-2.jsonl",
+            "rules-2024-01-01.1-2.jsonl.manifest.json",
+            "notes.manifest.json",
+            "other-2024-01-01.1-2.jsonl.manifest.json",
+            "rules-2024-01-01.1-2.jsonl.rejected-x",
+        ] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let before = entries(&dir);
+        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO), 0);
+        assert_eq!(entries(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn age_file(path: &Path, hours: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(hours * 3600))
+            .unwrap();
+    }
+
+    #[test]
+    fn the_orphan_age_threshold_is_24_hours() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let young = "rules-2024-01-01.1-2.jsonl.manifest.json";
+        let old = "rules-2024-01-01.3-4.jsonl.manifest.json";
+        std::fs::write(dir.join(young), b"y").unwrap();
+        std::fs::write(dir.join(old), b"o").unwrap();
+        age_file(&dir.join(young), 23);
+        age_file(&dir.join(old), 25);
+        assert_eq!(set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE), 1);
+        assert!(dir.join(young).exists());
+        assert!(!dir.join(old).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn plant_old_orphans(dir: &Path) -> [&'static str; 2] {
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let names = [
+            "rules-2024-01-01.1-2.jsonl.manifest.json",
+            "events-2024-01-01.1-2.jsonl.manifest.json",
+        ];
+        for n in names {
+            std::fs::write(ad.join(n), b"orphan").unwrap();
+            age_file(&ad.join(n), 25);
+        }
+        names
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_archiving_sweep_sets_old_orphan_sidecars_aside(pool: PgPool) {
+        let dir = temp_dir();
+        let names = plant_old_orphans(&dir).await;
+        let ad = dir.join("audit_archive");
+        run_prune(&pool, &dir, 5, true, None).await.unwrap();
+        for n in names {
+            assert!(!ad.join(n).exists(), "{n} should be set aside (rules)");
+        }
+        // The rules sweep only tidies; run the events sweep for its own call.
+        let ad_names = entries(&ad);
+        assert!(
+            ad_names.iter().all(|n| n.contains(".orphan-")),
+            "{ad_names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir();
+        let names = plant_old_orphans(&dir).await;
+        let ad = dir.join("audit_archive");
+        run_prune_events(&pool, &dir, 5, true, None).await.unwrap();
+        assert!(entries(&ad)
+            .iter()
+            .any(|n| n.starts_with(names[1]) && n.contains(".orphan-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_non_archiving_sweep_leaves_orphan_sidecars_alone(pool: PgPool) {
+        let dir = temp_dir();
+        let names = plant_old_orphans(&dir).await;
+        let ad = dir.join("audit_archive");
+        run_prune(&pool, &dir, 5, false, None).await.unwrap();
+        run_prune_events(&pool, &dir, 5, false, None).await.unwrap();
+        for n in names {
+            assert!(ad.join(n).exists());
+        }
+        assert_eq!(entries(&ad).len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

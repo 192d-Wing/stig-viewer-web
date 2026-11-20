@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(n, 1);
         // Retention DELETE.
         let mut tx = app.pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "retention")
+        crate::audit_retention::declare_retention_delete(&mut tx)
             .await
             .unwrap();
         sqlx::query("DELETE FROM rule_audit")
