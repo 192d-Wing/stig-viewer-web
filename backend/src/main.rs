@@ -520,8 +520,14 @@ fn build_app(
                 get(download_attachment_handler).delete(delete_attachment_handler),
             )
             .route("/api/activity", get(activity_handler))
-            .route("/api/audit/search", get(audit_search_handler))
-            .route("/api/audit/events", get(audit_events_handler))
+            .route(
+                api::admission::AUDITED_READ_ROUTES[0],
+                get(audit_search_handler),
+            )
+            .route(
+                api::admission::AUDITED_READ_ROUTES[1],
+                get(audit_events_handler),
+            )
             .route(
                 "/api/drafts",
                 get(list_drafts_handler).post(create_draft_handler),
@@ -725,6 +731,13 @@ async fn main() -> Result<()> {
         std::env::var("STIG_ENV").ok().as_deref(),
         config.seed_dir.as_deref(),
     )?;
+    let admission_body = config::AdmissionBody::from_env()?;
+    info!(
+        first_byte_secs = admission_body.first_byte.as_secs(),
+        grace_secs = admission_body.grace.as_secs(),
+        min_rate_bytes_per_sec = admission_body.min_rate,
+        "admission body limits"
+    );
     let sources = Arc::new(load_sources()?);
 
     info!(
@@ -792,7 +805,7 @@ async fn main() -> Result<()> {
         config: config.clone(),
         signing: signing.clone(),
         tasks: tasks.clone(),
-        admission: api::admission::Admission::new(),
+        admission: api::admission::Admission::configured(admission_body.into()),
     };
 
     let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin)?);
@@ -1183,5 +1196,267 @@ mod router_tests {
             .await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    // ---- Admission through the real router (needs Postgres) ----
+
+    use api::admission::{
+        Admission, ADMIN_RESERVE, AUDITED_READ_ROUTES, AUDIT_BACKLOG_HIGH, MAX_IN_FLIGHT,
+        MAX_USER_IN_FLIGHT,
+    };
+    use sqlx::PgPool;
+    use std::sync::atomic::AtomicU32;
+
+    /// The assembled router with the test auth header on: `X-User-Id` names
+    /// the caller (the user must be seeded; its id is the header value).
+    fn db_app(state: AppState) -> Router {
+        let mut auth = test_fixtures::auth_state(&state);
+        auth.oidc.allow_test_auth_header = true;
+        let saml = test_fixtures::saml_state(&state);
+        let hooks = TestHooks {
+            production: false,
+            enable_test_routes: false,
+            allow_test_auth_header: true,
+        };
+        build_app(state, auth, saml, CorsLayer::new(), &hooks)
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        user: Option<&str>,
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(u) = user {
+            req = req.header("X-User-Id", u);
+        }
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        app.clone().oneshot(req.body(body).unwrap()).await.unwrap()
+    }
+
+    const CREATE: &str = r#"{"name":"admission set","stigIds":["TEST-STIG"]}"#;
+
+    async fn count(pool: &PgPool, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn retry_after(r: &axum::response::Response) -> Option<String> {
+        r.headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_checklist_set_create_is_refused_at_a_full_cap_and_changes_nothing(pool: PgPool) {
+        test_fixtures::seed_user(&pool, "cap-user").await;
+        sqlx::query(
+            "INSERT INTO stigs_catalog (id, title, category, version, release_info, json_path) \
+             VALUES ($1, $1, 'x', '2', 'R3', '')",
+        )
+        .bind(test_fixtures::STIG_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (state, _dir) = test_fixtures::app_state(pool.clone());
+        let adm = state.admission.clone();
+        let app = db_app(state.clone());
+
+        // Per-user cap: 429.
+        let mine: Vec<_> = (0..MAX_USER_IN_FLIGHT)
+            .map(|_| adm.try_admit("cap-user").unwrap())
+            .collect();
+        let r = send(
+            &app,
+            "POST",
+            "/api/checklist-sets",
+            Some("cap-user"),
+            Some(CREATE),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after(&r).as_deref(), Some("1"));
+        assert_eq!(
+            (
+                count(&pool, "checklist_sets").await,
+                count(&pool, "audit_events").await
+            ),
+            (0, 0)
+        );
+        drop(mine);
+
+        // Global cap for non-admins: 503.
+        let others: Vec<_> = (0..(MAX_IN_FLIGHT - ADMIN_RESERVE) / MAX_USER_IN_FLIGHT)
+            .flat_map(|u| (0..MAX_USER_IN_FLIGHT).map(move |_| u))
+            .map(|u| adm.try_admit(&format!("other-{u}")).unwrap())
+            .collect();
+        let r = send(
+            &app,
+            "POST",
+            "/api/checklist-sets",
+            Some("cap-user"),
+            Some(CREATE),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after(&r).as_deref(), Some("1"));
+        assert_eq!(
+            (
+                count(&pool, "checklist_sets").await,
+                count(&pool, "audit_events").await
+            ),
+            (0, 0)
+        );
+        drop(others);
+
+        // Audit backlog: 503 with the longer Retry-After.
+        let gauge: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(AUDIT_BACKLOG_HIGH)));
+        let mut backlogged = state.clone();
+        backlogged.admission = Admission::with_backlog(gauge);
+        let r = send(
+            &db_app(backlogged),
+            "POST",
+            "/api/checklist-sets",
+            Some("cap-user"),
+            Some(CREATE),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after(&r).as_deref(), Some("5"));
+        assert_eq!(
+            (
+                count(&pool, "checklist_sets").await,
+                count(&pool, "audit_events").await
+            ),
+            (0, 0)
+        );
+
+        // Released: the same request succeeds.
+        let r = send(
+            &app,
+            "POST",
+            "/api/checklist-sets",
+            Some("cap-user"),
+            Some(CREATE),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        adm.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "checklist_sets").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn public_health_is_unaffected_by_admission_refusals(pool: PgPool) {
+        test_fixtures::seed_user(&pool, "health-user").await;
+        let (state, _dir) = test_fixtures::app_state(pool.clone());
+        let adm = state.admission.clone();
+        let app = db_app(state);
+        // The status can depend on process-wide audit counters, so compare
+        // against the status before the fill instead of asserting 200.
+        let before = send(&app, "GET", "/api/health", None, None).await.status();
+
+        let _held: Vec<_> = (0..(MAX_IN_FLIGHT - ADMIN_RESERVE) / MAX_USER_IN_FLIGHT)
+            .flat_map(|u| (0..MAX_USER_IN_FLIGHT).map(move |_| (u, false)))
+            .map(|(u, _)| adm.try_admit(&format!("fill-{u}")).unwrap())
+            .chain((0..ADMIN_RESERVE).map(|_| adm.try_admit_as("admin-fill", true).unwrap()))
+            .collect();
+        assert_eq!(adm.in_flight(), MAX_IN_FLIGHT);
+        let r = send(
+            &app,
+            "POST",
+            "/api/checklist-sets",
+            Some("health-user"),
+            Some(CREATE),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let stats = adm.stats();
+        assert!(stats.refused_global >= 1);
+
+        for _ in 0..2 {
+            let r = send(&app, "GET", "/api/health", None, None).await;
+            assert_eq!(r.status(), before);
+            assert!(retry_after(&r).is_none());
+            let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(v.get("checks").is_some(), "{v}");
+        }
+        assert_eq!(
+            adm.stats(),
+            stats,
+            "health neither takes nor refuses a permit"
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn audited_read_routes_match_the_real_router(pool: PgPool) {
+        test_fixtures::seed_user(&pool, "reader-admin").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'reader-admin'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (state, _dir) = test_fixtures::app_state(pool.clone());
+        let adm = state.admission.clone();
+        let app = db_app(state);
+        let reads = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(repeat_count), 0)::bigint FROM audit_events \
+                 WHERE action = 'audit.read'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        let held: Vec<_> = (0..MAX_USER_IN_FLIGHT)
+            .map(|_| adm.try_admit_as("reader-admin", true).unwrap())
+            .collect();
+        for route in AUDITED_READ_ROUTES {
+            for method in ["GET", "HEAD"] {
+                let r = send(&app, method, route, Some("reader-admin"), None).await;
+                assert_eq!(
+                    r.status(),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "{method} {route}"
+                );
+            }
+        }
+        // Control: a read that records nothing is not admitted, so not refused.
+        let r = send(
+            &app,
+            "GET",
+            "/api/checklist-sets",
+            Some("reader-admin"),
+            None,
+        )
+        .await;
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(reads().await, 0);
+        drop(held);
+
+        let mut expected = 0;
+        for route in AUDITED_READ_ROUTES {
+            let r = send(&app, "GET", route, Some("reader-admin"), None).await;
+            assert_eq!(r.status(), StatusCode::OK, "GET {route}");
+            adm.idle().await;
+            crate::db_audit::drain().await;
+            expected += 1;
+            assert_eq!(reads().await, expected, "one audit.read row for {route}");
+        }
     }
 }

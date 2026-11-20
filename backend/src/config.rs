@@ -214,6 +214,91 @@ impl TestHooks {
     }
 }
 
+/// Parse an integer env value within `min..=max`. Unset, empty or whitespace
+/// gives `default`; anything else that is not an integer in range is an error
+/// naming the variable, so a typo on a security limit cannot be ignored.
+pub fn parse_bounded(
+    name: &str,
+    raw: Option<&str>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(default);
+    };
+    match v.parse::<u64>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
+        _ => anyhow::bail!("{name} must be an integer from {min} to {max} (got {v:?})"),
+    }
+}
+
+/// `ADMISSION_BODY_MIN_RATE_KIB` bounds (KiB/s).
+pub const ADMISSION_BODY_MIN_RATE_KIB_BOUNDS: (u64, u64) = (8, 8192);
+/// `ADMISSION_BODY_GRACE_SECS` bounds.
+pub const ADMISSION_BODY_GRACE_SECS_BOUNDS: (u64, u64) = (1, 120);
+/// `ADMISSION_BODY_FIRST_BYTE_SECS` bounds.
+pub const ADMISSION_BODY_FIRST_BYTE_SECS_BOUNDS: (u64, u64) = (1, 60);
+
+/// Request-body deadlines for admitted requests (see `api::admission`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionBody {
+    /// Time allowed for the first byte.
+    pub first_byte: std::time::Duration,
+    /// Time allowed on top of the rate rule once the first byte arrived.
+    pub grace: std::time::Duration,
+    /// Minimum average body rate, bytes per second.
+    pub min_rate: u64,
+}
+
+impl AdmissionBody {
+    pub fn from_env() -> Result<Self> {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::from_vars(
+            var("ADMISSION_BODY_FIRST_BYTE_SECS").as_deref(),
+            var("ADMISSION_BODY_GRACE_SECS").as_deref(),
+            var("ADMISSION_BODY_MIN_RATE_KIB").as_deref(),
+        )
+    }
+
+    pub fn from_vars(
+        first_byte_secs: Option<&str>,
+        grace_secs: Option<&str>,
+        min_rate_kib: Option<&str>,
+    ) -> Result<Self> {
+        use crate::api::admission as a;
+        let (fb_min, fb_max) = ADMISSION_BODY_FIRST_BYTE_SECS_BOUNDS;
+        let (gr_min, gr_max) = ADMISSION_BODY_GRACE_SECS_BOUNDS;
+        let (rt_min, rt_max) = ADMISSION_BODY_MIN_RATE_KIB_BOUNDS;
+        let first_byte = parse_bounded(
+            "ADMISSION_BODY_FIRST_BYTE_SECS",
+            first_byte_secs,
+            a::ADMITTED_BODY_FIRST_BYTE.as_secs(),
+            fb_min,
+            fb_max,
+        )?;
+        let grace = parse_bounded(
+            "ADMISSION_BODY_GRACE_SECS",
+            grace_secs,
+            a::ADMITTED_BODY_GRACE.as_secs(),
+            gr_min,
+            gr_max,
+        )?;
+        let rate_kib = parse_bounded(
+            "ADMISSION_BODY_MIN_RATE_KIB",
+            min_rate_kib,
+            a::ADMITTED_BODY_MIN_RATE / 1024,
+            rt_min,
+            rt_max,
+        )?;
+        Ok(Self {
+            first_byte: std::time::Duration::from_secs(first_byte),
+            grace: std::time::Duration::from_secs(grace),
+            min_rate: rate_kib * 1024,
+        })
+    }
+}
+
 /// Load and parse `stig-sources.toml` from the current directory.
 pub fn load_sources() -> Result<Vec<StigSource>> {
     let raw = fs::read_to_string("stig-sources.toml")
@@ -225,6 +310,49 @@ pub fn load_sources() -> Result<Vec<StigSource>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_body_defaults_when_unset_or_blank() {
+        use crate::api::admission as a;
+        for raw in [None, Some(""), Some("  ")] {
+            let b = AdmissionBody::from_vars(raw, raw, raw).unwrap();
+            assert_eq!(b.first_byte, a::ADMITTED_BODY_FIRST_BYTE);
+            assert_eq!(b.grace, a::ADMITTED_BODY_GRACE);
+            assert_eq!(b.min_rate, a::ADMITTED_BODY_MIN_RATE);
+        }
+    }
+
+    #[test]
+    fn admission_body_accepts_overrides_within_bounds() {
+        let b = AdmissionBody::from_vars(Some("2"), Some(" 30 "), Some("128")).unwrap();
+        assert_eq!(b.first_byte, std::time::Duration::from_secs(2));
+        assert_eq!(b.grace, std::time::Duration::from_secs(30));
+        assert_eq!(b.min_rate, 128 * 1024);
+        let lo = AdmissionBody::from_vars(Some("1"), Some("1"), Some("8")).unwrap();
+        assert_eq!(lo.min_rate, 8 * 1024);
+        assert_eq!(lo.first_byte, std::time::Duration::from_secs(1));
+        let hi = AdmissionBody::from_vars(Some("60"), Some("120"), Some("8192")).unwrap();
+        assert_eq!(hi.min_rate, 8192 * 1024);
+        assert_eq!(hi.grace, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn admission_body_rejects_out_of_range_and_garbage() {
+        for bad in ["0", "7", "8193", "-1", "64k", "1.5"] {
+            let err = AdmissionBody::from_vars(None, None, Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ADMISSION_BODY_MIN_RATE_KIB"), "{bad}: {err}");
+        }
+        let err = AdmissionBody::from_vars(Some("61"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ADMISSION_BODY_FIRST_BYTE_SECS"), "{err}");
+        let err = AdmissionBody::from_vars(None, Some("121"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ADMISSION_BODY_GRACE_SECS"), "{err}");
+    }
 
     #[test]
     fn require_signature_accepts_only_explicit_booleans() {

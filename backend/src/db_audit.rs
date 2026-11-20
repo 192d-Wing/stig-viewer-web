@@ -36,9 +36,13 @@
 //! pins this arithmetic; it holds for any `RATE_LIMIT_BURST` and for admins,
 //! who bypass the rate limiter. It is strict only while the pool is healthy:
 //! a stalled insert lets one request leave late writes behind under its permit.
-//! When that happens the count of non-restricted pending writes
-//! ([`WriteQueue::open_gauge`]) climbs past the healthy bound, and `admission`
-//! refuses new requests (503) at a high-water mark until it drains. That damps
+//! When that happens the count of pending writes that hold an admission
+//! permit and are not restricted ([`WriteQueue::admitted_gauge`]) climbs past
+//! the healthy bound, and `admission` refuses new requests (503) at a
+//! high-water mark until it drains. Permit-less writes (login
+//! acknowledgements, system events) are not counted: they are bounded by the
+//! total cap and by shedding, and counting them would let them trip a refusal
+//! meant for admitted work. That damps
 //! the stacking; it does not bound it, since requests already admitted can
 //! still leave writes behind.
 
@@ -475,9 +479,10 @@ pub(crate) struct WriteQueue {
     cap: u32,
     denied_cap: u32,
     user_denied_cap: u32,
-    /// Pending non-restricted writes. Written only under the `state` lock (so
-    /// it always matches `pending - denied`), read without it by admission.
-    open_pending: AtomicU32,
+    /// Pending writes that hold an admission permit and are not restricted
+    /// (see [`Reserve::counts_toward_backlog`]). Written only under the
+    /// `state` lock, read without it by admission.
+    admitted_pending: AtomicU32,
 }
 
 /// Pending counts, all behind one lock so a reservation checks and takes
@@ -541,6 +546,24 @@ struct Reserve {
     user: Option<String>,
     /// A `denied`/`rejected` event, subject to the denied sub-cap.
     restricted: bool,
+    /// The event's request context holds an admission permit.
+    admitted: bool,
+}
+
+impl Reserve {
+    /// Whether this write counts toward the admission backlog gauge.
+    fn counts_toward_backlog(&self) -> bool {
+        !self.restricted && self.admitted
+    }
+}
+
+/// The reservation for a user event.
+fn reserve_for(ev: &NewAuditEvent<'_>) -> Reserve {
+    Reserve {
+        user: Some(ev.user_id.to_owned()),
+        restricted: matches!(ev.outcome, "denied" | "rejected"),
+        admitted: ev.ctx.is_some_and(|c| c.permit.is_some()),
+    }
 }
 
 /// Why a write was refused.
@@ -574,8 +597,9 @@ impl Drop for Slot {
             st.pending = st.pending.saturating_sub(1);
             if self.reserve.restricted {
                 st.denied = st.denied.saturating_sub(1);
-            } else {
-                self.queue.open_pending.fetch_sub(1, Ordering::Relaxed);
+            }
+            if self.reserve.counts_toward_backlog() {
+                self.queue.admitted_pending.fetch_sub(1, Ordering::Relaxed);
             }
             if let (true, Some(u)) = (self.reserve.restricted, &self.reserve.user) {
                 if let Some(i) = st.users.iter().position(|e| &e.user == u) {
@@ -615,13 +639,14 @@ impl WriteQueue {
             cap,
             denied_cap,
             user_denied_cap,
-            open_pending: AtomicU32::new(0),
+            admitted_pending: AtomicU32::new(0),
         }
     }
 
-    /// Pending non-restricted writes, readable without the queue lock.
-    pub(crate) fn open_gauge(&'static self) -> &'static AtomicU32 {
-        &self.open_pending
+    /// Pending permit-holding, non-restricted writes, readable without the
+    /// queue lock.
+    pub(crate) fn admitted_gauge(&'static self) -> &'static AtomicU32 {
+        &self.admitted_pending
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -663,8 +688,9 @@ impl WriteQueue {
         st.pending += 1;
         if reserve.restricted {
             st.denied += 1;
-        } else {
-            self.open_pending.fetch_add(1, Ordering::Relaxed);
+        }
+        if reserve.counts_toward_backlog() {
+            self.admitted_pending.fetch_add(1, Ordering::Relaxed);
         }
         drop(st);
         Ok(Slot {
@@ -711,9 +737,9 @@ static GLOBAL_QUEUE: WriteQueue = WriteQueue::new(
     MAX_USER_DENIED_PENDING,
 );
 
-/// The process-wide queue's count of pending non-restricted writes.
-pub(crate) fn open_pending_gauge() -> &'static AtomicU32 {
-    GLOBAL_QUEUE.open_gauge()
+/// The process-wide queue's count of pending permit-holding, non-restricted writes.
+pub(crate) fn admitted_pending_gauge() -> &'static AtomicU32 {
+    GLOBAL_QUEUE.admitted_gauge()
 }
 
 /// Wait for every pending audit write (shutdown).
@@ -1021,6 +1047,7 @@ async fn record_system_counted(
     let reserve = Reserve {
         user: None,
         restricted: false,
+        admitted: false,
     };
     submit(queue, limits, log, reserve, write).await;
 }
@@ -1048,10 +1075,7 @@ async fn record_counted(
         checklist_id: ids.checklist_id.clone(),
         stig_id: ids.stig_id.clone(),
     };
-    let reserve = Reserve {
-        user: Some(ev.user_id.to_owned()),
-        restricted: matches!(ev.outcome, "denied" | "rejected"),
-    };
+    let reserve = reserve_for(&ev);
     let owned = OwnedEvent::from(ev);
     let pool = pool.clone();
     submit(queue, limits, log, reserve, async move {
@@ -1605,10 +1629,11 @@ mod tests {
     }
 
     /// A reservation for `user`, restricted for denied/rejected events.
-    fn rsv(user: &str, restricted: bool) -> Reserve {
+    fn rsv(user: &str, restricted: bool, admitted: bool) -> Reserve {
         Reserve {
             user: Some(user.to_owned()),
             restricted,
+            admitted,
         }
     }
 
@@ -1665,7 +1690,7 @@ mod tests {
                 &Q,
                 LONG,
                 log_fields(),
-                rsv("u1", false),
+                rsv("u1", false, true),
                 gated_write(gate, ran.clone(), true),
             ));
             assert!(poll_once(&mut call).await, "waiting on the gate");
@@ -1690,7 +1715,7 @@ mod tests {
                 &Q,
                 LONG,
                 log_fields(),
-                rsv("u1", false),
+                rsv("u1", false, true),
                 gated_write(gate, ran.clone(), false),
             ));
             assert!(poll_once(&mut call).await);
@@ -1716,7 +1741,7 @@ mod tests {
             &Q,
             limits,
             log_fields(),
-            rsv("u1", false),
+            rsv("u1", false, true),
             gated_write(gate, ran.clone(), true),
         )
         .await;
@@ -1744,7 +1769,7 @@ mod tests {
             &Q,
             limits,
             log_fields(),
-            rsv("u1", false),
+            rsv("u1", false, true),
             std::future::pending::<Result<()>>(),
         )
         .await;
@@ -1763,7 +1788,7 @@ mod tests {
             &Q,
             LONG,
             log_fields(),
-            rsv("u1", false),
+            rsv("u1", false, true),
             gated_write(gate, ran.clone(), true),
         ));
         assert!(poll_once(&mut first).await);
@@ -1776,7 +1801,7 @@ mod tests {
             &Q,
             LONG,
             log_fields(),
-            rsv("u1", false),
+            rsv("u1", false, true),
             async move {
                 flag.store(true, Ordering::SeqCst);
                 Ok(())
@@ -1810,13 +1835,22 @@ mod tests {
         user: &str,
         restricted: bool,
     ) -> Option<(tokio::sync::oneshot::Sender<()>, BoxCall)> {
+        try_gated_as(q, user, restricted, true).await
+    }
+
+    async fn try_gated_as(
+        q: &'static WriteQueue,
+        user: &str,
+        restricted: bool,
+        admitted: bool,
+    ) -> Option<(tokio::sync::oneshot::Sender<()>, BoxCall)> {
         let (open, gate) = tokio::sync::oneshot::channel();
         let ran = Arc::new(AtomicBool::new(false));
         let mut call: BoxCall = Box::pin(submit(
             q,
             LONG,
             log_fields(),
-            rsv(user, restricted),
+            rsv(user, restricted, admitted),
             gated_write(gate, ran, true),
         ));
         poll_once(&mut call).await.then_some((open, call))
@@ -1846,7 +1880,7 @@ mod tests {
             &Q,
             LONG,
             log_fields(),
-            rsv("c", true),
+            rsv("c", true, true),
             std::future::pending::<Result<()>>(),
         ));
         assert!(!poll_once(&mut third).await);
@@ -1906,7 +1940,7 @@ mod tests {
             q,
             LONG,
             log_fields(),
-            rsv(user, restricted),
+            rsv(user, restricted, true),
             std::future::pending::<Result<()>>(),
         ));
         !poll_once(&mut call).await
@@ -2069,16 +2103,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_open_gauge_follows_non_restricted_reservations_only() {
+    async fn the_admitted_gauge_ignores_restricted_and_permit_less_writes() {
         queue!(C, Q, 64);
-        let g = Q.open_gauge();
+        let g = Q.admitted_gauge();
         let mut held = vec![
-            gated_submit(&Q, "a", false).await,
-            gated_submit(&Q, "b", false).await,
-            gated_submit(&Q, "c", true).await,
+            try_gated_as(&Q, "a", false, true).await.unwrap(),
+            try_gated_as(&Q, "b", false, true).await.unwrap(),
+            try_gated_as(&Q, "c", true, true).await.unwrap(),
+            try_gated_as(&Q, "d", false, false).await.unwrap(),
         ];
-        assert_eq!((Q.pending(), g.load(Ordering::Relaxed)), (3, 2));
-        // Finish the restricted one: the gauge is unchanged.
+        assert_eq!((Q.pending(), g.load(Ordering::Relaxed)), (4, 2));
+        // Finish the restricted one and the permit-less one: gauge unchanged.
+        let (open, call) = held.remove(3);
+        let _ = open.send(());
+        call.await;
         let (open, call) = held.remove(2);
         let _ = open.send(());
         call.await;
@@ -2093,7 +2131,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_open_gauge_returns_to_zero_after_a_failed_write() {
+    async fn a_burst_of_permit_less_writes_does_not_trip_the_backlog_refusal() {
+        use crate::api::admission::Admission;
+        queue!(C, Q, 64);
+        let adm = Admission::with_backlog(Q.admitted_gauge());
+        let mut held = Vec::new();
+        for i in 0..40 {
+            held.push(
+                try_gated_as(&Q, &format!("u{i}"), false, false)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(Q.admitted_gauge().load(Ordering::Relaxed), 0);
+        assert!(adm.try_admit("fresh").is_ok());
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+    }
+
+    #[test]
+    fn reserve_for_counts_only_permit_holding_non_restricted_events() {
+        let adm = crate::api::admission::Admission::new();
+        let mut with_permit = ctx();
+        with_permit.permit = Some(adm.try_admit("u1").unwrap());
+        let without_permit = ctx();
+        let event = |outcome: &'static str, ctx: Option<&RequestCtx>| {
+            reserve_for(&NewAuditEvent {
+                user_id: "u1",
+                action: "checklist.save",
+                outcome,
+                asset_id: None,
+                checklist_id: None,
+                stig_id: None,
+                detail: json!({}),
+                ctx,
+            })
+        };
+        assert!(!event("ok", None).counts_toward_backlog());
+        assert!(!event("ok", Some(&without_permit)).counts_toward_backlog());
+        let r = event("ok", Some(&with_permit));
+        assert!(r.admitted && !r.restricted && r.counts_toward_backlog());
+        let r = event("denied", Some(&with_permit));
+        assert!(r.admitted && r.restricted && !r.counts_toward_backlog());
+    }
+
+    #[tokio::test]
+    async fn the_admitted_gauge_returns_to_zero_after_a_failed_write() {
         queue!(C, Q, 64);
         let (_open, gate) = tokio::sync::oneshot::channel::<()>();
         drop(_open);
@@ -2101,21 +2187,21 @@ mod tests {
             &Q,
             LONG,
             log_fields(),
-            rsv("u1", false),
+            rsv("u1", false, true),
             gated_write(gate, Arc::new(AtomicBool::new(false)), false),
         ));
         let _ = poll_once(&mut call).await;
         call.await;
         Q.drain().await;
-        assert_eq!(Q.open_gauge().load(Ordering::Relaxed), 0);
+        assert_eq!(Q.admitted_gauge().load(Ordering::Relaxed), 0);
         assert_eq!(C.snapshot().total, 1);
     }
 
     #[tokio::test]
-    async fn a_backlog_of_open_writes_refuses_admission_until_it_drains() {
+    async fn a_backlog_of_admitted_writes_refuses_admission_until_it_drains() {
         use crate::api::admission::{Admission, Refusal, AUDIT_BACKLOG_HIGH};
         queue!(C, Q, 64);
-        let adm = Admission::with_backlog(Q.open_gauge());
+        let adm = Admission::with_backlog(Q.admitted_gauge());
         assert!(adm.try_admit("u0").is_ok());
         let mut held = Vec::new();
         for i in 0..AUDIT_BACKLOG_HIGH {
