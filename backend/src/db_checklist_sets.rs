@@ -21,14 +21,32 @@ pub struct SetRow {
     pub last_attached_at: Option<DateTime<Utc>>,
     /// Client token of the most recent autosave that bumped the revision.
     pub last_save_id: Option<String>,
+    /// Hash of the request content that stored `last_save_id`; `None` for
+    /// rows written before the hash existed.
+    pub last_save_body_sha256: Option<String>,
+}
+
+/// A client retry token with the hash of the request content it arrived with.
+#[derive(Debug, Clone, Copy)]
+pub struct Token<'a> {
+    pub id: &'a str,
+    pub body_sha256: &'a str,
 }
 
 /// True when a request is a retry of the autosave that produced the set's
-/// current revision: same `save_id`, and the set sits exactly one revision
-/// past the request's base. Any later write breaks the condition.
-pub fn is_replay(set: &SetRow, base_revision: i64, save_id: Option<&str>) -> bool {
-    match (save_id, set.last_save_id.as_deref()) {
-        (Some(req), Some(stored)) => req == stored && set.revision == base_revision + 1,
+/// current revision: same token, the set sits exactly one revision past the
+/// request's base, and the content hash matches (a row with no stored hash
+/// predates it and matches any). Any later write breaks the condition.
+pub fn is_replay(set: &SetRow, base_revision: i64, token: Option<&Token>) -> bool {
+    match (token, set.last_save_id.as_deref()) {
+        (Some(req), Some(stored)) => {
+            req.id == stored
+                && set.revision == base_revision + 1
+                && set
+                    .last_save_body_sha256
+                    .as_deref()
+                    .is_none_or(|h| h == req.body_sha256)
+        }
         _ => false,
     }
 }
@@ -117,6 +135,8 @@ pub enum CreateOutcome {
     Created,
     /// The owner already created a set with this key; its id.
     Existing(String),
+    /// The key was used before with different request content.
+    KeyConflict,
     Limit,
 }
 
@@ -126,6 +146,37 @@ pub enum AddStig {
     Limit,
     Added,
     Exists,
+}
+
+/// Longest a write statement may run or wait for a lock, in milliseconds.
+/// Postgres cuts a stalled write and rolls it back before the server
+/// deadline in `detached` has to abandon it.
+const STATEMENT_TIMEOUT_MS: i64 = 8_000;
+
+async fn bound_ms(tx: &mut sqlx::PgConnection, ms: i64) -> Result<()> {
+    sqlx::query(
+        "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)",
+    )
+    .bind(ms.to_string())
+    .execute(tx)
+    .await?;
+    Ok(())
+}
+
+/// Transaction-local statement and lock timeouts; the first call in a writer.
+async fn bound(tx: &mut sqlx::PgConnection) -> Result<()> {
+    bound_ms(tx, STATEMENT_TIMEOUT_MS).await
+}
+
+/// True when the error is Postgres cutting a statement (`57014`) or a lock
+/// wait (`55P03`) short.
+pub fn is_timeout(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::Database(d)) if matches!(d.code().as_deref(), Some("57014" | "55P03"))
+        )
+    })
 }
 
 pub async fn list_sets(pool: &PgPool, owner_id: &str) -> Result<Vec<SetSummaryRow>> {
@@ -144,7 +195,8 @@ pub async fn list_sets(pool: &PgPool, owner_id: &str) -> Result<Vec<SetSummaryRo
 
 pub async fn get_set(pool: &PgPool, owner_id: &str, id: &str) -> Result<Option<SetRow>> {
     Ok(sqlx::query_as::<_, SetRow>(
-        "SELECT id, name, asset_id, revision, created_at, updated_at, last_attached_at, last_save_id
+        "SELECT id, name, asset_id, revision, created_at, updated_at, last_attached_at, last_save_id,
+                last_save_body_sha256
          FROM checklist_sets WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
@@ -183,7 +235,8 @@ pub async fn list_rules(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<V
 /// transaction. Creates nothing and returns `Limit` when the owner already has
 /// `max_sets`. The owner's user row is locked so concurrent creates cannot
 /// both pass the limit, and so a `create_key` lookup cannot race. When
-/// `create_key` matches one of the owner's sets, that set's id is returned.
+/// `create_key` matches one of the owner's sets, that set's id is returned if
+/// the content hash also matches (or none was stored), else `KeyConflict`.
 pub async fn insert_set(
     pool: &PgPool,
     owner_id: &str,
@@ -191,22 +244,27 @@ pub async fn insert_set(
     name: &str,
     stigs: &[(String, String, String)],
     max_sets: i64,
-    create_key: Option<&str>,
+    create_key: Option<Token<'_>>,
 ) -> Result<CreateOutcome> {
     let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(owner_id)
         .fetch_optional(&mut *tx)
         .await?;
     if let Some(key) = create_key {
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM checklist_sets WHERE owner_id = $1 AND create_key = $2")
-                .bind(owner_id)
-                .bind(key)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some((existing_id,)) = existing {
-            return Ok(CreateOutcome::Existing(existing_id));
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, create_body_sha256 FROM checklist_sets WHERE owner_id = $1 AND create_key = $2",
+        )
+        .bind(owner_id)
+        .bind(key.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((existing_id, stored)) = existing {
+            return Ok(match stored {
+                Some(h) if h != key.body_sha256 => CreateOutcome::KeyConflict,
+                _ => CreateOutcome::Existing(existing_id),
+            });
         }
     }
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_sets WHERE owner_id = $1")
@@ -217,12 +275,14 @@ pub async fn insert_set(
         return Ok(CreateOutcome::Limit);
     }
     sqlx::query(
-        "INSERT INTO checklist_sets (id, owner_id, name, create_key) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO checklist_sets (id, owner_id, name, create_key, create_body_sha256)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(id)
     .bind(owner_id)
     .bind(name)
-    .bind(create_key)
+    .bind(create_key.map(|t| t.id))
+    .bind(create_key.map(|t| t.body_sha256))
     .execute(&mut *tx)
     .await?;
     for (i, (stig_id, version, release)) in stigs.iter().enumerate() {
@@ -243,14 +303,17 @@ pub async fn insert_set(
 }
 
 pub async fn rename_set(pool: &PgPool, owner_id: &str, id: &str, name: &str) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let r = sqlx::query(
         "UPDATE checklist_sets SET name = $3, updated_at = NOW() WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
     .bind(owner_id)
     .bind(name)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -261,6 +324,8 @@ pub async fn unlink_asset(
     owner_id: &str,
     id: &str,
 ) -> Result<Option<Option<String>>> {
+    let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "WITH old AS (SELECT asset_id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE)
          UPDATE checklist_sets c SET asset_id = NULL, updated_at = NOW()
@@ -269,8 +334,9 @@ pub async fn unlink_asset(
     )
     .bind(id)
     .bind(owner_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| r.0))
 }
 
@@ -288,11 +354,14 @@ pub async fn link_asset(pool: &PgPool, owner_id: &str, id: &str, asset_id: &str)
 }
 
 pub async fn delete_set(pool: &PgPool, owner_id: &str, id: &str) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let r = sqlx::query("DELETE FROM checklist_sets WHERE id = $1 AND owner_id = $2")
         .bind(id)
         .bind(owner_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -307,6 +376,7 @@ pub async fn add_stig(
     max_stigs: i64,
 ) -> Result<AddStig> {
     let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("SELECT id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE")
             .bind(id)
@@ -363,6 +433,7 @@ pub async fn remove_stig(
     stig_id: &str,
 ) -> Result<Option<bool>> {
     let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("SELECT id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE")
             .bind(id)
@@ -380,7 +451,8 @@ pub async fn remove_stig(
     let removed = r.rows_affected() > 0;
     if removed {
         sqlx::query(
-            "UPDATE checklist_sets SET revision = revision + 1, last_save_id = NULL, updated_at = NOW() WHERE id = $1",
+            "UPDATE checklist_sets SET revision = revision + 1, last_save_id = NULL,
+                last_save_body_sha256 = NULL, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .execute(&mut *tx)
@@ -388,6 +460,37 @@ pub async fn remove_stig(
     }
     tx.commit().await?;
     Ok(Some(removed))
+}
+
+/// `(rows, bytes, touched rows, touched bytes)` of the set's stored rules,
+/// where "touched" means named by `changes`.
+async fn totals(
+    tx: &mut sqlx::PgConnection,
+    id: &str,
+    changes: &[RuleChange],
+) -> Result<(i64, i64, i64, i64)> {
+    let stigs: Vec<&str> = changes.iter().map(|c| c.stig_id.as_str()).collect();
+    let rules: Vec<&str> = changes.iter().map(|c| c.rule_id.as_str()).collect();
+    Ok(sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "WITH sz AS (
+             SELECT r.rule_id, (t.rule_id IS NOT NULL) AS touched,
+                    octet_length(r.rule_id) + octet_length(r.finding_details)
+                      + octet_length(r.comments) AS n
+             FROM checklist_set_rules r
+             LEFT JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::text[]) AS u(stig_id, rule_id)) t
+               ON t.stig_id = r.stig_id AND t.rule_id = r.rule_id
+             WHERE r.set_id = $1
+         )
+         SELECT COUNT(*), COALESCE(SUM(n), 0)::bigint,
+                COUNT(*) FILTER (WHERE touched),
+                COALESCE(SUM(n) FILTER (WHERE touched), 0)::bigint
+         FROM sz",
+    )
+    .bind(id)
+    .bind(&stigs)
+    .bind(&rules)
+    .fetch_one(tx)
+    .await?)
 }
 
 /// Autosave: replace each sent rule's state exactly, in one transaction,
@@ -399,9 +502,10 @@ pub async fn write_rules(
     base_revision: i64,
     changes: &[RuleChange],
     budget: SetBudget,
-    save_id: Option<&str>,
+    save: Option<Token<'_>>,
 ) -> Result<WriteOutcome> {
     let mut tx = pool.begin().await?;
+    bound(&mut tx).await?;
     let bumped: Option<(i64, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
         "WITH old AS (
              SELECT last_edit_event_at FROM checklist_sets
@@ -411,6 +515,7 @@ pub async fn write_rules(
              revision = c.revision + 1,
              updated_at = NOW(),
              last_save_id = $4,
+             last_save_body_sha256 = $5,
              last_edit_event_at = CASE
                  WHEN old.last_edit_event_at IS NULL OR old.last_edit_event_at < NOW() - INTERVAL '{EDIT_EVENT_WINDOW}'
                  THEN NOW() ELSE old.last_edit_event_at END
@@ -422,13 +527,14 @@ pub async fn write_rules(
     .bind(id)
     .bind(owner_id)
     .bind(base_revision)
-    .bind(save_id)
+    .bind(save.map(|t| t.id))
+    .bind(save.map(|t| t.body_sha256))
     .fetch_optional(&mut *tx)
     .await?;
     let Some((revision, updated_at, edit_event_due)) = bumped else {
         drop(tx);
         return Ok(match get_set(pool, owner_id, id).await? {
-            Some(s) if is_replay(&s, base_revision, save_id) => WriteOutcome::Replayed {
+            Some(s) if is_replay(&s, base_revision, save.as_ref()) => WriteOutcome::Replayed {
                 revision: s.revision,
                 updated_at: s.updated_at,
             },
@@ -450,30 +556,15 @@ pub async fn write_rules(
     // Totals for the whole set and for the rows this request touches, taken
     // before the writes (one scan): the set's size afterwards follows by
     // arithmetic, and a save that only shrinks or rewrites an over-budget set
-    // is told apart from one that grows it.
-    let (total_rows, total_bytes, old_rows, old_bytes) = {
-        let stigs: Vec<&str> = changes.iter().map(|c| c.stig_id.as_str()).collect();
-        let rules: Vec<&str> = changes.iter().map(|c| c.rule_id.as_str()).collect();
-        sqlx::query_as::<_, (i64, i64, i64, i64)>(
-            "WITH sz AS (
-                 SELECT r.rule_id, (t.rule_id IS NOT NULL) AS touched,
-                        octet_length(r.rule_id) + octet_length(r.finding_details)
-                          + octet_length(r.comments) AS n
-                 FROM checklist_set_rules r
-                 LEFT JOIN (SELECT DISTINCT * FROM UNNEST($2::text[], $3::text[]) AS u(stig_id, rule_id)) t
-                   ON t.stig_id = r.stig_id AND t.rule_id = r.rule_id
-                 WHERE r.set_id = $1
-             )
-             SELECT COUNT(*), COALESCE(SUM(n), 0)::bigint,
-                    COUNT(*) FILTER (WHERE touched),
-                    COALESCE(SUM(n) FILTER (WHERE touched), 0)::bigint
-             FROM sz",
-        )
-        .bind(id)
-        .bind(&stigs)
-        .bind(&rules)
-        .fetch_one(&mut *tx)
-        .await?
+    // is told apart from one that grows it. They must be read before the
+    // DELETE: the touched rows include the ones about to be deleted, and
+    // reading afterwards would refuse "delete 2, add 1" on an over-budget
+    // set. A save with nothing to write has no growth to check, so it skips
+    // the scan.
+    let sizes = if up.is_empty() {
+        None
+    } else {
+        Some(totals(&mut tx, id, changes).await?)
     };
     if !del.is_empty() {
         let stigs: Vec<&str> = del.iter().map(|c| c.stig_id.as_str()).collect();
@@ -533,6 +624,7 @@ pub async fn write_rules(
         }
         // A set already over budget (the limit was lowered) stays usable: only
         // a save that grows it in that dimension is refused.
+        let (total_rows, total_bytes, old_rows, old_bytes) = sizes.unwrap_or_default();
         let new_rows = up.len() as i64;
         let new_bytes: i64 = up
             .iter()
@@ -563,4 +655,22 @@ pub async fn catalog_entry(pool: &PgPool, stig_id: &str) -> Result<Option<(Strin
             .fetch_optional(pool)
             .await?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_statement_bound_cuts_a_slow_statement_and_is_recognised(pool: PgPool) {
+        let mut tx = pool.begin().await.unwrap();
+        bound_ms(&mut tx, 100).await.unwrap();
+        let err = sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert!(is_timeout(&anyhow::Error::from(err)));
+        assert!(!is_timeout(&anyhow::anyhow!("something else")));
+    }
 }

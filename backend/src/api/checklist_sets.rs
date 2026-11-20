@@ -9,16 +9,19 @@
 //! enforced at save-to-system by [`save_to_asset`].
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
@@ -33,7 +36,7 @@ use crate::db_audit::{self, NewAuditEvent};
 use crate::db_checklist_sets::{
     self as db, AddStig, CreateOutcome, RuleChange, SetBudget, WriteOutcome,
 };
-use crate::detached;
+use crate::detached::{self, Limits, Origin, Shield, Stopped};
 use crate::AppState;
 
 const MAX_SETS_PER_USER: i64 = 50;
@@ -45,6 +48,21 @@ const MAX_SET_ROWS: i64 = 10_000;
 /// already over this (the limit was lowered) stays readable, deletable and
 /// editable as long as a save does not grow it.
 const MAX_SET_BYTES: i64 = 4 * 1024 * 1024;
+
+/// Server deadlines. The client gives up at 15 s (writes) and 60 s (save to
+/// system), so the server answers first and the client's retry with the same
+/// token resolves as a replay or a plain retry. Postgres cuts a stalled write
+/// at 8 s (`db_checklist_sets::STATEMENT_TIMEOUT_MS`), inside the deadline.
+const SET_LIMITS: Limits = Limits {
+    deadline: Duration::from_secs(10),
+    write_grace: Duration::from_secs(10),
+};
+const SAVE_TO_SYSTEM_LIMITS: Limits = Limits {
+    deadline: Duration::from_secs(45),
+    write_grace: Duration::from_secs(10),
+};
+/// Bound on the plain GET routes (not spawned).
+const READ_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Handler error: a bare status, or a prepared JSON response.
 pub struct ApiError(Box<Response>);
@@ -63,9 +81,55 @@ impl From<StatusCode> for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+/// 503 with `Retry-After: 1` and a plain-text body, like admission's.
+fn deadline_exceeded() -> ApiError {
+    ApiError(Box::new(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+            "server deadline exceeded",
+        )
+            .into_response(),
+    ))
+}
+
+impl From<Stopped> for ApiError {
+    fn from(s: Stopped) -> Self {
+        match s {
+            Stopped::Panicked => StatusCode::INTERNAL_SERVER_ERROR.into(),
+            Stopped::Deadline => deadline_exceeded(),
+        }
+    }
+}
+
 fn map_db(e: anyhow::Error) -> ApiError {
+    if db::is_timeout(&e) {
+        tracing::warn!("checklist set DB statement timed out: {e:#}");
+        return deadline_exceeded();
+    }
     tracing::error!("checklist set DB error: {e:#}");
     StatusCode::INTERNAL_SERVER_ERROR.into()
+}
+
+/// Bound a read handler's work to `limit`.
+async fn within<T>(limit: Duration, fut: impl Future<Output = ApiResult<T>>) -> ApiResult<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!("checklist set read exceeded its deadline");
+            Err(deadline_exceeded())
+        }
+    }
+}
+
+fn request_conflict() -> ApiError {
+    ApiError(Box::new(
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "request_id_conflict" })),
+        )
+            .into_response(),
+    ))
 }
 
 fn conflict(revision: i64) -> ApiError {
@@ -146,6 +210,49 @@ fn canonical_token(raw: Option<&str>) -> Result<Option<String>, StatusCode> {
             .map(|u| Some(u.hyphenated().to_string()))
             .map_err(|_| StatusCode::BAD_REQUEST),
     }
+}
+
+/// Log form of a replay token: its first 8 characters.
+fn short(t: &Option<String>) -> String {
+    t.as_deref()
+        .map(|t| t.chars().take(8).collect())
+        .unwrap_or_default()
+}
+
+/// Hex SHA-256 of the canonical JSON of `v`. This binds a retry token to the
+/// request content it was first used with (idempotency); it is not a MAC or
+/// an integrity control, and the tokens are not secrets.
+fn sha256_hex(v: &impl Serialize) -> ApiResult<String> {
+    let bytes = serde_json::to_vec(v).map_err(|e| {
+        tracing::error!("checklist set fingerprint failed: {e}");
+        ApiError::from(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+/// Hash of what a create request asks for, as sent (the token is excluded).
+/// Idempotency binding only.
+fn create_fingerprint(req: &CreateRequest) -> ApiResult<String> {
+    sha256_hex(&("checklist-set.create.v1", &req.name, &req.stig_ids))
+}
+
+/// Hash of what an autosave asks for, as sent and before dedupe (the token
+/// is excluded). Idempotency binding only.
+fn autosave_fingerprint(req: &AutosaveRequest) -> ApiResult<String> {
+    let changes: Vec<(&str, &str, &str, &str, &str)> = req
+        .changes
+        .iter()
+        .map(|c| {
+            (
+                c.stig_id.as_str(),
+                c.rule_id.as_str(),
+                c.status.as_str(),
+                c.finding_details.as_str(),
+                c.comments.as_str(),
+            )
+        })
+        .collect();
+    sha256_hex(&("checklist-set.autosave.v1", req.revision, changes))
 }
 
 /// `Some(None)` is an explicit JSON null; an absent field is `None`.
@@ -335,25 +442,28 @@ pub async fn list_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<ChecklistSetSummary>>> {
-    let rows = db::list_sets(state.pool.as_ref(), &user.id)
-        .await
-        .map_err(map_db)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let asset_name =
-            visible_asset_name(&state, &user, r.asset_id.as_deref(), r.asset_name).await;
-        out.push(ChecklistSetSummary {
-            id: r.id,
-            name: r.name,
-            revision: r.revision,
-            stig_count: r.stig_count,
-            touched_count: r.touched_count,
-            asset_id: r.asset_id,
-            asset_name,
-            updated_at: r.updated_at,
-        });
-    }
-    Ok(Json(out))
+    within(READ_DEADLINE, async {
+        let rows = db::list_sets(state.pool.as_ref(), &user.id)
+            .await
+            .map_err(map_db)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let asset_name =
+                visible_asset_name(&state, &user, r.asset_id.as_deref(), r.asset_name).await;
+            out.push(ChecklistSetSummary {
+                id: r.id,
+                name: r.name,
+                revision: r.revision,
+                stig_count: r.stig_count,
+                touched_count: r.touched_count,
+                asset_id: r.asset_id,
+                asset_name,
+                updated_at: r.updated_at,
+            });
+        }
+        Ok(Json(out))
+    })
+    .await
 }
 
 /// POST /api/checklist-sets
@@ -366,10 +476,17 @@ pub async fn create_handler(
     Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreateRequest>,
 ) -> ApiResult<(StatusCode, Json<ChecklistSetDetail>)> {
+    let origin = Origin {
+        what: "set create",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(&tasks, "set create", create_work(state, user, ctx, req))
-        .await
-        .map_err(ApiError::from)?
+    detached::run_bounded(&tasks, origin, SET_LIMITS, move |shield| {
+        create_work(state, user, ctx, req, shield)
+    })
+    .await
+    .map_err(ApiError::from)?
 }
 
 async fn create_work(
@@ -377,9 +494,18 @@ async fn create_work(
     user: AuthUser,
     ctx: RequestCtx,
     req: CreateRequest,
+    shield: Shield,
 ) -> ApiResult<(StatusCode, Json<ChecklistSetDetail>)> {
     let pool = state.pool.as_ref();
     let create_key = canonical_token(req.client_request_id.as_deref())?;
+    let fingerprint = match create_key {
+        Some(_) => Some(create_fingerprint(&req)?),
+        None => None,
+    };
+    let token = match (create_key.as_deref(), fingerprint.as_deref()) {
+        (Some(id), Some(body_sha256)) => Some(db::Token { id, body_sha256 }),
+        _ => None,
+    };
     let mut seen = HashSet::new();
     let ids: Vec<&String> = req
         .stig_ids
@@ -402,25 +528,23 @@ async fn create_work(
         }
     };
     let id = uuid::Uuid::new_v4().to_string();
-    match db::insert_set(
-        pool,
-        &user.id,
-        &id,
-        &name,
-        &stigs,
-        MAX_SETS_PER_USER,
-        create_key.as_deref(),
-    )
-    .await
-    .map_err(map_db)?
+    let hold = shield.hold();
+    match db::insert_set(pool, &user.id, &id, &name, &stigs, MAX_SETS_PER_USER, token)
+        .await
+        .map_err(map_db)?
     {
         CreateOutcome::Created => {}
         CreateOutcome::Existing(existing) => {
-            tracing::info!(user = %user.id, set = %existing, token = ?create_key, "checklist set create replayed");
+            drop(hold);
+            tracing::info!(user = %user.id, set = %existing, token = %short(&create_key), "checklist set create replayed");
             return Ok((
                 StatusCode::OK,
                 Json(detail_of(&state, &user, &existing).await?),
             ));
+        }
+        CreateOutcome::KeyConflict => {
+            tracing::warn!(user = %user.id, token = %short(&create_key), "checklist set create token reused with different content");
+            return Err(request_conflict());
         }
         CreateOutcome::Limit => {
             return Err(ApiError(Box::new(
@@ -440,6 +564,7 @@ async fn create_work(
         ),
     )
     .await;
+    drop(hold);
     Ok((
         StatusCode::CREATED,
         Json(detail_of(&state, &user, &id).await?),
@@ -452,7 +577,10 @@ pub async fn get_handler(
     Extension(user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
-    Ok(Json(detail_of(&state, &user, &id).await?))
+    within(READ_DEADLINE, async {
+        Ok(Json(detail_of(&state, &user, &id).await?))
+    })
+    .await
 }
 
 /// PATCH /api/checklist-sets/:id — rename, or unlink (`assetId: null`).
@@ -467,10 +595,17 @@ pub async fn patch_handler(
     Path(id): Path<String>,
     Json(req): Json<PatchRequest>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
+    let origin = Origin {
+        what: "set patch",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(&tasks, "set patch", patch_work(state, user, ctx, id, req))
-        .await
-        .map_err(ApiError::from)?
+    detached::run_bounded(&tasks, origin, SET_LIMITS, move |shield| {
+        patch_work(state, user, ctx, id, req, shield)
+    })
+    .await
+    .map_err(ApiError::from)?
 }
 
 async fn patch_work(
@@ -479,6 +614,7 @@ async fn patch_work(
     ctx: RequestCtx,
     id: String,
     req: PatchRequest,
+    shield: Shield,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     if matches!(req.asset_id, Some(Some(_))) {
@@ -495,6 +631,7 @@ async fn patch_work(
     {
         return Err(StatusCode::NOT_FOUND.into());
     }
+    let hold = shield.hold();
     if let Some(n) = &name {
         if !db::rename_set(pool, &user.id, &id, n)
             .await
@@ -533,6 +670,7 @@ async fn patch_work(
             db_audit::record_or_log(pool, ev).await;
         }
     }
+    drop(hold);
     Ok(Json(detail_of(&state, &user, &id).await?))
 }
 
@@ -546,10 +684,17 @@ pub async fn delete_handler(
     Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let origin = Origin {
+        what: "set delete",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(&tasks, "set delete", delete_work(state, user, ctx, id))
-        .await
-        .map_err(ApiError::from)?
+    detached::run_bounded(&tasks, origin, SET_LIMITS, move |shield| {
+        delete_work(state, user, ctx, id, shield)
+    })
+    .await
+    .map_err(ApiError::from)?
 }
 
 async fn delete_work(
@@ -557,8 +702,10 @@ async fn delete_work(
     user: AuthUser,
     ctx: RequestCtx,
     id: String,
+    shield: Shield,
 ) -> ApiResult<StatusCode> {
     let pool = state.pool.as_ref();
+    let _hold = shield.hold();
     if !db::delete_set(pool, &user.id, &id).await.map_err(map_db)? {
         return Err(StatusCode::NOT_FOUND.into());
     }
@@ -588,12 +735,15 @@ pub async fn add_stig_handler(
     Path(id): Path<String>,
     Json(req): Json<AddStigRequest>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
+    let origin = Origin {
+        what: "set stig add",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(
-        &tasks,
-        "set stig add",
-        add_stig_work(state, user, ctx, id, req),
-    )
+    detached::run_bounded(&tasks, origin, SET_LIMITS, move |shield| {
+        add_stig_work(state, user, ctx, id, req, shield)
+    })
     .await
     .map_err(ApiError::from)?
 }
@@ -604,6 +754,7 @@ async fn add_stig_work(
     ctx: RequestCtx,
     id: String,
     req: AddStigRequest,
+    shield: Shield,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     if db::get_set(pool, &user.id, &id)
@@ -614,6 +765,7 @@ async fn add_stig_work(
         return Err(StatusCode::NOT_FOUND.into());
     }
     let (version, release) = catalog_stig(&state, &req.stig_id).await?;
+    let hold = shield.hold();
     match db::add_stig(
         pool,
         &user.id,
@@ -644,6 +796,7 @@ async fn add_stig_work(
             .await;
         }
     }
+    drop(hold);
     Ok(Json(detail_of(&state, &user, &id).await?))
 }
 
@@ -657,12 +810,15 @@ pub async fn remove_stig_handler(
     Extension(ctx): Extension<RequestCtx>,
     Path((id, stig_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
+    let origin = Origin {
+        what: "set stig remove",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(
-        &tasks,
-        "set stig remove",
-        remove_stig_work(state, user, ctx, id, stig_id),
-    )
+    detached::run_bounded(&tasks, origin, SET_LIMITS, move |shield| {
+        remove_stig_work(state, user, ctx, id, stig_id, shield)
+    })
     .await
     .map_err(ApiError::from)?
 }
@@ -673,8 +829,10 @@ async fn remove_stig_work(
     ctx: RequestCtx,
     id: String,
     stig_id: String,
+    shield: Shield,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
+    let hold = shield.hold();
     let removed = db::remove_stig(pool, &user.id, &id, &stig_id)
         .await
         .map_err(map_db)?
@@ -694,6 +852,7 @@ async fn remove_stig_work(
         )
         .await;
     }
+    drop(hold);
     Ok(Json(detail_of(&state, &user, &id).await?))
 }
 
@@ -710,14 +869,29 @@ pub async fn autosave_handler(
         max_rows: MAX_SET_ROWS,
         max_bytes: MAX_SET_BYTES,
     };
-    // Spawned so a client disconnect cannot land between the commit and the
-    // audit event (a retry is acknowledged without a second event).
+    autosave_run(state, user, ctx, id, req, budget, SET_LIMITS).await
+}
+
+/// Spawned so a client disconnect cannot land between the commit and the
+/// audit event (a retry is acknowledged without a second event).
+async fn autosave_run(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    id: String,
+    req: AutosaveRequest,
+    budget: SetBudget,
+    limits: Limits,
+) -> ApiResult<Json<AutosaveResponse>> {
+    let origin = Origin {
+        what: "set autosave",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(
-        &tasks,
-        "set autosave",
-        autosave_with_budget(state, user, ctx, id, req, budget),
-    )
+    detached::run_bounded(&tasks, origin, limits, move |shield| {
+        autosave_with_budget(state, user, ctx, id, req, budget, shield)
+    })
     .await
     .map_err(ApiError::from)?
 }
@@ -730,6 +904,7 @@ async fn autosave_with_budget(
     id: String,
     req: AutosaveRequest,
     budget: SetBudget,
+    shield: Shield,
 ) -> ApiResult<Json<AutosaveResponse>> {
     let pool = state.pool.as_ref();
     if req.changes.len() > MAX_RULES {
@@ -760,13 +935,24 @@ async fn autosave_with_budget(
         }
     }
     let save_id = canonical_token(req.save_id.as_deref())?;
+    let fingerprint = match save_id {
+        Some(_) => Some(autosave_fingerprint(&req)?),
+        None => None,
+    };
+    let token = match (save_id.as_deref(), fingerprint.as_deref()) {
+        (Some(id), Some(body_sha256)) => Some(db::Token { id, body_sha256 }),
+        _ => None,
+    };
     if req.revision != set.revision {
-        if db::is_replay(&set, req.revision, save_id.as_deref()) {
-            tracing::info!(user = %user.id, set = %id, token = ?save_id, "checklist set autosave replayed");
+        if db::is_replay(&set, req.revision, token.as_ref()) {
+            tracing::info!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave replayed");
             return Ok(Json(AutosaveResponse {
                 revision: set.revision,
                 updated_at: set.updated_at,
             }));
+        }
+        if save_id.is_some() && set.last_save_id == save_id && set.revision == req.revision + 1 {
+            tracing::warn!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave token reused with different content");
         }
         return Err(conflict(set.revision));
     }
@@ -801,18 +987,11 @@ async fn autosave_with_budget(
         v.dedup();
         v
     };
-    match db::write_rules(
-        pool,
-        &user.id,
-        &id,
-        req.revision,
-        &changes,
-        budget,
-        save_id.as_deref(),
-    )
-    .await
-    .map_err(map_db)?
-    {
+    let hold = shield.hold();
+    let outcome = db::write_rules(pool, &user.id, &id, req.revision, &changes, budget, token)
+        .await
+        .map_err(map_db)?;
+    match outcome {
         WriteOutcome::Written {
             revision,
             updated_at,
@@ -832,6 +1011,7 @@ async fn autosave_with_budget(
                 )
                 .await;
             }
+            drop(hold);
             Ok(Json(AutosaveResponse {
                 revision,
                 updated_at,
@@ -841,7 +1021,7 @@ async fn autosave_with_budget(
             revision,
             updated_at,
         } => {
-            tracing::info!(user = %user.id, set = %id, token = ?save_id, "checklist set autosave replayed");
+            tracing::info!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave replayed");
             Ok(Json(AutosaveResponse {
                 revision,
                 updated_at,
@@ -873,12 +1053,15 @@ pub async fn save_to_system_handler(
     Path(id): Path<String>,
     Json(req): Json<SaveToSystemRequest>,
 ) -> ApiResult<Json<SetSaveResponse>> {
+    let origin = Origin {
+        what: "set save",
+        user_id: user.id.clone(),
+        request_id: ctx.request_id.clone(),
+    };
     let tasks = state.tasks.clone();
-    detached::run(
-        &tasks,
-        "set save",
-        save_to_system_work(state, user, ctx, id, req),
-    )
+    detached::run_bounded(&tasks, origin, SAVE_TO_SYSTEM_LIMITS, move |shield| {
+        save_to_system_work(state, user, ctx, id, req, shield)
+    })
     .await
     .map_err(ApiError::from)?
 }
@@ -889,12 +1072,15 @@ async fn save_to_system_work(
     ctx: RequestCtx,
     id: String,
     req: SaveToSystemRequest,
+    shield: Shield,
 ) -> ApiResult<Json<SetSaveResponse>> {
     let pool = state.pool.as_ref();
     let set = db::get_set(pool, &user.id, &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    // Every later exit records an event, so hold from here on.
+    let _hold = shield.hold();
     // Early refusals leave a record too; no asset id until it is known to exist.
     let reject = |reason: &'static str| {
         db_audit::record_or_log(
@@ -1451,6 +1637,7 @@ mod tests {
                     save_id: None,
                 },
                 b,
+                Shield::default(),
             )
         };
         let too_large = |e: ApiError| async move {
@@ -1598,7 +1785,7 @@ mod tests {
 
     #[test]
     fn replay_needs_a_matching_id_one_revision_behind() {
-        let at = |revision, last: Option<&str>| db::SetRow {
+        let at = |revision, last: Option<&str>, hash: Option<&str>| db::SetRow {
             id: "s".into(),
             name: "n".into(),
             asset_id: None,
@@ -1607,12 +1794,139 @@ mod tests {
             updated_at: Utc::now(),
             last_attached_at: None,
             last_save_id: last.map(str::to_string),
+            last_save_body_sha256: hash.map(str::to_string),
         };
-        assert!(db::is_replay(&at(1, Some(KEY_A)), 0, Some(KEY_A)));
-        assert!(!db::is_replay(&at(2, Some(KEY_A)), 0, Some(KEY_A)));
-        assert!(!db::is_replay(&at(1, Some(KEY_A)), 0, Some(KEY_B)));
-        assert!(!db::is_replay(&at(1, Some(KEY_A)), 0, None));
-        assert!(!db::is_replay(&at(1, None), 0, Some(KEY_A)));
+        let h1 = "a".repeat(64);
+        let h2 = "b".repeat(64);
+        let tok = |id, h| db::Token { id, body_sha256: h };
+        let stored = Some(h1.as_str());
+        assert!(db::is_replay(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h1))
+        ));
+        assert!(!db::is_replay(
+            &at(2, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h1))
+        ));
+        assert!(!db::is_replay(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_B, &h1))
+        ));
+        assert!(!db::is_replay(&at(1, Some(KEY_A), stored), 0, None));
+        assert!(!db::is_replay(
+            &at(1, None, None),
+            0,
+            Some(&tok(KEY_A, &h1))
+        ));
+        // Same token, different content: not a replay.
+        assert!(!db::is_replay(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h2))
+        ));
+        // A row from before the hash existed matches any content.
+        assert!(db::is_replay(
+            &at(1, Some(KEY_A), None),
+            0,
+            Some(&tok(KEY_A, &h2))
+        ));
+    }
+
+    fn create_req(name: Option<&str>, ids: &[&str]) -> CreateRequest {
+        CreateRequest {
+            name: name.map(str::to_string),
+            stig_ids: ids.iter().map(|s| s.to_string()).collect(),
+            client_request_id: Some(KEY_A.into()),
+        }
+    }
+
+    fn save_req(revision: i64, changes: Vec<SetRuleChange>) -> AutosaveRequest {
+        AutosaveRequest {
+            revision,
+            changes,
+            save_id: Some(KEY_A.into()),
+        }
+    }
+
+    fn cfp(r: &CreateRequest) -> String {
+        create_fingerprint(r).ok().unwrap()
+    }
+
+    fn afp(r: &AutosaveRequest) -> String {
+        autosave_fingerprint(r).ok().unwrap()
+    }
+
+    #[test]
+    fn create_fingerprint_binds_content_but_not_the_token() {
+        let base = create_req(Some("n"), &["A", "B"]);
+        let f = cfp(&base);
+        assert_eq!(f.len(), 64);
+        assert_eq!(f, cfp(&create_req(Some("n"), &["A", "B"])));
+        let mut other_token = create_req(Some("n"), &["A", "B"]);
+        other_token.client_request_id = Some(KEY_B.into());
+        assert_eq!(f, cfp(&other_token));
+        assert_ne!(f, cfp(&create_req(Some("m"), &["A", "B"])));
+        assert_ne!(f, cfp(&create_req(None, &["A", "B"])));
+        assert_ne!(f, cfp(&create_req(Some("n"), &["B", "A"])));
+        assert_ne!(f, cfp(&create_req(Some("n"), &["A"])));
+    }
+
+    #[test]
+    fn autosave_fingerprint_binds_content_but_not_the_token() {
+        let one = || change("S", "r1", "open", "d", "c");
+        let f = afp(&save_req(3, vec![one()]));
+        assert_eq!(f.len(), 64);
+        assert_eq!(f, afp(&save_req(3, vec![one()])));
+        let mut other_token = save_req(3, vec![one()]);
+        other_token.save_id = Some(KEY_B.into());
+        assert_eq!(f, afp(&other_token));
+        assert_ne!(f, afp(&save_req(4, vec![one()])));
+        for tweaked in [
+            change("T", "r1", "open", "d", "c"),
+            change("S", "r2", "open", "d", "c"),
+            change("S", "r1", "not_a_finding", "d", "c"),
+            change("S", "r1", "open", "e", "c"),
+            change("S", "r1", "open", "d", "x"),
+        ] {
+            assert_ne!(f, afp(&save_req(3, vec![tweaked])));
+        }
+        // Order and repeats count: the hash covers the request as sent.
+        let two = || change("S", "r2", "open", "", "");
+        assert_ne!(
+            afp(&save_req(3, vec![one(), two()])),
+            afp(&save_req(3, vec![two(), one()]))
+        );
+        assert_ne!(
+            afp(&save_req(3, vec![one()])),
+            afp(&save_req(3, vec![one(), one()]))
+        );
+    }
+
+    #[test]
+    fn server_deadlines_sit_inside_the_client_ones() {
+        // Client: 15 s for set requests, 60 s for save to system.
+        assert_eq!(SET_LIMITS.deadline, Duration::from_secs(10));
+        assert_eq!(SET_LIMITS.write_grace, Duration::from_secs(10));
+        assert_eq!(SAVE_TO_SYSTEM_LIMITS.deadline, Duration::from_secs(45));
+        assert_eq!(SAVE_TO_SYSTEM_LIMITS.write_grace, Duration::from_secs(10));
+        assert_eq!(READ_DEADLINE, Duration::from_secs(10));
+        assert!(SET_LIMITS.deadline < Duration::from_secs(15));
+        assert!(SAVE_TO_SYSTEM_LIMITS.deadline < Duration::from_secs(60));
+        assert!(READ_DEADLINE < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_server_deadline_answers_503_with_retry_after() {
+        let res = ApiError::from(Stopped::Deadline).into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(
+            ApiError::from(Stopped::Panicked).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -1810,6 +2124,7 @@ mod tests {
                     save_id: None,
                 },
                 b,
+                Shield::default(),
             )
         };
         // Seed under a roomy budget: 3 rows holding about 300 bytes of text.
@@ -2245,6 +2560,7 @@ mod tests {
         .unwrap();
         start_then_abort(&state.tasks, push(&state, "owner", &set.id, 1, Some("a1"))).await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(audit_count(&pool, "checklist_set.save_to_system").await, 1);
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
@@ -2308,6 +2624,7 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
         assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
     }
@@ -2333,6 +2650,7 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(
             count(
                 &pool,
@@ -2375,6 +2693,7 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(
             count(
                 &pool,
@@ -2410,6 +2729,7 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 0);
         assert_eq!(audit_count(&pool, "checklist_set.delete").await, 1);
     }
@@ -2433,6 +2753,7 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
             2
@@ -2458,10 +2779,391 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
+        crate::db_audit::drain().await;
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
             1
         );
         assert_eq!(audit_count(&pool, "checklist_set.stig_remove").await, 1);
+    }
+
+    // ── Deadlines, content-bound tokens, delete-only saves ─────────────────
+
+    const ROOMY: SetBudget = SetBudget {
+        max_rows_per_stig: MAX_RULES as i64,
+        max_rows: MAX_SET_ROWS,
+        max_bytes: MAX_SET_BYTES,
+    };
+
+    async fn body_text(e: ApiError) -> (StatusCode, String) {
+        let res = e.into_response();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_request_past_the_server_deadline_is_a_503_and_leaves_no_trace(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let req = || AutosaveRequest {
+            revision: 0,
+            changes: vec![change(STIG_ID, RULES[0], "open", "", "")],
+            save_id: Some(KEY_A.into()),
+        };
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let limits = Limits {
+            deadline: Duration::from_millis(200),
+            write_grace: Duration::from_secs(30),
+        };
+        let res = autosave_run(
+            state.clone(),
+            auth("owner", "author"),
+            crate::test_fixtures::ctx(),
+            set.id.clone(),
+            req(),
+            ROOMY,
+            limits,
+        )
+        .await;
+        let Err(e) = res else {
+            panic!("expected the deadline to cut the request");
+        };
+        let res = e.into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        lock.rollback().await.unwrap();
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            0
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 0);
+        // The same request, retried with the same token, succeeds.
+        let ok = autosave_run(
+            state.clone(),
+            auth("owner", "author"),
+            crate::test_fixtures::ctx(),
+            set.id.clone(),
+            req(),
+            ROOMY,
+            SET_LIMITS,
+        )
+        .await;
+        assert_eq!(ok.ok().map(|Json(r)| r.revision), Some(1));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_read_past_its_deadline_is_a_503(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let user = auth("owner", "author");
+        let r = within(
+            Duration::from_millis(200),
+            detail_of(&state, &user, &set.id),
+        )
+        .await;
+        assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
+        lock.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_changed_autosave_under_a_used_save_id_is_a_409_and_writes_nothing(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let a = || vec![change(STIG_ID, RULES[0], "open", "d", "c")];
+        let b = || vec![change(STIG_ID, RULES[0], "not_a_finding", "other", "c")];
+        assert_eq!(
+            autosave_keyed(&state, &set.id, 0, KEY_A, a())
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        crate::db_audit::drain().await;
+        assert_eq!(
+            autosave_keyed(&state, &set.id, 0, KEY_A, b()).await,
+            Err(StatusCode::CONFLICT)
+        );
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_set_rules WHERE status = 'open' AND finding_details = 'd'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
+        // The identical request is still a replay.
+        assert_eq!(
+            autosave_keyed(&state, &set.id, 0, KEY_A, a())
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+
+    async fn create_with(
+        state: &AppState,
+        key: &str,
+        name: Option<&str>,
+        ids: &[&str],
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        let req = CreateRequest {
+            name: name.map(str::to_string),
+            stig_ids: ids.iter().map(|s| s.to_string()).collect(),
+            client_request_id: Some(key.into()),
+        };
+        match create_handler(
+            st(state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Json(req),
+        )
+        .await
+        {
+            Ok((c, _)) => Ok(c),
+            Err(e) => Err(body_text(e).await),
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_create_key_reused_with_different_content_is_a_409(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        assert_eq!(
+            create_with(&state, KEY_A, Some("one"), &[STIG_ID]).await,
+            Ok(StatusCode::CREATED)
+        );
+        for (name, ids) in [(Some("one"), vec![STIG2]), (Some("two"), vec![STIG_ID])] {
+            let (c, body) = create_with(&state, KEY_A, name, &ids).await.unwrap_err();
+            assert_eq!(c, StatusCode::CONFLICT);
+            assert!(body.contains("request_id_conflict"), "{body}");
+        }
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
+        assert_eq!(audit_count(&pool, "checklist_set.create").await, 1);
+        assert_eq!(
+            create_with(&state, KEY_A, Some("one"), &[STIG_ID]).await,
+            Ok(StatusCode::OK)
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_stig_removal_clears_the_stored_save_hash(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID, STIG2]).await;
+        autosave_keyed(
+            &state,
+            &set.id,
+            0,
+            KEY_A,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        let stored = "SELECT COUNT(*) FROM checklist_sets WHERE last_save_body_sha256 IS NOT NULL";
+        assert_eq!(count(&pool, stored).await, 1);
+        let rm = Path((set.id.clone(), STIG2.to_string()));
+        assert!(
+            remove_stig_handler(st(&state), Extension(auth("owner", "author")), cx(), rm)
+                .await
+                .is_ok()
+        );
+        assert_eq!(count(&pool, stored).await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn delete_two_add_one_is_accepted_on_an_over_budget_set(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let run = |revision: i64, changes: Vec<SetRuleChange>, b: SetBudget| {
+            autosave_with_budget(
+                state.clone(),
+                auth("owner", "author"),
+                crate::test_fixtures::ctx(),
+                set.id.clone(),
+                AutosaveRequest {
+                    revision,
+                    changes,
+                    save_id: None,
+                },
+                b,
+                Shield::default(),
+            )
+        };
+        let seed = vec![
+            change(STIG_ID, "r0", "open", "x", ""),
+            change(STIG_ID, "r1", "open", "y", ""),
+            change(STIG_ID, "r2", "open", "z", ""),
+        ];
+        assert_eq!(code(run(0, seed, ROOMY).await), None);
+        // One row allowed, three stored: shrinking by one net is fine.
+        let tiny = SetBudget {
+            max_rows: 1,
+            ..ROOMY
+        };
+        let mixed = vec![
+            change(STIG_ID, "r1", "not_reviewed", "", ""),
+            change(STIG_ID, "r2", "not_reviewed", "", ""),
+            change(STIG_ID, "r9", "open", "n", ""),
+        ];
+        assert_eq!(code(run(1, mixed, tiny).await), None);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            2
+        );
+        // A pure add on the still over-budget set is refused.
+        let grow = vec![change(STIG_ID, "r10", "open", "", "")];
+        assert_eq!(
+            code(run(2, grow, tiny).await),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_delete_only_save_of_an_unstored_rule_only_bumps_the_revision(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let r = autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "not_reviewed", "", "")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.revision, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            0
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_lock_timeout_maps_to_a_503(pool: PgPool) {
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('lock_timeout', '100', true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let err = sqlx::query("SELECT id FROM checklist_sets")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        let err = anyhow::Error::from(err);
+        assert!(db::is_timeout(&err));
+        assert_eq!(
+            map_db(err).into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        lock.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_tokened_autosave_with_no_changes_replays(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        for _ in 0..2 {
+            assert_eq!(
+                autosave_keyed(&state, &set.id, 0, KEY_A, vec![])
+                    .await
+                    .unwrap()
+                    .revision,
+                1
+            );
+        }
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_tokened_create_with_no_stigs_is_refused_every_time(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        for _ in 0..2 {
+            let (c, _) = create_with(&state, KEY_A, None, &[]).await.unwrap_err();
+            assert_eq!(c, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 0);
+        // The refused token was never stored, so a real create may use it.
+        assert_eq!(
+            create_with(&state, KEY_A, None, &[STIG_ID]).await,
+            Ok(StatusCode::CREATED)
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_blocked_writer_is_cut_by_the_lock_timeout_and_commits_nothing(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        // SHARE blocks writers but not the reads that come first.
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN SHARE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        // The deadline is generous so Postgres' own 8 s lock_timeout fires first.
+        let limits = Limits {
+            deadline: Duration::from_secs(30),
+            write_grace: Duration::from_secs(5),
+        };
+        let res = autosave_run(
+            state.clone(),
+            auth("owner", "author"),
+            crate::test_fixtures::ctx(),
+            set.id.clone(),
+            AutosaveRequest {
+                revision: 0,
+                changes: vec![change(STIG_ID, RULES[0], "open", "", "")],
+                save_id: None,
+            },
+            ROOMY,
+            limits,
+        )
+        .await;
+        let Err(e) = res else {
+            panic!("expected the lock timeout to cut the write");
+        };
+        let res = e.into_response();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(res.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        lock.rollback().await.unwrap();
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            0
+        );
+        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 0);
     }
 }
