@@ -22,6 +22,7 @@ DECLARE
     mode TEXT := COALESCE(current_setting('stig.audit_maintenance', true), '');
     c_repeat CONSTANT TEXT := 'repeat_count';
     c_last CONSTANT TEXT := 'last_occurred_at';
+    c_denied CONSTANT TEXT := '42501';
     proto TEXT := COALESCE(current_setting('stig.audit_retention_protocol', true), '');
 BEGIN
     IF mode = 'test' AND NOT EXISTS (
@@ -32,7 +33,7 @@ BEGIN
           AND 'stig.audit_allow_test_mode=on' = ANY (s.setconfig)
     ) THEN
         RAISE EXCEPTION 'audit maintenance mode "test" is not enabled for this database (% on %)', TG_OP, TG_TABLE_NAME
-            USING ERRCODE = '42501',
+            USING ERRCODE = c_denied,
                   HINT = 'Test databases only: a superuser runs ALTER DATABASE ... SET stig.audit_allow_test_mode = ''on''.';
     END IF;
     IF TG_OP = 'DELETE' AND mode = 'retention' THEN
@@ -40,7 +41,7 @@ BEGIN
             RETURN OLD;
         END IF;
         RAISE EXCEPTION 'audit retention DELETE on % needs retention protocol 2; this server version is too old to prune audit rows', TG_TABLE_NAME
-            USING ERRCODE = '42501',
+            USING ERRCODE = c_denied,
                   HINT = 'Upgrade this replica; retention sweeps from older versions are refused.';
     ELSIF TG_OP = 'TRUNCATE' AND mode IN ('restore', 'test') THEN
         RETURN NULL;
@@ -64,6 +65,6 @@ BEGIN
         END IF;
     END IF;
     RAISE EXCEPTION '% on % is not permitted outside audit maintenance', TG_OP, TG_TABLE_NAME
-        USING ERRCODE = '42501';
+        USING ERRCODE = c_denied;
 END;
 $$;

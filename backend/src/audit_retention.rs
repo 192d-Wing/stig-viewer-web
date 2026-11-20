@@ -553,11 +553,11 @@ fn write_segment_with(
             hook(WriteStage::SidecarPublished, &name).and_then(|()| {
                 match publish_new(dir, &name, &body)? {
                     Publish::Created => Ok(()),
-                    Publish::Taken => Err(anyhow::Error::new(std::io::Error::new(
+                    Publish::Taken => Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
                         "segment name already taken",
                     ))
-                    .context(format!("segment {name} already exists"))),
+                    .with_context(|| format!("segment {name} already exists")),
                 }
             });
         if published.is_err() {
