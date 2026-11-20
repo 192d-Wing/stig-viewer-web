@@ -117,7 +117,7 @@ export async function setUserRole(userName, role) {
   }
 }
 
-/** Non-secret metadata of the AC-8 acknowledgement rows (no nonce/verifier values). */
+/** Non-secret metadata of the AC-8 acknowledgement rows. Rows carry `idSha256` (a digest of the ack id), never the id, nonce or verifier values. */
 export async function loginAcks() {
   const res = await fetch(`${BACKEND}/api/test/login-acks`);
   if (res.status !== 200) {

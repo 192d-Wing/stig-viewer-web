@@ -1,7 +1,8 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use axum_extra::extract::cookie::{CookieJar, SameSite};
 use serde::Deserialize;
@@ -11,8 +12,9 @@ use crate::api::asset_email_cc::run_asset_email_schedules;
 use crate::api::auth::{
     client_ip, cookie_secure, session_cookie, user_agent, SESSION_COOKIE, SESSION_LIFETIME_HOURS,
 };
+use crate::api::catalog_diff::seed_archive_handler;
 use crate::api::compliance_report;
-use crate::api::dashboard::take_snapshot;
+use crate::api::dashboard::{snapshot_handler, take_snapshot};
 use crate::api::rate_limit;
 use crate::api::saml::saml_login_user;
 use crate::api::webhooks::run_overdue_digest;
@@ -548,7 +550,7 @@ pub async fn inject_scheduler_error_handler(
 }
 
 /// GET /api/test/login-acks — read-only metadata of the AC-8 acknowledgement
-/// rows (ids, timestamps, method, state digest, whether nonce/verifier are
+/// rows (id digests, timestamps, method, state digest, whether nonce/verifier are
 /// set). Deliberately omits the nonce and PKCE verifier values.
 pub async fn login_acks_handler(
     State(state): State<AppState>,
@@ -562,10 +564,113 @@ pub async fn login_acks_handler(
         })
 }
 
+/// Merge the unauthenticated test-only routes into `app` when `enabled`
+/// (`STIG_ENABLE_TEST_ROUTES=true`); otherwise return `app` unchanged.
+/// `TestHooks::validate` already refused that flag under `STIG_ENV=production`.
+pub fn mount(app: Router, enabled: bool, state: AppState) -> Router {
+    if !enabled {
+        return app;
+    }
+    let test_router: Router = Router::new()
+        .route("/api/test/reset", post(reset_handler))
+        .route("/api/test/set-role", post(set_role_handler))
+        .route("/api/test/snapshot", post(snapshot_handler))
+        .route("/api/test/backdate-rule", post(backdate_handler))
+        .route(
+            "/api/test/backdate-baseline",
+            post(backdate_baseline_handler),
+        )
+        .route("/api/test/bump-stig", post(bump_stig_handler))
+        .route("/api/test/run-digest", post(run_digest_handler))
+        .route("/api/test/run-report", post(run_report_handler))
+        .route("/api/test/run-retention", post(run_retention_handler))
+        .route(
+            "/api/test/run-asset-email-schedules",
+            post(run_asset_email_schedules_handler),
+        )
+        .route("/api/test/backdate-audit", post(backdate_audit_handler))
+        .route("/api/test/run-scheduler", post(run_scheduler_handler))
+        .route(
+            "/api/test/inject-scheduler-error",
+            post(inject_scheduler_error_handler),
+        )
+        .route("/api/test/saml-login", post(saml_login_handler))
+        .route("/api/test/seed-archive", post(seed_archive_handler))
+        .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
+        .route("/api/test/login-acks", get(login_acks_handler))
+        .with_state(state);
+    app.merge(test_router)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_fixtures::seed_user;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn login_acks_route_is_404_when_test_routes_disabled() {
+        let (state, _dir) = crate::test_fixtures::lazy_state();
+        let app = mount(Router::new(), false, state);
+        for (method, uri) in [("GET", "/api/test/login-acks"), ("POST", "/api/test/reset")] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn login_acks_handler_returns_digests_not_ids(pool: sqlx::PgPool) {
+        use crate::db_notice::{ack_id_digest, consume_ack, insert_ack, LoginBinding};
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let id = "distinct-ack-id-value";
+        insert_ack(&pool, id, "v1", "", "", 300).await.unwrap();
+        let b = LoginBinding::Oidc {
+            state: "distinct-state-value",
+            nonce: "distinct-nonce-value",
+            pkce_verifier: "distinct-verifier-value",
+        };
+        consume_ack(&pool, id, "v1", &b).await.unwrap();
+
+        let app = mount(Router::new(), true, state);
+        let other = Request::builder()
+            .method("POST")
+            .uri("/api/test/reset-ratelimit")
+            .body(Body::empty())
+            .unwrap();
+        let other_resp = app.clone().oneshot(other).await.unwrap();
+        assert_ne!(other_resp.status(), StatusCode::NOT_FOUND);
+        let req = Request::builder()
+            .uri("/api/test/login-acks")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("id").is_none());
+        assert_eq!(rows[0]["idSha256"], ack_id_digest(id));
+        assert_eq!(rows[0]["hasNonce"], true);
+        for v in [
+            id,
+            "distinct-state-value",
+            "distinct-nonce-value",
+            "distinct-verifier-value",
+        ] {
+            assert!(!body.contains(v), "the probe leaked {v}");
+        }
+    }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]

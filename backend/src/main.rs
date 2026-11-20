@@ -98,7 +98,6 @@ use api::{
     catalog::get_catalog,
     catalog_diff::{
         diff_handler as catalog_diff_handler, list_archive_handler as list_catalog_archive_handler,
-        seed_archive_handler as seed_catalog_archive_handler,
     },
     catalog_search::search_handler as catalog_search_handler,
     checklist_save::save_handler as checklist_save_handler,
@@ -124,8 +123,7 @@ use api::{
         list_handler as list_compliance_reports_handler, run_report as run_compliance_report,
     },
     dashboard::{
-        asset_trend_handler, get_handler as get_dashboard_handler,
-        snapshot_handler as snapshot_trigger_handler, take_snapshot,
+        asset_trend_handler, get_handler as get_dashboard_handler, take_snapshot,
         trend_handler as get_dashboard_trend_handler,
     },
     diff::diff_handler,
@@ -170,13 +168,6 @@ use api::{
     },
     stig::get_stig,
     stig_validator::lint_handler as stig_lint_handler,
-    test_support::{
-        backdate_audit_handler, backdate_baseline_handler, backdate_handler, bump_stig_handler,
-        inject_scheduler_error_handler, login_acks_handler, reset_handler, reset_ratelimit_handler,
-        run_asset_email_schedules_handler, run_digest_handler, run_report_handler,
-        run_retention_handler, run_scheduler_handler,
-        saml_login_handler as test_saml_login_handler, set_role_handler,
-    },
     upload::{upload_library, upload_stig, MAX_UPLOAD_BYTES},
     webhooks::{
         create_handler as create_webhook_handler, delete_handler as delete_webhook_handler,
@@ -784,7 +775,7 @@ async fn main() -> Result<()> {
     ))
     .with_state(state.clone());
 
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
@@ -796,40 +787,7 @@ async fn main() -> Result<()> {
         .merge(saml_routes)
         .merge(draft_routes);
 
-    // Unauthenticated test-only routes. Mounted only on explicit opt-in
-    // (`STIG_ENABLE_TEST_ROUTES=true`); `TestHooks::validate` above already
-    // refused that flag under `STIG_ENV=production`.
-    if test_hooks.enable_test_routes {
-        let test_router: Router = Router::new()
-            .route("/api/test/reset", post(reset_handler))
-            .route("/api/test/set-role", post(set_role_handler))
-            .route("/api/test/snapshot", post(snapshot_trigger_handler))
-            .route("/api/test/backdate-rule", post(backdate_handler))
-            .route(
-                "/api/test/backdate-baseline",
-                post(backdate_baseline_handler),
-            )
-            .route("/api/test/bump-stig", post(bump_stig_handler))
-            .route("/api/test/run-digest", post(run_digest_handler))
-            .route("/api/test/run-report", post(run_report_handler))
-            .route("/api/test/run-retention", post(run_retention_handler))
-            .route(
-                "/api/test/run-asset-email-schedules",
-                post(run_asset_email_schedules_handler),
-            )
-            .route("/api/test/backdate-audit", post(backdate_audit_handler))
-            .route("/api/test/run-scheduler", post(run_scheduler_handler))
-            .route(
-                "/api/test/inject-scheduler-error",
-                post(inject_scheduler_error_handler),
-            )
-            .route("/api/test/saml-login", post(test_saml_login_handler))
-            .route("/api/test/seed-archive", post(seed_catalog_archive_handler))
-            .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
-            .route("/api/test/login-acks", get(login_acks_handler))
-            .with_state(state.clone());
-        app = app.merge(test_router);
-    }
+    let app = api::test_support::mount(app, test_hooks.enable_test_routes, state.clone());
 
     let app = app
         .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))

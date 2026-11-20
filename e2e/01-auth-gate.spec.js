@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { test, expect, request as pwRequest } from "@playwright/test";
 import {
   acknowledgeNotice,
@@ -367,16 +368,25 @@ test.describe("AC-8 server-side gate", () => {
     expect(login.status()).toBe(303);
     const state = new URL(login.headers()["location"]).searchParams.get("state");
     expect(state).toBeTruthy();
+    const stateCookie = login
+      .headersArray()
+      .filter((h) => h.name.toLowerCase() === "set-cookie")
+      .map((h) => h.value)
+      .find((v) => v.startsWith("stig_oidc_state="));
+    expect(stateCookie).toBeTruthy();
+    // The cookie value is the ack id; the probe serves only its digest.
+    const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
+    const idDigest = sha256(stateCookie.split(";")[0].slice("stig_oidc_state=".length));
+    const mine = async () => (await loginAcks()).filter((r) => r.idSha256 === idDigest);
 
-    const before = await loginAcks();
+    const before = await mine();
     expect(before).toHaveLength(1);
     expect(before[0].consumedAt).toBeTruthy();
     expect(before[0].method).toBe("oidc");
     expect(before[0].hasNonce).toBe(true);
     expect(before[0].hasPkceVerifier).toBe(true);
     // The state is stored only as its SHA-256 digest.
-    expect(before[0].oidcStateSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(before[0].oidcStateSha256).not.toBe(state);
+    expect(before[0].oidcStateSha256).toBe(sha256(state));
 
     const ctxB = await pwRequest.newContext();
     const res = await ctxB.get(
@@ -387,7 +397,7 @@ test.describe("AC-8 server-side gate", () => {
     const cookies = res.headersArray().filter((h) => h.name.toLowerCase() === "set-cookie");
     expect(cookies.some((h) => h.value.startsWith("stig_session="))).toBe(false);
 
-    expect(await loginAcks()).toEqual(before);
+    expect(await mine()).toEqual(before);
     await ctxA.dispose();
     await ctxB.dispose();
   });
