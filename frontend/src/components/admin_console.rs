@@ -373,6 +373,9 @@ struct AuditSearch {
 struct AuditEventRow {
     occurred_at: Option<String>,
     by_name: String,
+    /// Server-computed: the event has no acting user. The UI keys on this,
+    /// never on the `by_name` text.
+    is_system: bool,
     asset_name: Option<String>,
     stig_title: Option<String>,
     action: String,
@@ -1276,9 +1279,51 @@ fn OwnerSection(props: &SectionProps) -> Html {
 #[derive(Clone, PartialEq, Default)]
 struct AuditFilters {
     user_id: String,
+    /// Requests view only: select system-originated events (`actor=system`).
+    actor_system: bool,
     asset_id: String,
     from: String,
     to: String,
+}
+
+/// How the "By" cell of a request event is shown. Decided only from the
+/// server-computed flag, never from the name text.
+#[derive(Debug, PartialEq)]
+enum ActorCell<'a> {
+    System,
+    Name(&'a str),
+}
+
+fn actor_cell(r: &AuditEventRow) -> ActorCell<'_> {
+    if r.is_system {
+        ActorCell::System
+    } else {
+        ActorCell::Name(&r.by_name)
+    }
+}
+
+/// Select sentinel for the "System" actor choice in the audit User filter.
+const AUDIT_ACTOR_SYSTEM: &str = "__actor:system__";
+
+/// Query pairs (unencoded) for the audit endpoints. `actor=system` is sent
+/// only for the requests view, and never together with `userId`.
+fn audit_filter_pairs(f: &AuditFilters, requests: bool) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for (key, value) in [
+        ("userId", &f.user_id),
+        ("assetId", &f.asset_id),
+        ("from", &f.from),
+        ("to", &f.to),
+    ] {
+        if !value.is_empty() {
+            out.push((key, value.clone()));
+        }
+    }
+    if requests && f.actor_system {
+        out.retain(|(k, _)| *k != "userId");
+        out.push(("actor", "system".to_string()));
+    }
+    out
 }
 
 /// Audit log search. Filters are applied on Search-button click
@@ -1321,20 +1366,13 @@ fn AuditSection(props: &SectionProps) -> Html {
             move |(tick, page, filters, view)| {
                 let cancelled = Rc::new(Cell::new(false));
                 if *tick != 0 {
-                    let mut qs = Vec::new();
-                    for (key, value) in [
-                        ("userId", &filters.user_id),
-                        ("assetId", &filters.asset_id),
-                        ("from", &filters.from),
-                        ("to", &filters.to),
-                    ] {
-                        if !value.is_empty() {
-                            qs.push(format!("{key}={}", encode_uri_component(value)));
-                        }
-                    }
+                    let requests = view == "requests";
+                    let mut qs: Vec<String> = audit_filter_pairs(filters, requests)
+                        .into_iter()
+                        .map(|(key, value)| format!("{key}={}", encode_uri_component(&value)))
+                        .collect();
                     qs.push(format!("page={page}"));
                     qs.push(format!("pageSize={AUDIT_PAGE_SIZE}"));
-                    let requests = view == "requests";
                     let endpoint = if requests { "events" } else { "search" };
                     let path = format!("/api/audit/{endpoint}?{}", qs.join("&"));
                     let cancelled = cancelled.clone();
@@ -1381,11 +1419,18 @@ fn AuditSection(props: &SectionProps) -> Html {
         let (user, asset, from, to) = (user.clone(), asset.clone(), from.clone(), to.clone());
         let (submitted, page, search_tick) = (submitted.clone(), page.clone(), search_tick.clone());
         Callback::from(move |_: MouseEvent| {
+            let selected = user
+                .as_ref()
+                .map(|o| o.value.to_string())
+                .unwrap_or_default();
+            let actor_system = selected == AUDIT_ACTOR_SYSTEM;
             submitted.set(AuditFilters {
-                user_id: user
-                    .as_ref()
-                    .map(|o| o.value.to_string())
-                    .unwrap_or_default(),
+                user_id: if actor_system {
+                    String::new()
+                } else {
+                    selected
+                },
+                actor_system,
                 asset_id: asset
                     .as_ref()
                     .map(|o| o.value.to_string())
@@ -1421,7 +1466,13 @@ fn AuditSection(props: &SectionProps) -> Html {
             error.clone(),
             loading.clone(),
         );
+        let user = user.clone();
         Callback::from(move |id: AttrValue| {
+            // The rules endpoint ignores `actor`, so a lingering "System"
+            // selection would silently list everything.
+            if user.as_ref().is_some_and(|o| o.value == AUDIT_ACTOR_SYSTEM) {
+                user.set(None);
+            }
             view.set(id.to_string());
             rows.set(Vec::new());
             event_rows.set(Vec::new());
@@ -1450,6 +1501,12 @@ fn AuditSection(props: &SectionProps) -> Html {
     };
 
     let mut user_options = vec![SelectOption::new("", "Any user")];
+    if *view == "requests" {
+        user_options.push(
+            SelectOption::new(AUDIT_ACTOR_SYSTEM, "System")
+                .description("Automated events with no acting user"),
+        );
+    }
     user_options.extend(console.user_options());
     let mut asset_options = vec![SelectOption::new("", "Any asset")];
     asset_options.extend(console.asset_options());
@@ -1482,11 +1539,10 @@ fn AuditSection(props: &SectionProps) -> Html {
         Column::new("when", "When", |r: &AuditEventRow| {
             html! { {r.occurred_at.as_deref().filter(|s| !s.is_empty()).map(to_locale_string).unwrap_or_else(|| "—".into())} }
         }),
-        Column::new(
-            "by",
-            "By",
-            |r: &AuditEventRow| html! { {r.by_name.clone()} },
-        ),
+        Column::new("by", "By", |r: &AuditEventRow| match actor_cell(r) {
+            ActorCell::System => html! { <Badge testid="audit-actor-system">{"System"}</Badge> },
+            ActorCell::Name(n) => html! { {n.to_string()} },
+        }),
         Column::new(
             "asset",
             "Asset",
@@ -2719,6 +2775,75 @@ mod audit_event_tests {
         // An older backend sends no status.
         let (kind, _) = RestoreResult::default().summary();
         assert_eq!(kind, "warning");
+    }
+
+    #[test]
+    fn is_system_comes_from_the_flag_not_the_name() {
+        let r: AuditEventRow =
+            serde_json::from_value(json!({ "byName": "system", "isSystem": true })).unwrap();
+        assert!(r.is_system);
+        let r: AuditEventRow = serde_json::from_value(json!({ "byName": "system" })).unwrap();
+        assert!(!r.is_system);
+    }
+
+    #[test]
+    fn the_by_cell_keys_on_the_flag_only() {
+        let sys = AuditEventRow {
+            is_system: true,
+            by_name: "system".into(),
+            ..AuditEventRow::default()
+        };
+        assert_eq!(actor_cell(&sys), ActorCell::System);
+        let spoof = AuditEventRow {
+            by_name: "system".into(),
+            ..AuditEventRow::default()
+        };
+        assert_eq!(actor_cell(&spoof), ActorCell::Name("system"));
+    }
+
+    #[test]
+    fn audit_filter_pairs_pass_dates_and_gate_actor() {
+        let f = AuditFilters {
+            from: "2024-01-01".into(),
+            to: "2024-02-01".into(),
+            ..AuditFilters::default()
+        };
+        let p = audit_filter_pairs(&f, true);
+        assert!(p.contains(&("from", "2024-01-01".to_string())));
+        assert!(p.contains(&("to", "2024-02-01".to_string())));
+        assert!(!p.iter().any(|(k, _)| *k == "actor"));
+        let f = AuditFilters {
+            actor_system: true,
+            ..AuditFilters::default()
+        };
+        assert!(!audit_filter_pairs(&f, false)
+            .iter()
+            .any(|(k, _)| *k == "actor"));
+    }
+
+    #[test]
+    fn audit_filter_pairs_send_actor_only_for_requests() {
+        let f = AuditFilters {
+            actor_system: true,
+            asset_id: "a1".into(),
+            ..AuditFilters::default()
+        };
+        let req = audit_filter_pairs(&f, true);
+        assert!(req.contains(&("actor", "system".to_string())));
+        assert!(req.contains(&("assetId", "a1".to_string())));
+        assert!(!req.iter().any(|(k, _)| *k == "userId"));
+        assert!(!audit_filter_pairs(&f, false)
+            .iter()
+            .any(|(k, _)| *k == "actor"));
+        // Even a stray user id is dropped next to actor=system.
+        let f = AuditFilters {
+            user_id: "u1".into(),
+            actor_system: true,
+            ..AuditFilters::default()
+        };
+        assert!(!audit_filter_pairs(&f, true)
+            .iter()
+            .any(|(k, _)| *k == "userId"));
     }
 
     fn event(detail: Value) -> AuditEventRow {

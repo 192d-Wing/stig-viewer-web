@@ -399,6 +399,54 @@ test.describe("Audit log search", () => {
     await expect(page.getByTestId("audit-search-table")).toBeVisible();
   });
 
+  test("API: a user named system is not a system event; actor filter is validated", async ({ request }) => {
+    // The X-User-Id path makes display_name the header value, so this is a
+    // real user (UUID id) who merely displays as "system".
+    await ensureUser(request, "system");
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "system", "spoof-host", []);
+
+    const h = { headers: { "X-User-Id": "alice" } };
+    const all = await request.get(`${BACKEND}/api/audit/events?action=checklist.create`, h);
+    expect(all.status()).toBe(200);
+    const row = (await all.json()).rows[0];
+    expect(row.byName).toBe("system");
+    expect(row.isSystem).toBe(false);
+
+    const sys = await request.get(`${BACKEND}/api/audit/events?actor=system&action=checklist.create`, h);
+    expect(sys.status()).toBe(200);
+    expect((await sys.json()).totalCount).toBe(0);
+    expect((await request.get(`${BACKEND}/api/audit/events?actor=bogus`, h)).status()).toBe(400);
+    expect((await request.get(`${BACKEND}/api/audit/events?actor=system&userId=x`, h)).status()).toBe(400);
+  });
+
+  test("UI: a user named system is plain text, not the System badge; System filter only under Requests", async ({ page, request }) => {
+    await ensureUser(request, "system");
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await seedActivity(request, "system", "spoof-ui-host", []);
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    const userSelect = page.getByTestId("audit-user-select");
+    await userSelect.click();
+    await expect(page.getByRole("option", { name: /^System/ })).toHaveCount(0);
+    await page.keyboard.press("Escape");
+
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    await userSelect.click();
+    await expect(page.getByRole("option", { name: /^System/ })).toHaveCount(1);
+    await page.keyboard.press("Escape");
+
+    await page.getByTestId("audit-search-button").click();
+    const table = page.getByTestId("audit-events-table");
+    const createRow = table.getByRole("row").filter({ hasText: "checklist.create" }).first();
+    await expect(createRow).toContainText("system", { timeout: 10_000 });
+    await expect(page.getByTestId("audit-actor-system")).toHaveCount(0);
+  });
+
   test("API: a search is audited as audit.read with request context, visible under Requests", async ({ request }) => {
     await ensureUser(request, "alice");
     await setUserRole("alice", "admin");
