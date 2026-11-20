@@ -49,8 +49,9 @@
 //! are early warnings of a slow pool; they do not degrade the public status.
 //!
 //! The admin endpoint also reports `admission` (`inFlight`, `refusedUser`,
-//! `refusedGlobal`, `bodyDeadline`): requests refused by the audited-request cap
-//! (`api::admission`). Refusals never touch the public status.
+//! `refusedGlobal`, `refusedBacklog`, `bodyDeadline`, `slowBody`): requests
+//! refused by the audited-request cap or the audit-backlog mark, and bodies
+//! cut off or slow (`api::admission`). Refusals never touch the public status.
 //!
 //! All queries have a 200ms timeout and the handler aims for ~250ms
 //! end-to-end. The endpoint must stay fast — uptime monitors hit it
@@ -62,6 +63,7 @@ use axum::{extract::State, http::StatusCode, Extension, Json};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
+use crate::api::admission::AdmissionStats;
 use crate::api::auth::AuthUser;
 use crate::failure_counters::{FailureSnapshot, ACK_PRUNE, AUDIT_WRITES};
 use crate::AppState;
@@ -197,7 +199,7 @@ fn counters_body(
     audit: &FailureSnapshot,
     audit_queue: (u64, u64, u64),
     prune: &FailureSnapshot,
-    admission: (u32, u64, u64, u64),
+    admission: AdmissionStats,
 ) -> Value {
     json!({
         "audit": {
@@ -214,10 +216,12 @@ fn counters_body(
             "lastSuccessAt": rfc3339(prune.last_success_at),
         },
         "admission": {
-            "inFlight": admission.0,
-            "refusedUser": admission.1,
-            "refusedGlobal": admission.2,
-            "bodyDeadline": admission.3,
+            "inFlight": admission.in_flight,
+            "refusedUser": admission.refused_user,
+            "refusedGlobal": admission.refused_global,
+            "refusedBacklog": admission.refused_backlog,
+            "bodyDeadline": admission.body_deadline,
+            "slowBody": admission.slow_body,
         },
     })
 }
@@ -543,13 +547,30 @@ mod tests {
     #[test]
     fn counters_body_holds_exactly_the_documented_keys() {
         let s = snap(1, 1, Some(D::zero()));
-        let b = counters_body(&s, (3, 2, 4), &s, (5, 6, 7, 8));
+        let adm = AdmissionStats {
+            in_flight: 5,
+            refused_user: 6,
+            refused_global: 7,
+            refused_backlog: 9,
+            body_deadline: 8,
+            slow_body: 10,
+        };
+        let b = counters_body(&s, (3, 2, 4), &s, adm);
         assert_eq!(keys(&b), ["admission", "audit", "loginAckPrune"]);
         assert_eq!(
             keys(&b["admission"]),
-            ["bodyDeadline", "inFlight", "refusedGlobal", "refusedUser"]
+            [
+                "bodyDeadline",
+                "inFlight",
+                "refusedBacklog",
+                "refusedGlobal",
+                "refusedUser",
+                "slowBody"
+            ]
         );
         assert_eq!(b["admission"]["refusedUser"], 6);
+        assert_eq!(b["admission"]["refusedBacklog"], 9);
+        assert_eq!(b["admission"]["slowBody"], 10);
         assert_eq!(
             keys(&b["audit"]),
             [

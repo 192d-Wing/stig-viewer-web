@@ -503,8 +503,31 @@ cd backend && cargo clippy -- -D warnings
   client behind a buffering reverse proxy never reaches the backend until the
   proxy has the whole body, which removes this vector entirely; slow links
   below 64 KiB/s will be cut off.
+  A body that stays just inside those deadlines is also caught: if it spent
+  more than 3 s waiting on the client in one stretch, or if the waits between
+  chunks add up to more than 3 s beyond what the 64 KiB/s floor allows for each
+  chunk (a chunk's credit counts only for the wait before it, never banked
+  across the body), it is counted as `slowBody`, logged per user,
+  and scores one penalty point (a cut-off scores two; 6 points within 60 s block
+  the user for 30 s, so three cut-offs or six slow bodies do). A link averaging near
+  the 64 KiB/s floor can earn such a half-weight strike. A body sent steadily at or
+  above the 64 KiB/s floor is by design never slow and still holds a permit for
+  its whole duration (about 160 s for 10 MiB), so about 7 accounts at about
+  1.8 MB/s in all can hold the 28 non-admin permits; it is indistinguishable
+  from a legitimate slow link and surfaces only through the 60 s body-wait
+  warning. Stalls under 3 s
+  each are not counted as slow; a user whose body-wait reaches 60 s within 60 s
+  is logged, and blocks and audit-backlog changes are logged. The refusal log lines name the users with the most
+  body-wait time (`top_body_wait`).
+  The audit queue is watched too: while 32 or more non-restricted audit writes
+  are pending (the healthy bound), ordinary accounts are refused with 503
+  `server busy` and `Retry-After: 5` until the count falls to 24 or fewer. Admins
+  are refused only at 40 or more, so incident response survives pool contention;
+  the two audited GETs are not spared. Each refusal is counted as
+  `refusedBacklog` and logged as `audit_backlog`. This reduces stacking but does
+  not eliminate it: requests already admitted can still leave writes pending.
   Refusals are counted on `/api/admin/failure-counters` (`admission`) and
-  logged (a global refusal also names the users at their own cap) at most once a minute per reason, not written to the audit table. On SIGTERM or Ctrl-C the
+  logged (a global or backlog refusal also names the users at their own cap) at most once a minute per reason, not written to the audit table. On SIGTERM or Ctrl-C the
   backend waits up to 8 s for open requests and pending writes; keep the
   container stop grace period above that.
 - `source_ip` is the same client IP the login notice uses: the socket peer
