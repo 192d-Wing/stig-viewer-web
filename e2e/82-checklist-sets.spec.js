@@ -249,6 +249,40 @@ test.describe("Checklist sets — API", () => {
     expect((await send(0, saveId)).status()).toBe(409);
   });
 
+  test("a clientRequestId reused with different stigIds is a 409 and creates nothing", async ({ request }) => {
+    const key = "0b9d6f0e-39a4-4d7a-9a0e-5d6a1c2b3e4f";
+    const first = await request.post(SETS, { headers: JSON_HEADERS("alice"), data: { stigIds: ["edge"], clientRequestId: key } });
+    expect(first.status()).toBe(201);
+    const other = await request.post(SETS, {
+      headers: JSON_HEADERS("alice"),
+      data: { stigIds: ["edge", "windows-10"], clientRequestId: key },
+    });
+    expect(other.status()).toBe(409);
+    expect(await other.json()).toEqual({ error: "request_id_conflict" });
+    const list = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    expect(list).toHaveLength(1);
+  });
+
+  test("a saveId reused at the same revision with different changes is a 409 and changes nothing", async ({ request }) => {
+    const set = await createSet(request, "alice");
+    const ids = await edgeRuleIds(request);
+    const saveId = "7c1e2f3a-4b5c-4d6e-8f70-91a2b3c4d5e6";
+    const send = (changes) =>
+      request.patch(`${SETS}/${set.id}/rules`, { headers: JSON_HEADERS("alice"), data: { revision: 0, changes, saveId } });
+    const original = [{ stigId: "edge", ruleId: ids[0], status: "open", findingDetails: "", comments: "" }];
+    expect((await send(original)).status()).toBe(200);
+    const changed = [{ stigId: "edge", ruleId: ids[0], status: "not_a_finding", findingDetails: "x", comments: "" }];
+    const res = await send(changed);
+    expect(res.status()).toBe(409);
+    expect(await res.json()).toEqual({ error: "revision_conflict", revision: 1 });
+    const detail = await getSet(request, "alice", set.id).then((r) => r.json());
+    expect(detail.revision).toBe(1);
+    expect(detail.stigs[0].rules).toHaveLength(1);
+    expect(detail.stigs[0].rules[0].status).toBe("open");
+    // The exact original is still acknowledged.
+    expect((await send(original)).status()).toBe(200);
+  });
+
   test("autosave shares the per-user mutation budget", async ({ request }) => {
     expect((await request.post(`${BACKEND}/api/test/reset-ratelimit`)).status()).toBe(204);
     const set = await createSet(request, "alice");
@@ -520,6 +554,159 @@ test.describe("Checklist sets — UI", () => {
     });
     await page.getByRole("button", { name: "My checklists" }).click();
     await expect(page.getByText(/timed out/i).first()).toBeVisible({ timeout: 25_000 });
+  });
+
+  test("a save in doubt after pagehide is resent unchanged and settles without a conflict", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    // Record every fetch made with keepalive (the pagehide save).
+    await page.addInitScript(() => {
+      window.__keepalives = [];
+      const orig = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        if (init && init.keepalive === true) {
+          window.__keepalives.push({ url: String(input), method: init.method, body: String(init.body) });
+        }
+        return orig(input, init);
+      };
+    });
+    const bodies = [];
+    await page.route("**/api/checklist-sets/*/rules", async (route) => {
+      if (route.request().method() === "PATCH") bodies.push(route.request().postData());
+      await route.continue();
+    });
+    await loginAs(page, "alice");
+    const listbox = await openEdge(page);
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+    const [set] = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+
+    // Edit again and hide the page inside the 3 s debounce window.
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    const keepalives = await page.evaluate(() => window.__keepalives);
+    expect(keepalives).toHaveLength(1);
+    expect(keepalives[0].method).toBe("PATCH");
+    expect(keepalives[0].url).toMatch(/\/api\/checklist-sets\/[^/]+\/rules$/);
+    const sent = JSON.parse(keepalives[0].body);
+    expect(sent.revision).toBe(1);
+    expect(sent.saveId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+
+    // The page lived on: the in-doubt body is resent as it was, and the server
+    // acknowledges it as a replay rather than a conflict.
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 30_000 });
+    await expect(page.getByTestId("set-conflict")).toHaveCount(0);
+    expect(bodies.at(-1)).toBe(keepalives[0].body);
+    await expect
+      .poll(async () => {
+        const d = await getSet(request, "alice", set.id).then((r) => r.json());
+        return `${d.revision}:${d.stigs[0].rules.length}`;
+      })
+      .toBe("2:2");
+  });
+
+  test("a save in doubt that the set has moved past raises the conflict alert", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    await loginAs(page, "alice");
+    const listbox = await openEdge(page);
+    await listbox.getByRole("option").nth(0).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+    const [set] = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+
+    // The next save never reaches the server, and the set moves on meanwhile.
+    let patches = 0;
+    await page.route("**/api/checklist-sets/*/rules", async (route) => {
+      patches += 1;
+      if (patches === 1) {
+        expect((await autosave(request, "alice", set.id, 1, [])).status()).toBe(200);
+        await route.abort();
+        return;
+      }
+      await route.continue();
+    });
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect.poll(() => patches, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+    await expect(page.getByTestId("set-conflict")).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("a create whose answer stalls mid-body is reported as timed out", async ({ page }) => {
+    test.setTimeout(45_000);
+    // Headers arrive, the body never finishes; the client's own timer must fire
+    // and abort it. The fake body follows the request's abort signal.
+    await page.addInitScript(() => {
+      const orig = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const req = input instanceof Request ? input : null;
+        const url = req ? req.url : String(input);
+        const method = ((init && init.method) || (req && req.method) || "GET").toUpperCase();
+        if (window.__stallBody && method === "GET" && /\/api\/checklist-sets$/.test(url)) {
+          const signal = (init && init.signal) || (req && req.signal);
+          const body = new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("["));
+              if (signal) {
+                signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+              }
+            },
+          });
+          return Promise.resolve(new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }));
+        }
+        return orig(input, init);
+      };
+    });
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.evaluate(() => {
+      window.__stallBody = true;
+    });
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await expect(page.getByText(/timed out/i).first()).toBeVisible({ timeout: 25_000 });
+  });
+
+  test("deleting a set that is already gone is not an error", async ({ page, request }) => {
+    await createSet(request, "alice");
+    const [set] = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await expect(page.getByTestId("set-open")).toHaveCount(1);
+    expect((await request.delete(`${SETS}/${set.id}`, { headers: { "X-User-Id": "alice" } })).status()).toBe(204);
+    page.on("dialog", (d) => d.accept());
+    const deleted = page.waitForResponse((r) => r.request().method() === "DELETE" && r.url().includes("/api/checklist-sets/"));
+    await page.getByTestId("set-delete").click();
+    expect((await deleted).status()).toBe(404);
+    await expect(page.getByTestId("set-open")).toHaveCount(0);
+    await expect(page.getByText(/Delete failed/)).toHaveCount(0);
+  });
+
+  test("a request id the server rejects as reused is replaced on the next create", async ({ page }) => {
+    const keys = [];
+    await page.route(new RegExp("/api/checklist-sets$"), async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      keys.push(JSON.parse(route.request().postData() ?? "{}").clientRequestId);
+      return route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "request_id_conflict" }),
+      });
+    });
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await page.getByTestId("new-set-stigs").click();
+    await page.getByRole("option", { name: /edge/i }).first().click();
+    await page.getByRole("heading", { name: "New checklist" }).click();
+    const create = page.getByTestId("new-set-create");
+    await create.click();
+    await expect(page.getByText("Could not create the checklist. Try again.")).toBeVisible();
+    await create.click();
+    await expect.poll(() => keys.length).toBe(2);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBeTruthy();
+    expect(keys[1]).not.toBe(keys[0]);
   });
 
   test("a local file tab is marked as not saved to the account", async ({ page }) => {

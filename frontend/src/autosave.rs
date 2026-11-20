@@ -317,11 +317,22 @@ fn classify(status: u16, retry_after: Option<u32>, text: String) -> Failure {
     }
 }
 
-/// Like `classify`, for creating a set: its only 409 is the per-user set
-/// limit, which no retry or reload can fix.
+/// Whether a failed create must drop its remembered request key: only when
+/// the server says the key was bound to other content.
+fn forget_create_key(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("request_id_conflict")
+}
+
+const CREATE_CONFLICT_MSG: &str =
+    "This checklist could not be created. Reload the page and try again.";
+
+/// Like `classify`, for creating a set: a 409 is either the per-user set
+/// limit or a reused request id (`request_id_conflict`); neither is a
+/// revision conflict and no automatic retry fixes them.
 fn classify_create(status: u16, retry_after: Option<u32>, text: String) -> Failure {
     match status {
-        409 => Failure::Fatal(LIMIT_MSG.into()),
+        409 if text.contains("set_limit") => Failure::Fatal(LIMIT_MSG.into()),
+        409 => Failure::Fatal(CREATE_CONFLICT_MSG.into()),
         _ => classify(status, retry_after, text),
     }
 }
@@ -725,6 +736,10 @@ impl Autosave {
         })?;
         let res = Self::send_json("POST", "/api/checklist-sets", &json).await?;
         if !res.ok() {
+            if forget_create_key(res.status, &res.body) {
+                // The key is bound to other content; a retry needs a fresh one.
+                self.inner.borrow_mut().create_keys.remove(&tab.id);
+            }
             return Err(classify_create(res.status, res.retry_after, res.body));
         }
         let wire = res
@@ -1169,8 +1184,17 @@ mod tests {
     }
 
     #[test]
+    fn only_a_request_id_conflict_drops_the_create_key() {
+        assert!(forget_create_key(409, r#"{"error":"request_id_conflict"}"#));
+        assert!(!forget_create_key(409, r#"{"error":"set_limit"}"#));
+        assert!(!forget_create_key(409, ""));
+        assert!(!forget_create_key(503, "request_id_conflict"));
+        assert!(!forget_create_key(200, ""));
+    }
+
+    #[test]
     fn creating_a_set_treats_409_as_the_limit_not_a_conflict() {
-        let f = classify_create(409, None, String::new());
+        let f = classify_create(409, None, r#"{"error":"set_limit"}"#.into());
         assert_eq!(f, Failure::Fatal(LIMIT_MSG.into()));
         let o = outcome(f, 0);
         assert_eq!(o.status, SaveStatus::Error(LIMIT_MSG.into()));
@@ -1178,6 +1202,18 @@ mod tests {
         assert!(!o.stop);
         // The same status while saving rules stays a conflict.
         assert_eq!(classify(409, None, String::new()), Failure::Conflict);
+        // A reused request id is neither the limit nor a revision conflict.
+        let c = classify_create(409, None, r#"{"error":"request_id_conflict"}"#.into());
+        assert_eq!(c, Failure::Fatal(CREATE_CONFLICT_MSG.into()));
+        assert_eq!(
+            classify_create(409, None, String::new()),
+            Failure::Fatal(CREATE_CONFLICT_MSG.into())
+        );
+        // Other statuses classify as for any save.
+        assert_eq!(
+            classify_create(503, Some(1), String::new()),
+            classify(503, Some(1), String::new())
+        );
     }
 
     #[test]

@@ -65,6 +65,21 @@ fn reusable_key(last: Option<&CreateAttempt>, name: &str, ids: &[String]) -> Opt
     }
 }
 
+/// The message for a failed create, and whether the remembered request key
+/// must be dropped: a key the server bound to other content is never reused.
+fn create_failure(e: &str) -> (String, bool) {
+    if e.contains("set_limit") {
+        (
+            "You have reached the limit of 50 checklists. Delete one first.".into(),
+            false,
+        )
+    } else if e.contains("request_id_conflict") {
+        ("Could not create the checklist. Try again.".into(), true)
+    } else {
+        (format!("Could not create the checklist: {e}"), false)
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct MyChecklistsProps {
     pub show: bool,
@@ -184,11 +199,11 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
                         open_set.emit(set.id);
                     }
                     Err(e) => {
-                        error.set(Some(if e.contains("set_limit") {
-                            "You have reached the limit of 50 checklists. Delete one first.".into()
-                        } else {
-                            format!("Could not create the checklist: {e}")
-                        }));
+                        let (message, reset_key) = create_failure(&e);
+                        if reset_key {
+                            *create_attempt.borrow_mut() = None;
+                        }
+                        error.set(Some(message));
                         busy.set(false);
                     }
                 }
@@ -413,6 +428,21 @@ pub fn MyChecklists(p: &MyChecklistsProps) -> Html {
 
 #[cfg(test)]
 mod tests {
+    use super::create_failure;
+
+    #[test]
+    fn a_request_id_conflict_resets_the_key_and_says_try_again() {
+        let (m, reset) = create_failure(r#"{"error":"request_id_conflict"}"#);
+        assert_eq!(m, "Could not create the checklist. Try again.");
+        assert!(reset);
+        let (m, reset) = create_failure(r#"{"error":"set_limit"}"#);
+        assert!(m.contains("limit of 50"));
+        assert!(!reset);
+        let (m, reset) = create_failure("timed out");
+        assert_eq!(m, "Could not create the checklist: timed out");
+        assert!(!reset);
+    }
+
     use super::*;
 
     #[test]
