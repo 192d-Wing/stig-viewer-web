@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
+import { loginAs, resetDb, setUserRole, mintSystemAuditEvent, BACKEND } from "./helpers.js";
 
 /**
  * Auto-create the test user via the X-User-Id bypass and return the
@@ -524,5 +524,68 @@ test.describe("Audit log search", () => {
     await page.waitForTimeout(500);
     await expect(table).not.toContainText("stale marker");
     await expect(table).toContainText("checklist.create");
+  });
+
+  test("API: actor=system returns a real system event", async ({ request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    // A user-attributed row, so the filter has something to exclude.
+    await seedActivity(request, "alice", "system-event-host", []);
+    await mintSystemAuditEvent();
+
+    const h = { headers: { "X-User-Id": "alice" } };
+    await expect
+      .poll(async () => {
+        const res = await request.get(`${BACKEND}/api/audit/events?actor=system`, h);
+        return res.status() === 200 ? (await res.json()).totalCount : -1;
+      })
+      .toBe(1);
+    const sys = await (await request.get(`${BACKEND}/api/audit/events?actor=system`, h)).json();
+    expect(sys.rows[0]).toMatchObject({
+      isSystem: true,
+      action: "catalog.sync",
+      outcome: "rejected",
+      userRole: "system",
+    });
+    expect(sys.rows[0].detail.reasonCode).toBe("download_too_large");
+
+    const byAction = await (await request.get(`${BACKEND}/api/audit/events?action=catalog.sync`, h)).json();
+    expect(byAction.totalCount).toBe(1);
+    expect(byAction.rows[0].isSystem).toBe(true);
+  });
+
+  test("UI: a system event shows the System badge under Requests", async ({ page, request }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    await mintSystemAuditEvent();
+    // The write is detached: wait for the row before driving the UI.
+    const h = { headers: { "X-User-Id": "alice" } };
+    await expect
+      .poll(async () => {
+        const res = await request.get(`${BACKEND}/api/audit/events?actor=system`, h);
+        return res.status() === 200 ? (await res.json()).totalCount : -1;
+      })
+      .toBe(1);
+
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByTestId("audit-search-table")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Requests" }).click();
+    const userSelect = page.getByTestId("audit-user-select");
+    await userSelect.click();
+    await page.getByRole("option", { name: /^System/ }).click();
+    await expect(userSelect).toContainText("System");
+    await page.getByTestId("audit-search-button").click();
+
+    const table = page.getByTestId("audit-events-table");
+    await expect(table).toContainText("catalog.sync", { timeout: 10_000 });
+    const badge = page.getByTestId("audit-actor-system");
+    await expect(badge).toHaveCount(1);
+    await expect(badge).toBeVisible();
+
+    // Switching to Rule changes drops the System selection (#162).
+    await page.getByTestId("audit-view-switch").getByRole("button", { name: "Rule changes" }).click();
+    await expect(userSelect).toContainText("Any user");
+    await expect(userSelect).not.toContainText("System");
   });
 });

@@ -89,6 +89,26 @@ impl std::fmt::Display for DownloadTooLarge {
 
 impl std::error::Error for DownloadTooLarge {}
 
+/// The audit event for a download stopped by the size cap: no acting user, no
+/// URL. Shared by the DISA path and the test-only `system-audit-event` route
+/// so the route writes the production event shape.
+pub(crate) fn download_too_large_event(
+    stig_id: &str,
+    limit: usize,
+    declared: Option<u64>,
+) -> crate::db_audit::NewSystemEvent<'_> {
+    crate::db_audit::NewSystemEvent {
+        action: "catalog.sync",
+        outcome: "rejected",
+        stig_id: Some(stig_id),
+        detail: serde_json::json!({
+            "reasonCode": "download_too_large",
+            "limitBytes": limit,
+            "declaredBytes": declared,
+        }),
+    }
+}
+
 /// Read a response body, refusing more than `limit` bytes. A declared
 /// `Content-Length` over the limit is refused before any body is read; a
 /// body without one (or lying about it) is cut off as it streams.
@@ -186,16 +206,7 @@ async fn sync_one_with(
                 );
                 crate::db_audit::record_system_or_log(
                     pool,
-                    crate::db_audit::NewSystemEvent {
-                        action: "catalog.sync",
-                        outcome: "rejected",
-                        stig_id: Some(&source.id),
-                        detail: serde_json::json!({
-                            "reasonCode": "download_too_large",
-                            "limitBytes": t.limit,
-                            "declaredBytes": t.declared,
-                        }),
-                    },
+                    download_too_large_event(&source.id, t.limit, t.declared),
                 )
                 .await;
             }

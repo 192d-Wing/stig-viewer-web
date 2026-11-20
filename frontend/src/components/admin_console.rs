@@ -1305,6 +1305,13 @@ fn actor_cell(r: &AuditEventRow) -> ActorCell<'_> {
 /// Select sentinel for the "System" actor choice in the audit User filter.
 const AUDIT_ACTOR_SYSTEM: &str = "__actor:system__";
 
+/// Whether switching to `target_view` must drop a "System" actor selection:
+/// the rule-changes endpoint ignores `actor`, so a lingering "System" would
+/// silently list everything. Requests accepts System, so it is kept there.
+fn view_switch_clears_user(selected: Option<&str>, target_view: &str) -> bool {
+    target_view != "requests" && selected == Some(AUDIT_ACTOR_SYSTEM)
+}
+
 /// Query pairs (unencoded) for the audit endpoints. `actor=system` is sent
 /// only for the requests view, and never together with `userId`.
 fn audit_filter_pairs(f: &AuditFilters, requests: bool) -> Vec<(&'static str, String)> {
@@ -1470,7 +1477,7 @@ fn AuditSection(props: &SectionProps) -> Html {
         Callback::from(move |id: AttrValue| {
             // The rules endpoint ignores `actor`, so a lingering "System"
             // selection would silently list everything.
-            if user.as_ref().is_some_and(|o| o.value == AUDIT_ACTOR_SYSTEM) {
+            if view_switch_clears_user(user.as_ref().map(|o| o.value.as_str()), &id) {
                 user.set(None);
             }
             view.set(id.to_string());
@@ -2752,6 +2759,17 @@ fn BackupSection(props: &SectionProps) -> Html {
 #[cfg(test)]
 mod audit_event_tests {
     use super::*;
+
+    #[test]
+    fn switching_to_rule_changes_clears_the_system_filter() {
+        assert!(view_switch_clears_user(Some(AUDIT_ACTOR_SYSTEM), "rules"));
+        assert!(!view_switch_clears_user(Some("some-user-id"), "rules"));
+        assert!(!view_switch_clears_user(None, "rules"));
+        assert!(!view_switch_clears_user(
+            Some(AUDIT_ACTOR_SYSTEM),
+            "requests"
+        ));
+    }
 
     #[test]
     fn restore_summary_warns_unless_the_signature_was_verified() {

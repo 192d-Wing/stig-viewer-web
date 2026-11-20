@@ -257,7 +257,8 @@ async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> 
 fn warn_enabled_test_hooks(test_hooks: &TestHooks) {
     if test_hooks.enable_test_routes {
         tracing::warn!(
-            "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted. \
+            "STIG_ENABLE_TEST_ROUTES is on: unauthenticated /api/test/* routes are mounted \
+             (they can reset data and write synthetic system audit records). \
              Never enable this on a reachable deployment."
         );
     }
@@ -316,101 +317,16 @@ fn exit_migrate(result: Result<()>) -> ! {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    // `migrate`: run migrations and grants as the owner role, then exit.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        exit_migrate(run_migrate_command().await);
-    }
-
-    // Test-only hooks are opt-in, and a production deployment that has one
-    // enabled refuses to start — before touching the DB or binding a port.
-    let test_hooks = TestHooks::from_env();
-    test_hooks.validate()?;
-    warn_enabled_test_hooks(&test_hooks);
-
-    let config = Arc::new(Config::from_env()?);
-    config::validate_seed_dir(
-        std::env::var("STIG_ENV").ok().as_deref(),
-        config.seed_dir.as_deref(),
-    )?;
-    let sources = Arc::new(load_sources()?);
-
-    info!(
-        "Loaded {} STIG sources, data_dir={}",
-        sources.len(),
-        config.data_dir.display()
-    );
-
-    tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
-
-    let pool = Arc::new(open_database(&config, &test_hooks).await?);
-    let _ = stig_id::warn_non_conforming(&pool).await;
-
-    if let Some(seed_dir) = &config.seed_dir {
-        seed::seed(seed_dir, &config.data_dir.join("stigs"), &pool, &sources).await;
-    }
-    seed::warn_orphaned_ids(&pool, &sources, config.seed_dir.as_deref()).await;
-
-    // ── Signing (optional) ──────────────────────────────────────────────────
-    let signing = api::signing::SigningState::from_env()?;
-    match &signing {
-        Some(s) => info!("Signing enabled (key_id={})", s.key_id),
-        None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
-    }
-
-    // ── OIDC setup ──────────────────────────────────────────────────────────
-    let oidc_env = OidcEnv::from_env(test_hooks.allow_test_auth_header)?;
-    let frontend_origin = oidc_env.frontend_url.clone();
-    let oidc = build_oidc_context(&oidc_env).await?;
-    info!(
-        "OIDC client ready (issuer={}, test_header_auth={})",
-        oidc_env.internal_issuer_url, oidc_env.allow_test_auth_header
-    );
-
-    api::notice::log_proxy_trust_config();
-    let auth_state = AppAuthState {
-        pool: pool.clone(),
-        oidc: oidc.clone(),
-    };
-
-    // CORS — cookie-based auth requires a specific origin (not "*")
-    // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
-    // `x-user-id` is only an allowed request header when the test-auth
-    // bypass is on.
-    let mut cors_headers = vec![header::CONTENT_TYPE, header::COOKIE];
-    if test_hooks.allow_test_auth_header {
-        cors_headers.push(header::HeaderName::from_static("x-user-id"));
-    }
-    let cors = CorsLayer::new()
-        .allow_origin(frontend_origin.parse::<HeaderValue>()?)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-        ])
-        .allow_headers(cors_headers)
-        .allow_credentials(true);
-
-    let state = AppState {
-        pool: pool.clone(),
-        config: config.clone(),
-        signing: signing.clone(),
-        tasks: detached::Tracker::new(),
-        admission: api::admission::Admission::new(),
-    };
-
+/// Assemble the full application router: public routes, auth, SAML, the protected
+/// stack, then the test-only routes (only when `test_hooks.enable_test_routes`), the
+/// body limit and CORS. The layer order is load-bearing; see `router_tests`.
+fn build_app(
+    state: AppState,
+    auth_state: AppAuthState,
+    saml_state: AppSamlState,
+    cors: CorsLayer,
+    test_hooks: &TestHooks,
+) -> Router {
     // Auth flow routes — public, do not require an existing session.
     let auth_routes: Router = Router::new()
         .route("/auth/login", get(login_handler))
@@ -426,17 +342,6 @@ async fn main() -> Result<()> {
     // SSO URL is configured the login route returns 503 with a helpful
     // message but /metadata still works (useful when handing the SP
     // metadata to an IdP admin to register us).
-    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin)?);
-    info!(
-        "SAML SP ready (configured={}, sp_entity_id={}, acs_url={})",
-        saml_config.is_configured(),
-        saml_config.sp_entity_id,
-        saml_config.sp_acs_url,
-    );
-    let saml_state = AppSamlState {
-        pool: pool.clone(),
-        config: saml_config.clone(),
-    };
     let saml_routes: Router = Router::new()
         .route("/auth/saml/login", get(saml_login_handler))
         .route(
@@ -789,9 +694,117 @@ async fn main() -> Result<()> {
 
     let app = api::test_support::mount(app, test_hooks.enable_test_routes, state.clone());
 
-    let app = app
-        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
-        .layer(cors);
+    app.layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
+        .layer(cors)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // `migrate`: run migrations and grants as the owner role, then exit.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
+        exit_migrate(run_migrate_command().await);
+    }
+
+    // Test-only hooks are opt-in, and a production deployment that has one
+    // enabled refuses to start — before touching the DB or binding a port.
+    let test_hooks = TestHooks::from_env();
+    test_hooks.validate()?;
+    warn_enabled_test_hooks(&test_hooks);
+
+    let config = Arc::new(Config::from_env()?);
+    config::validate_seed_dir(
+        std::env::var("STIG_ENV").ok().as_deref(),
+        config.seed_dir.as_deref(),
+    )?;
+    let sources = Arc::new(load_sources()?);
+
+    info!(
+        "Loaded {} STIG sources, data_dir={}",
+        sources.len(),
+        config.data_dir.display()
+    );
+
+    tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
+
+    let pool = Arc::new(open_database(&config, &test_hooks).await?);
+    let _ = stig_id::warn_non_conforming(&pool).await;
+
+    if let Some(seed_dir) = &config.seed_dir {
+        seed::seed(seed_dir, &config.data_dir.join("stigs"), &pool, &sources).await;
+    }
+    seed::warn_orphaned_ids(&pool, &sources, config.seed_dir.as_deref()).await;
+
+    // ── Signing (optional) ──────────────────────────────────────────────────
+    let signing = api::signing::SigningState::from_env()?;
+    match &signing {
+        Some(s) => info!("Signing enabled (key_id={})", s.key_id),
+        None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
+    }
+
+    // ── OIDC setup ──────────────────────────────────────────────────────────
+    let oidc_env = OidcEnv::from_env(test_hooks.allow_test_auth_header)?;
+    let frontend_origin = oidc_env.frontend_url.clone();
+    let oidc = build_oidc_context(&oidc_env).await?;
+    info!(
+        "OIDC client ready (issuer={}, test_header_auth={})",
+        oidc_env.internal_issuer_url, oidc_env.allow_test_auth_header
+    );
+
+    api::notice::log_proxy_trust_config();
+    let auth_state = AppAuthState {
+        pool: pool.clone(),
+        oidc: oidc.clone(),
+    };
+
+    // CORS — cookie-based auth requires a specific origin (not "*")
+    // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
+    // `x-user-id` is only an allowed request header when the test-auth
+    // bypass is on.
+    let mut cors_headers = vec![header::CONTENT_TYPE, header::COOKIE];
+    if test_hooks.allow_test_auth_header {
+        cors_headers.push(header::HeaderName::from_static("x-user-id"));
+    }
+    let cors = CorsLayer::new()
+        .allow_origin(frontend_origin.parse::<HeaderValue>()?)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers(cors_headers)
+        .allow_credentials(true);
+
+    let state = AppState {
+        pool: pool.clone(),
+        config: config.clone(),
+        signing: signing.clone(),
+        tasks: detached::Tracker::new(),
+        admission: api::admission::Admission::new(),
+    };
+
+    let saml_config = Arc::new(SamlConfig::from_env(&frontend_origin)?);
+    info!(
+        "SAML SP ready (configured={}, sp_entity_id={}, acs_url={})",
+        saml_config.is_configured(),
+        saml_config.sp_entity_id,
+        saml_config.sp_acs_url,
+    );
+    let saml_state = AppSamlState {
+        pool: pool.clone(),
+        config: saml_config.clone(),
+    };
+    let app = build_app(state.clone(), auth_state, saml_state, cors, &test_hooks);
 
     {
         let cfg = config.clone();
@@ -1083,4 +1096,89 @@ async fn shutdown_signal() {
         () = term => {},
     }
     info!("Shutting down…");
+}
+
+#[cfg(test)]
+mod router_tests {
+    //! Drives the assembled router from `build_app`, so the test-route gate is
+    //! proven on the real layer stack and not only on `test_support::mount`.
+    //! A `DELETE` (no route uses it) answers 405 on a mounted path and 404 on
+    //! an unmounted one without running a handler, so no database is needed.
+    use super::*;
+    use axum::{body::Body, http::Request, http::StatusCode};
+    use tower::ServiceExt;
+
+    fn app(hooks: &TestHooks) -> (Router, test_fixtures::StigDir) {
+        let (state, dir) = test_fixtures::lazy_state();
+        let auth = test_fixtures::auth_state(&state);
+        let saml = test_fixtures::saml_state(&state);
+        (build_app(state, auth, saml, CorsLayer::new(), hooks), dir)
+    }
+
+    async fn status(app: &Router, method: &str, uri: &str, body: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                Body::from(b.to_string())
+            }
+            None => Body::empty(),
+        };
+        app.clone()
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_routes_are_404_when_the_flag_is_off() {
+        // The auth-header flag is on to show it is not what gates the routes.
+        let hooks = TestHooks {
+            production: false,
+            enable_test_routes: false,
+            allow_test_auth_header: true,
+        };
+        let (app, _dir) = app(&hooks);
+        for path in api::test_support::ROUTE_PATHS {
+            for method in ["POST", "GET", "DELETE"] {
+                assert_eq!(
+                    status(&app, method, path, None).await,
+                    StatusCode::NOT_FOUND,
+                    "{method} {path}"
+                );
+            }
+        }
+        assert_ne!(
+            status(&app, "GET", "/api/health", None).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routes_are_served_when_the_flag_is_on() {
+        let hooks = TestHooks {
+            production: false,
+            enable_test_routes: true,
+            allow_test_auth_header: false,
+        };
+        let (app, _dir) = app(&hooks);
+        for path in api::test_support::ROUTE_PATHS {
+            assert_eq!(
+                status(&app, "DELETE", path, None).await,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "DELETE {path}"
+            );
+        }
+        assert_eq!(
+            status(
+                &app,
+                "POST",
+                "/api/test/inject-scheduler-error",
+                Some(r#"{"name":"nope"}"#)
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

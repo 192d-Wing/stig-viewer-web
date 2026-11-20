@@ -564,6 +564,45 @@ pub async fn login_acks_handler(
         })
 }
 
+/// POST /api/test/system-audit-event — write one fixed system audit event
+/// (the DISA download-cap shape, `stig_id = "e2e-system-event"`) through the
+/// production writer, so specs can see a real NULL-user `system` row.
+/// Takes no body and no query: the event is not caller-influenced. Only
+/// registered through [`mount`]; the row is removed by `/api/test/reset`. The
+/// writer is detached, so this returns 204 before the row is necessarily visible.
+pub async fn system_audit_event_handler(State(state): State<AppState>) -> StatusCode {
+    crate::db_audit::record_system_or_log(
+        state.pool.as_ref(),
+        crate::sync::disa::download_too_large_event("e2e-system-event", 1024, Some(2048)),
+    )
+    .await;
+    StatusCode::NO_CONTENT
+}
+
+/// Every path [`mount`] registers. Keep in step with `mount`: the router tests
+/// use it to prove each one is absent when the flag is off and present when on.
+#[cfg(test)]
+pub(crate) const ROUTE_PATHS: &[&str] = &[
+    "/api/test/reset",
+    "/api/test/set-role",
+    "/api/test/snapshot",
+    "/api/test/backdate-rule",
+    "/api/test/backdate-baseline",
+    "/api/test/bump-stig",
+    "/api/test/run-digest",
+    "/api/test/run-report",
+    "/api/test/run-retention",
+    "/api/test/run-asset-email-schedules",
+    "/api/test/backdate-audit",
+    "/api/test/run-scheduler",
+    "/api/test/inject-scheduler-error",
+    "/api/test/saml-login",
+    "/api/test/seed-archive",
+    "/api/test/reset-ratelimit",
+    "/api/test/login-acks",
+    "/api/test/system-audit-event",
+];
+
 /// Merge the unauthenticated test-only routes into `app` when `enabled`
 /// (`STIG_ENABLE_TEST_ROUTES=true`); otherwise return `app` unchanged.
 /// `TestHooks::validate` already refused that flag under `STIG_ENV=production`.
@@ -598,6 +637,10 @@ pub fn mount(app: Router, enabled: bool, state: AppState) -> Router {
         .route("/api/test/seed-archive", post(seed_archive_handler))
         .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
         .route("/api/test/login-acks", get(login_acks_handler))
+        .route(
+            "/api/test/system-audit-event",
+            post(system_audit_event_handler),
+        )
         .with_state(state);
     app.merge(test_router)
 }
@@ -613,15 +656,36 @@ mod tests {
     async fn login_acks_route_is_404_when_test_routes_disabled() {
         let (state, _dir) = crate::test_fixtures::lazy_state();
         let app = mount(Router::new(), false, state);
-        for (method, uri) in [("GET", "/api/test/login-acks"), ("POST", "/api/test/reset")] {
-            let req = Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        for uri in ROUTE_PATHS {
+            for method in ["GET", "POST", "DELETE"] {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(*uri)
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+            }
         }
+    }
+
+    /// `ROUTE_PATHS` must list exactly the paths `mount` registers: read the
+    /// path literals out of `mount`'s own source.
+    #[test]
+    fn route_paths_match_the_routes_mount_registers() {
+        let src = include_str!("test_support.rs");
+        let start = src.find("pub fn mount(").unwrap();
+        let end = src.find("#[cfg(test)]\nmod tests").unwrap();
+        let mut found: Vec<&str> = src[start..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| s.starts_with("/api/test/"))
+            .collect();
+        found.sort_unstable();
+        let mut listed = ROUTE_PATHS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(found, listed);
     }
 
     #[sqlx::test]
@@ -637,6 +701,13 @@ mod tests {
             pkce_verifier: "distinct-verifier-value",
         };
         consume_ack(&pool, id, "v1", &b).await.unwrap();
+        let saml_id = "distinct-saml-ack-id";
+        let saml_req = "distinct-saml-request-id";
+        insert_ack(&pool, saml_id, "v1", "", "", 300).await.unwrap();
+        let sb = LoginBinding::Saml {
+            request_id: saml_req,
+        };
+        consume_ack(&pool, saml_id, "v1", &sb).await.unwrap();
 
         let app = mount(Router::new(), true, state);
         let other = Request::builder()
@@ -658,12 +729,26 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
         let rows = rows.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].get("id").is_none());
-        assert_eq!(rows[0]["idSha256"], ack_id_digest(id));
-        assert_eq!(rows[0]["hasNonce"], true);
+        assert_eq!(rows.len(), 2);
+        let oidc = rows
+            .iter()
+            .find(|r| r["idSha256"] == ack_id_digest(id))
+            .unwrap();
+        assert!(oidc.get("id").is_none());
+        assert_eq!(oidc["hasNonce"], true);
+        let saml = rows
+            .iter()
+            .find(|r| r["idSha256"] == ack_id_digest(saml_id))
+            .unwrap();
+        assert_eq!(
+            saml["samlRequestIdSha256"],
+            crate::db_notice::state_digest(saml_req)
+        );
+        assert!(saml.get("samlRequestId").is_none());
         for v in [
             id,
+            saml_id,
+            saml_req,
             "distinct-state-value",
             "distinct-nonce-value",
             "distinct-verifier-value",
@@ -680,6 +765,8 @@ mod tests {
         sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO audit_events (user_id, user_role, action, outcome) VALUES (NULL,'system','catalog.sync','rejected')")
             .execute(&pool).await.unwrap();
         backdate_audit(&pool, "r1", 60).await.unwrap();
         let old: i64 = sqlx::query_scalar(
@@ -717,5 +804,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(old, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn system_audit_event_route_writes_a_system_row(pool: sqlx::PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let app = mount(Router::new(), true, state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/test/system-audit-event")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"action":"x"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        crate::db_audit::drain().await;
+        type Row = (Option<String>, String, String, String, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT user_id, user_role, action, outcome, detail->>'reasonCode' FROM audit_events",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                None,
+                "system".to_string(),
+                "catalog.sync".to_string(),
+                "rejected".to_string(),
+                Some("download_too_large".to_string())
+            )]
+        );
     }
 }

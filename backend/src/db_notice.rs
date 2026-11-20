@@ -246,7 +246,9 @@ pub struct AckProbe {
     pub oidc_state_sha256: Option<String>,
     pub has_nonce: bool,
     pub has_pkce_verifier: bool,
-    pub saml_request_id: Option<String>,
+    /// Lowercase hex SHA-256 of the SAML request id (the `InResponseTo` value
+    /// the IdP echoes), digested like `id_sha256`; the raw id is never returned.
+    pub saml_request_id_sha256: Option<String>,
 }
 
 /// All acknowledgement rows ordered by id digest, without the secret values.
@@ -254,7 +256,8 @@ pub async fn list_ack_probes(pool: &PgPool) -> Result<Vec<AckProbe>> {
     Ok(sqlx::query_as::<_, AckProbe>(
         "SELECT encode(sha256(convert_to(id, 'UTF8')), 'hex') AS id_sha256, consumed_at, expires_at, method, oidc_state_sha256, \
                 oidc_nonce IS NOT NULL AS has_nonce, \
-                oidc_pkce_verifier IS NOT NULL AS has_pkce_verifier, saml_request_id \
+                oidc_pkce_verifier IS NOT NULL AS has_pkce_verifier, \
+                encode(sha256(convert_to(saml_request_id, 'UTF8')), 'hex') AS saml_request_id_sha256 \
            FROM login_notice_acks ORDER BY 1",
     )
     .fetch_all(pool)

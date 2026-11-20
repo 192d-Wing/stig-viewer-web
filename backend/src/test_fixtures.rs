@@ -353,3 +353,63 @@ pub fn lazy_state() -> (AppState, StigDir) {
     };
     (state, StigDir(dir))
 }
+
+/// An `AppAuthState` over `state`'s pool with an offline OIDC client (no
+/// discovery, empty key set, test-auth header off), for router-level tests
+/// that never reach the identity provider.
+pub fn auth_state(state: &AppState) -> crate::api::auth::AppAuthState {
+    use openidconnect::core::{
+        CoreClient, CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreResponseType, CoreSubjectIdentifierType,
+    };
+    use openidconnect::{
+        AuthUrl, ClientId, ClientSecret, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
+    };
+    const ISS: &str = "https://idp.test/realms/x";
+    let meta = CoreProviderMetadata::new(
+        IssuerUrl::new(ISS.into()).expect("issuer"),
+        AuthUrl::new("https://idp.test/auth".into()).expect("auth url"),
+        JsonWebKeySetUrl::new("https://idp.test/jwks".into()).expect("jwks url"),
+        vec![ResponseTypes::new(vec![CoreResponseType::Code])],
+        vec![CoreSubjectIdentifierType::Public],
+        vec![CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256],
+        Default::default(),
+    );
+    let client_id = ClientId::new("cid".into());
+    let client_secret = ClientSecret::new("secret".into());
+    let client =
+        CoreClient::from_provider_metadata(meta, client_id.clone(), Some(client_secret.clone()));
+    crate::api::auth::AppAuthState {
+        pool: state.pool.clone(),
+        oidc: crate::api::auth::OidcContext {
+            client: Arc::new(client),
+            http: reqwest::Client::new(),
+            public_auth_base: "https://idp.test".into(),
+            internal_issuer: ISS.into(),
+            public_issuer: ISS.into(),
+            jwks: CoreJsonWebKeySet::new(vec![]),
+            client_id,
+            client_secret,
+            frontend_url: "http://localhost:5173".into(),
+            allow_test_auth_header: false,
+        },
+    }
+}
+
+/// An unconfigured `AppSamlState` over `state`'s pool.
+pub fn saml_state(state: &AppState) -> crate::api::saml::AppSamlState {
+    crate::api::saml::AppSamlState {
+        pool: state.pool.clone(),
+        config: Arc::new(crate::api::saml::SamlConfig {
+            idp_sso_url: String::new(),
+            idp_entity_id: String::new(),
+            sp_entity_id: "sp".into(),
+            sp_acs_url: "http://localhost:8080/auth/saml/acs".into(),
+            idp_cert_pem: None,
+            frontend_url: "http://localhost:5173".into(),
+            is_production: false,
+            insecure_skip_verify: false,
+            clock_skew_secs: 120,
+        }),
+    }
+}
