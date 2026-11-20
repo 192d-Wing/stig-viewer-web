@@ -451,6 +451,10 @@ cd backend && cargo clippy -- -D warnings
   (also returned in the `X-Request-Id` response header; an inbound
   `X-Request-Id` is ignored) and the source IP. Reading the audit log is itself
   recorded, as `audit.read` (view, bounded filters, page and rows returned).
+  System-originated events have no user; `/api/audit/events` flags them
+  `isSystem` and filters them with `actor=system`. `isSystem` is the
+  authoritative field; `byName` is display-only (a user's display name can be
+  "system").
 - Audit writes fail open: if a row cannot be written, the request still
   completes and the backend logs an error on the `audit` target containing
   `failed to write audit event`, with the user, action, outcome and ids. Alert

@@ -406,12 +406,14 @@ pub async fn search_handler(
 //
 // Request-level events from `audit_events` (bulk status, save to system,
 // checklist creation, including rejected and denied requests). Admin-only,
-// like `/api/audit/search`; all filters optional.
+// like `/api/audit/search`; all filters optional. `actor=system` selects
+// system-originated rows (`user_id IS NULL`); it cannot be combined with `userId`.
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEventsQuery {
     pub user_id: Option<String>,
+    pub actor: Option<String>,
     pub asset_id: Option<String>,
     pub checklist_id: Option<String>,
     pub action: Option<String>,
@@ -427,6 +429,7 @@ struct AuditEventDbRow {
     id: i64,
     occurred_at: DateTime<Utc>,
     by_name: String,
+    is_system: bool,
     asset_name: Option<String>,
     stig_title: Option<String>,
     action: String,
@@ -446,6 +449,8 @@ pub struct AuditEventRow {
     pub id: i64,
     pub occurred_at: DateTime<Utc>,
     pub by_name: String,
+    /// True when the event has no acting user (`user_id IS NULL`).
+    pub is_system: bool,
     pub asset_name: Option<String>,
     pub stig_title: Option<String>,
     pub action: String,
@@ -467,12 +472,29 @@ pub struct AuditEventsResponse {
     pub rows: Vec<AuditEventRow>,
 }
 
+/// Validate the `actor` filter: only `system` is accepted, and not together
+/// with `userId` (the result would be silently empty).
+fn system_actor_filter(p: &AuditEventsQuery) -> Result<bool, StatusCode> {
+    match p.actor.as_deref() {
+        None | Some("") => Ok(false),
+        Some("system") => {
+            if p.user_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                Err(StatusCode::BAD_REQUEST)
+            } else {
+                Ok(true)
+            }
+        }
+        Some(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
 /// Push the optional filters as a WHERE clause (all values bound).
 fn push_event_filters<'a>(
     qb: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
     p: &'a AuditEventsQuery,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
+    system_only: bool,
 ) {
     let mut sep = " WHERE ";
     let texts: [(&str, &'a Option<String>); 5] = [
@@ -487,6 +509,10 @@ fn push_event_filters<'a>(
             qb.push(sep).push(col).push(" = ").push_bind(v);
             sep = " AND ";
         }
+    }
+    if system_only {
+        qb.push(sep).push("e.user_id IS NULL");
+        sep = " AND ";
     }
     if let Some(ts) = from {
         qb.push(sep).push("e.occurred_at >= ").push_bind(ts);
@@ -519,9 +545,10 @@ pub async fn events_handler(
         Some(s) if !s.is_empty() => Some(parse_date_param(s, true)?),
         _ => None,
     };
+    let system_only = system_actor_filter(&params)?;
 
     let mut count_qb = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM audit_events e");
-    push_event_filters(&mut count_qb, &params, from_ts, to_ts);
+    push_event_filters(&mut count_qb, &params, from_ts, to_ts, system_only);
     let total_count: i64 = count_qb
         .build_query_scalar()
         .fetch_one(state.pool.as_ref())
@@ -531,9 +558,12 @@ pub async fn events_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // `by_name` is display-only (a user's display name can be "system");
+    // `is_system` is authoritative.
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT e.id, e.occurred_at, \
                 COALESCE(u.display_name, e.user_id, 'system') AS by_name, \
+                (e.user_id IS NULL) AS is_system, \
                 ast.name AS asset_name, \
                 COALESCE(sc.title, e.stig_id) AS stig_title, \
                 e.action, e.outcome, e.detail::text AS detail, \
@@ -544,7 +574,7 @@ pub async fn events_handler(
            LEFT JOIN assets ast ON ast.id = e.asset_id \
            LEFT JOIN stigs_catalog sc ON sc.id = e.stig_id",
     );
-    push_event_filters(&mut qb, &params, from_ts, to_ts);
+    push_event_filters(&mut qb, &params, from_ts, to_ts, system_only);
     qb.push(" ORDER BY e.occurred_at DESC, e.id DESC LIMIT ")
         .push_bind(page_size)
         .push(" OFFSET ")
@@ -564,6 +594,7 @@ pub async fn events_handler(
             id: r.id,
             occurred_at: r.occurred_at,
             by_name: r.by_name,
+            is_system: r.is_system,
             asset_name: r.asset_name,
             stig_title: r.stig_title,
             action: r.action,
@@ -585,6 +616,7 @@ pub async fn events_handler(
             view: "events",
             filters: &[
                 ("userId", &params.user_id),
+                ("actor", &params.actor),
                 ("assetId", &params.asset_id),
                 ("checklistId", &params.checklist_id),
                 ("action", &params.action),
@@ -616,6 +648,7 @@ mod events_tests {
     fn query(action: Option<&str>) -> AuditEventsQuery {
         AuditEventsQuery {
             user_id: None,
+            actor: None,
             asset_id: None,
             checklist_id: None,
             action: action.map(str::to_string),
@@ -703,7 +736,130 @@ mod events_tests {
         let Json(all) = call(&state, "admin", query(None)).await.unwrap();
         assert_eq!(all.total_count, 1);
         assert_eq!(all.rows[0].by_name, "system");
+        assert!(all.rows[0].is_system);
         assert_eq!(all.rows[0].action, "catalog.sync");
+    }
+
+    #[test]
+    fn system_actor_filter_validates_actor_and_user_id() {
+        let mk = |actor: Option<&str>, uid: Option<&str>| {
+            let mut q = query(None);
+            q.actor = actor.map(str::to_string);
+            q.user_id = uid.map(str::to_string);
+            system_actor_filter(&q)
+        };
+        assert_eq!(mk(None, None), Ok(false));
+        assert_eq!(mk(Some(""), None), Ok(false));
+        assert_eq!(mk(Some(""), Some("u1")), Ok(false));
+        assert_eq!(mk(Some("system"), None), Ok(true));
+        assert_eq!(mk(Some("system"), Some("")), Ok(true));
+        assert_eq!(mk(Some("system"), Some("u1")), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(mk(Some("bogus"), None), Err(StatusCode::BAD_REQUEST));
+    }
+
+    async fn insert_event(pool: &PgPool, user: Option<&str>, role: &str, action: &str) {
+        sqlx::query(
+            "INSERT INTO audit_events (user_id, user_role, action, outcome, detail) \
+             VALUES ($1, $2, $3, 'ok', '{}')",
+        )
+        .bind(user)
+        .bind(role)
+        .bind(action)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn actor_system_filter_returns_only_null_user_rows(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        insert_event(&pool, None, "system", "catalog.sync").await;
+        insert_event(&pool, Some("u1"), "author", "catalog.sync").await;
+        let (state, _dir) = app_state(pool.clone());
+
+        let Json(all) = call(&state, "admin", query(Some("catalog.sync")))
+            .await
+            .unwrap();
+        assert_eq!(all.total_count, 2);
+
+        let mut q = query(Some("catalog.sync"));
+        q.actor = Some("system".into());
+        let Json(sys) = call(&state, "admin", q).await.unwrap();
+        assert_eq!(sys.total_count, 1);
+        assert_eq!(sys.rows.len(), 1);
+        assert!(sys.rows[0].is_system);
+
+        let mut q = query(Some("catalog.sync"));
+        q.user_id = Some("u1".into());
+        let Json(user_rows) = call(&state, "admin", q).await.unwrap();
+        assert_eq!(user_rows.total_count, 1);
+        assert!(!user_rows.rows[0].is_system);
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail::text FROM audit_events WHERE action = 'audit.read' \
+             AND detail->'filters'->>'actor' = 'system'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let d: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(d["filters"]["actor"], "system");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_user_named_or_identified_as_system_is_not_system(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        seed_user(&pool, "system").await;
+        insert_event(&pool, Some("system"), "system", "catalog.sync").await;
+        insert_event(&pool, None, "system", "catalog.sync").await;
+        let (state, _dir) = app_state(pool.clone());
+
+        let Json(all) = call(&state, "admin", query(Some("catalog.sync")))
+            .await
+            .unwrap();
+        assert_eq!(all.total_count, 2);
+        let named: Vec<_> = all.rows.iter().filter(|r| !r.is_system).collect();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].by_name, "system");
+
+        let mut q = query(Some("catalog.sync"));
+        q.actor = Some("system".into());
+        let Json(sys) = call(&state, "admin", q).await.unwrap();
+        assert_eq!(sys.total_count, 1);
+        assert!(sys.rows[0].is_system);
+
+        let mut q = query(Some("catalog.sync"));
+        q.user_id = Some("system".into());
+        let Json(by_id) = call(&state, "admin", q).await.unwrap();
+        assert_eq!(by_id.total_count, 1);
+        assert!(!by_id.rows[0].is_system);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_bad_actor_filter_is_400_and_writes_no_audit_read(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let mut q = query(None);
+        q.actor = Some("bogus".into());
+        assert_eq!(
+            call(&state, "admin", q).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        let mut q = query(None);
+        q.actor = Some("system".into());
+        q.user_id = Some("u1".into());
+        assert_eq!(
+            call(&state, "admin", q).await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     fn search_query() -> AuditSearchQuery {
