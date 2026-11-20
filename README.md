@@ -375,6 +375,12 @@ DATABASE_URL=postgres://stig_app@db/stig DATABASE_MIGRATION_URL=postgres://stig_
   stig-viewer-backend migrate
 ```
 
+`migrate` exits 0 on success, 75 (EX_TEMPFAIL) for a retryable failure (the
+database is unreachable or the application role does not exist yet) and 1 for
+anything else (checksum mismatch, planted objects, bad credentials, missing
+URL), so a supervisor can retry only the former. Concurrent `migrate` runs are
+serialised by a database advisory lock.
+
 Without `DATABASE_MIGRATION_URL` the server behaves as before when its role
 owns the schema (migrates itself; this single-role mode is for development
 only, and production refuses it), and otherwise only verifies that all
@@ -417,7 +423,10 @@ then set `DATABASE_MIGRATION_URL` to `stig_owner` and run `migrate`.
 The dev and CI compose stack does this: a one-shot `db-roles` service creates
 `stig_app` (dev password only), the backend connects as `stig_app` and migrates
 as `stig`. With `STIG_ENABLE_TEST_ROUTES` the owner role sets the audit test
-flag, so it must be a superuser or hold the parameter grant.
+flag, so it must be a superuser or hold the parameter grant. The backend
+container runs the owner step once per start: after `migrate` succeeds, the
+first server run is started without `DATABASE_MIGRATION_URL` (verify only);
+later `cargo watch` restarts keep it so new migrations apply.
 
 ### Frontend-only development
 

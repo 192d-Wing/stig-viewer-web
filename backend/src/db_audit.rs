@@ -96,6 +96,10 @@ pub(crate) async fn set_maintenance(
 /// Per-database; never reuse this value for another lock.
 pub(crate) const RETENTION_SWEEP_LOCK: i64 = 0x7374_6967_7265_746E;
 
+/// Advisory-lock key serializing the owner step of `migrate` (ASCII "stigownr").
+/// Session-level, per-database; never reuse this value for another lock.
+pub(crate) const OWNER_STEP_LOCK: i64 = 0x7374_6967_6F77_6E72;
+
 /// How long a sweep waits for the lock before failing (and retrying on the
 /// next scheduler tick).
 pub(crate) const RETENTION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -165,19 +169,35 @@ pub(crate) async fn test_maintenance_allowed(pool: &PgPool) -> Result<bool> {
 
 /// Flag the current database for audit `test` maintenance mode. Idempotent.
 /// Needs a superuser or `GRANT SET ON PARAMETER stig.audit_allow_test_mode`.
+///
+/// Concurrent callers race on the same `pg_db_role_setting` row: the loser's
+/// `ALTER DATABASE` fails ("tuple concurrently updated", or a unique violation
+/// when the first-ever set races) even though the flag ends up set. Both are
+/// raised only after the winner committed, so on failure the flag is checked
+/// again and, if present, the call succeeds. The error text is never matched;
+/// without the flag the original error (e.g. 42501) stands. The owner step
+/// also takes [`OWNER_STEP_LOCK`], so this covers callers outside that lock.
 pub(crate) async fn allow_test_maintenance(pool: &PgPool) -> Result<()> {
     use anyhow::Context;
     if test_maintenance_allowed(pool).await? {
         return Ok(());
     }
-    sqlx::query(
+    let set = sqlx::query(
         "DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET stig.audit_allow_test_mode = %L', \
          current_database(), 'on'); END $$",
     )
     .execute(pool)
-    .await
-    .context("enabling audit test mode needs a superuser or GRANT SET ON PARAMETER stig.audit_allow_test_mode (PostgreSQL 15+; older versions: superuser only)")?;
-    Ok(())
+    .await;
+    match set {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if test_maintenance_allowed(pool).await.unwrap_or(false) {
+                tracing::debug!("audit test mode was set concurrently: {e}");
+                return Ok(());
+            }
+            Err(e).context("enabling audit test mode needs a superuser or GRANT SET ON PARAMETER stig.audit_allow_test_mode (PostgreSQL 15+; older versions: superuser only)")
+        }
+    }
 }
 
 /// Startup rule for the flag: a flagged database with test routes off is
@@ -1064,6 +1084,37 @@ mod tests {
             .execute(pool).await.unwrap();
         sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
             .execute(pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn allow_test_maintenance_survives_concurrent_callers(pool: PgPool) {
+        disallow_audit_test_mode(&pool).await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            set.spawn(async move {
+                barrier.wait().await;
+                allow_test_maintenance(&pool).await
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap().unwrap();
+        }
+        assert!(test_maintenance_allowed(&pool).await.unwrap());
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_catalog.pg_db_role_setting s \
+             JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
+             WHERE d.datname = pg_catalog.current_database() AND s.setrole = 0 \
+               AND 'stig.audit_allow_test_mode=on' = ANY (s.setconfig)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        disallow_audit_test_mode(&pool).await;
     }
 
     #[sqlx::test]

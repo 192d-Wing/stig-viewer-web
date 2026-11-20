@@ -149,18 +149,29 @@ services:
       keycloak:
         condition: service_healthy
     # podman-compose does not wait for db-roles to finish, so retry the owner
-    # step (`migrate`: migrations + grants) until the stig_app role exists.
+    # step (`migrate`: migrations + grants) while it exits 75 (retryable:
+    # database unreachable or stig_app not created yet). Any other exit code is
+    # permanent (checksum mismatch, planted object, bad credentials, compile
+    # error) and stops the container at once instead of retrying 30 times.
+    # `migrate` already ran the owner step, so the FIRST serve blanks
+    # DATABASE_MIGRATION_URL and only verifies; later cargo-watch restarts keep
+    # the URL, so a newly added migration is still applied on reload.
     command:
       - sh
       - -c
       - |
         n=0
-        until cargo run -- migrate; do
+        while true; do
+          cargo run -- migrate
+          rc=$$?
+          if [ "$$rc" -eq 0 ]; then break; fi
+          if [ "$$rc" -ne 75 ]; then echo "migrate failed permanently (exit $$rc)" >&2; exit "$$rc"; fi
           n=$$((n + 1))
           if [ "$$n" -ge 30 ]; then echo "migrate failed 30 times; giving up" >&2; exit 1; fi
           echo "waiting for db-roles / postgres (attempt $$n)"; sleep 2
         done
-        exec cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -x run
+        touch /tmp/owner-step-done
+        exec cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -s 'if [ -e /tmp/owner-step-done ]; then rm -f /tmp/owner-step-done; exec env DATABASE_MIGRATION_URL= cargo run; else exec cargo run; fi'
 
   frontend:
     build:

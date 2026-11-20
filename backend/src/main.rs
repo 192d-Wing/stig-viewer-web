@@ -312,6 +312,19 @@ async fn run_migrate_command() -> Result<()> {
     Ok(())
 }
 
+/// End a `migrate` run. Distinct exit codes let the dev compose loop retry
+/// only transient failures. Same output shape as anyhow's default; no URL is
+/// logged.
+fn exit_migrate(result: Result<()>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(db_roles::migrate_exit_code(&e));
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -325,7 +338,7 @@ async fn main() -> Result<()> {
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        return run_migrate_command().await;
+        exit_migrate(run_migrate_command().await);
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one

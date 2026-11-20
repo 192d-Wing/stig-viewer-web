@@ -27,6 +27,56 @@ pub fn app_role_from_url(database_url: &str) -> Result<String> {
     Ok(opts.get_username().to_string())
 }
 
+/// The application role named in the connection URL does not exist (yet). The
+/// owner step cannot proceed, but this is retryable: the role may be created
+/// by a concurrent bootstrap.
+#[derive(Debug)]
+pub struct AppRoleMissing(pub String);
+
+impl std::fmt::Display for AppRoleMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "application role {:?} does not exist; create it before migrating",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AppRoleMissing {}
+
+/// Exit code of `migrate` for a retryable failure (EX_TEMPFAIL).
+pub const MIGRATE_EXIT_TRANSIENT: i32 = 75;
+
+/// True when retrying the owner step later can succeed: the database is not
+/// reachable yet or the application role is not created yet.
+pub fn is_transient(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if cause.is::<AppRoleMissing>() || cause.is::<OwnerStepLockHeld>() {
+            return true;
+        }
+        match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(d)) => d.code().is_some_and(|c| {
+                matches!(
+                    &*c,
+                    "57P03" | "08000" | "08001" | "08003" | "08004" | "08006"
+                )
+            }),
+            _ => false,
+        }
+    })
+}
+
+/// Process exit code for a failed `migrate`: 75 if transient, else 1.
+pub fn migrate_exit_code(err: &anyhow::Error) -> i32 {
+    if is_transient(err) {
+        MIGRATE_EXIT_TRANSIENT
+    } else {
+        1
+    }
+}
+
 /// Reject an owner step whose owner and application roles are the same.
 fn check_distinct_roles(owner: &str, app: &str) -> Result<()> {
     if owner == app {
@@ -108,7 +158,8 @@ pub async fn migrate_as_owner(
     migrate_with(owner_opts, &app_role, test_routes).await
 }
 
-/// [`migrate_as_owner`] with parsed options (the tests pass their own).
+/// [`migrate_as_owner`] with parsed options (the tests pass their own). The
+/// whole step runs under the [`crate::db_audit::OWNER_STEP_LOCK`] advisory lock.
 async fn migrate_with(
     owner_opts: PgConnectOptions,
     app_role: &str,
@@ -116,7 +167,11 @@ async fn migrate_with(
 ) -> Result<()> {
     check_distinct_roles(owner_opts.get_username(), app_role)?;
     let owner_pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(2)
+        // One connection holds the session-level advisory lock for the whole
+        // step, so never recycle it; `close()` at the end releases it.
+        .idle_timeout(None)
+        .max_lifetime(None)
         // Do not let a role- or database-level search_path setting decide
         // which schema the migrations and grants act on. `pg_catalog` is then
         // searched first implicitly, so nothing in `public` can shadow a
@@ -132,7 +187,18 @@ async fn migrate_with(
         .connect_with(owner_opts)
         .await
         .context("connecting with DATABASE_MIGRATION_URL")?;
+    let mut lock_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
     let result = async {
+        // Serialise the whole owner step across replicas: the grants, the
+        // REVOKE and the test-mode flag all update shared catalog rows and
+        // fail with "tuple concurrently updated" when run concurrently. The
+        // session-level lock lives on a connection held out of the pool for
+        // the whole step (the pool has a second one for the work), so it can
+        // never be swapped for another session.
+        lock_conn = Some(owner_pool.acquire().await?);
+        if let Some(c) = lock_conn.as_mut() {
+            lock_owner_step(c, OWNER_LOCK_WAIT).await?;
+        }
         // Close the schema to the application role and refuse pre-planted
         // objects before anything unqualified runs as the owner.
         let mut conn = owner_pool.acquire().await?;
@@ -148,8 +214,56 @@ async fn migrate_with(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    // Return the lock connection first so `close()` ends the session, which
+    // releases the lock.
+    drop(lock_conn);
     owner_pool.close().await;
     result
+}
+
+/// How long an owner step waits for another one before giving up (retryable).
+const OWNER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Another session holds the owner-step lock. Retryable.
+#[derive(Debug)]
+pub struct OwnerStepLockHeld;
+
+impl std::fmt::Display for OwnerStepLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "owner step lock held by another session")
+    }
+}
+
+impl std::error::Error for OwnerStepLockHeld {}
+
+/// Take the owner-step advisory lock on `conn`, waiting up to `wait`. The
+/// timeout (55P03) becomes [`OwnerStepLockHeld`]. `pg_catalog`-qualified so
+/// nothing planted in `public` can run. `lock_timeout` is session-scoped to
+/// this connection and reset afterwards; the migrations use another one.
+async fn lock_owner_step(conn: &mut PgConnection, wait: std::time::Duration) -> Result<()> {
+    // SET cannot take bind parameters; the value is an integer we format.
+    let ms = wait.as_millis().max(1);
+    sqlx::query(&format!("SET lock_timeout = {ms}"))
+        .execute(&mut *conn)
+        .await?;
+    tracing::info!("waiting for owner step lock");
+    if let Err(e) = sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+        .bind(crate::db_audit::OWNER_STEP_LOCK)
+        .execute(&mut *conn)
+        .await
+    {
+        if e.as_database_error()
+            .and_then(|d| d.code())
+            .is_some_and(|c| c == "55P03")
+        {
+            return Err(OwnerStepLockHeld.into());
+        }
+        return Err(e.into());
+    }
+    sqlx::query("SET lock_timeout = 0")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// A schema as `(raw name, server-quoted identifier)`.
@@ -175,7 +289,7 @@ async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result
             .fetch_one(&mut *conn)
             .await?;
     if !exists {
-        bail!("application role {app_role:?} does not exist; create it before migrating");
+        return Err(AppRoleMissing(app_role.to_string()).into());
     }
 
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
@@ -1208,6 +1322,90 @@ mod tests {
         .unwrap();
         let err = verify_migrations(&app.pool).await.unwrap_err().to_string();
         assert!(err.contains("pending migrations"), "{err}");
+        app.cleanup(&pool).await;
+    }
+
+    #[test]
+    fn transient_errors_exit_75_and_the_rest_exit_1() {
+        let missing = anyhow::Error::new(AppRoleMissing("x".into()));
+        assert!(is_transient(&missing));
+        assert_eq!(migrate_exit_code(&missing), MIGRATE_EXIT_TRANSIENT);
+        let wrapped = missing.context("owner step");
+        assert!(is_transient(&wrapped));
+        let io = anyhow::Error::new(sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )))
+        .context("connecting with DATABASE_MIGRATION_URL");
+        assert_eq!(migrate_exit_code(&io), 75);
+        let timeout = anyhow::Error::new(sqlx::Error::PoolTimedOut);
+        assert_eq!(migrate_exit_code(&timeout), 75);
+        let mismatch = anyhow::Error::new(sqlx::migrate::MigrateError::VersionMismatch(1));
+        assert!(!is_transient(&mismatch));
+        assert_eq!(migrate_exit_code(&mismatch), 1);
+        assert_eq!(migrate_exit_code(&anyhow::anyhow!("boom")), 1);
+        let held = anyhow::Error::new(OwnerStepLockHeld);
+        assert_eq!(migrate_exit_code(&held), 75);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_missing_app_role_is_transient_and_a_planted_object_is_not(pool: PgPool) {
+        let err = migrate_with(
+            (*pool.connect_options()).clone(),
+            "stig_no_such_role_x",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_transient(&err), "{err:#}");
+
+        let app = app_role_pool(&pool, false).await;
+        exec(&pool, "GRANT CREATE ON SCHEMA public TO PUBLIC").await;
+        exec(
+            &app.pool,
+            "CREATE FUNCTION public.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1'",
+        )
+        .await;
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap_err();
+        assert!(!is_transient(&err), "{err:#}");
+        exec(&pool, "DROP FUNCTION public.quote_ident(text)").await;
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_held_owner_lock_times_out_as_a_transient_error(pool: PgPool) {
+        let mut holder = pool.acquire().await.unwrap();
+        lock_owner_step(&mut holder, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut waiter = pool.acquire().await.unwrap();
+        let err = lock_owner_step(&mut waiter, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(err.is::<OwnerStepLockHeld>(), "{err:#}");
+        assert!(is_transient(&err));
+        assert_eq!(migrate_exit_code(&err), 75);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn concurrent_owner_steps_all_succeed(pool: PgPool) {
+        let app = app_role_pool(&pool, true).await;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let opts = (*pool.connect_options()).clone();
+            let name = app.name.clone();
+            set.spawn(async move { migrate_with(opts, &name, true).await });
+        }
+        while let Some(r) = set.join_next().await {
+            r.unwrap().unwrap();
+        }
+        assert!(crate::db_audit::test_maintenance_allowed(&pool)
+            .await
+            .unwrap());
         app.cleanup(&pool).await;
     }
 }
