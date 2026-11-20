@@ -137,6 +137,14 @@ for local work. The ones you may want to change:
   boot sync.) A source URL that answers 404/410 is logged as a warning naming
   the entry and counted as a stale URL in the scheduler summary; update
   `backend/stig-sources.toml` when you see one.
+- `ADMISSION_BODY_MIN_RATE_KIB` (default `64`, 8 to 8192),
+  `ADMISSION_BODY_GRACE_SECS` (default `10`, 1 to 120) and
+  `ADMISSION_BODY_FIRST_BYTE_SECS` (default `5`, 1 to 60) — the request-body
+  deadlines for admitted requests (see "Operations: audit"). An unset or empty
+  value uses the default; a value that is not an integer in range stops the
+  backend at startup. Lowering the rate floor lengthens how long one slow
+  upload can hold a permit (10 MiB at 8 KiB/s takes about 21 minutes), so
+  fewer accounts are needed to hold the 28 non-admin permits.
 - `ALLOW_TEST_AUTH_HEADER` — enables the `X-User-Id` test bypass (any client
   can act as any user). Off unless set to `true`/`1`; the compose file turns it
   on for local dev and the E2E suite.
@@ -490,15 +498,22 @@ cd backend && cargo clippy -- -D warnings
   is (16 slots stay free for login acknowledgements and scheduled-sync events).
   Ordinary accounts can hold at most 28 of the 32 permits; the last 4 are for
   admins (who are still limited to 4 each). `HEAD` on the audit read routes
-  counts like `GET`. The bound is strict only while the database pool is
+  counts like `GET`. A mutation by a `viewer` that the read-only gate will
+  refuse takes no permit: it always gets 403 (with its `authz.denied` record,
+  bounded by the rate limiter and the per-user denied limit), never 429 or 503. The bound is strict only while the database pool is
   healthy: a stalled audit insert can leave a request's late writes pending
   under its permit. A permit is also held while a request body is still being
   received, so bodies are rate-checked once the handler starts reading them:
   the first byte must arrive within 5 s, then the body must average at least
-  64 KiB/s after a 10 s grace (a 500 MiB upload is fine at that rate). A body
-  that falls behind is cut off (400, permit released); the handler's work after
-  the body has arrived is not limited. Each cut-off is counted as `bodyDeadline`
-  on `/api/admin/failure-counters` and logged with the user id; 3 cut-offs
+  64 KiB/s after a 10 s grace (a 500 MiB upload is fine at that rate); these are
+  the defaults of the `ADMISSION_BODY_*` variables. A body that falls behind is
+  cut off (400, permit released); the handler's work after the body has arrived
+  is not limited. Time between a delivered chunk and the handler's next read is
+  the handler's, so it extends the deadline (the exact arithmetic above
+  therefore applies to a handler that reads without pausing). A handler that
+  stops reading while the body is still being waited for is still charged, and
+  an abandoned body at most 3 s. Each cut-off is counted as `bodyDeadline` on
+  `/api/admin/failure-counters` and logged with the user id; 3 cut-offs
   within 60 s make that user's next requests fail with 429 for 30 s. A slow
   client behind a buffering reverse proxy never reaches the backend until the
   proxy has the whole body, which removes this vector entirely; slow links
@@ -519,8 +534,10 @@ cd backend && cargo clippy -- -D warnings
   each are not counted as slow; a user whose body-wait reaches 60 s within 60 s
   is logged, and blocks and audit-backlog changes are logged. The refusal log lines name the users with the most
   body-wait time (`top_body_wait`).
-  The audit queue is watched too: while 32 or more non-restricted audit writes
-  are pending (the healthy bound), ordinary accounts are refused with 503
+  The audit queue is watched too: while 32 or more audit writes that hold an
+  admission permit and are not `denied`/`rejected` are pending (the healthy
+  bound; login acknowledgements and scheduled-sync events hold no permit and
+  are not counted), ordinary accounts are refused with 503
   `server busy` and `Retry-After: 5` until the count falls to 24 or fewer. Admins
   are refused only at 40 or more, so incident response survives pool contention;
   the two audited GETs are not spared. Each refusal is counted as

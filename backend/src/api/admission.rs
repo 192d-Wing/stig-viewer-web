@@ -10,8 +10,10 @@
 //! handler mutates anything, so a flood is turned away instead of committing
 //! changes whose audit events would then be shed.
 //!
-//! A third refusal looks at the audit queue: while the non-restricted pending
-//! audit writes (`db_audit::open_pending_gauge`) are at or above
+//! A third refusal looks at the audit queue: while the pending audit writes
+//! that hold an admission permit and are not restricted
+//! (`db_audit::admitted_pending_gauge`; login acknowledgements and system
+//! events hold no permit and are not counted) are at or above
 //! [`AUDIT_BACKLOG_HIGH`] (32, the healthy bound), non-admins get 503 `server
 //! busy` with `Retry-After: 5` (a backlog means writes slower than the 5 s
 //! caller wait, so a 1 s retry is pointless) until the gauge falls to
@@ -31,11 +33,13 @@
 //! The body of an admitted request must keep arriving. Timing starts at the
 //! first read of the body (a handler that does other work first is not
 //! charged for it) and is only consulted while the client is being waited
-//! for: a frame the body can deliver at once is never charged. This depends
-//! on the handler reading without long pauses mid-body: hyper's HTTP/1 body
-//! channel is want-driven, so after a long gap in reading the next poll can
-//! return Pending even though the client sent everything, and a handler that
-//! pauses past the deadline then gets a spurious 400 and a penalty strike. The
+//! for: a frame the body can deliver at once is never charged. Time between
+//! a delivered frame and the next poll is the handler's, not the client's, so
+//! it is added to the deadline (hyper's HTTP/1 body channel is want-driven,
+//! and after a long gap in reading the next poll can return Pending even
+//! though the client sent everything). What remains: a handler that stops
+//! polling while the body is Pending (for example `select!`-ing away) is still
+//! charged, and an abandoned body is charged at most `slow_wait`. The
 //! first byte is due
 //! within `ADMITTED_BODY_FIRST_BYTE` (5 s); after that the body is cut off
 //! once `first_byte_at + ADMITTED_BODY_GRACE (10 s) + bytes_received /
@@ -81,7 +85,11 @@
 //! above).
 //!
 //! Admitted: every non-read method, and the GETs in [`AUDITED_READ_ROUTES`]
-//! (the only GETs that record an event). Other GETs are not admitted:
+//! (the only GETs that record an event). The exception is a mutation that
+//! `viewer_guard` will refuse (a `viewer` outside its allowlist): it takes no
+//! permit, is never counted against a cap or the backlog, and is answered 403
+//! with an `authz.denied` row (bounded by the rate limiter and the per-user
+//! denied sub-cap), never 429 or 503. Other GETs are not admitted:
 //! dashboards fire many parallel reads. An `authz.denied` from a 403 on such
 //! a GET holds no permit; it is bounded by the denied share and the per-user
 //! denied sub-cap in `db_audit`.
@@ -158,9 +166,10 @@ const BODY_WAIT_NOTE_FLOOR: Duration = Duration::from_secs(1);
 /// Penalty points for a body cut-off, and for a slow body.
 pub const CUT_WEIGHT: u32 = 2;
 pub const SLOW_WEIGHT: u32 = 1;
-/// Non-restricted pending audit writes at or above which non-admins are
-/// refused (503). The healthy bound: every one of the `MAX_IN_FLIGHT` permits
-/// holds one write.
+/// Pending permit-holding, non-restricted audit writes at or above which
+/// non-admins are refused (503). The healthy bound: every one of the
+/// `MAX_IN_FLIGHT` permits holds one write. Permit-less writes (login
+/// acknowledgements, system events) are not counted.
 pub const AUDIT_BACKLOG_HIGH: u32 = MAX_IN_FLIGHT;
 /// The refusal for non-admins ends once the gauge is at or below this.
 pub const AUDIT_BACKLOG_LOW: u32 = 24;
@@ -186,6 +195,17 @@ pub struct BodyLimits {
     pub slow_wait: Duration,
     /// Penalty points per slow body (0: count and log only).
     pub slow_weight: u32,
+}
+
+impl From<crate::config::AdmissionBody> for BodyLimits {
+    fn from(c: crate::config::AdmissionBody) -> Self {
+        Self {
+            first_byte: c.first_byte,
+            grace: c.grace,
+            min_rate: c.min_rate,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for BodyLimits {
@@ -432,7 +452,8 @@ pub struct Admission {
     wait_warn: Mutex<UserWarnThrottle>,
     body_cut_offs: AtomicU64,
     slow_bodies: AtomicU64,
-    /// Non-restricted pending audit writes (see `db_audit::WriteQueue`).
+    /// Pending permit-holding, non-restricted audit writes (see
+    /// `db_audit::WriteQueue::admitted_gauge`).
     backlog: &'static AtomicU32,
     cap: u32,
     user_cap: u32,
@@ -460,12 +481,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Admission {
     /// The production admission, wired to the process-wide audit queue.
     pub fn new() -> Arc<Self> {
+        Self::configured(BodyLimits::default())
+    }
+
+    /// The production admission with configured body limits.
+    pub fn configured(body: BodyLimits) -> Arc<Self> {
         Self::build(
             MAX_IN_FLIGHT,
             MAX_USER_IN_FLIGHT,
             ADMIN_RESERVE,
-            BodyLimits::default(),
-            crate::db_audit::open_pending_gauge(),
+            body,
+            crate::db_audit::admitted_pending_gauge(),
         )
     }
 
@@ -805,17 +831,20 @@ impl Admission {
 /// A request body that errors once it falls behind the minimum rate (see the
 /// module docs). The clock starts at the first read, and is only consulted
 /// when the inner body returns Pending (the client is being waited for), so a
-/// frame the inner body can deliver at once is never charged. Handlers must
-/// read without long pauses mid-body: after a long gap hyper's want-driven
-/// HTTP/1 channel can answer Pending even though the client sent everything,
-/// and the body is then cut off (400 and a penalty strike). Streams frames
-/// from the inner body unchanged.
+/// frame the inner body can deliver at once is never charged. The time between
+/// a delivered frame and the next poll is handler time and extends the
+/// deadline (`paused`). A handler that stops polling while the body is Pending
+/// is still charged. Streams frames from the inner body unchanged.
 struct DeadlineBody {
     inner: Body,
     adm: Arc<Admission>,
     user_id: String,
     origin: Option<tokio::time::Instant>,
     first_byte_at: Option<tokio::time::Instant>,
+    /// When the last frame was delivered to the handler, and the handler time
+    /// (gaps between a delivered frame and the next poll) credited so far.
+    last_frame_at: Option<tokio::time::Instant>,
+    paused: Duration,
     received: u64,
     ended: bool,
     failed: bool,
@@ -839,6 +868,8 @@ impl DeadlineBody {
             user_id,
             origin: None,
             first_byte_at: None,
+            last_frame_at: None,
+            paused: Duration::ZERO,
             received: 0,
             ended,
             failed: false,
@@ -885,7 +916,9 @@ impl DeadlineBody {
         match self.first_byte_at {
             None => origin + b.first_byte,
             Some(t) => {
-                t + b.grace + Duration::from_secs_f64(self.received as f64 / b.min_rate as f64)
+                t + b.grace
+                    + self.paused
+                    + Duration::from_secs_f64(self.received as f64 / b.min_rate as f64)
             }
         }
     }
@@ -907,6 +940,9 @@ impl http_body::Body for DeadlineBody {
             return Pin::new(&mut this.inner).poll_frame(cx);
         }
         let now = tokio::time::Instant::now();
+        if let Some(t) = this.last_frame_at.take() {
+            this.paused = this.paused.saturating_add(now.saturating_duration_since(t));
+        }
         let origin = *this.origin.get_or_insert(now);
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(None) => {
@@ -924,6 +960,8 @@ impl http_body::Body for DeadlineBody {
                 if this.inner.is_end_stream() {
                     this.ended = true;
                     this.finish(false);
+                } else {
+                    this.last_frame_at = Some(now);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1018,6 +1056,15 @@ pub async fn admission(
     if !needs_permit(req.method(), path) {
         return next.run(req).await;
     }
+    // A viewer mutation `viewer_guard` will refuse takes no permit: it gets
+    // the 403 and its `authz.denied` row, never a 429 or 503.
+    // Invariant: skipping is safe only because `viewer_guard` answers 403
+    // without reading the body. `rate_limit` is the outermost layer of
+    // `protected_stack`, so denied viewers are still rate-limited, and further
+    // `authz.denied` writes are shed by the per-user restricted sub-cap.
+    if crate::api::viewer_guard::denies(&user.role, req.method(), req.uri().path()) {
+        return next.run(req).await;
+    }
     match adm.try_admit_as(&user.id, user.role == "admin") {
         Ok(permit) => {
             let (parts, body) = req.into_parts();
@@ -1099,53 +1146,21 @@ mod tests {
         assert_eq!(b.try_admit("a").unwrap_err(), Refusal::User);
     }
 
-    enum Send {
-        Nothing,
-        /// One byte every 10 ms (100 B/s).
-        Drip,
-        /// 15 chunks of 5000 bytes, 40 ms apart (125 kB/s), 75000 in all.
-        Steady,
-    }
-
-    /// Open a POST with a Content-Length of 75000, send the body as `how`,
-    /// and read the response status line.
-    async fn raw_status(base: &str, how: Send) -> String {
+    /// Open a POST with a Content-Length of 75000, send no body, and read the
+    /// response status line (real-socket smoke: wide margins only).
+    async fn raw_status_header_only(base: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let addr = base.trim_start_matches("http://");
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
         let head = "POST /api/body HTTP/1.1\r\nHost: x\r\nx-user: slow-body\r\n\
                     Content-Length: 75000\r\n\r\n";
         conn.write_all(head.as_bytes()).await.unwrap();
-        let (mut rd, mut wr) = conn.into_split();
-        // Kept alive until the response is read, so the connection stays open.
-        let writer = tokio::spawn(async move {
-            match how {
-                Send::Nothing => std::future::pending::<()>().await,
-                Send::Drip => {
-                    for _ in 0..75_000 {
-                        if wr.write_all(b"x").await.is_err() {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-                Send::Steady => {
-                    for _ in 0..15 {
-                        if wr.write_all(&[b'x'; 5000]).await.is_err() {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(40)).await;
-                    }
-                    std::future::pending::<()>().await;
-                }
-            }
-        });
+        // `conn` stays open until the response is read.
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(10), rd.read(&mut buf))
+        let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
             .await
             .expect("no response")
             .unwrap();
-        writer.abort();
         String::from_utf8_lossy(&buf[..n])
             .lines()
             .next()
@@ -1170,12 +1185,52 @@ mod tests {
         (serve(app(state, gate.clone())).await, adm, gate)
     }
 
+    /// The `app` router driven in-process (no sockets), so a paused clock is
+    /// sound: nothing waits on kernel I/O.
+    fn paused_app(b: BodyLimits) -> (Router, Arc<Admission>, Arc<Gate>) {
+        let (mut state, _dir) = lazy_state();
+        state.admission = Admission::with_body(b);
+        let adm = state.admission.clone();
+        let (gate, _entered) = Gate::new();
+        (app(state, gate.clone()), adm, gate)
+    }
+
+    /// A request body made of [`Timed`] steps.
+    fn timed_body(steps: &[(u64, Option<usize>)]) -> Body {
+        let steps = steps
+            .iter()
+            .map(|&(ms, n)| {
+                (
+                    Duration::from_millis(ms),
+                    n.map(|n| Bytes::from(vec![b'x'; n])),
+                )
+            })
+            .collect();
+        Body::new(Timed { steps, sleep: None })
+    }
+
+    async fn post_body(router: &Router, path: &str, user: &str, body: Body) -> Response {
+        use tower::ServiceExt;
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("x-user", user)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn a_header_only_post_is_cut_off_at_the_first_byte_deadline_and_attributed() {
+    async fn a_header_only_post_over_a_real_socket_is_cut_off_and_attributed() {
         // A huge grace shows it is the first-byte deadline that fires.
         let (base, adm, _gate) = body_app(limits(400, 600_000, 1000)).await;
         let started = std::time::Instant::now();
-        assert!(raw_status(&base, Send::Nothing).await.contains(" 400"));
+        assert!(raw_status_header_only(&base).await.contains(" 400"));
         assert!(started.elapsed() < Duration::from_secs(5));
         adm.idle().await;
         assert_eq!(adm.in_flight(), 0);
@@ -1184,54 +1239,84 @@ mod tests {
         assert_eq!(lock(&adm.state).penalties["slow-body"].strikes.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_header_only_post_is_cut_off_at_the_first_byte_deadline() {
+        let (router, adm, _gate) = paused_app(limits(400, 600_000, 1000));
+        let t0 = tokio::time::Instant::now();
+        let r = post_body(
+            &router,
+            "/api/body",
+            "slow-body",
+            timed_body(&[(10_000_000, Some(1))]),
+        )
+        .await;
+        assert_eq!(r.status().as_u16(), 400);
+        let waited = t0.elapsed();
+        assert!(
+            waited >= Duration::from_millis(400) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+        adm.idle().await;
+        assert_eq!(adm.in_flight(), 0);
+        assert_eq!(adm.stats().body_deadline, 1);
+        assert_eq!(lock(&adm.state).penalties["slow-body"].strikes.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_drip_below_the_minimum_rate_is_cut_off() {
         // 100 B/s against a 1000 B/s minimum, so the deadline only creeps
         // ahead of the 10 ms pace once the 400 ms grace is used up.
-        let (base, adm, _gate) = body_app(limits(400, 400, 1000)).await;
-        assert!(raw_status(&base, Send::Drip).await.contains(" 400"));
+        let (router, adm, _gate) = paused_app(limits(400, 400, 1000));
+        let steps: Vec<_> = (0..200).map(|_| (10, Some(1))).chain([(0, None)]).collect();
+        let r = post_body(&router, "/api/body", "slow-body", timed_body(&steps)).await;
+        assert_eq!(r.status().as_u16(), 400);
         adm.idle().await;
         assert_eq!(adm.in_flight(), 0);
         assert_eq!(adm.stats().body_deadline, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_body_above_the_minimum_rate_survives_past_the_grace() {
         // About 600 ms in all against a 400 ms grace, at 125 kB/s against a
         // 100 kB/s minimum.
-        let (base, adm, _gate) = body_app(limits(400, 400, 100_000)).await;
-        assert!(raw_status(&base, Send::Steady).await.contains(" 200"));
+        let (router, adm, _gate) = paused_app(limits(400, 400, 100_000));
+        let steps: Vec<_> = (0..15)
+            .map(|_| (40, Some(5000)))
+            .chain([(0, None)])
+            .collect();
+        let r = post_body(&router, "/api/body", "slow-body", timed_body(&steps)).await;
+        assert_eq!(r.status().as_u16(), 200);
         adm.idle().await;
         assert_eq!(adm.stats().body_deadline, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_deadline_does_not_cancel_a_handler_after_the_body_is_complete() {
-        let (base, adm, _gate) = body_app(limits(500, 500, 1000)).await;
-        let r = reqwest::Client::new()
-            .post(format!("{base}/api/slow"))
-            .header("x-user", "slow-handler")
-            .body("done")
-            .send()
-            .await
-            .unwrap();
+        let (router, adm, _gate) = paused_app(limits(500, 500, 1000));
+        let r = post_body(
+            &router,
+            "/api/slow",
+            "slow-handler",
+            timed_body(&[(0, Some(4)), (0, None)]),
+        )
+        .await;
         // The handler ran for 1.5 s, well past the 500 ms limits.
         assert_eq!(r.status().as_u16(), 200);
         adm.idle().await;
         assert_eq!(adm.stats().body_deadline, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_handler_that_reads_the_body_late_is_not_charged_for_its_delay() {
-        let (base, adm, _gate) = body_app(limits(300, 300, 1000)).await;
-        let r = reqwest::Client::new()
-            .post(format!("{base}/api/late"))
-            .header("x-user", "late-reader")
-            .body("complete body")
-            .send()
-            .await
-            .unwrap();
-        // The body was sent at once; the handler read it 900 ms later.
+        let (router, adm, _gate) = paused_app(limits(300, 300, 1000));
+        let r = post_body(
+            &router,
+            "/api/late",
+            "late-reader",
+            timed_body(&[(0, Some(13)), (0, None)]),
+        )
+        .await;
+        // The body was ready at once; the handler read it 900 ms later.
         assert_eq!(r.status().as_u16(), 200);
         adm.idle().await;
         assert_eq!(adm.stats().body_deadline, 0);
@@ -1353,26 +1438,28 @@ mod tests {
         adm.idle().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn three_cut_offs_block_the_user_through_the_middleware() {
-        let (base, adm, gate) = body_app(limits(150, 600_000, 1000)).await;
+        let (router, adm, gate) = paused_app(limits(150, 600_000, 1000));
         for _ in 0..BODY_PENALTY_CUTS {
-            assert!(raw_status(&base, Send::Nothing).await.contains(" 400"));
+            let r = post_body(
+                &router,
+                "/api/body",
+                "slow-body",
+                timed_body(&[(10_000_000, Some(1))]),
+            )
+            .await;
+            assert_eq!(r.status().as_u16(), 400);
         }
         adm.idle().await;
         assert_eq!(adm.stats().body_deadline, u64::from(BODY_PENALTY_CUTS));
         // "slow-body" is now refused before the handler; others are not.
-        expect_refused(
-            call(&base, "POST", "/api/gate", "slow-body").await,
-            429,
-            "too many concurrent requests",
-        )
-        .await;
+        let r = post_body(&router, "/api/gate", "slow-body", Body::empty()).await;
+        assert_eq!(r.status().as_u16(), 429);
+        assert_eq!(r.headers().get("retry-after").unwrap(), "1");
         assert_eq!(gate.entered.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            call(&base, "POST", "/api/fast", "innocent").await.status(),
-            200
-        );
+        let r = post_body(&router, "/api/fast", "innocent", Body::empty()).await;
+        assert_eq!(r.status().as_u16(), 200);
     }
 
     /// An inner body that yields `frames` at once, then ends or stays Pending.
@@ -1557,6 +1644,10 @@ mod tests {
             Router::new()
                 .route("/api/gate", post(gated))
                 .route("/api/fast", post(|| async { StatusCode::OK }))
+                .route(
+                    "/api/notifications/mark-read",
+                    post(|| async { StatusCode::OK }),
+                )
                 .route("/api/probe", get(probe).post(probe))
                 .route("/api/audit/events", get(probe))
                 .route("/api/audit/search", get(probe))
@@ -1808,22 +1899,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_runs_before_viewer_guard() {
+    async fn an_allowlisted_viewer_mutation_is_still_admitted_and_refused_at_the_cap() {
         let (state, _dir) = lazy_state();
         let adm = state.admission.clone();
         let (gate, _entered) = Gate::new();
-        let g = gate.clone();
         let base = serve(app(state, gate)).await;
         let _held: Vec<_> = (0..4).map(|_| adm.try_admit("viewer-v").unwrap()).collect();
-        // A viewer over its cap gets 429, not the guard's 403, and the
-        // handler is never entered.
+        // The allowlisted mutation passes `viewer_guard`, so it takes a
+        // permit and is refused at the cap. (A non-allowlisted one would be
+        // a 403 with an audit write, which this lazy-pool test must avoid.)
         expect_refused(
-            call(&base, "POST", "/api/gate", "viewer-v").await,
+            call(&base, "POST", "/api/notifications/mark-read", "viewer-v").await,
             429,
             "too many concurrent requests",
         )
         .await;
-        assert_eq!(g.entered.load(Ordering::SeqCst), 0);
+        assert_eq!(adm.stats().refused_user, 1);
     }
 
     /// An inner body that, for each step, waits `delay` and then yields the
@@ -2095,6 +2186,195 @@ mod tests {
         assert_eq!(points(&adm, "u"), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_pause_mid_body_past_the_deadline_is_not_cut_off() {
+        let (mut b, adm) = timed(
+            &[(0, Some(10)), (100, Some(10)), (0, None)],
+            limits(1000, 1000, 1000),
+        );
+        assert!(next_frame(&mut b).await.unwrap().is_ok());
+        // The handler does other work: far past first byte + grace + credit.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // The inner body is then Pending for 100 ms: the pause is credited.
+        assert!(next_frame(&mut b).await.unwrap().is_ok());
+        assert!(next_frame(&mut b).await.is_none());
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (0, 0));
+        assert_eq!(points(&adm, "u"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_pause_does_not_excuse_a_client_stall_afterwards() {
+        let (mut b, adm) = timed(
+            &[(0, Some(10)), (1_000_000, Some(1))],
+            limits(1000, 1000, 1000),
+        );
+        assert!(next_frame(&mut b).await.unwrap().is_ok());
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // Pending past the grace (1 s plus the credited 30 s): cut off.
+        assert!(next_frame(&mut b).await.unwrap().is_err());
+        drop(b);
+        assert_eq!(adm.stats().body_deadline, 1);
+        assert_eq!(points(&adm, "u"), CUT_WEIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_body_limits_change_the_cut_off() {
+        let cfg = crate::config::AdmissionBody::from_vars(Some("2"), None, None).unwrap();
+        let adm = Admission::configured(cfg.into());
+        let inner = Body::new(Script {
+            frames: vec![],
+            then_end: false,
+        });
+        let mut b = DeadlineBody::new(inner, adm.clone(), "cfg-user".into());
+        let t0 = tokio::time::Instant::now();
+        // Still alive at 1.9 s ...
+        let early = tokio::time::timeout(Duration::from_millis(1900), next_frame(&mut b)).await;
+        assert!(early.is_err(), "cut off before the 2 s first-byte limit");
+        // ... and cut off at 2 s.
+        assert!(next_frame(&mut b).await.unwrap().is_err());
+        let waited = t0.elapsed();
+        assert!(
+            waited >= Duration::from_secs(2) && waited < Duration::from_millis(2100),
+            "{waited:?}"
+        );
+        drop(b);
+        assert_eq!(adm.stats().body_deadline, 1);
+    }
+
+    #[test]
+    fn refusal_lines_carry_reason_user_pending_and_summaries() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let gauge: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(7)));
+        let adm = Admission::with_backlog(gauge);
+        let _held = adm.try_admit("holder").unwrap();
+        for (why, reason, crowded) in [
+            (Refusal::User, "user_cap", false),
+            (Refusal::Global, "global_cap", true),
+            (Refusal::Backlog, "audit_backlog", true),
+        ] {
+            cap.clear();
+            adm.refuse("bad\nuser", why);
+            let l = cap.take_one();
+            assert_eq!(l["reason"], reason);
+            assert_eq!(l["user_id"], "bad?user", "{reason}");
+            assert_eq!(l["suppressed"], "0", "{reason}");
+            assert_eq!(l["pending"], "7", "{reason}");
+            assert_eq!(!l["top_holders"].is_empty(), crowded, "{reason}");
+            assert_eq!(!l["top_body_wait"].is_empty(), crowded, "{reason}");
+            if crowded {
+                assert_eq!(l["top_holders"], "holder(1)");
+            }
+        }
+    }
+
+    #[test]
+    fn cut_off_slow_and_block_lines_are_logged_with_ids_only() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let adm = Admission::with_body(BodyLimits::default());
+        cap.clear();
+        adm.note_cut_off("cut\nuser");
+        let l = cap.take_one();
+        assert_eq!(
+            l["message"],
+            "request body cut off: too slow while holding an admission permit"
+        );
+        assert_eq!(
+            (l["user_id"].as_str(), l["suppressed"].as_str()),
+            ("cut?user", "0")
+        );
+
+        cap.clear();
+        let wait = BodyWait {
+            waited: Duration::from_secs(5),
+            longest: Duration::from_secs(4),
+            excess: Duration::from_secs(4),
+        };
+        adm.note_body_done("slow\nuser", wait, 100, false);
+        let l = cap.take_one();
+        assert!(l["message"].starts_with("request body slow"), "{l:?}");
+        assert_eq!(l["user_id"], "slow?user");
+        assert_eq!(
+            (l["waited_ms"].as_str(), l["bytes"].as_str()),
+            ("5000", "100")
+        );
+        assert_eq!(l["suppressed"], "0");
+
+        cap.clear();
+        let strict = Admission::with_body(BodyLimits {
+            penalty_cuts: 1,
+            ..BodyLimits::default()
+        });
+        strict.note_cut_off_at("block\nuser", Instant::now());
+        let l = cap.take_one();
+        assert_eq!(l["reason"], "body_penalty_block");
+        assert_eq!(l["user_id"], "block?user");
+        assert_eq!(l["points"], CUT_WEIGHT.to_string());
+        assert_eq!(l["until_ms"], "30000");
+    }
+
+    #[test]
+    fn backlog_latch_changes_are_logged_once_each() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let gauge: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+        let adm = Admission::with_backlog(gauge);
+        cap.clear();
+        gauge.store(AUDIT_BACKLOG_HIGH, Ordering::Relaxed);
+        assert_eq!(adm.try_admit("u").unwrap_err(), Refusal::Backlog);
+        let l = cap.take_one();
+        assert!(l["message"].contains("backlog high"), "{l:?}");
+        assert_eq!(l["pending"], AUDIT_BACKLOG_HIGH.to_string());
+        // Still high: no second line, and the drain is the only new one.
+        assert_eq!(adm.try_admit("u").unwrap_err(), Refusal::Backlog);
+        gauge.store(AUDIT_BACKLOG_LOW, Ordering::Relaxed);
+        assert!(adm.try_admit("u").is_ok());
+        let l = cap.take_one();
+        assert!(l["message"].contains("backlog drained"), "{l:?}");
+        assert_eq!(l["pending"], AUDIT_BACKLOG_LOW.to_string());
+    }
+
+    /// Axum 0.7 cannot list a router's routes, so this scans the sources:
+    /// the `audit.read` action is recorded only in `audit.rs`, by exactly as
+    /// many call sites as there are entries in [`AUDITED_READ_ROUTES`].
+    // A cheap text tripwire that compares a count, not the route set. The
+    // DB-backed `audited_read_routes_match_the_real_router` test in `main.rs`
+    // is authoritative for the listed routes.
+    #[test]
+    fn audit_read_is_recorded_only_by_the_listed_handlers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+        let literal = ["\"audit", ".read\""].concat();
+        let mut sites = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&path).unwrap();
+            match name.as_str() {
+                // This file names the literal in its own docs and tests.
+                "admission.rs" => {}
+                "audit.rs" => {
+                    sites = src.matches("record_audit_read(").count()
+                        - src.matches("fn record_audit_read(").count();
+                }
+                _ => assert!(
+                    !src.contains(&literal),
+                    "{name} records audit.read: add its route to AUDITED_READ_ROUTES \
+                     (api/admission.rs) so it is admitted, and update this test"
+                ),
+            }
+        }
+        assert_eq!(
+            sites,
+            AUDITED_READ_ROUTES.len(),
+            "audit.rs records audit.read from {sites} handlers but AUDITED_READ_ROUTES lists {}: \
+             update the list (and the routes in main.rs)",
+            AUDITED_READ_ROUTES.len()
+        );
+    }
+
     fn slow_at(a: &Admission, user: &str, t: Instant) {
         a.note_body_done_at(user, Duration::from_secs(5), 0, false, t);
     }
@@ -2234,11 +2514,11 @@ mod tests {
     fn the_production_admission_reads_the_global_audit_queue_gauge() {
         assert!(std::ptr::eq(
             Admission::new().backlog,
-            crate::db_audit::open_pending_gauge()
+            crate::db_audit::admitted_pending_gauge()
         ));
         assert!(!std::ptr::eq(
             Admission::with_caps(3, 2).backlog,
-            crate::db_audit::open_pending_gauge()
+            crate::db_audit::admitted_pending_gauge()
         ));
     }
 
@@ -2461,7 +2741,7 @@ mod flood_tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
-    async fn an_admitted_viewer_post_is_403_with_one_authz_denied_row(pool: PgPool) {
+    async fn a_viewer_post_is_403_with_one_authz_denied_row(pool: PgPool) {
         seed_user(&pool, "viewer-d").await;
         let (state, _dir) = app_state(pool.clone());
         let adm = state.admission.clone();
@@ -2485,5 +2765,70 @@ mod flood_tests {
             .await
             .unwrap();
         assert_eq!(got, [("authz.denied".to_string(), "denied".to_string())]);
+    }
+
+    async fn viewer_router(state: AppState) -> String {
+        let router = with_user(protected_stack(
+            Router::new().route("/api/save", post(|| async { StatusCode::OK })),
+            &state,
+        ))
+        .with_state(state);
+        serve_app(router).await
+    }
+
+    async fn viewer_post(base: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}/api/save"))
+            .header("x-user", "viewer-d")
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn audit_rows(pool: &PgPool) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT action, outcome FROM audit_events")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_viewer_over_its_cap_is_403_with_an_authz_denied_row(pool: PgPool) {
+        seed_user(&pool, "viewer-d").await;
+        let (state, _dir) = app_state(pool.clone());
+        let adm = state.admission.clone();
+        let _held: Vec<_> = (0..MAX_USER_IN_FLIGHT)
+            .map(|_| adm.try_admit("viewer-d").unwrap())
+            .collect();
+        let base = viewer_router(state).await;
+        // Not a 429: a viewer's refused mutation takes no permit.
+        assert_eq!(viewer_post(&base).await.status().as_u16(), 403);
+        crate::db_audit::drain().await;
+        assert_eq!(
+            audit_rows(&pool).await,
+            [("authz.denied".to_string(), "denied".to_string())]
+        );
+        let st = adm.stats();
+        assert_eq!(st.refused_user, 0);
+        assert_eq!(st.in_flight, MAX_USER_IN_FLIGHT);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_viewer_mutation_under_audit_backlog_is_403_not_503(pool: PgPool) {
+        seed_user(&pool, "viewer-d").await;
+        let (mut state, _dir) = app_state(pool.clone());
+        let gauge: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(AUDIT_BACKLOG_HIGH)));
+        state.admission = Admission::with_backlog(gauge);
+        let adm = state.admission.clone();
+        let base = viewer_router(state).await;
+        assert_eq!(viewer_post(&base).await.status().as_u16(), 403);
+        crate::db_audit::drain().await;
+        assert_eq!(
+            audit_rows(&pool).await,
+            [("authz.denied".to_string(), "denied".to_string())]
+        );
+        assert_eq!(adm.stats().refused_backlog, 0);
     }
 }
