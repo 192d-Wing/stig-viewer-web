@@ -121,6 +121,8 @@ test.describe("Deep /api/health", () => {
     expect(typeof body.admission.refusedUser).toBe("number");
     expect(typeof body.admission.refusedGlobal).toBe("number");
     expect(typeof body.admission.bodyDeadline).toBe("number");
+    expect(typeof body.admission.refusedBacklog).toBe("number");
+    expect(typeof body.admission.slowBody).toBe("number");
     expect(typeof body.loginAckPrune.failures).toBe("number");
     expect(typeof body.loginAckPrune.consecutiveFailures).toBe("number");
 

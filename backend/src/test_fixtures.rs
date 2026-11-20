@@ -299,7 +299,11 @@ pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, Sti
         }),
         signing: None,
         tasks: crate::detached::Tracker::new(),
-        admission: crate::api::admission::Admission::new(),
+        admission: crate::api::admission::Admission::with_limits(
+            crate::api::admission::MAX_IN_FLIGHT,
+            crate::api::admission::MAX_USER_IN_FLIGHT,
+            crate::api::admission::ADMIN_RESERVE,
+        ),
     };
     (state, guard)
 }
@@ -349,7 +353,11 @@ pub fn lazy_state() -> (AppState, StigDir) {
         }),
         signing: None,
         tasks: crate::detached::Tracker::new(),
-        admission: crate::api::admission::Admission::new(),
+        admission: crate::api::admission::Admission::with_limits(
+            crate::api::admission::MAX_IN_FLIGHT,
+            crate::api::admission::MAX_USER_IN_FLIGHT,
+            crate::api::admission::ADMIN_RESERVE,
+        ),
     };
     (state, StigDir(dir))
 }

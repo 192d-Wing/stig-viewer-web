@@ -10,6 +10,20 @@
 //! handler mutates anything, so a flood is turned away instead of committing
 //! changes whose audit events would then be shed.
 //!
+//! A third refusal looks at the audit queue: while the non-restricted pending
+//! audit writes (`db_audit::open_pending_gauge`) are at or above
+//! [`AUDIT_BACKLOG_HIGH`] (32, the healthy bound), non-admins get 503 `server
+//! busy` with `Retry-After: 5` (a backlog means writes slower than the 5 s
+//! caller wait, so a 1 s retry is pointless) until the gauge falls to
+//! [`AUDIT_BACKLOG_LOW`] (24). Admins are spared until
+//! [`AUDIT_BACKLOG_ADMIN_HIGH`] (40, a judgment value) so incident response
+//! survives pool contention, and are refused with no hysteresis beyond it; the
+//! audited GETs are not spared (an unrecorded read is worse than a refused
+//! one). Unadmitted GETs, `/api/health` and the admin counters stay available.
+//! This is damping, not a hard bound: the requests already admitted can still
+//! leave writes behind. Order of checks: penalty block, user cap (429),
+//! backlog (503), global cap (503). Counted as `refusedBacklog`.
+//!
 //! The permit travels in [`RequestCtx::permit`]. `OwnedEvent` clones the ctx
 //! into the detached audit write and detached work functions take the ctx by
 //! value, so the permit lives until the write or task ends, however late.
@@ -33,6 +47,39 @@
 //! for 30 s. Streaming is kept: nothing is buffered here, and the routes'
 //! `DefaultBodyLimit`s still apply.
 //!
+//! A body can also hold a permit by staying just inside those deadlines. A
+//! body is "slow" when it finishes, errors or is dropped without a cut-off and
+//! its waiting on the client (time the inner body spent Pending, in stretches
+//! each ended by a frame, the end, an error or a drop) is excessive. Each
+//! stretch of length `d` that ends with a data frame of `n` bytes earns a rate
+//! credit of `n / ADMITTED_BODY_MIN_RATE` for that stretch only (credit is
+//! never banked across the body, so a burst cannot pay for later stalls or a
+//! trickle); its `excess` is `max(0, d - n / min_rate)`, and a stretch ending
+//! in the end, an error or a drop has `n = 0`. The body is slow when the summed
+//! excess exceeds `ADMITTED_BODY_SLOW_WAIT` (3 s), or any single stretch was
+//! longer than that. The summed-excess clause subsumes the earlier "total wait
+//! over 3 s plus `received / min_rate`" one (excess >= waited - received/rate),
+//! so that clause is gone. A steady upload at or above the floor rate is never
+//! slow. False-positive edge: a link averaging near the 64 KiB/s floor, with
+//! chunks arriving a little slower than the rate, can accumulate excess and
+//! earn a half-weight strike (one point; six in a minute block).
+//! Residual by design: a body sent steadily at or above the 64 KiB/s floor is
+//! never slow yet holds its permit for its whole duration (about 160 s for
+//! 10 MiB), so about 7 accounts at about 1.8 MB/s in all can hold the 28
+//! non-admin permits. It is indistinguishable from a legitimate slow link and
+//! surfaces only through the 60 s body-wait warning. Slow bodies are counted
+//! (`slowBody`), logged per user, and score `SLOW_WEIGHT` (1) penalty points
+//! against `CUT_WEIGHT` (2) for a cut-off; the block triggers at
+//! `BODY_PENALTY_CUTS * CUT_WEIGHT` (6) points in 60 s, so three cut-offs or
+//! six slow bodies block for 30 s. Setting `slow_weight` to 0 counts and logs
+//! only. Residual: stalls under 3 s each, many per request, are not counted as
+//! slow; a user whose body-wait within 60 s reaches `BODY_WAIT_ALERT` (60 s)
+//! is logged (throttled per user) instead. Blocks and backlog latch changes
+//! are logged. The top users by windowed body-wait time are named in the
+//! refusal log lines (ids only). A handler that abandons a body mid-wait is
+//! charged at most `slow_wait` for the open stretch (see the want-driven note
+//! above).
+//!
 //! Admitted: every non-read method, and the GETs in [`AUDITED_READ_ROUTES`]
 //! (the only GETs that record an event). Other GETs are not admitted:
 //! dashboards fire many parallel reads. An `authz.denied` from a 403 on such
@@ -48,7 +95,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -91,6 +138,37 @@ pub const ADMITTED_BODY_MIN_RATE: u64 = 64 * 1024;
 pub const BODY_PENALTY_CUTS: u32 = 3;
 pub const BODY_PENALTY_WINDOW: Duration = Duration::from_secs(60);
 pub const BODY_PENALTY_BLOCK: Duration = Duration::from_secs(30);
+/// How long a body waited on the client: in all, the longest single stretch,
+/// and the sum over stretches of each stretch's time beyond its own rate credit.
+#[derive(Debug, Clone, Copy, Default)]
+struct BodyWait {
+    waited: Duration,
+    longest: Duration,
+    excess: Duration,
+}
+
+/// A body that waited on the client more than this (plus the rate credit for
+/// the bytes it received) is "slow" even though it met its deadlines.
+pub const ADMITTED_BODY_SLOW_WAIT: Duration = Duration::from_secs(3);
+/// A user whose body-wait time within the penalty window reaches this is
+/// logged (the residual for stalls too short to be "slow").
+const BODY_WAIT_ALERT: Duration = Duration::from_secs(60);
+/// Body waits shorter than this are not accounted at all (hot path).
+const BODY_WAIT_NOTE_FLOOR: Duration = Duration::from_secs(1);
+/// Penalty points for a body cut-off, and for a slow body.
+pub const CUT_WEIGHT: u32 = 2;
+pub const SLOW_WEIGHT: u32 = 1;
+/// Non-restricted pending audit writes at or above which non-admins are
+/// refused (503). The healthy bound: every one of the `MAX_IN_FLIGHT` permits
+/// holds one write.
+pub const AUDIT_BACKLOG_HIGH: u32 = MAX_IN_FLIGHT;
+/// The refusal for non-admins ends once the gauge is at or below this.
+pub const AUDIT_BACKLOG_LOW: u32 = 24;
+/// Admins are refused at or above this (a judgment constant: between the
+/// healthy bound and the queue's non-restricted share).
+pub const AUDIT_BACKLOG_ADMIN_HIGH: u32 = 40;
+/// `Retry-After` for a backlog refusal.
+const BACKLOG_RETRY_AFTER_SECS: &str = "5";
 /// Users tracked for body penalties and log throttling at once.
 const MAX_TRACKED_USERS: usize = 1024;
 /// Users listed in a global-refusal log line.
@@ -105,6 +183,9 @@ pub struct BodyLimits {
     pub penalty_cuts: u32,
     pub penalty_window: Duration,
     pub penalty_block: Duration,
+    pub slow_wait: Duration,
+    /// Penalty points per slow body (0: count and log only).
+    pub slow_weight: u32,
 }
 
 impl Default for BodyLimits {
@@ -116,6 +197,8 @@ impl Default for BodyLimits {
             penalty_cuts: BODY_PENALTY_CUTS,
             penalty_window: BODY_PENALTY_WINDOW,
             penalty_block: BODY_PENALTY_BLOCK,
+            slow_wait: ADMITTED_BODY_SLOW_WAIT,
+            slow_weight: SLOW_WEIGHT,
         }
     }
 }
@@ -125,6 +208,9 @@ impl Default for BodyLimits {
 pub const UNADMITTED_RESERVE: u32 = 16;
 
 const _: () = assert!(ADMIN_RESERVE < MAX_IN_FLIGHT);
+const _: () = assert!(AUDIT_BACKLOG_LOW < AUDIT_BACKLOG_HIGH);
+const _: () = assert!(AUDIT_BACKLOG_HIGH <= AUDIT_BACKLOG_ADMIN_HIGH);
+const _: () = assert!(AUDIT_BACKLOG_ADMIN_HIGH < MAX_PENDING_WRITES - MAX_DENIED_PENDING);
 
 // Handlers await each audit write in turn, so an admitted request has at most
 // one non-restricted write pending at a time on a healthy pool, and a late
@@ -135,6 +221,10 @@ const _: () = assert!(
     MAX_IN_FLIGHT + UNADMITTED_RESERVE <= MAX_PENDING_WRITES - MAX_DENIED_PENDING,
     "admission caps must leave the audit queue's non-restricted share intact"
 );
+const _: () = assert!(
+    AUDIT_BACKLOG_HIGH + UNADMITTED_RESERVE <= MAX_PENDING_WRITES - MAX_DENIED_PENDING,
+    "the backlog mark must leave the unadmitted reserve free"
+);
 
 /// GET routes (as `MatchedPath` templates) that record an `audit.read` event.
 pub const AUDITED_READ_ROUTES: [&str; 2] = ["/api/audit/search", "/api/audit/events"];
@@ -144,8 +234,8 @@ const WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// Per-reason rate limit for the refusal log line, counting what it hid.
 #[derive(Debug, Default)]
 struct WarnThrottle {
-    last: [Option<Instant>; 2],
-    suppressed: [u64; 2],
+    last: [Option<Instant>; 3],
+    suppressed: [u64; 3],
 }
 
 impl WarnThrottle {
@@ -195,21 +285,103 @@ impl UserWarnThrottle {
     }
 }
 
-/// Recent body cut-offs of one user, and any admission block they earned.
+/// The user's penalty entry, created if absent. When the table is full of
+/// live entries nothing is created (`None`): the caller's count is kept but
+/// there is no per-user state.
+fn penalty_entry<'a>(
+    s: &'a mut Counts,
+    b: &BodyLimits,
+    user_id: &str,
+    now: Instant,
+) -> Option<&'a mut Penalty> {
+    if !s.penalties.contains_key(user_id) && s.penalties.len() >= MAX_TRACKED_USERS {
+        s.penalties.retain(|_, p| {
+            p.blocked_until.is_some_and(|t| now < t)
+                || p.wait_live(now, b.penalty_window)
+                || p.strikes
+                    .iter()
+                    .any(|(t, _)| now.saturating_duration_since(*t) < b.penalty_window)
+        });
+        if s.penalties.len() >= MAX_TRACKED_USERS {
+            return None;
+        }
+    }
+    Some(s.penalties.entry(user_id.to_owned()).or_default())
+}
+
+/// Add `weight` penalty points for `user_id`; block them once the points in
+/// the window reach `penalty_cuts * CUT_WEIGHT` (the points are then cleared).
+/// Returns the points that caused a block, when this strike blocked.
+fn add_strike(
+    s: &mut Counts,
+    b: &BodyLimits,
+    user_id: &str,
+    weight: u32,
+    now: Instant,
+) -> Option<u32> {
+    let p = penalty_entry(s, b, user_id, now)?;
+    p.strikes
+        .retain(|(t, _)| now.saturating_duration_since(*t) < b.penalty_window);
+    p.strikes.push((now, weight));
+    let points: u32 = p
+        .strikes
+        .iter()
+        .map(|(_, w)| *w)
+        .fold(0, u32::saturating_add);
+    if points >= b.penalty_cuts.saturating_mul(CUT_WEIGHT) {
+        p.strikes.clear();
+        p.blocked_until = Some(now + b.penalty_block);
+        return Some(points);
+    }
+    None
+}
+
+/// Log a block the moment it is set (never throttled: it is rare, bounded by
+/// the block length, and the event an operator needs).
+fn log_block(user_id: &str, blocked: Option<u32>, b: &BodyLimits) {
+    if let Some(points) = blocked {
+        tracing::warn!(
+            target: "audit",
+            user_id = %crate::db_audit::audit_safe_id(user_id),
+            points,
+            reason = "body_penalty_block",
+            until_ms = b.penalty_block.as_millis() as u64,
+            "user blocked from admission after repeated slow or cut-off request bodies"
+        );
+    }
+}
+
+/// Recent penalty strikes (time, points) and body-wait time of one user, and
+/// any admission block they earned.
 #[derive(Debug, Default)]
 struct Penalty {
-    cuts: Vec<Instant>,
+    strikes: Vec<(Instant, u32)>,
     blocked_until: Option<Instant>,
+    /// Start of the current body-wait window, and the wait summed in it.
+    wait_window_start: Option<Instant>,
+    waited: Duration,
+}
+
+impl Penalty {
+    fn wait_live(&self, now: Instant, window: Duration) -> bool {
+        self.wait_window_start
+            .is_some_and(|t| now.saturating_duration_since(t) < window)
+    }
 }
 
 /// `"a(3), b(2) (+4 more)"`, or `"none"`, with each id made log-safe.
 fn format_holders(top: &[(String, u32)], total: usize) -> String {
+    format_listed(top, total, "")
+}
+
+/// [`format_holders`] with a unit after each value (`"a(42s)"`).
+fn format_listed<N: std::fmt::Display>(top: &[(String, N)], total: usize, unit: &str) -> String {
     if top.is_empty() {
         return "none".to_string();
     }
     let mut out = top
         .iter()
-        .map(|(i, n)| format!("{}({n})", crate::db_audit::audit_safe_id(i)))
+        .map(|(i, n)| format!("{}({n}{unit})", crate::db_audit::audit_safe_id(i)))
         .collect::<Vec<_>>()
         .join(", ");
     if total > top.len() {
@@ -223,10 +395,25 @@ fn format_holders(top: &[(String, u32)], total: usize) -> String {
 pub enum Refusal {
     User = 0,
     Global = 1,
+    /// The audit queue's backlog is at its high-water mark.
+    Backlog = 2,
+}
+
+/// Counters reported on `GET /api/admin/failure-counters`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionStats {
+    pub in_flight: u32,
+    pub refused_user: u64,
+    pub refused_global: u64,
+    pub refused_backlog: u64,
+    pub body_deadline: u64,
+    pub slow_body: u64,
 }
 
 #[derive(Debug, Default)]
 struct Counts {
+    /// Latched while the audit backlog is between the low and high marks.
+    backlogged: bool,
     total: u32,
     users: HashMap<String, u32>,
     penalties: HashMap<String, Penalty>,
@@ -238,9 +425,15 @@ pub struct Admission {
     idle: Notify,
     refused_user: AtomicU64,
     refused_global: AtomicU64,
+    refused_backlog: AtomicU64,
     warn: Mutex<WarnThrottle>,
     cut_warn: Mutex<UserWarnThrottle>,
+    slow_warn: Mutex<UserWarnThrottle>,
+    wait_warn: Mutex<UserWarnThrottle>,
     body_cut_offs: AtomicU64,
+    slow_bodies: AtomicU64,
+    /// Non-restricted pending audit writes (see `db_audit::WriteQueue`).
+    backlog: &'static AtomicU32,
     cap: u32,
     user_cap: u32,
     admin_reserve: u32,
@@ -254,13 +447,38 @@ pub struct Permit {
     user_id: String,
 }
 
+/// A gauge nothing writes (every constructor but [`Admission::new`]), so a
+/// test's admission is not affected by the process-wide audit queue.
+fn private_gauge() -> &'static AtomicU32 {
+    Box::leak(Box::new(AtomicU32::new(0)))
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Admission {
+    /// The production admission, wired to the process-wide audit queue.
     pub fn new() -> Arc<Self> {
-        Self::with_limits(MAX_IN_FLIGHT, MAX_USER_IN_FLIGHT, ADMIN_RESERVE)
+        Self::build(
+            MAX_IN_FLIGHT,
+            MAX_USER_IN_FLIGHT,
+            ADMIN_RESERVE,
+            BodyLimits::default(),
+            crate::db_audit::open_pending_gauge(),
+        )
+    }
+
+    /// Default caps over a caller-owned backlog gauge (tests).
+    #[cfg(test)]
+    pub(crate) fn with_backlog(gauge: &'static AtomicU32) -> Arc<Self> {
+        Self::build(
+            MAX_IN_FLIGHT,
+            MAX_USER_IN_FLIGHT,
+            ADMIN_RESERVE,
+            BodyLimits::default(),
+            gauge,
+        )
     }
 
     /// Caps with no admin reserve (tests).
@@ -270,23 +488,46 @@ impl Admission {
 
     /// Default caps with other body limits (tests).
     pub fn with_body(body: BodyLimits) -> Arc<Self> {
-        Self::build(MAX_IN_FLIGHT, MAX_USER_IN_FLIGHT, ADMIN_RESERVE, body)
+        Self::build(
+            MAX_IN_FLIGHT,
+            MAX_USER_IN_FLIGHT,
+            ADMIN_RESERVE,
+            body,
+            private_gauge(),
+        )
     }
 
     pub fn with_limits(cap: u32, user_cap: u32, admin_reserve: u32) -> Arc<Self> {
-        Self::build(cap, user_cap, admin_reserve, BodyLimits::default())
+        Self::build(
+            cap,
+            user_cap,
+            admin_reserve,
+            BodyLimits::default(),
+            private_gauge(),
+        )
     }
 
-    fn build(cap: u32, user_cap: u32, admin_reserve: u32, mut body: BodyLimits) -> Arc<Self> {
+    fn build(
+        cap: u32,
+        user_cap: u32,
+        admin_reserve: u32,
+        mut body: BodyLimits,
+        backlog: &'static AtomicU32,
+    ) -> Arc<Self> {
         body.min_rate = body.min_rate.max(1);
         Arc::new(Self {
             state: Mutex::new(Counts::default()),
             idle: Notify::new(),
             refused_user: AtomicU64::new(0),
             refused_global: AtomicU64::new(0),
+            refused_backlog: AtomicU64::new(0),
             warn: Mutex::new(WarnThrottle::default()),
             cut_warn: Mutex::new(UserWarnThrottle::default()),
+            slow_warn: Mutex::new(UserWarnThrottle::default()),
+            wait_warn: Mutex::new(UserWarnThrottle::default()),
             body_cut_offs: AtomicU64::new(0),
+            slow_bodies: AtomicU64::new(0),
+            backlog,
             cap,
             user_cap,
             admin_reserve,
@@ -302,8 +543,9 @@ impl Admission {
     /// Take a permit for `user_id`, or say which cap is full. The per-user
     /// cap is checked first (admins included). Non-admins stop
     /// `admin_reserve` short of the global cap. All checked and taken under
-    /// one lock. A user with too many recent body cut-offs is refused (as
-    /// `User`) until their block ends.
+    /// one lock. A user with too many recent penalty points is refused (as
+    /// `User`) until their block ends. While the audit backlog is high,
+    /// requests are refused as `Backlog` (see the module docs).
     pub fn try_admit_as(
         self: &Arc<Self>,
         user_id: &str,
@@ -329,6 +571,21 @@ impl Admission {
         if s.users.get(user_id).copied().unwrap_or(0) >= self.user_cap {
             return Err(Refusal::User);
         }
+        let n = self.backlog.load(Ordering::Relaxed);
+        if n >= AUDIT_BACKLOG_HIGH && !s.backlogged {
+            s.backlogged = true;
+            tracing::warn!(target: "audit", pending = n, "audit backlog high: refusing non-admin requests");
+        } else if n <= AUDIT_BACKLOG_LOW && s.backlogged {
+            s.backlogged = false;
+            tracing::info!(target: "audit", pending = n, "audit backlog drained: admitting requests again");
+        }
+        if if admin {
+            n >= AUDIT_BACKLOG_ADMIN_HIGH
+        } else {
+            s.backlogged
+        } {
+            return Err(Refusal::Backlog);
+        }
         let limit = if admin {
             self.cap
         } else {
@@ -349,18 +606,20 @@ impl Admission {
         lock(&self.state).total
     }
 
-    /// `(inFlight, refusedUser, refusedGlobal, bodyDeadline)`.
-    pub fn stats(&self) -> (u32, u64, u64, u64) {
-        (
-            self.in_flight(),
-            self.refused_user.load(Ordering::Relaxed),
-            self.refused_global.load(Ordering::Relaxed),
-            self.body_cut_offs.load(Ordering::Relaxed),
-        )
+    pub fn stats(&self) -> AdmissionStats {
+        AdmissionStats {
+            in_flight: self.in_flight(),
+            refused_user: self.refused_user.load(Ordering::Relaxed),
+            refused_global: self.refused_global.load(Ordering::Relaxed),
+            refused_backlog: self.refused_backlog.load(Ordering::Relaxed),
+            body_deadline: self.body_cut_offs.load(Ordering::Relaxed),
+            slow_body: self.slow_bodies.load(Ordering::Relaxed),
+        }
     }
 
-    /// Record that `user_id`'s body was cut off: count it, block the user after
-    /// [`BodyLimits::penalty_cuts`] within the window, and log it (ids only,
+    /// Record that `user_id`'s body was cut off: count it, score
+    /// [`CUT_WEIGHT`] points (a block follows at
+    /// `penalty_cuts * CUT_WEIGHT` within the window), and log it (ids only,
     /// throttled per user).
     fn note_cut_off(&self, user_id: &str) {
         let now = Instant::now();
@@ -378,26 +637,116 @@ impl Admission {
     fn note_cut_off_at(&self, user_id: &str, now: Instant) {
         self.body_cut_offs.fetch_add(1, Ordering::Relaxed);
         let b = self.body;
-        let mut s = lock(&self.state);
-        if !s.penalties.contains_key(user_id) && s.penalties.len() >= MAX_TRACKED_USERS {
-            s.penalties.retain(|_, p| {
-                p.blocked_until.is_some_and(|t| now < t)
-                    || p.cuts
-                        .iter()
-                        .any(|c| now.saturating_duration_since(*c) < b.penalty_window)
-            });
-            if s.penalties.len() >= MAX_TRACKED_USERS {
-                return; // counted above; no per-user state when the table is full
+        let blocked = add_strike(&mut lock(&self.state), &b, user_id, CUT_WEIGHT, now);
+        log_block(user_id, blocked, &b);
+    }
+
+    /// A body is done (ended, errored, cut off or dropped) after waiting
+    /// `waited` on the client for `received` bytes. Does nothing but a
+    /// comparison for a body that barely waited. Otherwise the wait goes into
+    /// the user's window, and a body that was not cut off but waited more than
+    /// `slow_wait` plus the rate credit is counted, logged and scored.
+    fn note_body_done(&self, user_id: &str, wait: BodyWait, received: u64, cut: bool) {
+        self.note_body_wait_at(user_id, wait, received, cut, Instant::now());
+    }
+
+    /// Whole-body rule only (no per-stretch information): the credit is
+    /// taken off the total, as if banked.
+    #[cfg(test)]
+    fn note_body_done_at(
+        &self,
+        user_id: &str,
+        waited: Duration,
+        received: u64,
+        cut: bool,
+        now: Instant,
+    ) {
+        let credit = Duration::from_secs_f64(received as f64 / self.body.min_rate as f64);
+        let wait = BodyWait {
+            waited,
+            longest: Duration::ZERO,
+            excess: waited.saturating_sub(credit),
+        };
+        self.note_body_wait_at(user_id, wait, received, cut, now);
+    }
+
+    fn note_body_wait_at(
+        &self,
+        user_id: &str,
+        wait: BodyWait,
+        received: u64,
+        cut: bool,
+        now: Instant,
+    ) {
+        let BodyWait {
+            waited,
+            longest,
+            excess,
+        } = wait;
+        if waited < BODY_WAIT_NOTE_FLOOR {
+            return;
+        }
+        let b = self.body;
+        let slow = !cut && (longest > b.slow_wait || excess > b.slow_wait);
+        let mut heavy = false;
+        let mut blocked = None;
+        {
+            let mut s = lock(&self.state);
+            if let Some(p) = penalty_entry(&mut s, &b, user_id, now) {
+                if !p.wait_live(now, b.penalty_window) {
+                    p.wait_window_start = Some(now);
+                    p.waited = Duration::ZERO;
+                }
+                p.waited = p.waited.saturating_add(waited);
+                heavy = p.waited >= BODY_WAIT_ALERT;
+            }
+            if slow && b.slow_weight > 0 {
+                blocked = add_strike(&mut s, &b, user_id, b.slow_weight, now);
             }
         }
-        let p = s.penalties.entry(user_id.to_owned()).or_default();
-        p.cuts
-            .retain(|c| now.saturating_duration_since(*c) < b.penalty_window);
-        p.cuts.push(now);
-        if p.cuts.len() as u32 >= b.penalty_cuts {
-            p.cuts.clear();
-            p.blocked_until = Some(now + b.penalty_block);
+        log_block(user_id, blocked, &b);
+        if heavy && !slow {
+            if let Some(hidden) = lock(&self.wait_warn).decide(user_id, now) {
+                tracing::warn!(
+                    target: "audit",
+                    user_id = %crate::db_audit::audit_safe_id(user_id),
+                    window_s = b.penalty_window.as_secs(),
+                    suppressed = hidden,
+                    "request bodies waited on the client a long time in total while holding admission permits"
+                );
+            }
         }
+        if slow {
+            self.slow_bodies.fetch_add(1, Ordering::Relaxed);
+            if let Some(hidden) = lock(&self.slow_warn).decide(user_id, now) {
+                tracing::warn!(
+                    target: "audit",
+                    user_id = %crate::db_audit::audit_safe_id(user_id),
+                    waited_ms = waited.as_millis() as u64,
+                    bytes = received,
+                    suppressed = hidden,
+                    "request body slow: waited on the client while holding an admission permit"
+                );
+            }
+        }
+    }
+
+    /// The users with the most body-wait time in their current window (wait
+    /// desc, then id), for the refusal log lines.
+    fn top_body_wait_summary(&self) -> String {
+        let now = Instant::now();
+        let window = self.body.penalty_window;
+        let s = lock(&self.state);
+        let mut waits: Vec<(String, u64)> = s
+            .penalties
+            .iter()
+            .filter(|(_, p)| p.wait_live(now, window))
+            .map(|(u, p)| (u.clone(), p.waited.as_secs()))
+            .collect();
+        waits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total = waits.len();
+        waits.truncate(MAX_LISTED_USERS);
+        format_listed(&waits, total, "s")
     }
 
     /// The users holding the most permits right now (count desc, then id),
@@ -429,22 +778,24 @@ impl Admission {
         let counter = match why {
             Refusal::User => &self.refused_user,
             Refusal::Global => &self.refused_global,
+            Refusal::Backlog => &self.refused_backlog,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         let hidden = lock(&self.warn).decide(why, Instant::now());
         if let Some(hidden) = hidden {
+            let crowded = matches!(why, Refusal::Global | Refusal::Backlog);
             tracing::warn!(
                 target: "audit",
                 user_id = %crate::db_audit::audit_safe_id(user_id),
                 reason = match why {
                     Refusal::User => "user_cap",
                     Refusal::Global => "global_cap",
+                    Refusal::Backlog => "audit_backlog",
                 },
                 suppressed = hidden,
-                top_holders = %match why {
-                    Refusal::Global => self.top_holders_summary(),
-                    Refusal::User => String::new(),
-                },
+                pending = self.backlog.load(Ordering::Relaxed),
+                top_holders = %if crowded { self.top_holders_summary() } else { String::new() },
+                top_body_wait = %if crowded { self.top_body_wait_summary() } else { String::new() },
                 "request refused: too many audited requests in flight"
             );
         }
@@ -468,6 +819,14 @@ struct DeadlineBody {
     received: u64,
     ended: bool,
     failed: bool,
+    /// When the current Pending stretch began, and the Pending time so far.
+    wait_since: Option<tokio::time::Instant>,
+    waited: Duration,
+    /// The longest single Pending stretch, and the summed per-stretch excess.
+    longest: Duration,
+    excess: Duration,
+    /// The admission has been told how this body went (once).
+    noted: bool,
     timer: Pin<Box<tokio::time::Sleep>>,
 }
 
@@ -483,7 +842,41 @@ impl DeadlineBody {
             received: 0,
             ended,
             failed: false,
+            wait_since: None,
+            waited: Duration::ZERO,
+            longest: Duration::ZERO,
+            excess: Duration::ZERO,
+            noted: false,
             timer: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        }
+    }
+
+    /// Fold an open Pending stretch ending at `now` into `waited`.
+    /// `bytes` is the data frame that ended the stretch (0 for none).
+    fn close_wait(&mut self, now: tokio::time::Instant, bytes: u64) {
+        if let Some(t) = self.wait_since.take() {
+            self.fold(now.saturating_duration_since(t), bytes);
+        }
+    }
+
+    fn fold(&mut self, stretch: Duration, bytes: u64) {
+        let credit = Duration::from_secs_f64(bytes as f64 / self.adm.body.min_rate as f64);
+        self.waited = self.waited.saturating_add(stretch);
+        self.longest = self.longest.max(stretch);
+        self.excess = self.excess.saturating_add(stretch.saturating_sub(credit));
+    }
+
+    /// Report the body's wait to the admission, once.
+    fn finish(&mut self, cut: bool) {
+        if !self.noted {
+            self.noted = true;
+            let wait = BodyWait {
+                waited: self.waited,
+                longest: self.longest,
+                excess: self.excess,
+            };
+            self.adm
+                .note_body_done(&self.user_id, wait, self.received, cut);
         }
     }
 
@@ -517,21 +910,30 @@ impl http_body::Body for DeadlineBody {
         let origin = *this.origin.get_or_insert(now);
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(None) => {
+                this.close_wait(now, 0);
                 this.ended = true;
+                this.finish(false);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(frame))) => {
+                this.close_wait(now, frame.data_ref().map_or(0, |d| d.len() as u64));
                 if let Some(d) = frame.data_ref().filter(|d| !d.is_empty()) {
                     this.received += d.len() as u64;
                     this.first_byte_at.get_or_insert(now);
                 }
                 if this.inner.is_end_stream() {
                     this.ended = true;
+                    this.finish(false);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(other) => Poll::Ready(other),
+            Poll::Ready(other) => {
+                this.close_wait(now, 0);
+                this.finish(false);
+                Poll::Ready(other)
+            }
             Poll::Pending => {
+                this.wait_since.get_or_insert(now);
                 // Waiting on the client: keep a timer armed for the deadline.
                 let deadline = this.deadline(origin);
                 if this.timer.deadline() != deadline {
@@ -539,7 +941,9 @@ impl http_body::Body for DeadlineBody {
                 }
                 if this.timer.as_mut().poll(cx).is_ready() {
                     this.failed = true;
+                    this.close_wait(now, 0);
                     this.adm.note_cut_off(&this.user_id);
+                    this.finish(true);
                     return Poll::Ready(Some(Err(axum::Error::new(
                         "request body fell behind the minimum rate",
                     ))));
@@ -555,6 +959,22 @@ impl http_body::Body for DeadlineBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+impl Drop for DeadlineBody {
+    /// A client that disconnects, or a handler that abandons the body, still
+    /// reports what the body waited. A body never read reports nothing.
+    fn drop(&mut self) {
+        if self.origin.is_some() && !self.noted {
+            // The handler may simply have stopped reading, which is not the
+            // client's wait: charge an open stretch at most `slow_wait`.
+            if let Some(t) = self.wait_since.take() {
+                let open = tokio::time::Instant::now().saturating_duration_since(t);
+                self.fold(open.min(self.adm.body.slow_wait), 0);
+            }
+            self.finish(false);
+        }
     }
 }
 
@@ -611,16 +1031,22 @@ pub async fn admission(
         }
         Err(why) => {
             adm.refuse(&user.id, why);
-            let (status, msg) = match why {
+            let (status, msg, retry_after) = match why {
                 Refusal::User => (
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many concurrent requests",
+                    "1",
                 ),
-                Refusal::Global => (StatusCode::SERVICE_UNAVAILABLE, "server busy"),
+                Refusal::Global => (StatusCode::SERVICE_UNAVAILABLE, "server busy", "1"),
+                Refusal::Backlog => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server busy",
+                    BACKLOG_RETRY_AFTER_SECS,
+                ),
             };
             (
                 status,
-                [("Retry-After", "1")],
+                [("Retry-After", retry_after)],
                 Json(json!({ "error": msg })),
             )
                 .into_response()
@@ -754,8 +1180,8 @@ mod tests {
         adm.idle().await;
         assert_eq!(adm.in_flight(), 0);
         // Counted, and recorded against the holder.
-        assert_eq!(adm.stats().3, 1);
-        assert_eq!(lock(&adm.state).penalties["slow-body"].cuts.len(), 1);
+        assert_eq!(adm.stats().body_deadline, 1);
+        assert_eq!(lock(&adm.state).penalties["slow-body"].strikes.len(), 1);
     }
 
     #[tokio::test]
@@ -766,7 +1192,7 @@ mod tests {
         assert!(raw_status(&base, Send::Drip).await.contains(" 400"));
         adm.idle().await;
         assert_eq!(adm.in_flight(), 0);
-        assert_eq!(adm.stats().3, 1);
+        assert_eq!(adm.stats().body_deadline, 1);
     }
 
     #[tokio::test]
@@ -776,7 +1202,7 @@ mod tests {
         let (base, adm, _gate) = body_app(limits(400, 400, 100_000)).await;
         assert!(raw_status(&base, Send::Steady).await.contains(" 200"));
         adm.idle().await;
-        assert_eq!(adm.stats().3, 0);
+        assert_eq!(adm.stats().body_deadline, 0);
     }
 
     #[tokio::test]
@@ -792,7 +1218,7 @@ mod tests {
         // The handler ran for 1.5 s, well past the 500 ms limits.
         assert_eq!(r.status().as_u16(), 200);
         adm.idle().await;
-        assert_eq!(adm.stats().3, 0);
+        assert_eq!(adm.stats().body_deadline, 0);
     }
 
     #[tokio::test]
@@ -808,7 +1234,7 @@ mod tests {
         // The body was sent at once; the handler read it 900 ms later.
         assert_eq!(r.status().as_u16(), 200);
         adm.idle().await;
-        assert_eq!(adm.stats().3, 0);
+        assert_eq!(adm.stats().body_deadline, 0);
     }
 
     #[test]
@@ -835,7 +1261,7 @@ mod tests {
         assert!(a
             .try_admit_at("u1", false, t0 + Duration::from_secs(12 + 30))
             .is_ok());
-        assert_eq!(a.stats().3, 3);
+        assert_eq!(a.stats().body_deadline, 3);
     }
 
     #[test]
@@ -934,7 +1360,7 @@ mod tests {
             assert!(raw_status(&base, Send::Nothing).await.contains(" 400"));
         }
         adm.idle().await;
-        assert_eq!(adm.stats().3, u64::from(BODY_PENALTY_CUTS));
+        assert_eq!(adm.stats().body_deadline, u64::from(BODY_PENALTY_CUTS));
         // "slow-body" is now refused before the handler; others are not.
         expect_refused(
             call(&base, "POST", "/api/gate", "slow-body").await,
@@ -997,7 +1423,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(100)).await;
         assert!(next_frame(&mut b).await.unwrap().is_ok());
         assert!(next_frame(&mut b).await.is_none());
-        assert_eq!(adm.stats().3, 0);
+        assert_eq!(adm.stats().body_deadline, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1007,10 +1433,10 @@ mod tests {
         assert!(next_frame(&mut b).await.unwrap().is_ok());
         // Nothing more is coming: the timer (paused clock auto-advances) fires.
         assert!(next_frame(&mut b).await.unwrap().is_err());
-        assert_eq!(adm.stats().3, 1);
+        assert_eq!(adm.stats().body_deadline, 1);
         // Once cut off, it stays an error without counting again.
         assert!(next_frame(&mut b).await.unwrap().is_err());
-        assert_eq!(adm.stats().3, 1);
+        assert_eq!(adm.stats().body_deadline, 1);
     }
 
     #[test]
@@ -1199,8 +1625,12 @@ mod tests {
     }
 
     async fn expect_refused(resp: reqwest::Response, status: u16, msg: &str) {
+        expect_refused_after(resp, status, msg, "1").await;
+    }
+
+    async fn expect_refused_after(resp: reqwest::Response, status: u16, msg: &str, retry: &str) {
         assert_eq!(resp.status().as_u16(), status);
-        assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(resp.headers().get("retry-after").unwrap(), retry);
         let body = json_of(resp).await;
         assert_eq!(body["error"], msg);
     }
@@ -1237,7 +1667,14 @@ mod tests {
             "never reached the handler"
         );
         assert_eq!(adm.in_flight(), 4);
-        assert_eq!(adm.stats(), (4, 1, 0, 0));
+        assert_eq!(
+            adm.stats(),
+            AdmissionStats {
+                in_flight: 4,
+                refused_user: 1,
+                ..Default::default()
+            }
+        );
         // Another user is unaffected.
         assert_eq!(
             call(&base, "POST", "/api/fast", "other").await.status(),
@@ -1277,7 +1714,14 @@ mod tests {
         )
         .await;
         assert_eq!(gate.entered.load(Ordering::SeqCst), 3);
-        assert_eq!(adm.stats(), (3, 0, 1, 0));
+        assert_eq!(
+            adm.stats(),
+            AdmissionStats {
+                in_flight: 3,
+                refused_global: 1,
+                ..Default::default()
+            }
+        );
         gate.open();
         for h in held {
             assert_eq!(h.await.unwrap(), 200);
@@ -1326,7 +1770,13 @@ mod tests {
             "rate limit exceeded",
         )
         .await;
-        assert_eq!(adm.stats(), (4, 0, 0, 0));
+        assert_eq!(
+            adm.stats(),
+            AdmissionStats {
+                in_flight: 4,
+                ..Default::default()
+            }
+        );
         gate.open();
         for h in held {
             assert_eq!(h.await.unwrap(), 200);
@@ -1374,6 +1824,466 @@ mod tests {
         )
         .await;
         assert_eq!(g.entered.load(Ordering::SeqCst), 0);
+    }
+
+    /// An inner body that, for each step, waits `delay` and then yields the
+    /// frame (or ends on `None`).
+    struct Timed {
+        steps: std::collections::VecDeque<(Duration, Option<Bytes>)>,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl http_body::Body for Timed {
+        type Data = Bytes;
+        type Error = axum::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, axum::Error>>> {
+            let Some(&(delay, _)) = self.steps.front() else {
+                return Poll::Ready(None);
+            };
+            let sleep = self
+                .sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            if sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.sleep = None;
+            match self.steps.pop_front() {
+                Some((_, Some(b))) => Poll::Ready(Some(Ok(http_body::Frame::data(b)))),
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    fn timed(steps: &[(u64, Option<usize>)], b: BodyLimits) -> (DeadlineBody, Arc<Admission>) {
+        let adm = Admission::with_body(b);
+        let steps = steps
+            .iter()
+            .map(|&(ms, n)| {
+                (
+                    Duration::from_millis(ms),
+                    n.map(|n| Bytes::from(vec![b'x'; n])),
+                )
+            })
+            .collect();
+        let inner = Body::new(Timed { steps, sleep: None });
+        (DeadlineBody::new(inner, adm.clone(), "u".into()), adm)
+    }
+
+    async fn drain_body(b: &mut DeadlineBody) -> usize {
+        let mut errors = 0;
+        while let Some(f) = next_frame(b).await {
+            errors += usize::from(f.is_err());
+            if f.is_err() {
+                break;
+            }
+        }
+        errors
+    }
+
+    fn points(a: &Admission, user: &str) -> u32 {
+        lock(&a.state)
+            .penalties
+            .get(user)
+            .map_or(0, |p| p.strikes.iter().map(|(_, w)| *w).sum())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_compliant_body_is_counted_scored_and_named() {
+        // First byte at 4.9 s (due by 5 s), done at 14.9 s (due by ~14.9 s).
+        let (mut b, adm) = timed(&[(4900, Some(4)), (10_000, None)], BodyLimits::default());
+        assert_eq!(drain_body(&mut b).await, 0);
+        // Polling after the end does not count it again.
+        assert!(next_frame(&mut b).await.is_none());
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (0, 1));
+        assert_eq!(points(&adm, "u"), SLOW_WEIGHT);
+        assert_eq!(adm.top_body_wait_summary(), "u(14s)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_body_is_not_slow_and_leaves_no_state() {
+        let (mut b, adm) = scripted(true);
+        assert_eq!(drain_body(&mut b).await, 0);
+        drop(b);
+        assert_eq!(adm.stats().slow_body, 0);
+        assert!(lock(&adm.state).penalties.is_empty());
+        assert_eq!(adm.top_body_wait_summary(), "none");
+    }
+
+    #[test]
+    fn a_large_body_above_the_minimum_rate_with_brief_stalls_is_not_slow() {
+        let a = Admission::with_body(BodyLimits::default());
+        let t0 = Instant::now();
+        // 640 KiB earns 10 s of credit: 12 s waited is within 3 s + 10 s.
+        a.note_body_done_at("u", Duration::from_secs(12), 640 * 1024, false, t0);
+        assert_eq!(a.stats().slow_body, 0);
+        assert_eq!(points(&a, "u"), 0);
+        // Past it, it is slow.
+        a.note_body_done_at("u", Duration::from_secs(14), 640 * 1024, false, t0);
+        assert_eq!(a.stats().slow_body, 1);
+    }
+
+    #[test]
+    fn padding_a_body_past_64_kib_does_not_bypass_the_slow_rule() {
+        let a = Admission::with_body(BodyLimits::default());
+        a.note_body_done_at(
+            "u",
+            Duration::from_secs(12),
+            65 * 1024,
+            false,
+            Instant::now(),
+        );
+        assert_eq!(a.stats().slow_body, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_off_body_scores_the_cut_weight_and_is_not_also_slow() {
+        let (mut b, adm) = scripted(false);
+        assert_eq!(drain_body(&mut b).await, 1);
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (1, 0));
+        assert_eq!(points(&adm, "u"), CUT_WEIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_dropped_mid_wait_is_counted_once() {
+        // A 4 s stall that ended, then a second wait the client abandons.
+        let (mut b, adm) = timed(&[(4000, Some(1)), (60_000, Some(1))], BodyLimits::default());
+        assert!(next_frame(&mut b).await.unwrap().is_ok());
+        let pending = std::future::poll_fn(|cx| {
+            Poll::Ready(http_body::Body::poll_frame(Pin::new(&mut b), cx).is_pending())
+        })
+        .await;
+        assert!(pending);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        drop(b);
+        assert_eq!(adm.stats().slow_body, 1);
+        assert_eq!(adm.stats().body_deadline, 0);
+        // A body that was never read reports nothing.
+        let (b2, adm2) = timed(&[(60_000, Some(1))], BodyLimits::default());
+        drop(b2);
+        assert_eq!(adm2.stats(), AdmissionStats::default());
+    }
+
+    #[test]
+    fn dropping_a_polled_body_outside_a_runtime_does_not_panic() {
+        // Shutdown can drop a body after the runtime is gone.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let (mut b, adm) = rt.block_on(async {
+            let (mut b, adm) = timed(&[(60_000, Some(1))], BodyLimits::default());
+            let pending = std::future::poll_fn(|cx| {
+                Poll::Ready(http_body::Body::poll_frame(Pin::new(&mut b), cx).is_pending())
+            })
+            .await;
+            assert!(pending);
+            (b, adm)
+        });
+        drop(rt);
+        // Outside any runtime now: the Drop reads the clock and reports.
+        let _ = &mut b;
+        drop(b);
+        assert_eq!(adm.stats().body_deadline, 0);
+        // The open stretch is capped and tiny here: not slow, not an error.
+        assert_eq!(adm.stats().slow_body, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_open_wait_is_charged_at_most_the_slow_wait() {
+        let (mut b, adm) = timed(&[(600_000, Some(1))], BodyLimits::default());
+        let pending = std::future::poll_fn(|cx| {
+            Poll::Ready(http_body::Body::poll_frame(Pin::new(&mut b), cx).is_pending())
+        })
+        .await;
+        assert!(pending);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        drop(b);
+        // Capped at exactly slow_wait, which is not over it.
+        assert_eq!(adm.stats().slow_body, 0);
+        assert_eq!(adm.top_body_wait_summary(), "u(3s)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_then_one_long_stall_is_slow_whatever_the_rate_credit() {
+        // 9 MiB at once (about 144 s of rate credit), then the last byte after
+        // 140 s: inside the cut-off deadline, and under 3 s + credit in total.
+        let (mut b, adm) = timed(
+            &[(0, Some(9 << 20)), (140_000, Some(1)), (0, None)],
+            BodyLimits::default(),
+        );
+        assert_eq!(drain_body(&mut b).await, 0);
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (0, 1));
+        assert_eq!(points(&adm, "u"), SLOW_WEIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_then_a_trickle_under_the_single_stall_limit_is_slow() {
+        // 9 MiB at once, then 1 byte every 2.9 s for 140 s (48 stretches).
+        let steps: Vec<_> = [(0, Some(9 << 20))]
+            .into_iter()
+            .chain((0..48).map(|_| (2900, Some(1))))
+            .chain([(0, None)])
+            .collect();
+        let (mut b, adm) = timed(&steps, BodyLimits::default());
+        assert_eq!(drain_body(&mut b).await, 0);
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (0, 1));
+        assert_eq!(points(&adm, "u"), SLOW_WEIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_steady_upload_at_the_minimum_rate_is_not_slow() {
+        // 64 KiB every second for 30 s: exactly the 64 KiB/s floor.
+        let steps: Vec<_> = (0..30)
+            .map(|_| (1000, Some(64 * 1024)))
+            .chain([(0, None)])
+            .collect();
+        let (mut b, adm) = timed(&steps, BodyLimits::default());
+        assert_eq!(drain_body(&mut b).await, 0);
+        drop(b);
+        assert_eq!(adm.stats().slow_body, 0);
+        assert_eq!(points(&adm, "u"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stalls_then_disconnects_over_a_real_socket_is_slow() {
+        use tokio::io::AsyncWriteExt;
+        let (base, adm, _gate) = body_app(BodyLimits {
+            slow_wait: Duration::from_millis(300),
+            ..BodyLimits::default()
+        })
+        .await;
+        let mut conn = tokio::net::TcpStream::connect(base.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        conn.write_all(
+            b"POST /api/body HTTP/1.1\r\nHost: x\r\nx-user: sock-slow\r\n\
+              Content-Length: 75000\r\n\r\n0123456789",
+        )
+        .await
+        .unwrap();
+        // Over the 1 s accounting floor and the 300 ms slow limit.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        drop(conn);
+        adm.idle().await;
+        let st = adm.stats();
+        assert_eq!((st.slow_body, st.body_deadline), (1, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_large_steady_upload_with_short_gaps_is_not_slow() {
+        // 20 chunks of 200 KiB, 2 s apart (100 KiB/s): 40 s waited in all.
+        let steps: Vec<_> = (0..20)
+            .map(|_| (2000, Some(200 * 1024)))
+            .chain([(0, None)])
+            .collect();
+        let (mut b, adm) = timed(&steps, BodyLimits::default());
+        assert_eq!(drain_body(&mut b).await, 0);
+        drop(b);
+        let st = adm.stats();
+        assert_eq!((st.body_deadline, st.slow_body), (0, 0));
+        assert_eq!(points(&adm, "u"), 0);
+    }
+
+    fn slow_at(a: &Admission, user: &str, t: Instant) {
+        a.note_body_done_at(user, Duration::from_secs(5), 0, false, t);
+    }
+
+    #[test]
+    fn six_slow_bodies_in_the_window_block_and_five_do_not() {
+        let a = Admission::with_body(BodyLimits::default());
+        let t0 = Instant::now();
+        for i in 0..5u64 {
+            slow_at(&a, "u1", t0 + Duration::from_secs(i));
+        }
+        let t = t0 + Duration::from_secs(6);
+        assert!(a.try_admit_at("u1", false, t).is_ok());
+        slow_at(&a, "u1", t0 + Duration::from_secs(5));
+        assert_eq!(a.try_admit_at("u1", false, t).unwrap_err(), Refusal::User);
+        assert!(a.try_admit_at("u2", false, t).is_ok());
+        assert_eq!(a.stats().slow_body, 6);
+        assert!(a
+            .try_admit_at("u1", false, t0 + Duration::from_secs(5 + 30))
+            .is_ok());
+    }
+
+    #[test]
+    fn two_cut_offs_plus_two_slow_bodies_block_and_three_cut_offs_still_do() {
+        let a = Admission::with_body(BodyLimits::default());
+        let t0 = Instant::now();
+        a.note_cut_off_at("u1", t0);
+        a.note_cut_off_at("u1", t0 + Duration::from_secs(1));
+        slow_at(&a, "u1", t0 + Duration::from_secs(2));
+        let t = t0 + Duration::from_secs(3);
+        assert!(a.try_admit_at("u1", false, t).is_ok());
+        slow_at(&a, "u1", t0 + Duration::from_secs(3));
+        assert_eq!(a.try_admit_at("u1", false, t).unwrap_err(), Refusal::User);
+        let b = Admission::with_body(BodyLimits::default());
+        for i in 0..3 {
+            b.note_cut_off_at("u1", t0 + Duration::from_secs(i));
+        }
+        assert_eq!(b.try_admit_at("u1", false, t).unwrap_err(), Refusal::User);
+    }
+
+    #[test]
+    fn a_zero_slow_weight_counts_and_logs_but_never_blocks() {
+        let a = Admission::with_body(BodyLimits {
+            slow_weight: 0,
+            ..BodyLimits::default()
+        });
+        let t0 = Instant::now();
+        for i in 0..20u64 {
+            slow_at(&a, "u1", t0 + Duration::from_secs(i));
+        }
+        assert_eq!(a.stats().slow_body, 20);
+        assert_eq!(points(&a, "u1"), 0);
+        assert!(a
+            .try_admit_at("u1", false, t0 + Duration::from_secs(21))
+            .is_ok());
+    }
+
+    #[test]
+    fn body_wait_is_summed_per_window_and_listed_top_first() {
+        let a = Admission::with_body(BodyLimits::default());
+        let now = Instant::now();
+        a.note_body_done_at("bob", Duration::from_secs(20), 1 << 30, false, now);
+        a.note_body_done_at("alice", Duration::from_secs(30), 1 << 30, false, now);
+        a.note_body_done_at("bob", Duration::from_secs(20), 1 << 30, false, now);
+        // Under the note floor: not recorded.
+        a.note_body_done_at("carol", Duration::from_millis(900), 0, false, now);
+        assert_eq!(a.top_body_wait_summary(), "bob(40s), alice(30s)");
+    }
+
+    fn gauge() -> &'static AtomicU32 {
+        Box::leak(Box::new(AtomicU32::new(0)))
+    }
+
+    #[test]
+    fn the_audit_backlog_refuses_non_admins_at_the_mark_with_hysteresis() {
+        let g = gauge();
+        let a = Admission::with_backlog(g);
+        g.store(AUDIT_BACKLOG_HIGH - 1, Ordering::Relaxed);
+        assert!(a.try_admit("u1").is_ok());
+        g.store(AUDIT_BACKLOG_HIGH, Ordering::Relaxed);
+        assert_eq!(a.try_admit("u2").unwrap_err(), Refusal::Backlog);
+        // An admin is spared between the marks.
+        assert!(a.try_admit_as("admin-x", true).is_ok());
+        // Still refused while draining above the low mark.
+        g.store(AUDIT_BACKLOG_LOW + 1, Ordering::Relaxed);
+        assert_eq!(a.try_admit("u2").unwrap_err(), Refusal::Backlog);
+        g.store(AUDIT_BACKLOG_LOW, Ordering::Relaxed);
+        assert!(a.try_admit("u2").is_ok());
+        // Cleared: back above low but below high is admitted again.
+        g.store(AUDIT_BACKLOG_HIGH - 1, Ordering::Relaxed);
+        assert!(a.try_admit("u3").is_ok());
+    }
+
+    #[test]
+    fn the_audit_backlog_refuses_admins_at_the_admin_mark() {
+        let g = gauge();
+        let a = Admission::with_backlog(g);
+        g.store(AUDIT_BACKLOG_ADMIN_HIGH - 1, Ordering::Relaxed);
+        assert!(a.try_admit_as("admin-x", true).is_ok());
+        g.store(AUDIT_BACKLOG_ADMIN_HIGH, Ordering::Relaxed);
+        assert_eq!(
+            a.try_admit_as("admin-y", true).unwrap_err(),
+            Refusal::Backlog
+        );
+    }
+
+    #[test]
+    fn the_user_cap_wins_over_the_backlog_and_backlog_refusals_are_counted() {
+        let g = gauge();
+        let a = Admission::with_backlog(g);
+        let _held: Vec<_> = (0..MAX_USER_IN_FLIGHT)
+            .map(|_| a.try_admit("u1").unwrap())
+            .collect();
+        g.store(AUDIT_BACKLOG_HIGH, Ordering::Relaxed);
+        assert_eq!(a.try_admit("u1").unwrap_err(), Refusal::User);
+        let why = a.try_admit("u2").unwrap_err();
+        assert_eq!(why, Refusal::Backlog);
+        a.refuse("u2", why);
+        assert_eq!(a.stats().refused_backlog, 1);
+        assert_eq!(a.stats().refused_user, 0);
+    }
+
+    #[test]
+    fn the_third_refusal_reason_is_throttled_independently() {
+        let mut t = WarnThrottle::default();
+        let t0 = Instant::now();
+        assert_eq!(t.decide(Refusal::Global, t0), Some(0));
+        assert_eq!(t.decide(Refusal::Global, t0), None);
+        assert_eq!(t.decide(Refusal::Backlog, t0), Some(0));
+        assert_eq!(t.decide(Refusal::Backlog, t0), None);
+        assert_eq!(t.decide(Refusal::Backlog, t0), None);
+        assert_eq!(t.decide(Refusal::Backlog, t0 + WARN_INTERVAL), Some(2));
+        assert_eq!(t.decide(Refusal::Global, t0 + WARN_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn the_production_admission_reads_the_global_audit_queue_gauge() {
+        assert!(std::ptr::eq(
+            Admission::new().backlog,
+            crate::db_audit::open_pending_gauge()
+        ));
+        assert!(!std::ptr::eq(
+            Admission::with_caps(3, 2).backlog,
+            crate::db_audit::open_pending_gauge()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_backlog_is_refused_503_with_retry_after_5_before_the_handler() {
+        let g = gauge();
+        let (mut state, _dir) = lazy_state();
+        state.admission = Admission::with_backlog(g);
+        let adm = state.admission.clone();
+        let (gate, _entered) = Gate::new();
+        let base = serve(app(state, gate.clone())).await;
+        g.store(AUDIT_BACKLOG_HIGH, Ordering::Relaxed);
+        expect_refused_after(
+            call(&base, "POST", "/api/gate", "backlog-u").await,
+            503,
+            "server busy",
+            "5",
+        )
+        .await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), 0);
+        // An audited read is refused too; an unadmitted read is not.
+        expect_refused_after(
+            call(&base, "GET", "/api/audit/events", "backlog-u").await,
+            503,
+            "server busy",
+            "5",
+        )
+        .await;
+        assert_eq!(
+            call(&base, "GET", "/api/probe", "backlog-u").await.status(),
+            200
+        );
+        assert_eq!(adm.stats().refused_backlog, 2);
+        // An admin is spared below the admin mark.
+        assert_eq!(
+            call(&base, "POST", "/api/fast", "admin-backlog")
+                .await
+                .status(),
+            200
+        );
+        g.store(0, Ordering::Relaxed);
+        assert_eq!(
+            call(&base, "POST", "/api/fast", "backlog-u").await.status(),
+            200
+        );
     }
 }
 

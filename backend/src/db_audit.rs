@@ -36,8 +36,13 @@
 //! pins this arithmetic; it holds for any `RATE_LIMIT_BURST` and for admins,
 //! who bypass the rate limiter. It is strict only while the pool is healthy:
 //! a stalled insert lets one request leave late writes behind under its permit.
+//! When that happens the count of non-restricted pending writes
+//! ([`WriteQueue::open_gauge`]) climbs past the healthy bound, and `admission`
+//! refuses new requests (503) at a high-water mark until it drains. That damps
+//! the stacking; it does not bound it, since requests already admitted can
+//! still leave writes behind.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -470,6 +475,9 @@ pub(crate) struct WriteQueue {
     cap: u32,
     denied_cap: u32,
     user_denied_cap: u32,
+    /// Pending non-restricted writes. Written only under the `state` lock (so
+    /// it always matches `pending - denied`), read without it by admission.
+    open_pending: AtomicU32,
 }
 
 /// Pending counts, all behind one lock so a reservation checks and takes
@@ -566,6 +574,8 @@ impl Drop for Slot {
             st.pending = st.pending.saturating_sub(1);
             if self.reserve.restricted {
                 st.denied = st.denied.saturating_sub(1);
+            } else {
+                self.queue.open_pending.fetch_sub(1, Ordering::Relaxed);
             }
             if let (true, Some(u)) = (self.reserve.restricted, &self.reserve.user) {
                 if let Some(i) = st.users.iter().position(|e| &e.user == u) {
@@ -605,7 +615,13 @@ impl WriteQueue {
             cap,
             denied_cap,
             user_denied_cap,
+            open_pending: AtomicU32::new(0),
         }
+    }
+
+    /// Pending non-restricted writes, readable without the queue lock.
+    pub(crate) fn open_gauge(&'static self) -> &'static AtomicU32 {
+        &self.open_pending
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -647,6 +663,8 @@ impl WriteQueue {
         st.pending += 1;
         if reserve.restricted {
             st.denied += 1;
+        } else {
+            self.open_pending.fetch_add(1, Ordering::Relaxed);
         }
         drop(st);
         Ok(Slot {
@@ -692,6 +710,11 @@ static GLOBAL_QUEUE: WriteQueue = WriteQueue::new(
     MAX_DENIED_PENDING,
     MAX_USER_DENIED_PENDING,
 );
+
+/// The process-wide queue's count of pending non-restricted writes.
+pub(crate) fn open_pending_gauge() -> &'static AtomicU32 {
+    GLOBAL_QUEUE.open_gauge()
+}
 
 /// Wait for every pending audit write (shutdown).
 pub(crate) async fn drain() {
@@ -2039,6 +2062,68 @@ mod tests {
         assert_eq!((a as usize, b as usize), (MAX_ID_CHARS, MAX_ID_CHARS));
     }
 
+    #[tokio::test]
+    async fn the_open_gauge_follows_non_restricted_reservations_only() {
+        queue!(C, Q, 64);
+        let g = Q.open_gauge();
+        let mut held = vec![
+            gated_submit(&Q, "a", false).await,
+            gated_submit(&Q, "b", false).await,
+            gated_submit(&Q, "c", true).await,
+        ];
+        assert_eq!((Q.pending(), g.load(Ordering::Relaxed)), (3, 2));
+        // Finish the restricted one: the gauge is unchanged.
+        let (open, call) = held.remove(2);
+        let _ = open.send(());
+        call.await;
+        assert_eq!(Q.pending(), 2);
+        assert_eq!(g.load(Ordering::Relaxed), 2);
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert_eq!(g.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn the_open_gauge_returns_to_zero_after_a_failed_write() {
+        queue!(C, Q, 64);
+        let (_open, gate) = tokio::sync::oneshot::channel::<()>();
+        drop(_open);
+        let mut call = Box::pin(submit(
+            &Q,
+            LONG,
+            log_fields(),
+            rsv("u1", false),
+            gated_write(gate, Arc::new(AtomicBool::new(false)), false),
+        ));
+        let _ = poll_once(&mut call).await;
+        call.await;
+        Q.drain().await;
+        assert_eq!(Q.open_gauge().load(Ordering::Relaxed), 0);
+        assert_eq!(C.snapshot().total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_backlog_of_open_writes_refuses_admission_until_it_drains() {
+        use crate::api::admission::{Admission, Refusal, AUDIT_BACKLOG_HIGH};
+        queue!(C, Q, 64);
+        let adm = Admission::with_backlog(Q.open_gauge());
+        assert!(adm.try_admit("u0").is_ok());
+        let mut held = Vec::new();
+        for i in 0..AUDIT_BACKLOG_HIGH {
+            held.push(gated_submit(&Q, &format!("u{i}"), false).await);
+        }
+        assert_eq!(adm.try_admit("fresh").unwrap_err(), Refusal::Backlog);
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert!(adm.try_admit("fresh").is_ok());
+    }
+
     fn ctx() -> RequestCtx {
         RequestCtx {
             request_id: "req-1".into(),
@@ -2065,7 +2150,11 @@ mod tests {
         for _ in 0..5 {
             held.push(small.acquire().await.unwrap());
         }
-        let adm = crate::api::admission::Admission::new();
+        let adm = crate::api::admission::Admission::with_limits(
+            crate::api::admission::MAX_IN_FLIGHT,
+            crate::api::admission::MAX_USER_IN_FLIGHT,
+            crate::api::admission::ADMIN_RESERVE,
+        );
         let mut c = ctx();
         c.permit = Some(adm.try_admit("u1").unwrap());
         let mut e = ev("ok", json!({}));
