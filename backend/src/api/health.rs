@@ -44,7 +44,10 @@
 //! shared denied/rejected slots full), except one caused by a single user's
 //! own denied/rejected sub-cap (4) (a user can trigger those at will, so they must
 //! not be able to degrade this status); that one counts only in `shedWrites`
-//! and logs at most once a minute per user. Alert on the `shedWrites` rate and
+//! and logs at most once a minute per user (the shared-slot shed uses the
+//! same per-user limit; users beyond 32 tracked ones share one overflow bucket, whose summary line
+//! signals more than 32 distinct accounts shed in a minute (alert on it);
+//! held-back counts are logged in a later summary line). Alert on the `shedWrites` rate and
 //! on `writeFailures`, not only on the public status. `lateWrites` and `pendingWrites`
 //! are early warnings of a slow pool; they do not degrade the public status.
 //!

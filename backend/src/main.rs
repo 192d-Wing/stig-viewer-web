@@ -949,6 +949,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Test-mode flag re-check (#106): its own short interval, log and audit
+    // only. The audit row is written on a transition, the log line every time.
+    tokio::spawn(db_audit::run_test_flag_recheck(
+        (*pool).clone(),
+        test_hooks.enable_test_routes,
+        db_audit::TEST_FLAG_RECHECK_INTERVAL,
+    ));
+
+    // Held-back audit shed-log summaries, so counts show up after a flood stops.
+    tokio::spawn(db_audit::run_shed_flush(db_audit::SHED_FLUSH_INTERVAL));
+
     // Continuous compliance report scheduler — renders a fleet-wide PDF
     // on a configurable cadence (default weekly) and fires a
     // `compliance_report` webhook event so Slack / receivers can pick up
@@ -1036,7 +1047,7 @@ async fn main() -> Result<()> {
     // The drain budget starts at the shutdown signal and covers both the
     // server's graceful phase (which waits for open connections) and the wait
     // for detached work and audit writes.
-    let (signalled_tx, mut signalled_rx) = tokio::sync::oneshot::channel();
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel();
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1045,39 +1056,77 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         let _ = signalled_tx.send(tokio::time::Instant::now());
     });
-    let mut serve = Box::pin(std::future::IntoFuture::into_future(serve));
+    let outcome = serve_until_drained(
+        std::future::IntoFuture::into_future(serve),
+        signalled_rx,
+        async {
+            state.tasks.idle().await;
+            db_audit::drain().await;
+        },
+        SHUTDOWN_DRAIN,
+    )
+    .await;
+    // Every exit path: held-back shed counts would otherwise be lost.
+    db_audit::flush_shed_summaries();
+    let outcome = outcome?;
+    if outcome == ShutdownOutcome::BudgetExpired {
+        let (_, pending, _) = db_audit::write_stats();
+        tracing::error!(
+            target: "audit",
+            in_flight = state.tasks.in_flight(),
+            pending_audit_writes = pending,
+            "shutdown budget of {SHUTDOWN_DRAIN:?} from the signal expired; \
+             open requests and pending work are lost"
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownOutcome {
+    /// The server stopped without a signal (an accept error already returned).
+    ServerStopped,
+    /// Signalled; the server and `drain` finished within the budget.
+    Drained,
+    /// Signalled; the budget expired first and pending work is abandoned.
+    BudgetExpired,
+}
+
+/// Run `serve` until it ends or `signal_rx` reports the shutdown signal, then
+/// give it and `drain` until `budget` after the signal to finish.
+async fn serve_until_drained<S, D>(
+    serve: S,
+    mut signal_rx: tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+    drain: D,
+    budget: Duration,
+) -> Result<ShutdownOutcome>
+where
+    S: std::future::Future<Output = std::io::Result<()>>,
+    D: std::future::Future<Output = ()>,
+{
+    let mut serve = std::pin::pin!(serve);
     let signalled_at = tokio::select! {
         r = &mut serve => {
             // The server stopped without a signal (an accept error).
             r?;
-            None
+            return Ok(ShutdownOutcome::ServerStopped);
         }
-        Ok(at) = &mut signalled_rx => Some(at),
+        Ok(at) = &mut signal_rx => at,
     };
-    if let Some(at) = signalled_at {
-        let drained = tokio::time::timeout_at(at + SHUTDOWN_DRAIN, async {
-            let served = (&mut serve).await;
-            state.tasks.idle().await;
-            db_audit::drain().await;
-            served
-        })
-        .await;
-        match drained {
-            Ok(served) => served?,
-            Err(_) => {
-                let (_, pending, _) = db_audit::write_stats();
-                tracing::error!(
-                    target: "audit",
-                    in_flight = state.tasks.in_flight(),
-                    pending_audit_writes = pending,
-                    "shutdown budget of {SHUTDOWN_DRAIN:?} from the signal expired; \
-                     open requests and pending work are lost"
-                );
-            }
+    let drained = tokio::time::timeout_at(signalled_at + budget, async {
+        let served = (&mut serve).await;
+        drain.await;
+        served
+    })
+    .await;
+    match drained {
+        Ok(served) => {
+            served?;
+            Ok(ShutdownOutcome::Drained)
         }
+        Err(_) => Ok(ShutdownOutcome::BudgetExpired),
     }
-
-    Ok(())
 }
 
 /// Total shutdown budget, measured from the signal: the server's graceful
@@ -1089,6 +1138,19 @@ async fn main() -> Result<()> {
 /// it bounds a hung database, not a normal stop).
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
 
+/// Resolves on SIGTERM (never, off unix or if the handler cannot install).
+async fn terminate_signal() {
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if tokio::signal::ctrl_c().await.is_err() {
@@ -1096,22 +1158,122 @@ async fn shutdown_signal() {
             std::future::pending::<()>().await;
         }
     };
-    #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
     tokio::select! {
         () = ctrl_c => {},
-        () = term => {},
+        () = terminate_signal() => {},
     }
     info!("Shutting down…");
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    const BUDGET: Duration = Duration::from_secs(8);
+
+    #[tokio::test]
+    async fn shutdown_drains_pending_work_within_the_budget() {
+        let (tx, rx) = oneshot::channel();
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = drained.clone();
+        let _ = tx.send(tokio::time::Instant::now());
+        let out = serve_until_drained(
+            // Finishes only after the signal was seen, as a graceful server does.
+            async {
+                tokio::task::yield_now().await;
+                Ok(())
+            },
+            rx,
+            async move {
+                tokio::task::yield_now().await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            BUDGET,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, ShutdownOutcome::Drained);
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_budget_expiry_abandons_pending_work() {
+        let (tx, rx) = oneshot::channel();
+        let start = tokio::time::Instant::now();
+        let serve = async {
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        let _ = tx.send(start);
+        let out = serve_until_drained(serve, rx, std::future::pending::<()>(), BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(out, ShutdownOutcome::BudgetExpired);
+        assert_eq!(tokio::time::Instant::now() - start, BUDGET);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stops_without_a_signal_skips_the_drain() {
+        let (_tx, rx) = oneshot::channel();
+        let out = serve_until_drained(
+            async { Ok(()) },
+            rx,
+            async { panic!("the drain must not run without a signal") },
+            BUDGET,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, ShutdownOutcome::ServerStopped);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_without_a_signal_is_returned() {
+        let (_tx, rx) = oneshot::channel();
+        let r = serve_until_drained(
+            async { Err(std::io::Error::other("accept failed")) },
+            rx,
+            async {},
+            BUDGET,
+        )
+        .await;
+        assert!(r.is_err());
+    }
+
+    /// `tokio::signal` handlers are never uninstalled, so the check runs in a
+    /// re-executed child of this test binary; the parent's signal disposition
+    /// stays untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_signal_resolves_on_sigterm() {
+        const GUARD: &str = "STIG_TERMINATE_SIGNAL_CHILD";
+        const NAME: &str = "shutdown_tests::terminate_signal_resolves_on_sigterm";
+        if std::env::var_os(GUARD).is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let status = std::process::Command::new(exe)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(GUARD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child failed: {status:?}");
+            return;
+        }
+        let mut term = Box::pin(terminate_signal());
+        // First poll installs the handler.
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(term.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(pending);
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        tokio::time::timeout(Duration::from_secs(5), term)
+            .await
+            .expect("SIGTERM resolves terminate_signal");
+    }
 }
 
 #[cfg(test)]

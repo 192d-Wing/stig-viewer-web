@@ -181,6 +181,26 @@ jobs:
           docker compose logs backend
           exit 1
 
+      - name: Assert startup applied the audit test-mode policy
+        # Must run before Playwright: /api/test/reset truncates audit_events.
+        # The SQL mirrors TEST_FLAG_SQL in backend/src/db_audit.rs and migration
+        # 043. The flag alone can be set by the owner step in db_roles; only the
+        # startup call to apply_test_maintenance_policy writes the system row,
+        # so the row proves main.rs still applies the policy. `>= 1` because
+        # cargo watch may have restarted the backend.
+        run: |
+          psql_q() {
+            docker compose exec -T postgres psql -U stig -d stig_viewer -tAc "$1" | tr -d '[:space:]'
+          }
+          flag="$(psql_q "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase WHERE d.datname = pg_catalog.current_database() AND s.setrole = 0 AND 'stig.audit_allow_test_mode=on' = ANY (s.setconfig))")"
+          rows="$(psql_q "SELECT count(*) FROM audit_events WHERE action = 'audit.test_mode_enabled' AND user_id IS NULL AND user_role = 'system'")"
+          echo "flag=${flag} startup_rows=${rows}"
+          if [ "$flag" != "t" ] || [ "${rows:-0}" -lt 1 ]; then
+            echo "Startup did not apply the audit test-mode policy"
+            docker compose logs backend
+            exit 1
+          fi
+
       - name: Wait for frontend
         run: |
           # The first `trunk serve` compiles the wasm bundle from scratch.
