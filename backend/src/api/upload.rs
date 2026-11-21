@@ -7,7 +7,7 @@ use chrono::Utc;
 
 use crate::{
     api::{auth::AuthUser, request_ctx::RequestCtx, stig_validator::lint_stig},
-    db::{upsert_catalog, CatalogEntry},
+    db::{upsert_catalog_tx, CatalogEntry},
     parser::{
         extract_all_from_library, extract_xccdf_from_zip, parse_xccdf, LibraryAbort, LibrarySkip,
     },
@@ -34,12 +34,17 @@ struct Rejection<'a> {
     reason_code: &'static str,
     reason: &'a str,
     bytes_compressed: usize,
-    /// `(skipped, byReason, parsed)` for a library aborted part-way.
-    tally: Option<(
-        usize,
-        std::collections::BTreeMap<&'static str, usize>,
-        usize,
-    )>,
+    /// Skip counts for a library aborted part-way.
+    tally: Option<SkipTally>,
+}
+
+/// Skip counts gathered before a library import was aborted.
+struct SkipTally {
+    skipped: usize,
+    by_reason: std::collections::BTreeMap<&'static str, usize>,
+    parsed: usize,
+    /// Entry audit rows queued for the skips.
+    audited: usize,
 }
 
 impl<'a> Rejection<'a> {
@@ -82,10 +87,15 @@ async fn record_zip_rejection(
         "reason": reason,
         "bytesCompressed": bytes_compressed,
     });
-    if let (Some((skipped, by_reason, parsed)), Some(map)) = (tally, detail.as_object_mut()) {
-        map.insert("skipped".into(), skipped.into());
-        map.insert("byReason".into(), serde_json::json!(by_reason));
-        map.insert("parsed".into(), parsed.into());
+    if let (Some(t), Some(map)) = (tally, detail.as_object_mut()) {
+        map.insert("skipped".into(), t.skipped.into());
+        map.insert("byReason".into(), serde_json::json!(t.by_reason));
+        map.insert("parsed".into(), t.parsed.into());
+        map.insert("skippedAudited".into(), t.audited.into());
+        map.insert(
+            "skippedTruncated".into(),
+            (t.skipped > MAX_SKIPPED_ENTRIES_AUDITED).into(),
+        );
     }
     crate::db_audit::record_or_log(
         state.pool.as_ref(),
@@ -171,36 +181,52 @@ fn log_and_tally_skips(
     by_reason
 }
 
-/// Audit the skipped entries of an imported library: one
-/// `catalog.import_library_entry` row per skip up to the cap, plus one
-/// `catalog.import_library` summary row. Every skip is also logged. A skip of
-/// the outer archive is not handled here (it is recorded as a rejection).
+/// How the entry and summary audit rows are written: the overall deadline and
+/// the queue. Production uses the process-wide queue; a test passes its own so
+/// it does not share caps with other tests.
+#[derive(Clone, Copy)]
+struct AuditVia {
+    deadline: std::time::Duration,
+    queue: Option<&'static crate::db_audit::WriteQueue>,
+}
+
+const PRODUCTION_AUDIT: AuditVia = AuditVia {
+    deadline: ENTRY_AUDIT_DEADLINE,
+    queue: None,
+};
+
+async fn write_reporting(
+    via: AuditVia,
+    pool: &sqlx::PgPool,
+    ev: crate::db_audit::NewAuditEvent<'_>,
+) -> crate::db_audit::Submission {
+    match via.queue {
+        Some(q) => crate::db_audit::record_reporting_on(q, pool, ev).await,
+        None => crate::db_audit::record_or_log_reporting(pool, ev).await,
+    }
+}
+
+/// Write one `catalog.import_library_entry` row per skip, up to the cap and the
+/// overall deadline, and return how many writes were queued (not shed).
 ///
-/// Entry rows go through `record_or_log`, which collapses identical denied or
+/// Entry rows go through the queue, which collapses identical denied or
 /// rejected rows (same user, entry id, reason code) seen within 300 s into one
-/// row with a larger `repeat_count`. The summary row's `skipped` is the true
-/// count; `skippedAudited` is the number of entry writes queued (not shed) before the
-/// cap or `deadline` stopped them (so it may be below the cap). Writes are
-/// detached: when the deadline passes, the write in flight is not cancelled
-/// (it finishes and is counted on its own) and no further entry rows are
-/// submitted.
-async fn audit_library_skips(
+/// row with a larger `repeat_count`. Writes are detached: when the deadline
+/// passes, the write in flight is not cancelled (it finishes and is counted on
+/// its own) and no further entry rows are submitted. A skip of the outer
+/// archive is not handled here.
+async fn audit_skip_entries(
     state: &AppState,
     user: &AuthUser,
     ctx: &RequestCtx,
     skips: &[&LibrarySkip],
-    parsed: usize,
-    bytes_compressed: usize,
-    deadline: std::time::Duration,
-) {
-    if skips.is_empty() {
-        return;
-    }
-    let by_reason = log_and_tally_skips(user, skips);
-    let deadline = tokio::time::Instant::now() + deadline;
+    via: AuditVia,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + via.deadline;
     let mut attempted = 0usize;
     for skip in skips.iter().take(MAX_SKIPPED_ENTRIES_AUDITED) {
-        let write = crate::db_audit::record_or_log_reporting(
+        let write = write_reporting(
+            via,
             state.pool.as_ref(),
             crate::db_audit::NewAuditEvent {
                 user_id: &user.id,
@@ -229,29 +255,132 @@ async fn audit_library_skips(
             attempted += 1;
         }
     }
-    let n = skips.len();
-    crate::db_audit::record_or_log(
+    attempted
+}
+
+/// Counts for one import's `catalog.import_library` summary row.
+struct ImportCounts<'a> {
+    skipped: usize,
+    by_reason: &'a std::collections::BTreeMap<&'static str, usize>,
+    audited: usize,
+    parsed: usize,
+    /// Rows committed to the catalog.
+    imported: usize,
+    /// Entries that were parsed but could not be written.
+    failed: usize,
+    commit_failed: bool,
+    bytes_compressed: usize,
+}
+
+/// Outcome and detail of the summary row: `ok` with nothing skipped or failed,
+/// `partial` when something was imported alongside skips or failures, and
+/// `rejected` when nothing was imported.
+fn import_summary(c: &ImportCounts<'_>) -> (&'static str, serde_json::Value) {
+    let empty = c.skipped == 0 && c.failed == 0 && c.parsed == 0 && !c.commit_failed;
+    let outcome = if empty {
+        "rejected"
+    } else if c.skipped == 0 && c.failed == 0 {
+        "ok"
+    } else if c.imported > 0 {
+        "partial"
+    } else {
+        "rejected"
+    };
+    let reason_code = if c.commit_failed {
+        Some("commit_failed")
+    } else if empty {
+        Some("no_entries")
+    } else if c.skipped > 0 {
+        Some("entries_skipped")
+    } else if c.failed > 0 {
+        Some("write_failed")
+    } else {
+        None
+    };
+    let mut detail = serde_json::json!({
+        "skipped": c.skipped,
+        "skippedAudited": c.audited,
+        "skippedTruncated": c.skipped > MAX_SKIPPED_ENTRIES_AUDITED,
+        "byReason": c.by_reason,
+        "parsed": c.parsed,
+        "imported": c.imported,
+        "failed": c.failed,
+        "bytesCompressed": c.bytes_compressed,
+    });
+    if let (Some(code), Some(map)) = (reason_code, detail.as_object_mut()) {
+        map.insert("reasonCode".into(), code.into());
+    }
+    (outcome, detail)
+}
+
+/// Write the summary row through the queue (no transaction).
+async fn record_summary(
+    state: &AppState,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    outcome: &'static str,
+    detail: serde_json::Value,
+    via: AuditVia,
+) {
+    write_reporting(
+        via,
         state.pool.as_ref(),
         crate::db_audit::NewAuditEvent {
             user_id: &user.id,
             ctx: Some(ctx),
             action: "catalog.import_library",
-            outcome: if parsed > 0 { "partial" } else { "rejected" },
+            outcome,
             asset_id: None,
             checklist_id: None,
             stig_id: None,
-            detail: serde_json::json!({
-                "reasonCode": "entries_skipped",
-                "skipped": n,
-                "skippedAudited": attempted,
-                "skippedTruncated": n > MAX_SKIPPED_ENTRIES_AUDITED,
-                "byReason": by_reason,
-                "parsed": parsed,
-                "bytesCompressed": bytes_compressed,
-            }),
+            detail,
         },
     )
     .await;
+}
+
+/// Log a failed join of a blocking or detached task; the client gets a fixed
+/// message, never the error text.
+fn join_failed(what: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::error!("{what} task failed: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+}
+
+fn internal_error() -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+}
+
+/// Longest a catalog-commit statement may run or wait for a lock.
+const COMMIT_TIMEOUT_MS: i64 = 8_000;
+
+/// Commit catalog rows and the audit row in one transaction.
+async fn commit_catalog(
+    pool: &sqlx::PgPool,
+    entries: &[CatalogEntry],
+    ev: &crate::db_audit::NewAuditEvent<'_>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    // Bound every statement so a stuck commit fails (and its caller discards
+    // its temps) instead of holding the publish lock indefinitely.
+    sqlx::query(
+        "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)",
+    )
+    .bind(COMMIT_TIMEOUT_MS.to_string())
+    .execute(&mut *tx)
+    .await?;
+    for e in entries {
+        upsert_catalog_tx(&mut tx, e).await?;
+    }
+    crate::db_audit::record_in_tx(&mut tx, ev).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The validated fields of a single-STIG upload.
+pub(crate) struct StigUpload {
+    pub(crate) id: String,
+    pub(crate) category: String,
+    pub(crate) zip_bytes: Vec<u8>,
 }
 
 /// POST /api/upload
@@ -331,6 +460,55 @@ pub async fn upload_stig(
     let zip_bytes = zip_bytes.ok_or((StatusCode::BAD_REQUEST, "Missing 'file' field".into()))?;
     let id = id.ok_or((StatusCode::BAD_REQUEST, "Missing 'id' field".into()))?;
     let category = category.ok_or((StatusCode::BAD_REQUEST, "Missing 'category' field".into()))?;
+    publish_stig(
+        state,
+        user,
+        ctx,
+        StigUpload {
+            id,
+            category,
+            zip_bytes,
+        },
+    )
+    .await
+}
+
+/// Run the upload as a detached task; no await before the spawn, so a client
+/// disconnect cannot split the file, catalog row and audit row.
+pub(crate) async fn publish_stig(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    up: StigUpload,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tasks = state.tasks.clone();
+    crate::detached::run(
+        &tasks,
+        "stig upload",
+        upload_stig_work(state, user, ctx, up),
+    )
+    .await
+    .map_err(|code| (code, "internal error".to_string()))?
+}
+
+async fn upload_stig_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    up: StigUpload,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let StigUpload {
+        id,
+        category,
+        zip_bytes,
+    } = up;
+    let stigs_dir = state.config.data_dir.join("stigs");
+    crate::api::catalog_store::sweep_stale(
+        &stigs_dir,
+        &state.pool,
+        crate::api::catalog_store::STALE_AFTER,
+    )
+    .await;
 
     // Extract and parse XCCDF
     // Both steps are CPU-bound (decompression and XML parsing).
@@ -339,19 +517,29 @@ pub async fn upload_stig(
         extract_xccdf_from_zip(&zip_bytes).map(|xccdf| parse_xccdf(&xccdf))
     })
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Task panic: {e}"),
-        )
-    })?;
+    .map_err(|e| join_failed("stig parse", e))?;
     let stig = match extracted {
-        Ok(parsed) => parsed.map_err(|e| {
-            (
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(e)) => {
+            // The parser's text is untrusted; the audit row gets a fixed reason.
+            tracing::warn!(target: "audit", actor = %user.id, "XCCDF parse failed: {e}");
+            record_zip_rejection(
+                &state,
+                &user,
+                &ctx,
+                "catalog.upload",
+                Some(&id),
+                Rejection::new(
+                    ("parse_failed", "The XCCDF document could not be parsed."),
+                    compressed,
+                ),
+            )
+            .await;
+            return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("XCCDF parse failed: {e}"),
-            )
-        })?,
+            ));
+        }
         Err(e) => {
             record_zip_rejection(
                 &state,
@@ -370,10 +558,8 @@ pub async fn upload_stig(
     // multipart-supplied `id` + `category` alongside the parsed STIG so the
     // lint pass sees the full top-level shape it expects.
     let mut lint_value = serde_json::to_value(&stig).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Lint pre-serialise failed: {e}"),
-        )
+        tracing::error!("lint pre-serialise failed: {e}");
+        internal_error()
     })?;
     if let Some(obj) = lint_value.as_object_mut() {
         obj.insert("id".into(), serde_json::Value::String(id.clone()));
@@ -388,30 +574,22 @@ pub async fn upload_stig(
         return Err((StatusCode::BAD_REQUEST, body));
     }
 
-    // Write JSON file
-    let stigs_dir = state.config.data_dir.join("stigs");
-    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create data dir: {e}"),
-        )
-    })?;
-
-    let json_path = stigs_dir.join(format!("{id}.json"));
     let json_str = serde_json::to_string(&stig).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialisation failed: {e}"),
-        )
+        tracing::error!("stig serialisation failed: {e}");
+        internal_error()
     })?;
-    tokio::fs::write(&json_path, &json_str).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write JSON: {e}"),
-        )
+    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
+        tracing::error!("could not create the stigs dir: {e}");
+        internal_error()
     })?;
+    // Stage the file; it is published only after the catalog commit.
+    let staged = crate::api::catalog_store::stage(&stigs_dir, &id, &json_str)
+        .await
+        .map_err(|e| {
+            tracing::error!("could not stage the STIG file: {e}");
+            internal_error()
+        })?;
 
-    // Upsert catalog row
     let rule_count = stig.rules.len() as i32;
     let title = if stig.title.is_empty() {
         id.clone()
@@ -425,15 +603,51 @@ pub async fn upload_stig(
         version: stig.version.clone(),
         release_info: stig.release_info.clone(),
         rule_count,
-        json_path: json_path.to_string_lossy().into_owned(),
+        json_path: staged.dest.to_string_lossy().into_owned(),
         last_updated: Utc::now(),
     };
-    upsert_catalog(&state.pool, &entry).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database upsert failed: {e}"),
+    let publish_guard = crate::api::catalog_store::publish_lock().await;
+    let ev = crate::db_audit::NewAuditEvent {
+        user_id: &user.id,
+        ctx: Some(&ctx),
+        action: "catalog.upload",
+        outcome: "ok",
+        asset_id: None,
+        checklist_id: None,
+        stig_id: Some(&id),
+        detail: serde_json::json!({
+            "ruleCount": rule_count,
+            "bytesCompressed": compressed,
+        }),
+    };
+    if let Err(e) = commit_catalog(&state.pool, std::slice::from_ref(&entry), &ev).await {
+        tracing::error!("stig upload commit failed: {e:#}");
+        staged.discard().await;
+        return Err(internal_error());
+    }
+    if let Err(e) = staged.publish().await {
+        // The catalog row and its `ok` audit row are already committed, yet the
+        // request answers 500: the file is not in place. The temp stays, so the
+        // next upload's sweep rolls it forward. A follow-up row records the failure.
+        tracing::error!(target: "audit", stig_id = %id, "could not publish the STIG file: {e}");
+        drop(publish_guard);
+        write_reporting(
+            PRODUCTION_AUDIT,
+            state.pool.as_ref(),
+            crate::db_audit::NewAuditEvent {
+                user_id: &user.id,
+                ctx: Some(&ctx),
+                action: "catalog.upload_publish",
+                outcome: "error",
+                asset_id: None,
+                checklist_id: None,
+                stig_id: Some(&id),
+                detail: serde_json::json!({"reasonCode": "publish_failed"}),
+            },
         )
-    })?;
+        .await;
+        return Err(internal_error());
+    }
 
     tracing::info!("Uploaded STIG '{id}' ({title}): {rule_count} rules");
 
@@ -450,8 +664,9 @@ pub async fn upload_stig(
 ///
 /// Accepts a DISA SRG/STIG Library bundle ZIP (the big all-in-one download).
 /// Iterates every `*_STIG.zip` inside, parses each XCCDF, auto-assigns an ID
-/// from the inner filename and a category from the XCCDF title, then writes
-/// JSON files and upserts all catalog rows in one pass.
+/// from the inner filename and a category from the XCCDF title, then stages the
+/// JSON files, upserts all catalog rows and the summary audit row in one
+/// transaction, and publishes the files after the commit.
 ///
 /// Requires an authenticated session with the `admin` role.
 /// Body limit: `MAX_UPLOAD_BYTES` (set on the route in main.rs).
@@ -525,10 +740,8 @@ async fn import_library_work(
     let (lib_entries, parse_errors) =
         match tokio::task::spawn_blocking(move || extract_all_from_library(&zip_bytes))
             .await
-            .map_err(|e| {
-                tracing::error!("library parse task failed: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-            })? {
+            .map_err(|e| join_failed("library parse", e))?
+        {
             Ok(v) => v,
             Err(LibraryAbort {
                 error: e,
@@ -538,9 +751,17 @@ async fn import_library_work(
                 let entry_skips: Vec<&LibrarySkip> =
                     skips.iter().filter(|s| !s.is_outer()).collect();
                 let by_reason = log_and_tally_skips(&user, &entry_skips);
+                // Entry rows first, so the rejection row can say how many landed.
+                let audited =
+                    audit_skip_entries(&state, &user, &ctx, &entry_skips, PRODUCTION_AUDIT).await;
                 let reason = e.to_string();
                 let mut rejection = Rejection::new((e.code(), &reason), compressed);
-                rejection.tally = Some((entry_skips.len(), by_reason, parsed));
+                rejection.tally = Some(SkipTally {
+                    skipped: entry_skips.len(),
+                    by_reason,
+                    parsed,
+                    audited,
+                });
                 record_zip_rejection(
                     &state,
                     &user,
@@ -556,7 +777,8 @@ async fn import_library_work(
 
     // An unreadable outer archive is answered with 200 + errorDetail (below);
     // it is still recorded as a rejection.
-    if let Some(outer) = parse_errors.first().filter(|s| s.is_outer()) {
+    let outer = parse_errors.first().filter(|s| s.is_outer());
+    if let Some(outer) = outer {
         record_zip_rejection(
             &state,
             &user,
@@ -568,70 +790,166 @@ async fn import_library_work(
         .await;
     }
     let entry_skips: Vec<&LibrarySkip> = parse_errors.iter().filter(|s| !s.is_outer()).collect();
-    audit_library_skips(
-        &state,
-        &user,
-        &ctx,
-        &entry_skips,
-        lib_entries.len(),
-        compressed,
-        ENTRY_AUDIT_DEADLINE,
+    let by_reason = log_and_tally_skips(&user, &entry_skips);
+    let attempted = audit_skip_entries(&state, &user, &ctx, &entry_skips, PRODUCTION_AUDIT).await;
+
+    // Stage every entry; nothing is published until the catalog commit.
+    let stigs_dir = state.config.data_dir.join("stigs");
+    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
+        tracing::error!("could not create the stigs dir: {e}");
+        internal_error()
+    })?;
+    crate::api::catalog_store::sweep_stale(
+        &stigs_dir,
+        &state.pool,
+        crate::api::catalog_store::STALE_AFTER,
     )
     .await;
 
-    // Write JSON files and upsert catalog rows
-    let stigs_dir = state.config.data_dir.join("stigs");
-    tokio::fs::create_dir_all(&stigs_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create data dir: {e}"),
-        )
-    })?;
-
-    let mut imported = 0usize;
-    let mut db_errors: Vec<serde_json::Value> = Vec::new();
-
+    let parsed = lib_entries.len();
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    let mut staged: Vec<(crate::api::catalog_store::Staged, CatalogEntry)> = Vec::new();
     for entry in lib_entries {
-        let json_path = stigs_dir.join(format!("{}.json", entry.id));
-
         let json_str = match serde_json::to_string(&entry.stig) {
             Ok(s) => s,
             Err(e) => {
-                db_errors.push(serde_json::json!({"id": entry.id, "error": e.to_string()}));
+                tracing::error!("library entry '{}' serialisation failed: {e}", entry.id);
+                failures.push(write_failure(&entry.id, "write_failed"));
                 continue;
             }
         };
-        if let Err(e) = tokio::fs::write(&json_path, &json_str).await {
-            db_errors.push(serde_json::json!({"id": entry.id, "error": e.to_string()}));
-            continue;
-        }
-
-        let rule_count = entry.stig.rules.len() as i32;
+        let s = match crate::api::catalog_store::stage(&stigs_dir, &entry.id, &json_str).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("library entry '{}' could not be staged: {e}", entry.id);
+                failures.push(write_failure(&entry.id, "write_failed"));
+                continue;
+            }
+        };
         let title = if entry.stig.title.is_empty() {
             entry.id.clone()
         } else {
             entry.stig.title.clone()
         };
-
         let catalog_entry = CatalogEntry {
             id: entry.id.clone(),
-            title: title.clone(),
+            title,
             category: entry.category,
             version: entry.stig.version,
             release_info: entry.stig.release_info,
-            rule_count,
-            json_path: json_path.to_string_lossy().into_owned(),
+            rule_count: entry.stig.rules.len() as i32,
+            json_path: s.dest.to_string_lossy().into_owned(),
             last_updated: Utc::now(),
         };
+        staged.push((s, catalog_entry));
+    }
 
-        match upsert_catalog(&state.pool, &catalog_entry).await {
-            Ok(_) => {
-                tracing::info!("  Imported '{}' ({title}): {rule_count} rules", entry.id);
-                imported += 1;
+    let skipped = entry_skips.len();
+    let mut publish_failures: Vec<serde_json::Value> = Vec::new();
+    let mut imported = 0usize;
+    if staged.is_empty() {
+        // The header-mismatch case already has its one (rejection) row.
+        if !(outer.is_some() && entry_skips.is_empty()) {
+            let (outcome, detail) = import_summary(&ImportCounts {
+                skipped,
+                by_reason: &by_reason,
+                audited: attempted,
+                parsed,
+                imported: 0,
+                failed: failures.len(),
+                commit_failed: false,
+                bytes_compressed: compressed,
+            });
+            record_summary(&state, &user, &ctx, outcome, detail, PRODUCTION_AUDIT).await;
+        }
+    } else {
+        let publish_guard = crate::api::catalog_store::publish_lock().await;
+        let entries: Vec<CatalogEntry> = staged.iter().map(|(_, e)| e.clone()).collect();
+        let (outcome, detail) = import_summary(&ImportCounts {
+            skipped,
+            by_reason: &by_reason,
+            audited: attempted,
+            parsed,
+            imported: entries.len(),
+            failed: failures.len(),
+            commit_failed: false,
+            bytes_compressed: compressed,
+        });
+        let ev = crate::db_audit::NewAuditEvent {
+            user_id: &user.id,
+            ctx: Some(&ctx),
+            action: "catalog.import_library",
+            outcome,
+            asset_id: None,
+            checklist_id: None,
+            stig_id: None,
+            detail,
+        };
+        if let Err(e) = commit_catalog(&state.pool, &entries, &ev).await {
+            tracing::error!("library import commit failed: {e:#}");
+            for (s, _) in &staged {
+                s.discard().await;
             }
-            Err(e) => {
-                db_errors.push(serde_json::json!({"id": entry.id, "error": e.to_string()}));
+            let (outcome, detail) = import_summary(&ImportCounts {
+                skipped,
+                by_reason: &by_reason,
+                audited: attempted,
+                parsed,
+                imported: 0,
+                failed: failures.len() + staged.len(),
+                commit_failed: true,
+                bytes_compressed: compressed,
+            });
+            record_summary(&state, &user, &ctx, outcome, detail, PRODUCTION_AUDIT).await;
+            return Err(internal_error());
+        }
+        let mut failed_ids: Vec<String> = Vec::new();
+        for (s, e) in &staged {
+            match s.publish().await {
+                Ok(()) => {
+                    tracing::info!(
+                        "  Imported '{}' ({}): {} rules",
+                        e.id,
+                        e.title,
+                        e.rule_count
+                    );
+                    imported += 1;
+                }
+                Err(err) => {
+                    // The row is committed; the temp stays for the next sweep.
+                    tracing::error!(target: "audit", stig_id = %e.id, "could not publish the STIG file: {err}");
+                    publish_failures.push(write_failure(&e.id, "publish_failed"));
+                    failed_ids.push(crate::db_audit::audit_safe_id(&e.id));
+                }
             }
+        }
+        drop(publish_guard);
+        if !failed_ids.is_empty() {
+            // The summary row (written in the commit) counted these as imported;
+            // this follow-up records which files never reached `{id}.json`.
+            // Their temps stay, so the next sweep rolls them forward.
+            let n = failed_ids.len();
+            failed_ids.truncate(MAX_SKIPPED_ENTRIES_AUDITED);
+            write_reporting(
+                PRODUCTION_AUDIT,
+                state.pool.as_ref(),
+                crate::db_audit::NewAuditEvent {
+                    user_id: &user.id,
+                    ctx: Some(&ctx),
+                    action: "catalog.import_library_publish",
+                    outcome: "error",
+                    asset_id: None,
+                    checklist_id: None,
+                    stig_id: None,
+                    detail: serde_json::json!({
+                        "reasonCode": "publish_failed",
+                        "publishFailed": n,
+                        "ids": failed_ids,
+                        "idsTruncated": n > MAX_SKIPPED_ENTRIES_AUDITED,
+                    }),
+                },
+            )
+            .await;
         }
     }
 
@@ -639,7 +957,8 @@ async fn import_library_work(
         .iter()
         .map(|s| serde_json::json!({"id": s.id, "reasonCode": s.code, "error": s.message}))
         .collect();
-    all_errors.extend(db_errors);
+    all_errors.extend(failures);
+    all_errors.extend(publish_failures);
 
     let total_errors = all_errors.len();
     tracing::info!("Library import complete: {imported} imported, {total_errors} errors");
@@ -649,6 +968,16 @@ async fn import_library_work(
         "errors": total_errors,
         "errorDetail": all_errors,
     })))
+}
+
+/// An `errorDetail` item for an entry that could not be written; the real
+/// error is logged, not returned.
+fn write_failure(id: &str, code: &'static str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "reasonCode": code,
+        "error": "The entry could not be written.",
+    })
 }
 
 #[cfg(test)]
@@ -848,9 +1177,20 @@ mod tests {
             "{:?}",
             rows[0]
         );
-        assert!(rows_of(&pool, "catalog.import_library_entry")
-            .await
-            .is_empty());
+        assert_eq!(rows[0]["skippedAudited"], 2, "{:?}", rows[0]);
+        assert_eq!(rows[0]["skippedTruncated"], false, "{:?}", rows[0]);
+        crate::db_audit::drain().await;
+        let entries = rows_of(&pool, "catalog.import_library_entry").await;
+        let mut ids: Vec<_> = entries
+            .iter()
+            .map(|(o, stig, d)| {
+                assert_eq!(o, "rejected");
+                assert_eq!(d["reasonCode"], "malformed");
+                stig.clone().unwrap()
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["junka", "junkb"]);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
             .fetch_one(&pool)
             .await
@@ -1051,16 +1391,26 @@ mod tests {
             })
             .collect();
         let refs: Vec<&LibrarySkip> = skips.iter().collect();
-        audit_library_skips(
-            &state,
-            &user,
-            &ctx(),
-            &refs,
-            0,
-            10,
-            std::time::Duration::ZERO,
-        )
-        .await;
+        static C: crate::failure_counters::FailureCounter =
+            crate::failure_counters::FailureCounter::new();
+        static Q: crate::db_audit::WriteQueue = crate::db_audit::WriteQueue::new(&C, 64, 16, 4);
+        let via = AuditVia {
+            deadline: std::time::Duration::ZERO,
+            queue: Some(&Q),
+        };
+        let by_reason = log_and_tally_skips(&user, &refs);
+        let attempted = audit_skip_entries(&state, &user, &ctx(), &refs, via).await;
+        let (outcome, detail) = import_summary(&ImportCounts {
+            skipped: refs.len(),
+            by_reason: &by_reason,
+            audited: attempted,
+            parsed: 0,
+            imported: 0,
+            failed: 0,
+            commit_failed: false,
+            bytes_compressed: 10,
+        });
+        record_summary(&state, &user, &ctx(), outcome, detail, via).await;
         let deadline_lines = cap
             .lines()
             .iter()
@@ -1078,20 +1428,10 @@ mod tests {
         let audited = d["skippedAudited"].as_u64().unwrap();
         assert_eq!(audited, 1, "{d}");
 
-        // The write in flight at the deadline is detached; wait (bounded) for
-        // this test's own database to show it.
-        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let count = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM audit_events WHERE action = 'catalog.import_library_entry'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-        };
-        while count().await < audited as i64 && tokio::time::Instant::now() < end {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        // The write in flight at the deadline is detached; this test's own
+        // queue says when it has finished.
+        Q.drain().await;
+        assert_eq!(Q.shed_writes(), 0);
         let entries = rows_of(&pool, "catalog.import_library_entry").await;
         assert_eq!(entries.len() as u64, audited);
         let repeats: i64 = sqlx::query_scalar(
@@ -1130,6 +1470,13 @@ mod tests {
             .collect();
         assert_eq!(files, [format!("{}.json", crate::test_fixtures::STIG_ID)]);
         assert!(rows_of(&pool, "catalog.import_library").await.is_empty());
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE user_id = 'admin1' AND action LIKE 'catalog.%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[sqlx::test]
@@ -1211,5 +1558,308 @@ mod tests {
         assert_eq!(d["skippedAudited"], MAX_SKIPPED_ENTRIES_AUDITED);
         assert_eq!(d["skippedTruncated"], true);
         assert_eq!(d["parsed"], 0);
+    }
+
+    const GOOD_XML: &str = r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>G</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title></Rule></Group></Benchmark>"#;
+
+    #[tokio::test]
+    async fn a_join_failure_is_logged_and_answered_with_a_fixed_message() {
+        let e = tokio::task::spawn_blocking(|| -> () { panic!("SECRET") })
+            .await
+            .unwrap_err();
+        let (status, body) = join_failed("test", e);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal error");
+        assert!(!body.contains("SECRET"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn single_stig_upload_survives_the_handler_future_being_dropped(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let tasks = state.tasks.clone();
+        let call = publish_stig(
+            state,
+            auth("admin1", "admin"),
+            ctx(),
+            StigUpload {
+                id: "single-one".into(),
+                category: "Linux".into(),
+                zip_bytes: zip_of("a-xccdf.xml", GOOD_XML.as_bytes()),
+            },
+        );
+        crate::detached::abort_once_spawned(&tasks, call).await;
+        tasks.idle().await;
+        crate::db_audit::drain().await;
+
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog WHERE id = 'single-one'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
+        assert!(data_dir.join("stigs/single-one.json").exists());
+        let names: Vec<String> = std::fs::read_dir(data_dir.join("stigs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".upload-")),
+            "{names:?}"
+        );
+        let rows = rows_of(&pool, "catalog.upload").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "ok");
+        assert_eq!(rows[0].1.as_deref(), Some("single-one"));
+        assert_eq!(rows[0].2["ruleCount"], 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_clean_library_import_writes_one_ok_summary_row(pool: PgPool) {
+        let base = admin_server(&pool).await;
+        let good = zip_of("a-xccdf.xml", GOOD_XML.as_bytes());
+        let lib = lib_of(&[
+            ("U_GoodA_V1R1_STIG.zip".into(), good.clone()),
+            ("U_GoodB_V1R1_STIG.zip".into(), good),
+        ]);
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 200, "{body}");
+        let summary = sqlx::query_as::<_, (String, String, serde_json::Value)>(
+            "SELECT outcome, user_id, detail FROM audit_events WHERE action = 'catalog.import_library'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(summary.len(), 1, "{summary:?}");
+        let (outcome, user_id, d) = &summary[0];
+        assert_eq!(outcome, "ok");
+        assert_eq!(user_id, "admin1");
+        assert_eq!(d["parsed"], 2);
+        assert_eq!(d["imported"], 2);
+        assert_eq!(d["skipped"], 0);
+        assert_eq!(d["failed"], 0);
+        assert!(rows_of(&pool, "catalog.import_library_entry")
+            .await
+            .is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_catalog_commit_leaves_the_old_file_no_temp_and_no_ok_row(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE stigs_catalog ADD CONSTRAINT refuse_goodb CHECK (id <> 'goodb')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let stigs = state.config.data_dir.join("stigs");
+        std::fs::write(stigs.join("goodb.json"), "MARKER").unwrap();
+        let base = serve(state).await;
+        let good = zip_of("a-xccdf.xml", GOOD_XML.as_bytes());
+        let lib = lib_of(&[
+            ("U_GoodA_V1R1_STIG.zip".into(), good.clone()),
+            ("U_GoodB_V1R1_STIG.zip".into(), good),
+        ]);
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(body, "internal error");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            std::fs::read_to_string(stigs.join("goodb.json")).unwrap(),
+            "MARKER"
+        );
+        assert!(!stigs.join("gooda.json").exists());
+        let names: Vec<String> = std::fs::read_dir(&stigs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with(".upload-")),
+            "{names:?}"
+        );
+        let summary = rows_of(&pool, "catalog.import_library").await;
+        assert_eq!(summary.len(), 1, "{summary:?}");
+        assert_eq!(summary[0].0, "rejected");
+        assert_eq!(summary[0].2["reasonCode"], "commit_failed");
+    }
+
+    fn temps_in(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".upload-"))
+            .collect()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_single_upload_whose_rename_fails_keeps_the_row_and_temp_and_audits_it(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let (state, _dir) = app_state(pool.clone());
+        let stigs = state.config.data_dir.join("stigs");
+        // A directory at the destination makes the rename fail after the commit.
+        std::fs::create_dir(stigs.join("pub-fail.json")).unwrap();
+        let r = publish_stig(
+            state,
+            auth("admin1", "admin"),
+            ctx(),
+            StigUpload {
+                id: "pub-fail".into(),
+                category: "Linux".into(),
+                zip_bytes: zip_of("a-xccdf.xml", GOOD_XML.as_bytes()),
+            },
+        )
+        .await;
+        let Err((status, body)) = r else {
+            panic!("expected a 500");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal error");
+        crate::db_audit::drain().await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog WHERE id = 'pub-fail'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(temps_in(&stigs).len(), 1);
+        let rows = rows_of(&pool, "catalog.upload").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "ok");
+        let follow = rows_of(&pool, "catalog.upload_publish").await;
+        assert_eq!(follow.len(), 1, "{follow:?}");
+        assert_eq!(follow[0].0, "error");
+        assert_eq!(follow[0].2["reasonCode"], "publish_failed");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_library_import_whose_rename_fails_reports_publish_failed_and_audits_it(
+        pool: PgPool,
+    ) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (state, _dir) = app_state(pool.clone());
+        let stigs = state.config.data_dir.join("stigs");
+        std::fs::create_dir(stigs.join("gooda.json")).unwrap();
+        let base = serve(state).await;
+        let good = zip_of("a-xccdf.xml", GOOD_XML.as_bytes());
+        let lib = lib_of(&[
+            ("U_GoodA_V1R1_STIG.zip".into(), good.clone()),
+            ("U_GoodB_V1R1_STIG.zip".into(), good),
+        ]);
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["imported"], 1, "{body}");
+        assert_eq!(v["errorDetail"][0]["id"], "gooda");
+        assert_eq!(v["errorDetail"][0]["reasonCode"], "publish_failed");
+        crate::db_audit::drain().await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(temps_in(&stigs).len(), 1);
+        assert!(stigs.join("goodb.json").is_file());
+        let rows = rows_of(&pool, "catalog.import_library").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "ok");
+        let follow = rows_of(&pool, "catalog.import_library_publish").await;
+        assert_eq!(follow.len(), 1, "{follow:?}");
+        assert_eq!(follow[0].0, "error");
+        assert_eq!(follow[0].2["reasonCode"], "publish_failed");
+        assert_eq!(follow[0].2["publishFailed"], 1);
+        assert_eq!(follow[0].2["ids"][0], "gooda");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_unparseable_single_upload_is_422_and_audited(pool: PgPool) {
+        let base = admin_server(&pool).await;
+        let zip = zip_of("a-xccdf.xml", b"<Benchmark><title>SECRET</Benchmark>");
+        let (status, _) = post_zip(&base, "/api/upload", &zip).await;
+        assert_eq!(status, 422);
+        let rows = rejected_rows(&pool, "catalog.upload").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reasonCode"], "parse_failed");
+        assert!(!rows[0].to_string().contains("SECRET"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_empty_library_is_one_rejected_no_entries_row(pool: PgPool) {
+        let base = admin_server(&pool).await;
+        let lib = lib_of(&[("readme.txt".into(), b"hi".to_vec())]);
+        let (status, body) = post_zip(&base, "/api/upload/library", &lib).await;
+        assert_eq!(status, 200, "{body}");
+        let rows = rows_of(&pool, "catalog.import_library").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "rejected");
+        assert_eq!(rows[0].2["reasonCode"], "no_entries");
+        assert_eq!(rows[0].2["imported"], 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_blocked_catalog_commit_times_out_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let entry = CatalogEntry {
+            id: "blocked".into(),
+            title: "T".into(),
+            category: "Linux".into(),
+            version: "1".into(),
+            release_info: String::new(),
+            rule_count: 1,
+            json_path: "x".into(),
+            last_updated: Utc::now(),
+        };
+        // A second connection holds a conflicting table lock.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE stigs_catalog IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let c = ctx();
+        let ev = crate::db_audit::NewAuditEvent {
+            user_id: "admin1",
+            ctx: Some(&c),
+            action: "catalog.upload",
+            outcome: "ok",
+            asset_id: None,
+            checklist_id: None,
+            stig_id: Some("blocked"),
+            detail: serde_json::json!({}),
+        };
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            commit_catalog(&pool, std::slice::from_ref(&entry), &ev),
+        )
+        .await
+        .expect("the commit must fail by itself, not hang");
+        assert!(r.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        holder.rollback().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(rows_of(&pool, "catalog.upload").await.is_empty());
     }
 }

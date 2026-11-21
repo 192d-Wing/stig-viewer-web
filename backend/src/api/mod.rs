@@ -18,6 +18,7 @@ pub mod bundle;
 pub mod catalog;
 pub mod catalog_diff;
 pub mod catalog_search;
+pub mod catalog_store;
 pub mod checklist_save;
 pub mod checklist_sets;
 pub mod checklists;

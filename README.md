@@ -463,6 +463,21 @@ cd backend && cargo clippy -- -D warnings
 
 ## Operations: audit
 
+- Login session and `auth.notice_ack` are not one transaction (accepted gap,
+  see `notice::session_with_ack`). To reconcile, list `sessions` that have no
+  `auth.notice_ack` audit row whose `detail->>'sessionId'` equals the session id.
+- Catalog uploads stage the JSON to `stigs/.upload-{id}.{uuid}.tmp`, commit the
+  catalog row and its audit row (`catalog.upload`, `catalog.import_library`)
+  in one transaction, then rename the file into place. A crash in between leaves
+  a temp; the next upload or import sweeps temps older than an hour (rolled
+  forward when the catalog row matches, otherwise deleted).
+- A library import is all-or-nothing in the catalog: a database failure fails
+  the whole import (500) and leaves one `rejected` summary row with reason code
+  `commit_failed`. Every import leaves exactly one `catalog.import_library` summary row. If a
+  file cannot be renamed into place after the commit, a separate follow-up row
+  is written under `catalog.import_library_publish` (single uploads use
+  `catalog.upload_publish`), outcome `error`, reason code `publish_failed`;
+  the next upload's sweep rolls the file forward.
 - Durable request events live in `audit_events` (see `/api/audit/events`).
   Each row carries the user's role at the time, a server-generated request id
   (also returned in the `X-Request-Id` response header; an inbound
