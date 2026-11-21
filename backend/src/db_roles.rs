@@ -48,6 +48,14 @@ impl std::error::Error for AppRoleMissing {}
 /// Exit code of `migrate` for a retryable failure (EX_TEMPFAIL).
 pub const MIGRATE_EXIT_TRANSIENT: i32 = 75;
 
+/// Connection-class SQLSTATEs worth retrying. 08P01 (protocol violation) is permanent.
+fn sqlstate_is_transient(code: &str) -> bool {
+    matches!(
+        code,
+        "57P03" | "08000" | "08001" | "08003" | "08004" | "08006"
+    )
+}
+
 /// True when retrying the owner step later can succeed: the database is not
 /// reachable yet or the application role is not created yet.
 pub fn is_transient(err: &anyhow::Error) -> bool {
@@ -57,12 +65,7 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
         }
         match cause.downcast_ref::<sqlx::Error>() {
             Some(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut) => true,
-            Some(sqlx::Error::Database(d)) => d.code().is_some_and(|c| {
-                matches!(
-                    &*c,
-                    "57P03" | "08000" | "08001" | "08003" | "08004" | "08006"
-                )
-            }),
+            Some(sqlx::Error::Database(d)) => d.code().is_some_and(|c| sqlstate_is_transient(&c)),
             _ => false,
         }
     })
@@ -272,12 +275,42 @@ struct Schema {
     quoted: String,
 }
 
+/// Refuse when the application role, or any role it is a member of (even a
+/// NOINHERIT membership, which `SET ROLE` can still assume), can `CREATE` in
+/// the schema.
+async fn ensure_no_schema_create(
+    conn: &mut PgConnection,
+    app_role: &str,
+    schema: &Schema,
+) -> Result<()> {
+    let can_create: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+         WHERE pg_catalog.pg_has_role($1, r.oid, 'MEMBER') \
+           AND pg_catalog.has_schema_privilege(r.oid, $2, 'CREATE'))",
+    )
+    .bind(app_role)
+    .bind(&schema.raw)
+    .fetch_one(&mut *conn)
+    .await?;
+    if can_create {
+        bail!(
+            "application role {app_role:?} can still CREATE in schema {} (it, or a role it is \
+             a member of, holds CREATE: superuser, or a group membership?); revoke it from \
+             that role before migrating",
+            schema.quoted
+        );
+    }
+    Ok(())
+}
+
 /// Before migrating: check the application role exists, that the owner may
 /// revoke on the schema, revoke `CREATE` on it from PUBLIC and the application
 /// role, and refuse to continue if the schema already holds a function,
 /// operator, type or relation owned by a role other than the schema owner, the
 /// owner role or a superuser (an object planted while the application role
-/// could still `CREATE`). Only `pg_catalog`-qualified names are used.
+/// could still `CREATE`). Refuses (after the revokes) when the application
+/// role is a member of the schema owner, or can still `CREATE` through another
+/// role. Only `pg_catalog`-qualified names are used.
 async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result<Schema> {
     let owner: String = sqlx::query_scalar("SELECT current_user::pg_catalog.text")
         .fetch_one(&mut *conn)
@@ -333,6 +366,46 @@ async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result
         .await?;
     }
 
+    let app_is_superuser: bool =
+        sqlx::query_scalar("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = $1")
+            .bind(app_role)
+            .fetch_one(&mut *conn)
+            .await?;
+    if app_is_superuser {
+        bail!("application role {app_role:?} is a superuser; it must be a restricted role");
+    }
+    let member_of_owner: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.pg_has_role($1, n.nspowner, 'MEMBER') \
+         FROM pg_catalog.pg_namespace n WHERE n.nspname = $2",
+    )
+    .bind(app_role)
+    .bind(&schema.raw)
+    .fetch_one(&mut *conn)
+    .await?;
+    if member_of_owner {
+        bail!(
+            "application role {app_role:?} is a member of the role that owns schema {}; it \
+             could re-grant itself CREATE. Revoke that membership before migrating",
+            schema.quoted
+        );
+    }
+    // Objects owned by the owner login are exempt below, so the application
+    // role must not be able to act as it either.
+    let member_of_login: bool =
+        sqlx::query_scalar("SELECT pg_catalog.pg_has_role($1, current_user, 'MEMBER')")
+            .bind(app_role)
+            .fetch_one(&mut *conn)
+            .await?;
+    if member_of_login {
+        bail!(
+            "application role {app_role:?} is a member of the owner role ({owner:?}); revoke \
+             that membership before migrating"
+        );
+    }
+    ensure_no_schema_create(conn, app_role, &schema).await?;
+
+    // Deliberately not listed: pg_opclass, pg_opfamily (creating them needs a
+    // superuser) and pg_ts_parser, pg_ts_template (no owner, superuser-only).
     let planted: Vec<String> = sqlx::query_scalar(
         "WITH s AS (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $1), \
          objs AS ( \
@@ -346,7 +419,22 @@ async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result
              FROM pg_catalog.pg_type t WHERE t.typnamespace = (SELECT oid FROM s) \
            UNION ALL \
            SELECT 'relation ' || c.relname::pg_catalog.text, c.relowner \
-             FROM pg_catalog.pg_class c WHERE c.relnamespace = (SELECT oid FROM s)) \
+             FROM pg_catalog.pg_class c WHERE c.relnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'collation ' || k.collname::pg_catalog.text, k.collowner \
+             FROM pg_catalog.pg_collation k WHERE k.collnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'conversion ' || v.conname::pg_catalog.text, v.conowner \
+             FROM pg_catalog.pg_conversion v WHERE v.connamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'text search configuration ' || tc.cfgname::pg_catalog.text, tc.cfgowner \
+             FROM pg_catalog.pg_ts_config tc WHERE tc.cfgnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'text search dictionary ' || td.dictname::pg_catalog.text, td.dictowner \
+             FROM pg_catalog.pg_ts_dict td WHERE td.dictnamespace = (SELECT oid FROM s) \
+           UNION ALL \
+           SELECT 'statistics ' || st.stxname::pg_catalog.text, st.stxowner \
+             FROM pg_catalog.pg_statistic_ext st WHERE st.stxnamespace = (SELECT oid FROM s)) \
          SELECT objs.what || ' (owner ' || r.rolname::pg_catalog.text || ')' \
          FROM objs JOIN pg_catalog.pg_roles r ON r.oid = objs.o \
          WHERE NOT r.rolsuper \
@@ -431,15 +519,7 @@ pub async fn apply_app_grants(
     }
     tx.commit().await?;
 
-    let can_create: bool =
-        sqlx::query_scalar("SELECT pg_catalog.has_schema_privilege($1, $2, 'CREATE')")
-            .bind(app_role)
-            .bind(&raw)
-            .fetch_one(&mut *conn)
-            .await?;
-    if can_create {
-        bail!("application role {app_role:?} can still CREATE in schema {schema} (inherited from another role?)");
-    }
+    ensure_no_schema_create(conn, app_role, &prepared).await?;
     Ok(())
 }
 
@@ -569,7 +649,9 @@ pub async fn boundary_violations(pool: &PgPool, test_routes: bool) -> Result<Vec
          SELECT 'role can CREATE in schema ' || n.nspname \
          FROM pg_catalog.pg_namespace n \
          WHERE n.oid = (SELECT ns FROM s) \
-           AND pg_catalog.has_schema_privilege(current_user, n.oid, 'CREATE') \
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles gr \
+                       WHERE pg_catalog.pg_has_role(current_user, gr.oid, 'MEMBER') \
+                         AND pg_catalog.has_schema_privilege(gr.oid, n.oid, 'CREATE')) \
          UNION ALL \
          SELECT 'role can CREATE in database ' || pg_catalog.current_database() \
          WHERE pg_catalog.has_database_privilege(current_user, pg_catalog.current_database(), 'CREATE') \
@@ -670,10 +752,18 @@ pub fn boundary_policy(production: bool, violations: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Warning for an owner credential present on the serving process in production.
+pub fn owner_url_on_server_warning(production: bool, has_owner_url: bool) -> Option<&'static str> {
+    (production && has_owner_url).then_some(
+        "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
+         could read the owner credential. Prefer running `migrate` as a separate job.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{allow_audit_test_mode, app_role_pool, seed_user};
+    use crate::test_fixtures::{allow_audit_test_mode, app_role_pool, seed_user, temp_role};
     use sqlx::PgPool;
 
     fn code(e: &sqlx::Error) -> Option<String> {
@@ -690,6 +780,28 @@ mod tests {
         assert!(boundary_policy(false, &v).is_ok());
         let err = boundary_policy(true, &v).unwrap_err().to_string();
         assert!(err.contains("role is a superuser"));
+    }
+
+    const TRANSIENT_CODES: [&str; 6] = ["57P03", "08000", "08001", "08003", "08004", "08006"];
+    const PERMANENT_CODES: [&str; 6] = ["08P01", "55P03", "42501", "28P01", "3D000", ""];
+
+    #[test]
+    fn sqlstate_classification() {
+        for c in TRANSIENT_CODES {
+            assert!(sqlstate_is_transient(c), "{c}");
+        }
+        for c in PERMANENT_CODES {
+            assert!(!sqlstate_is_transient(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn owner_url_on_server_warning_truth_table() {
+        for (p, o) in [(false, false), (false, true), (true, false)] {
+            assert!(owner_url_on_server_warning(p, o).is_none());
+        }
+        let w = owner_url_on_server_warning(true, true).unwrap();
+        assert!(w.contains("DATABASE_MIGRATION_URL") && w.contains("migrate"));
     }
 
     #[test]
@@ -1120,8 +1232,8 @@ mod tests {
         let app = app_role_pool(&pool, false).await;
         let q = format!("\"{}\"", app.name);
         let db = db_name(&pool).await;
-        let dbo = format!("stig_t_dbo_{}", app.name.trim_start_matches("stig_t_"));
-        exec(&pool, &format!("CREATE ROLE \"{dbo}\" NOLOGIN")).await;
+        let dbo_role = temp_role(&pool, "dbo_").await;
+        let dbo = dbo_role.name.clone();
         exec(
             &pool,
             &format!("ALTER DATABASE \"{db}\" OWNER TO \"{dbo}\""),
@@ -1140,7 +1252,6 @@ mod tests {
             &format!("ALTER DATABASE \"{db}\" OWNER TO CURRENT_USER"),
         )
         .await;
-        exec(&pool, &format!("DROP ROLE \"{dbo}\"")).await;
         app.cleanup(&pool).await;
     }
 
@@ -1211,7 +1322,12 @@ mod tests {
             .await
             .unwrap();
         if ver < 150000 {
-            return; // GRANT ... ON PARAMETER does not exist before PostgreSQL 15
+            eprintln!("SKIPPED (PostgreSQL {ver} < 15): GRANT SET ON PARAMETER does not exist");
+            let app = app_role_pool(&pool, false).await;
+            let v = boundary_violations(&app.pool, false).await.unwrap();
+            assert!(!has(&v, "can SET"), "{v:?}");
+            app.cleanup(&pool).await;
+            return;
         }
         let app = app_role_pool(&pool, false).await;
         let q = format!("\"{}\"", app.name);
@@ -1249,11 +1365,11 @@ mod tests {
              AS 'INSERT INTO public.planted_log VALUES (''quote_ident''); SELECT $1' ",
         )
         .await;
-        let _ = sqlx::query(
+        exec(
+            &app.pool,
             "CREATE FUNCTION public.pg_advisory_lock(bigint) RETURNS void LANGUAGE sql \
-             AS 'INSERT INTO public.planted_log VALUES (''advisory''); SELECT NULL::void'",
+             AS 'INSERT INTO public.planted_log VALUES (''advisory'')'",
         )
-        .execute(&app.pool)
         .await;
 
         let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
@@ -1262,6 +1378,7 @@ mod tests {
             .to_string();
         assert!(err.contains("owned by other roles"), "{err}");
         assert!(err.contains("quote_ident"), "{err}");
+        assert!(err.contains("pg_advisory_lock"), "{err}");
         let calls: i64 = sqlx::query_scalar("SELECT count(*) FROM planted_log")
             .fetch_one(&pool)
             .await
@@ -1276,15 +1393,360 @@ mod tests {
                 .unwrap();
         assert!(!create);
         exec(&pool, "DROP FUNCTION public.quote_ident(text)").await;
-        let _ = sqlx::query("DROP FUNCTION public.pg_advisory_lock(bigint)")
-            .execute(&pool)
-            .await;
+        exec(&pool, "DROP FUNCTION public.pg_advisory_lock(bigint)").await;
         exec(&pool, "DROP TABLE planted_log").await;
         // With the plants gone the owner step succeeds.
         migrate_with((*pool.connect_options()).clone(), &app.name, false)
             .await
             .unwrap();
         app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn real_database_errors_are_classified_by_sqlstate(pool: PgPool) {
+        for (codes, want) in [(TRANSIENT_CODES, 75), (PERMANENT_CODES, 1)] {
+            for c in codes.into_iter().filter(|c| !c.is_empty()) {
+                let e = sqlx::query(&format!(
+                    "DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = '{c}'; END $$"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap_err();
+                assert_eq!(code(&e).as_deref(), Some(c));
+                let err = anyhow::Error::new(e).context("owner step");
+                assert_eq!(is_transient(&err), want == 75, "{c}");
+                assert_eq!(migrate_exit_code(&err), want, "{c}");
+            }
+        }
+    }
+
+    async fn migration_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_create_inherited_from_a_group_role_before_migrating(
+        pool: PgPool,
+    ) {
+        let app = app_role_pool(&pool, false).await;
+        let grp = temp_role(&pool, "grp_").await;
+        exec(
+            &pool,
+            &format!("GRANT CREATE ON SCHEMA public TO \"{}\"", grp.name),
+        )
+        .await;
+        exec(
+            &pool,
+            &format!("GRANT \"{}\" TO \"{}\"", grp.name, app.name),
+        )
+        .await;
+        let mut conn = pool.acquire().await.unwrap();
+        let err = prepare_owner_schema(&mut conn, &app.name)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("can still CREATE"), "{err}");
+        drop(conn);
+
+        exec(
+            &pool,
+            "DELETE FROM _sqlx_migrations WHERE version = \
+             (SELECT max(version) FROM _sqlx_migrations)",
+        )
+        .await;
+        let before = migration_rows(&pool).await;
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("can still CREATE"), "{err}");
+        assert_eq!(migration_rows(&pool).await, before, "migrations ran");
+
+        exec(
+            &pool,
+            &format!("REVOKE CREATE ON SCHEMA public FROM \"{}\"", grp.name),
+        )
+        .await;
+        let mut conn = pool.acquire().await.unwrap();
+        prepare_owner_schema(&mut conn, &app.name).await.unwrap();
+        drop(conn);
+        exec(
+            &pool,
+            &format!("REVOKE \"{}\" FROM \"{}\"", grp.name, app.name),
+        )
+        .await;
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_an_app_role_that_is_a_member_of_the_schema_owner(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let own = temp_role(&pool, "own_").await;
+        exec(
+            &pool,
+            &format!("ALTER SCHEMA public OWNER TO \"{}\"", own.name),
+        )
+        .await;
+        exec(&pool, &format!("ALTER ROLE \"{}\" NOINHERIT", app.name)).await;
+        exec(
+            &pool,
+            &format!("GRANT \"{}\" TO \"{}\"", own.name, app.name),
+        )
+        .await;
+        let create: bool =
+            sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+                .bind(&app.name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!create, "the CREATE check alone would miss this");
+
+        let mut conn = pool.acquire().await.unwrap();
+        let err = prepare_owner_schema(&mut conn, &app.name)
+            .await
+            .err()
+            .unwrap();
+        assert!(!is_transient(&err));
+        assert!(
+            err.to_string()
+                .contains("is a member of the role that owns schema"),
+            "{err}"
+        );
+        drop(conn);
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap_err();
+        assert!(!is_transient(&err));
+        assert!(
+            err.to_string()
+                .contains("is a member of the role that owns schema"),
+            "{err}"
+        );
+
+        exec(
+            &pool,
+            &format!("REVOKE \"{}\" FROM \"{}\"", own.name, app.name),
+        )
+        .await;
+        let mut conn = pool.acquire().await.unwrap();
+        prepare_owner_schema(&mut conn, &app.name).await.unwrap();
+        drop(conn);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_planted_collations_conversions_and_text_search_objects(
+        pool: PgPool,
+    ) {
+        let app = app_role_pool(&pool, false).await;
+        let cases = [
+            (
+                "CREATE COLLATION public.planted_coll FROM \"C\"",
+                "DROP COLLATION public.planted_coll",
+                "collation planted_coll",
+            ),
+            (
+                "CREATE CONVERSION public.planted_conv FOR 'LATIN1' TO 'UTF8' \
+                 FROM iso8859_1_to_utf8",
+                "DROP CONVERSION public.planted_conv",
+                "conversion planted_conv",
+            ),
+            (
+                "CREATE TEXT SEARCH CONFIGURATION public.planted_cfg (COPY = pg_catalog.simple)",
+                "DROP TEXT SEARCH CONFIGURATION public.planted_cfg",
+                "text search configuration planted_cfg",
+            ),
+            (
+                "CREATE STATISTICS public.planted_stat ON a, b FROM public.planted_tbl",
+                "DROP TABLE public.planted_tbl CASCADE",
+                "statistics planted_stat",
+            ),
+            (
+                "CREATE TEXT SEARCH DICTIONARY public.planted_dict (TEMPLATE = pg_catalog.simple)",
+                "DROP TEXT SEARCH DICTIONARY public.planted_dict",
+                "text search dictionary planted_dict",
+            ),
+        ];
+        for (create, drop_sql, label) in cases {
+            exec(&pool, "GRANT CREATE ON SCHEMA public TO PUBLIC").await;
+            if label.starts_with("statistics") {
+                exec(&app.pool, "CREATE TABLE public.planted_tbl (a int, b int)").await;
+            }
+            exec(&app.pool, create).await;
+            let mut conn = pool.acquire().await.unwrap();
+            let err = prepare_owner_schema(&mut conn, &app.name)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            drop(conn);
+            assert!(err.contains("owned by other roles"), "{err}");
+            assert!(err.contains(label), "{label}: {err}");
+            exec(&pool, drop_sql).await;
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        prepare_owner_schema(&mut conn, &app.name).await.unwrap();
+        drop(conn);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_create_held_by_a_noinherit_group_membership(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let grp = temp_role(&pool, "grp_").await;
+        exec(&pool, &format!("ALTER ROLE \"{}\" NOINHERIT", app.name)).await;
+        exec(
+            &pool,
+            &format!("GRANT CREATE ON SCHEMA public TO \"{}\"", grp.name),
+        )
+        .await;
+        exec(
+            &pool,
+            &format!("GRANT \"{}\" TO \"{}\"", grp.name, app.name),
+        )
+        .await;
+        let direct: bool =
+            sqlx::query_scalar("SELECT has_schema_privilege($1, 'public', 'CREATE')")
+                .bind(&app.name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !direct,
+            "NOINHERIT hides the privilege from has_schema_privilege"
+        );
+
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "role can CREATE in schema"), "{v:?}");
+
+        exec(
+            &pool,
+            "DELETE FROM _sqlx_migrations WHERE version = \
+             (SELECT max(version) FROM _sqlx_migrations)",
+        )
+        .await;
+        let before = migration_rows(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let err = prepare_owner_schema(&mut conn, &app.name)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        drop(conn);
+        assert!(err.contains("can still CREATE"), "{err}");
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("can still CREATE"), "{err}");
+        assert_eq!(migration_rows(&pool).await, before, "migrations ran");
+
+        exec(
+            &pool,
+            &format!("REVOKE \"{}\" FROM \"{}\"", grp.name, app.name),
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(!has(&v, "role can CREATE in schema"), "{v:?}");
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_a_superuser_app_role(pool: PgPool) {
+        let su = temp_role(&pool, "su_").await;
+        exec(&pool, &format!("ALTER ROLE \"{}\" SUPERUSER", su.name)).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let result = prepare_owner_schema(&mut conn, &su.name).await;
+        drop(conn);
+        // Demote first so a failing assertion never leaves a superuser behind.
+        exec(&pool, &format!("ALTER ROLE \"{}\" NOSUPERUSER", su.name)).await;
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("is a superuser"), "{err}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_refuses_an_app_role_that_is_a_member_of_the_owner_login(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let own = temp_role(&pool, "own_").await;
+        // A schema owner the app role is not a member of, so only the login
+        // membership check can fire.
+        exec(
+            &pool,
+            &format!("ALTER SCHEMA public OWNER TO \"{}\"", own.name),
+        )
+        .await;
+        let login: String = sqlx::query_scalar("SELECT current_user::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        exec(&pool, &format!("GRANT \"{login}\" TO \"{}\"", app.name)).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let err = prepare_owner_schema(&mut conn, &app.name)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        drop(conn);
+        assert!(err.contains("member of the owner role"), "{err}");
+        exec(&pool, &format!("REVOKE \"{login}\" FROM \"{}\"", app.name)).await;
+        let mut conn = pool.acquire().await.unwrap();
+        prepare_owner_schema(&mut conn, &app.name).await.unwrap();
+        drop(conn);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_temp_role_is_removed_when_its_test_task_panics(pool: PgPool) {
+        let role = temp_role(&pool, "panic_").await;
+        let name = role.name.clone();
+        let handle = tokio::spawn(async move {
+            let role = role;
+            panic!("simulated test failure holding {}", role.name);
+        });
+        let err = handle.await.unwrap_err();
+        assert!(err.is_panic());
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!exists);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn dropping_an_app_role_without_cleanup_removes_the_cluster_role(pool: PgPool) {
+        async fn exists(pool: &PgPool, name: &str) -> bool {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        let app = app_role_pool(&pool, false).await;
+        let name = app.name.clone();
+        assert!(exists(&pool, &name).await);
+        drop(app);
+        assert!(!exists(&pool, &name).await);
+
+        let own = temp_role(&pool, "own_").await;
+        let name = own.name.clone();
+        exec(&pool, &format!("ALTER SCHEMA public OWNER TO \"{name}\"")).await;
+        drop(own);
+        assert!(!exists(&pool, &name).await);
     }
 
     #[sqlx::test]

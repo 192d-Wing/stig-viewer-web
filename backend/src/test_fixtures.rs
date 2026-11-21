@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, PgConnection, PgPool};
 
 use crate::api::auth::AuthUser;
 use crate::config::Config;
@@ -41,25 +42,103 @@ pub async fn disallow_audit_test_mode(pool: &PgPool) {
     .expect("disallow audit test mode");
 }
 
+/// Remove a cluster-global test role together with anything it owns.
+/// `REASSIGN` first: tests make temp roles own schema `public` or the database.
+async fn drop_role(conn: &mut sqlx::PgConnection, name: &str) -> sqlx::Result<()> {
+    let q = format!("\"{name}\"");
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(&format!("REASSIGN OWNED BY {q} TO CURRENT_USER"))
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(&format!("DROP OWNED BY {q}"))
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(&format!("DROP ROLE {q}"))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// A cluster-global `NOLOGIN` test role that is dropped when the guard goes
+/// out of scope, even if the test panics. `Drop` runs the cleanup on its own
+/// thread and runtime (blocking inside the test runtime would panic); it is
+/// best-effort and bounded at 10 seconds.
+pub struct TempRole {
+    pub name: String,
+    admin: PgConnectOptions,
+    armed: bool,
+}
+
+impl Drop for TempRole {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        let admin = self.admin.clone();
+        let handle = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                let work = async {
+                    let mut conn = PgConnection::connect_with(&admin).await.ok()?;
+                    drop_role(&mut conn, &name).await.ok()
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), work).await;
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
+/// Create a random `NOLOGIN` role guarded by [`TempRole`].
+pub async fn temp_role(admin: &PgPool, prefix: &str) -> TempRole {
+    let name: String = sqlx::query_scalar(&format!(
+        "SELECT 'stig_t_{prefix}' || replace(gen_random_uuid()::text, '-', '')"
+    ))
+    .fetch_one(admin)
+    .await
+    .expect("role name");
+    sqlx::query(&format!("CREATE ROLE \"{name}\" NOLOGIN"))
+        .execute(admin)
+        .await
+        .expect("create role");
+    TempRole {
+        name,
+        admin: (*admin.connect_options()).clone(),
+        armed: true,
+    }
+}
+
 /// A restricted application role for one test database, as the owner step in
 /// production would provision it: DML grants only, assumed with `SET ROLE` on
 /// every connection. Needs the superuser test connection (`CREATE ROLE`,
-/// `SET ROLE`).
+/// `SET ROLE`). Dropping it without [`AppRole::cleanup`] still removes the
+/// role (best effort).
 pub struct AppRole {
+    // Field order matters: the pool drops before the role guard.
     pub pool: PgPool,
     pub name: String,
+    role: TempRole,
 }
 
 impl AppRole {
-    /// Best-effort removal of the cluster-global role (assertions that fail
-    /// earlier leave it behind; the name is random).
-    pub async fn cleanup(self, admin: &PgPool) {
+    /// Fast path for removing the cluster-global role; on failure the drop
+    /// guard retries.
+    pub async fn cleanup(mut self, admin: &PgPool) {
         self.pool.close().await;
-        let q = format!("\"{}\"", self.name);
-        let _ = sqlx::query(&format!("DROP OWNED BY {q}"))
-            .execute(admin)
-            .await;
-        let _ = sqlx::query(&format!("DROP ROLE {q}")).execute(admin).await;
+        let Ok(mut conn) = admin.acquire().await else {
+            return;
+        };
+        if drop_role(&mut conn, &self.name).await.is_ok() {
+            self.role.armed = false;
+        }
     }
 }
 
@@ -67,15 +146,8 @@ impl AppRole {
 /// [`crate::db_roles::apply_app_grants`] and return a pool whose connections
 /// all `SET ROLE` to it.
 pub async fn app_role_pool(admin: &PgPool, test_routes: bool) -> AppRole {
-    let name: String =
-        sqlx::query_scalar("SELECT 'stig_t_' || replace(gen_random_uuid()::text, '-', '')")
-            .fetch_one(admin)
-            .await
-            .expect("role name");
-    sqlx::query(&format!("CREATE ROLE \"{name}\" NOLOGIN"))
-        .execute(admin)
-        .await
-        .expect("create app role");
+    let role = temp_role(admin, "").await;
+    let name = role.name.clone();
     let mut conn = admin.acquire().await.expect("acquire");
     crate::db_roles::apply_app_grants(&mut conn, &name, test_routes)
         .await
@@ -94,7 +166,7 @@ pub async fn app_role_pool(admin: &PgPool, test_routes: bool) -> AppRole {
         .connect_with((*admin.connect_options()).clone())
         .await
         .expect("app role pool");
-    AppRole { pool, name }
+    AppRole { pool, name, role }
 }
 
 pub async fn seed_user(pool: &PgPool, id: &str) {
