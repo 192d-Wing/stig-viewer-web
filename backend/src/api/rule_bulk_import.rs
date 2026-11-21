@@ -298,15 +298,19 @@ pub async fn bulk_import_handler(
     Query(query): Query<BulkImportQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
-    let (checklist, asset) = tokio::spawn(authorise(
-        state.clone(),
-        user.clone(),
-        ctx.clone(),
-        checklist_id,
-        query.dry_run,
-    ))
-    .await
-    .map_err(join_failed)??;
+    let tasks = state.tasks.clone();
+    let (checklist, asset) = crate::detached::run(
+        &tasks,
+        "rule bulk-import",
+        authorise(
+            state.clone(),
+            user.clone(),
+            ctx.clone(),
+            checklist_id,
+            query.dry_run,
+        ),
+    )
+    .await??;
 
     // Slurp the first 'file' field into a buffer. CSVs for a checklist are
     // bounded by the rule count so we accept the memory cost.
@@ -340,7 +344,7 @@ pub async fn bulk_import_handler(
         let st = state.clone();
         let dry_run = query.dry_run;
         let (u, a, c, x) = (user.clone(), asset.clone(), checklist.clone(), ctx.clone());
-        let _ = tokio::spawn(async move {
+        let _ = crate::detached::run(&tasks, "rule bulk-import", async move {
             reject_event(st.pool.as_ref(), &u, &x, &a, &c, dry_run, reason).await;
         })
         .await;
@@ -361,11 +365,13 @@ pub(crate) async fn run_import(
     csv_bytes: Vec<u8>,
     dry_run: bool,
 ) -> Result<Json<BulkImportResponse>, StatusCode> {
-    tokio::spawn(import_work(
-        state, user, ctx, checklist, asset, csv_bytes, dry_run,
-    ))
-    .await
-    .map_err(join_failed)?
+    let tasks = state.tasks.clone();
+    crate::detached::run(
+        &tasks,
+        "rule bulk-import",
+        import_work(state, user, ctx, checklist, asset, csv_bytes, dry_run),
+    )
+    .await?
 }
 
 pub(crate) async fn import_work(
@@ -679,11 +685,6 @@ pub(crate) async fn import_work(
         pending_count,
         error_count,
     }))
-}
-
-fn join_failed(e: tokio::task::JoinError) -> StatusCode {
-    tracing::error!("rule bulk-import task failed: {e}");
-    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 fn map_db(e: anyhow::Error) -> StatusCode {
@@ -1146,21 +1147,22 @@ mod tests {
         .await
         .unwrap();
         let csv = format!("rule_id,status\n{},open\n", RULES[0]).into_bytes();
-        let st = state.clone();
-        let h = tokio::spawn(async move {
-            let _ = run_import(st, u, crate::test_fixtures::ctx(), c, a, csv, false).await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut seen = 0i64;
-        for _ in 0..200 {
-            seen = count(&pool, "SELECT COUNT(*) FROM audit_events").await;
-            if seen > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(seen, 1);
+        crate::detached::abort_once_spawned(
+            &state.tasks,
+            run_import(
+                state.clone(),
+                u,
+                crate::test_fixtures::ctx(),
+                c,
+                a,
+                csv,
+                false,
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events").await, 1);
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
             1

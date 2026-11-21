@@ -59,7 +59,7 @@ pub async fn get_checklist(pool: &PgPool, id: &str) -> Result<Option<ChecklistRo
 }
 
 pub async fn find_checklist(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     asset_id: &str,
     stig_id: &str,
 ) -> Result<Option<ChecklistRow>> {
@@ -68,7 +68,7 @@ pub async fn find_checklist(
     )
     .bind(asset_id)
     .bind(stig_id)
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await?;
     Ok(row)
 }
@@ -94,7 +94,10 @@ pub async fn insert_checklist(pool: &PgPool, row: &ChecklistRow) -> Result<()> {
 /// Insert a checklist unless one already exists for `(asset_id, stig_id)`.
 /// Returns true when this call inserted the row, false when the pair was
 /// already present (for example a concurrent save created it first).
-pub async fn insert_checklist_if_absent(pool: &PgPool, row: &ChecklistRow) -> Result<bool> {
+pub async fn insert_checklist_if_absent(
+    db: impl sqlx::PgExecutor<'_>,
+    row: &ChecklistRow,
+) -> Result<bool> {
     let res = sqlx::query(
         "INSERT INTO checklists \
             (id, asset_id, stig_id, status, applied_version, applied_release, created_by) \
@@ -108,7 +111,7 @@ pub async fn insert_checklist_if_absent(pool: &PgPool, row: &ChecklistRow) -> Re
     .bind(&row.applied_version)
     .bind(&row.applied_release)
     .bind(&row.created_by)
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(res.rows_affected() == 1)
 }
@@ -162,11 +165,14 @@ pub async fn prune_orphan_rule_overrides(
 /// Look up the current (version, release_info) for a STIG in the catalog.
 /// Returns ("", "") if not in the catalog so create_handler can still
 /// proceed for user-uploaded STIGs that don't sit in stigs_catalog.
-pub async fn catalog_version(pool: &PgPool, stig_id: &str) -> Result<(String, String)> {
+pub async fn catalog_version(
+    db: impl sqlx::PgExecutor<'_>,
+    stig_id: &str,
+) -> Result<(String, String)> {
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT version, release_info FROM stigs_catalog WHERE id = $1")
             .bind(stig_id)
-            .fetch_optional(pool)
+            .fetch_optional(db)
             .await?;
     Ok(row.unwrap_or_default())
 }
@@ -180,14 +186,14 @@ pub async fn delete_checklist(pool: &PgPool, id: &str) -> Result<()> {
 }
 
 pub async fn list_rule_overrides(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     checklist_id: &str,
 ) -> Result<Vec<ChecklistRuleRow>> {
     let rows = sqlx::query_as::<_, ChecklistRuleRow>(
         "SELECT * FROM checklist_rules WHERE checklist_id = $1",
     )
     .bind(checklist_id)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?;
     Ok(rows)
 }
@@ -408,15 +414,25 @@ pub const RULE_CHUNK: usize = 100;
 /// How long a batch chunk waits for the checklist lock before failing.
 pub(crate) const CHUNK_LOCK_TIMEOUT: &str = "5s";
 
-/// Bound lock waits for the rest of the transaction (chunk transactions only).
-pub(crate) async fn set_lock_timeout(
+/// Longest a statement in a batch chunk may run. It stays above
+/// `CHUNK_LOCK_TIMEOUT` so a lock wait still reports `55P03`, and a chunk
+/// whose caller was dropped cannot pin its pool connection for longer (see
+/// `crate::db::STATEMENT_TIMEOUT_MS`).
+pub(crate) const CHUNK_STATEMENT_TIMEOUT: &str = "8s";
+
+/// Bound lock waits and statement run time for the rest of the transaction
+/// (chunk transactions only).
+pub(crate) async fn set_chunk_timeouts(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    timeout: &str,
+    lock_timeout: &str,
 ) -> Result<()> {
-    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-        .bind(timeout)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    )
+    .bind(lock_timeout)
+    .bind(CHUNK_STATEMENT_TIMEOUT)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -503,7 +519,7 @@ async fn patch_chunk(
     lock_timeout: &str,
 ) -> Result<Vec<Result<(), PatchRejected>>> {
     let mut tx = pool.begin().await?;
-    set_lock_timeout(&mut tx, lock_timeout).await?;
+    set_chunk_timeouts(&mut tx, lock_timeout).await?;
     lock_checklist(&mut tx, checklist_id).await?;
     let ids: Vec<&str> = chunk.iter().map(|(id, _)| *id).collect();
     let mut rows: std::collections::HashMap<String, ChecklistRuleRow> =

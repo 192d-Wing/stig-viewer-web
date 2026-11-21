@@ -130,9 +130,16 @@ pub async fn list_assets(pool: &PgPool) -> Result<Vec<AssetSummary>> {
 }
 
 pub async fn get_asset(pool: &PgPool, id: &str) -> Result<Option<AssetRow>> {
+    let mut conn = pool.acquire().await?;
+    get_asset_on(&mut conn, id).await
+}
+
+/// [`get_asset`] on a caller-held connection, so a bounded transaction can
+/// read the asset without taking a second pool connection.
+pub async fn get_asset_on(conn: &mut sqlx::PgConnection, id: &str) -> Result<Option<AssetRow>> {
     let row = sqlx::query_as::<_, AssetRow>("SELECT * FROM assets WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
     let mut row = match row {
         Some(r) => r,
@@ -141,7 +148,7 @@ pub async fn get_asset(pool: &PgPool, id: &str) -> Result<Option<AssetRow>> {
     let tags: Vec<String> =
         sqlx::query_scalar("SELECT tag FROM asset_tags WHERE asset_id = $1 ORDER BY tag")
             .bind(id)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
     row.tags = tags;
     // Defensive read-side truncation — see `MAX_RUNBOOK_BYTES`.

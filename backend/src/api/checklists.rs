@@ -58,12 +58,13 @@ pub async fn create_handler(
     Path(asset_id): Path<String>,
     Json(req): Json<CreateChecklistRequest>,
 ) -> Result<(StatusCode, Json<db_checklists::ChecklistRow>), StatusCode> {
-    tokio::spawn(create_work(state, user, ctx, asset_id, req))
-        .await
-        .map_err(|e| {
-            tracing::error!("create checklist task failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+    let tasks = state.tasks.clone();
+    crate::detached::run(
+        &tasks,
+        "create checklist",
+        create_work(state, user, ctx, asset_id, req),
+    )
+    .await?
 }
 
 async fn create_work(
@@ -651,7 +652,8 @@ pub async fn update_rule_handler(
             let checklist_id = id.clone();
             let rule_id_clone = rule_id.clone();
             let due_date = req.due_date;
-            tokio::spawn(async move {
+            // Tracked, so shutdown waits for the delivery.
+            crate::detached::spawn(&state.tasks, async move {
                 fire_assigned_event(
                     &state_clone,
                     pool.as_ref(),
@@ -669,7 +671,7 @@ pub async fn update_rule_handler(
 }
 
 /// Resolve event metadata + dispatch an `assigned` webhook event for a
-/// single rule. Runs inside `tokio::spawn` from `update_rule_handler`;
+/// single rule. Runs in a tracked task (`detached::spawn`) from `update_rule_handler`;
 /// any failure here is logged but never bubbles back to the caller.
 async fn fire_assigned_event(
     state: &AppState,
@@ -1041,34 +1043,21 @@ mod tests {
         ));
     }
 
-    /// Relies on the current-thread runtime `#[sqlx::test]` uses: after one
-    /// `yield_now` the spawned handler task has been polled once and so has
-    /// spawned its inner task, which only runs once this test awaits again.
-    /// If the runtime ever becomes multi-threaded the abort may land later; the
-    /// test still passes but proves less.
+    /// Drops the handler future once its task is spawned; the checklist and
+    /// its audit event must still land.
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn create_work_and_event_survive_the_handler_future_being_dropped(pool: PgPool) {
         seed_user(&pool, "owner").await;
         seed_asset(&pool, "a1", "owner", false).await;
         let (state, _dir) = app_state(pool.clone());
-        let st = state.clone();
-        let h = tokio::spawn(async move {
-            let _ = create(&st, "owner", STIG_ID).await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut seen = 0i64;
-        for _ in 0..200 {
-            seen = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            if seen > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        crate::detached::abort_once_spawned(&state.tasks, create(&state, "owner", STIG_ID)).await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(seen, 1);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklists")
             .fetch_one(&pool)

@@ -8,7 +8,8 @@
 //! the hard cap. A [`Tracker`] counts the tasks in flight so shutdown and
 //! tests can wait for them with [`Tracker::idle`].
 //!
-//! Only tasks started through [`run`] or [`run_bounded`] are tracked.
+//! Only tasks started through [`run`], [`run_bounded`] or [`spawn`] are
+//! tracked; tasks from [`spawn`] carry no admission permit of their own.
 //!
 //! The number of tasks is bounded by the admission permit (`api::admission`)
 //! carried in the `RequestCtx` that each work function takes by value: at most
@@ -149,6 +150,16 @@ pub async fn run<T: Send + 'static>(
     })
 }
 
+/// Start `fut` as a tracked task and return at once. The tracker is entered
+/// before this returns, so [`Tracker::idle`] cannot miss the task.
+pub fn spawn(tracker: &Arc<Tracker>, fut: impl Future<Output = ()> + Send + 'static) {
+    let guard = tracker.enter();
+    tokio::spawn(async move {
+        let _guard = guard;
+        fut.await
+    });
+}
+
 /// Run the work as a spawned task and wait for it. If the caller is dropped
 /// the task keeps running; the server deadline lives inside the task, so it
 /// applies either way. A panicked task is logged as `"{what} task failed"`.
@@ -285,6 +296,22 @@ mod tests {
         let _ = open.send(());
         tracker.idle().await;
         assert_eq!(done_rx.await, Ok(7));
+        assert_eq!(tracker.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_is_tracked_at_once_and_idle_waits_for_it() {
+        let tracker = Tracker::new();
+        let (open, gate) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel();
+        spawn(&tracker, async move {
+            let _ = gate.await;
+            let _ = done_tx.send(3);
+        });
+        assert_eq!(tracker.in_flight(), 1);
+        let _ = open.send(());
+        tracker.idle().await;
+        assert_eq!(done_rx.await, Ok(3));
         assert_eq!(tracker.in_flight(), 0);
     }
 

@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use sqlx::PgConnection;
 
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
@@ -219,24 +220,33 @@ fn short(t: &Option<String>) -> String {
         .unwrap_or_default()
 }
 
-/// Hex SHA-256 of the canonical JSON of `v`. This binds a retry token to the
-/// request content it was first used with (idempotency); it is not a MAC or
-/// an integrity control, and the tokens are not secrets.
-fn sha256_hex(v: &impl Serialize) -> ApiResult<String> {
+/// Algorithm tag stored in front of every replay digest (`<alg>:<hex>`).
+/// Changing it makes in-flight tokens fail closed (409 / not a replay, since
+/// the stored and the new digests no longer compare equal), never accepted by
+/// mistake.
+const DIGEST_ALG: &str = "sha256";
+
+/// Tagged digest (`sha256:<hex>`) of the canonical JSON of `v`. This binds a
+/// retry token to the request content it was first used with (idempotency);
+/// it is not a MAC or an integrity control, and the tokens are not secrets.
+fn body_digest(v: &impl Serialize) -> ApiResult<String> {
     let bytes = serde_json::to_vec(v).map_err(|e| {
         tracing::error!("checklist set fingerprint failed: {e}");
         ApiError::from(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    Ok(format!(
+        "{DIGEST_ALG}:{}",
+        hex::encode(Sha256::digest(bytes))
+    ))
 }
 
-/// Hash of what a create request asks for, as sent (the token is excluded).
+/// Digest of what a create request asks for, as sent (the token is excluded).
 /// Idempotency binding only.
 fn create_fingerprint(req: &CreateRequest) -> ApiResult<String> {
-    sha256_hex(&("checklist-set.create.v1", &req.name, &req.stig_ids))
+    body_digest(&("checklist-set.create.v1", &req.name, &req.stig_ids))
 }
 
-/// Hash of what an autosave asks for, as sent and before dedupe (the token
+/// Digest of what an autosave asks for, as sent and before dedupe (the token
 /// is excluded). Idempotency binding only.
 fn autosave_fingerprint(req: &AutosaveRequest) -> ApiResult<String> {
     let changes: Vec<(&str, &str, &str, &str, &str)> = req
@@ -252,7 +262,7 @@ fn autosave_fingerprint(req: &AutosaveRequest) -> ApiResult<String> {
             )
         })
         .collect();
-    sha256_hex(&("checklist-set.autosave.v1", req.revision, changes))
+    body_digest(&("checklist-set.autosave.v1", req.revision, changes))
 }
 
 /// `Some(None)` is an explicit JSON null; an absent field is `None`.
@@ -362,28 +372,49 @@ fn event<'a>(
     }
 }
 
-/// The asset's name, only when the caller can still read it.
+/// The asset's name, only when the caller can still read it. Runs on the
+/// caller's (bounded) connection.
 async fn visible_asset_name(
-    state: &AppState,
+    conn: &mut PgConnection,
     user: &AuthUser,
     asset_id: Option<&str>,
     name: Option<String>,
-) -> Option<String> {
-    let id = asset_id?;
-    let name = name?;
-    asset_acl::user_can(state.pool.as_ref(), id, user, "read")
+) -> ApiResult<Option<String>> {
+    let (Some(id), Some(name)) = (asset_id, name) else {
+        return Ok(None);
+    };
+    // A database error (a timeout included) is a 503, not a hidden name.
+    let ok = asset_acl::user_can_on(conn, id, user, "read")
         .await
-        .then_some(name)
+        .map_err(map_db)?;
+    Ok(ok.then_some(name))
 }
 
 async fn detail_of(state: &AppState, user: &AuthUser, id: &str) -> ApiResult<ChecklistSetDetail> {
-    let pool = state.pool.as_ref();
-    let set = db::get_set(pool, &user.id, id)
+    detail_within(state, user, id, crate::db::STATEMENT_TIMEOUT_MS).await
+}
+
+/// [`detail_of`] with an explicit database bound in milliseconds.
+async fn detail_within(
+    state: &AppState,
+    user: &AuthUser,
+    id: &str,
+    bound_ms: i64,
+) -> ApiResult<ChecklistSetDetail> {
+    // One short bounded transaction for every read, committed at the end.
+    let mut tx = crate::db::begin_bounded_ms(state.pool.as_ref(), bound_ms)
+        .await
+        .map_err(map_db)?;
+    let set = db::get_set(&mut *tx, &user.id, id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let stigs = db::list_stigs(pool, &user.id, id).await.map_err(map_db)?;
-    let rules = db::list_rules(pool, &user.id, id).await.map_err(map_db)?;
+    let stigs = db::list_stigs(&mut *tx, &user.id, id)
+        .await
+        .map_err(map_db)?;
+    let rules = db::list_rules(&mut *tx, &user.id, id)
+        .await
+        .map_err(map_db)?;
     let mut by_stig: HashMap<String, Vec<SetRuleState>> = HashMap::new();
     for r in rules {
         by_stig.entry(r.stig_id).or_default().push(SetRuleState {
@@ -395,14 +426,15 @@ async fn detail_of(state: &AppState, user: &AuthUser, id: &str) -> ApiResult<Che
     }
     let asset_name = match set.asset_id.as_deref() {
         Some(a) => {
-            let name = db_assets::get_asset(pool, a)
+            let name = db_assets::get_asset_on(&mut tx, a)
                 .await
                 .map_err(map_db)?
                 .map(|x| x.name);
-            visible_asset_name(state, user, Some(a), name).await
+            visible_asset_name(&mut tx, user, Some(a), name).await?
         }
         None => None,
     };
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     Ok(ChecklistSetDetail {
         id: set.id,
         name: set.name,
@@ -425,11 +457,11 @@ async fn detail_of(state: &AppState, user: &AuthUser, id: &str) -> ApiResult<Che
 }
 
 /// A catalog STIG's `(version, release)`; 400 for a bad or unknown id.
-async fn catalog_stig(state: &AppState, stig_id: &str) -> ApiResult<(String, String)> {
+async fn catalog_stig(conn: &mut PgConnection, stig_id: &str) -> ApiResult<(String, String)> {
     if !is_valid_stig_id(stig_id) {
         return Err(StatusCode::BAD_REQUEST.into());
     }
-    db::catalog_entry(state.pool.as_ref(), stig_id)
+    db::catalog_entry(&mut *conn, stig_id)
         .await
         .map_err(map_db)?
         .ok_or_else(|| StatusCode::BAD_REQUEST.into())
@@ -442,14 +474,44 @@ pub async fn list_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<ChecklistSetSummary>>> {
-    within(READ_DEADLINE, async {
-        let rows = db::list_sets(state.pool.as_ref(), &user.id)
+    within(
+        READ_DEADLINE,
+        list_within(&state, &user, crate::db::STATEMENT_TIMEOUT_MS),
+    )
+    .await
+}
+
+/// The list read with an explicit database bound in milliseconds.
+async fn list_within(
+    state: &AppState,
+    user: &AuthUser,
+    bound_ms: i64,
+) -> ApiResult<Json<Vec<ChecklistSetSummary>>> {
+    {
+        let mut tx = crate::db::begin_bounded_ms(state.pool.as_ref(), bound_ms)
             .await
             .map_err(map_db)?;
+        let rows = db::list_sets(&mut *tx, &user.id).await.map_err(map_db)?;
         let mut out = Vec::with_capacity(rows.len());
+        // One ACL answer per distinct asset.
+        let mut readable: HashMap<String, bool> = HashMap::new();
         for r in rows {
-            let asset_name =
-                visible_asset_name(&state, &user, r.asset_id.as_deref(), r.asset_name).await;
+            let asset_name = match r.asset_id.as_deref() {
+                Some(a) if r.asset_name.is_some() => {
+                    let ok = match readable.get(a) {
+                        Some(ok) => *ok,
+                        None => {
+                            let ok = asset_acl::user_can_on(&mut tx, a, user, "read")
+                                .await
+                                .map_err(map_db)?;
+                            readable.insert(a.to_string(), ok);
+                            ok
+                        }
+                    };
+                    r.asset_name.filter(|_| ok)
+                }
+                _ => None,
+            };
             out.push(ChecklistSetSummary {
                 id: r.id,
                 name: r.name,
@@ -461,9 +523,9 @@ pub async fn list_handler(
                 updated_at: r.updated_at,
             });
         }
+        tx.commit().await.map_err(|e| map_db(e.into()))?;
         Ok(Json(out))
-    })
-    .await
+    }
 }
 
 /// POST /api/checklist-sets
@@ -503,7 +565,7 @@ async fn create_work(
         None => None,
     };
     let token = match (create_key.as_deref(), fingerprint.as_deref()) {
-        (Some(id), Some(body_sha256)) => Some(db::Token { id, body_sha256 }),
+        (Some(id), Some(body_digest)) => Some(db::Token { id, body_digest }),
         _ => None,
     };
     let mut seen = HashSet::new();
@@ -516,10 +578,12 @@ async fn create_work(
         return Err(StatusCode::BAD_REQUEST.into());
     }
     let mut stigs = Vec::with_capacity(ids.len());
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
     for id in &ids {
-        let (version, release) = catalog_stig(&state, id).await?;
+        let (version, release) = catalog_stig(&mut tx, id).await?;
         stigs.push(((*id).clone(), version, release));
     }
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     let name = match req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) => clean_name(n).ok_or(StatusCode::BAD_REQUEST)?,
         None => {
@@ -542,8 +606,32 @@ async fn create_work(
                 Json(detail_of(&state, &user, &existing).await?),
             ));
         }
-        CreateOutcome::KeyConflict => {
+        CreateOutcome::KeyConflict {
+            set_id,
+            stored_digest,
+        } => {
             tracing::warn!(user = %user.id, token = %short(&create_key), "checklist set create token reused with different content");
+            // Recorded while the shield is held, like the ok events. An exact
+            // repeat within `db_audit::collapse`'s window is folded into the
+            // first row's `repeat_count` / `last_occurred_at`; this is intended.
+            db_audit::record_or_log(
+                pool,
+                event(
+                    &user,
+                    &ctx,
+                    "checklist_set.create",
+                    "denied",
+                    None,
+                    json!({
+                        "setId": set_id,
+                        "reason": "request_id_conflict",
+                        "token": short(&create_key),
+                        "storedDigest": stored_digest,
+                    }),
+                ),
+            )
+            .await;
+            drop(hold);
             return Err(request_conflict());
         }
         CreateOutcome::Limit => {
@@ -624,11 +712,13 @@ async fn patch_work(
         Some(n) => Some(clean_name(n).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
     };
-    if db::get_set(pool, &user.id, &id)
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let found = db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
-        .is_none()
-    {
+        .is_some();
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
+    if !found {
         return Err(StatusCode::NOT_FOUND.into());
     }
     let hold = shield.hold();
@@ -757,14 +847,16 @@ async fn add_stig_work(
     shield: Shield,
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
-    if db::get_set(pool, &user.id, &id)
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    if db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
         .is_none()
     {
         return Err(StatusCode::NOT_FOUND.into());
     }
-    let (version, release) = catalog_stig(&state, &req.stig_id).await?;
+    let (version, release) = catalog_stig(&mut tx, &req.stig_id).await?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     let hold = shield.hold();
     match db::add_stig(
         pool,
@@ -896,6 +988,42 @@ async fn autosave_run(
     .map_err(ApiError::from)?
 }
 
+/// Audit a refused reuse of an autosave token (`save_id_conflict`). Callers
+/// hold the shield, like the ok events. `db_audit::collapse` folds an exact
+/// repeat within its window into the first row's `repeat_count` /
+/// `last_occurred_at`; this is intended.
+#[allow(clippy::too_many_arguments)]
+async fn record_save_id_conflict(
+    pool: &sqlx::PgPool,
+    user: &AuthUser,
+    ctx: &RequestCtx,
+    set_id: &str,
+    save_id: &Option<String>,
+    base_revision: i64,
+    revision: i64,
+    stored_digest: bool,
+) {
+    db_audit::record_or_log(
+        pool,
+        event(
+            user,
+            ctx,
+            "checklist_set.edit",
+            "denied",
+            None,
+            json!({
+                "setId": set_id,
+                "reason": "save_id_conflict",
+                "token": short(save_id),
+                "baseRevision": base_revision,
+                "revision": revision,
+                "storedDigest": stored_digest,
+            }),
+        ),
+    )
+    .await;
+}
+
 /// Autosave with explicit size bounds (tests pass small ones).
 async fn autosave_with_budget(
     state: AppState,
@@ -910,16 +1038,18 @@ async fn autosave_with_budget(
     if req.changes.len() > MAX_RULES {
         return Err(StatusCode::BAD_REQUEST.into());
     }
-    let set = db::get_set(pool, &user.id, &id)
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let set = db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let members: HashSet<String> = db::list_stigs(pool, &user.id, &id)
+    let members: HashSet<String> = db::list_stigs(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
         .into_iter()
         .map(|s| s.stig_id)
         .collect();
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     for c in &req.changes {
         let ok = members.contains(&c.stig_id)
             && !c.rule_id.is_empty()
@@ -940,7 +1070,7 @@ async fn autosave_with_budget(
         None => None,
     };
     let token = match (save_id.as_deref(), fingerprint.as_deref()) {
-        (Some(id), Some(body_sha256)) => Some(db::Token { id, body_sha256 }),
+        (Some(id), Some(body_digest)) => Some(db::Token { id, body_digest }),
         _ => None,
     };
     if req.revision != set.revision {
@@ -951,8 +1081,20 @@ async fn autosave_with_budget(
                 updated_at: set.updated_at,
             }));
         }
-        if save_id.is_some() && set.last_save_id == save_id && set.revision == req.revision + 1 {
+        if db::is_token_reuse(&set, req.revision, token.as_ref()) {
             tracing::warn!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave token reused with different content");
+            let _hold = shield.hold();
+            record_save_id_conflict(
+                pool,
+                &user,
+                &ctx,
+                &id,
+                &save_id,
+                req.revision,
+                set.revision,
+                set.last_save_body_digest.is_some(),
+            )
+            .await;
         }
         return Err(conflict(set.revision));
     }
@@ -1028,7 +1170,28 @@ async fn autosave_with_budget(
             }))
         }
         WriteOutcome::NotFound => Err(StatusCode::NOT_FOUND.into()),
-        WriteOutcome::Conflict { revision } => Err(conflict(revision)),
+        WriteOutcome::Conflict {
+            revision,
+            token_reused,
+            stored_digest,
+        } => {
+            if token_reused {
+                tracing::warn!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave token reused with different content");
+                record_save_id_conflict(
+                    pool,
+                    &user,
+                    &ctx,
+                    &id,
+                    &save_id,
+                    req.revision,
+                    revision,
+                    stored_digest,
+                )
+                .await;
+            }
+            drop(hold);
+            Err(conflict(revision))
+        }
         WriteOutcome::SetTooLarge => Err(ApiError(Box::new(
             (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -1075,10 +1238,14 @@ async fn save_to_system_work(
     shield: Shield,
 ) -> ApiResult<Json<SetSaveResponse>> {
     let pool = state.pool.as_ref();
-    let set = db::get_set(pool, &user.id, &id)
+    // Three short bounded transactions; every reject and audit record runs
+    // after the commit of the one before it, never inside one.
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let set = db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     // Every later exit records an event, so hold from here on.
     let _hold = shield.hold();
     // Early refusals leave a record too; no asset id until it is known to exist.
@@ -1111,7 +1278,20 @@ async fn save_to_system_work(
             return Err(StatusCode::BAD_REQUEST.into());
         }
     };
-    let Some(asset) = db_assets::get_asset(pool, &target).await.map_err(map_db)? else {
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let found = db_assets::get_asset_on(&mut tx, &target)
+        .await
+        .map_err(map_db)?;
+    let can_write = match &found {
+        Some(a) => Some(
+            asset_acl::user_can_on(&mut tx, &a.id, &user, "write")
+                .await
+                .map_err(map_db)?,
+        ),
+        None => None,
+    };
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
+    let Some(asset) = found else {
         reject("asset_not_found").await;
         return Err(StatusCode::NOT_FOUND.into());
     };
@@ -1127,17 +1307,23 @@ async fn save_to_system_work(
         ev.asset_id = Some(&asset.id);
         db_audit::record_or_log(pool, ev)
     };
-    if !asset_acl::user_can(pool, &asset.id, &user, "write").await {
+    if can_write != Some(true) {
         record("denied", json!({ "setId": id, "reason": "forbidden" })).await;
         return Err(StatusCode::FORBIDDEN.into());
     }
-    let stigs = db::list_stigs(pool, &user.id, &id).await.map_err(map_db)?;
-    let rules = db::list_rules(pool, &user.id, &id).await.map_err(map_db)?;
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let stigs = db::list_stigs(&mut *tx, &user.id, &id)
+        .await
+        .map_err(map_db)?;
+    let rules = db::list_rules(&mut *tx, &user.id, &id)
+        .await
+        .map_err(map_db)?;
     // What is pushed must be what the user last saw saved: re-check after the reads.
-    let after = db::get_set(pool, &user.id, &id)
+    let after = db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     if after.revision != req.revision {
         reject("revision_conflict").await;
         return Err(conflict(after.revision));
@@ -1794,11 +1980,11 @@ mod tests {
             updated_at: Utc::now(),
             last_attached_at: None,
             last_save_id: last.map(str::to_string),
-            last_save_body_sha256: hash.map(str::to_string),
+            last_save_body_digest: hash.map(str::to_string),
         };
         let h1 = "a".repeat(64);
         let h2 = "b".repeat(64);
-        let tok = |id, h| db::Token { id, body_sha256: h };
+        let tok = |id, h| db::Token { id, body_digest: h };
         let stored = Some(h1.as_str());
         assert!(db::is_replay(
             &at(1, Some(KEY_A), stored),
@@ -1827,9 +2013,72 @@ mod tests {
             0,
             Some(&tok(KEY_A, &h2))
         ));
-        // A row from before the hash existed matches any content.
-        assert!(db::is_replay(
+        // A row with no stored digest (written before it existed) is not a replay.
+        assert!(!db::is_replay(
             &at(1, Some(KEY_A), None),
+            0,
+            Some(&tok(KEY_A, &h2))
+        ));
+    }
+
+    #[test]
+    fn body_digest_is_tagged_with_its_algorithm() {
+        let d = body_digest(&("x", 1)).ok().unwrap();
+        let hex = d.strip_prefix("sha256:").unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(DIGEST_ALG == "sha256");
+    }
+
+    #[test]
+    fn token_reuse_is_the_refused_case_of_the_replay_window() {
+        let at = |revision, last: Option<&str>, hash: Option<&str>| db::SetRow {
+            id: "s".into(),
+            name: "n".into(),
+            asset_id: None,
+            revision,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_attached_at: None,
+            last_save_id: last.map(str::to_string),
+            last_save_body_digest: hash.map(str::to_string),
+        };
+        let h1 = "sha256:".to_string() + &"a".repeat(64);
+        let h2 = "sha256:".to_string() + &"b".repeat(64);
+        let tok = |id, h| db::Token { id, body_digest: h };
+        let stored = Some(h1.as_str());
+        // Same id, one revision behind, different content: refused reuse.
+        assert!(db::is_token_reuse(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h2))
+        ));
+        // An exact retry is a replay, not a reuse.
+        assert!(!db::is_token_reuse(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h1))
+        ));
+        // A later write, another token, or no token is not a reuse.
+        assert!(!db::is_token_reuse(
+            &at(2, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_A, &h2))
+        ));
+        assert!(!db::is_token_reuse(
+            &at(1, Some(KEY_A), stored),
+            0,
+            Some(&tok(KEY_B, &h2))
+        ));
+        assert!(!db::is_token_reuse(&at(1, Some(KEY_A), stored), 0, None));
+        // No stored digest: the token is refused, so it counts as a reuse.
+        assert!(db::is_token_reuse(
+            &at(1, Some(KEY_A), None),
+            0,
+            Some(&tok(KEY_A, &h1))
+        ));
+        assert!(!db::is_token_reuse(
+            &at(1, None, None),
             0,
             Some(&tok(KEY_A, &h2))
         ));
@@ -1863,7 +2112,7 @@ mod tests {
     fn create_fingerprint_binds_content_but_not_the_token() {
         let base = create_req(Some("n"), &["A", "B"]);
         let f = cfp(&base);
-        assert_eq!(f.len(), 64);
+        assert_eq!(f.len(), "sha256:".len() + 64);
         assert_eq!(f, cfp(&create_req(Some("n"), &["A", "B"])));
         let mut other_token = create_req(Some("n"), &["A", "B"]);
         other_token.client_request_id = Some(KEY_B.into());
@@ -1878,7 +2127,7 @@ mod tests {
     fn autosave_fingerprint_binds_content_but_not_the_token() {
         let one = || change("S", "r1", "open", "d", "c");
         let f = afp(&save_req(3, vec![one()]));
-        assert_eq!(f.len(), 64);
+        assert_eq!(f.len(), "sha256:".len() + 64);
         assert_eq!(f, afp(&save_req(3, vec![one()])));
         let mut other_token = save_req(3, vec![one()]);
         other_token.save_id = Some(KEY_B.into());
@@ -2544,6 +2793,29 @@ mod tests {
             .unwrap()
     }
 
+    async fn audit_count_ok(pool: &PgPool, action: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = $1 AND outcome = 'ok'")
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `(detail, request_id)` of every `denied` event for `action`.
+    async fn denied_events(
+        pool: &PgPool,
+        action: &str,
+    ) -> Vec<(serde_json::Value, Option<String>)> {
+        sqlx::query_as(
+            "SELECT detail, request_id FROM audit_events
+             WHERE action = $1 AND outcome = 'denied' ORDER BY id",
+        )
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn set_save_survives_the_handler_future_being_dropped(pool: PgPool) {
@@ -2878,6 +3150,99 @@ mod tests {
         .await;
         assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
         lock.rollback().await.unwrap();
+        // The dropped read's statement finishes once the lock is gone and its
+        // connection returns to the pool: a query succeeds promptly.
+        let n: i64 = tokio::time::timeout(
+            Duration::from_secs(5),
+            sqlx::query_scalar("SELECT COUNT(*) FROM checklist_sets").fetch_one(&pool),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Reads under an ACCESS EXCLUSIVE lock, with a short database bound: the
+    /// 503 comes from Postgres cutting the statement (the outer deadline is
+    /// ten seconds), and the connection is back in the pool at once.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn read_paths_are_cut_by_the_database_bound_and_release_the_connection(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let user = auth("owner", "author");
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let t = std::time::Instant::now();
+        let r = detail_within(&state, &user, &set.id, 150).await;
+        assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
+        let r = list_within(&state, &user, 150).await;
+        assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        lock.rollback().await.unwrap();
+        // Both connections went back to the pool: a query succeeds promptly.
+        let t = std::time::Instant::now();
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(detail_within(&state, &user, &set.id, 150).await.is_ok());
+    }
+
+    /// A timeout in the ACL check of a read path is a 503, not a 403 (hidden
+    /// name) or a 200.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_timeout_in_the_acl_check_of_a_read_is_a_503(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "other", &[STIG_ID]).await;
+        // "other" owns the set but only has a read ACL on owner's asset a1.
+        sqlx::query("UPDATE checklist_sets SET asset_id = 'a1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let user = auth("other", "author");
+        assert!(detail_within(&state, &user, &set.id, 150).await.is_ok());
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE asset_acl IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let r = detail_within(&state, &user, &set.id, 150).await;
+        assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
+        let r = list_within(&state, &user, 150).await;
+        assert_eq!(code(r), Some(StatusCode::SERVICE_UNAVAILABLE));
+        lock.rollback().await.unwrap();
+    }
+
+    /// The autosave race arm audits a refused reuse once, with a stored digest.
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_save_id_conflict_event_carries_the_stored_digest_flag(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let user = auth("owner", "author");
+        let id = Some(KEY_A.to_string());
+        for _ in 0..2 {
+            // The race arm and the early check share this helper.
+            record_save_id_conflict(
+                state.pool.as_ref(),
+                &user,
+                &crate::test_fixtures::ctx(),
+                &set.id,
+                &id,
+                0,
+                1,
+                true,
+            )
+            .await;
+        }
+        crate::db_audit::drain().await;
+        let denied = denied_events(&pool, "checklist_set.edit").await;
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].0["reason"], "save_id_conflict");
+        assert_eq!(denied[0].0["storedDigest"], true);
     }
 
     #[sqlx::test]
@@ -2909,7 +3274,18 @@ mod tests {
             .await,
             1
         );
-        assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.edit").await, 1);
+        // The refusal is audited once, with the token prefix and no content.
+        let denied = denied_events(&pool, "checklist_set.edit").await;
+        assert_eq!(denied.len(), 1);
+        let (detail, request_id) = &denied[0];
+        assert_eq!(detail["setId"], set.id.as_str());
+        assert_eq!(detail["reason"], "save_id_conflict");
+        assert_eq!(detail["token"], &KEY_A[..8]);
+        assert_eq!(detail["baseRevision"], 0);
+        assert_eq!(detail["revision"], 1);
+        assert_eq!(detail["storedDigest"], true);
+        assert_eq!(request_id.as_deref(), Some("test-request"));
         // The identical request is still a replay.
         assert_eq!(
             autosave_keyed(&state, &set.id, 0, KEY_A, a())
@@ -2959,11 +3335,108 @@ mod tests {
         }
         crate::db_audit::drain().await;
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
-        assert_eq!(audit_count(&pool, "checklist_set.create").await, 1);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.create").await, 1);
+        // Each refused reuse is audited; the audit layer's usual collapse of
+        // an exact repeat denied event turns the second into a repeat count.
+        let denied = denied_events(&pool, "checklist_set.create").await;
+        assert_eq!(denied.len(), 1);
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT repeat_count::bigint FROM audit_events WHERE outcome = 'denied'"
+            )
+            .await,
+            2
+        );
+        let set_id: String = sqlx::query_scalar("SELECT id FROM checklist_sets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        for (detail, request_id) in &denied {
+            assert_eq!(detail["setId"], set_id.as_str());
+            assert_eq!(detail["reason"], "request_id_conflict");
+            assert_eq!(detail["token"], &KEY_A[..8]);
+            assert_eq!(detail["storedDigest"], true);
+            assert_eq!(request_id.as_deref(), Some("test-request"));
+        }
         assert_eq!(
             create_with(&state, KEY_A, Some("one"), &[STIG_ID]).await,
             Ok(StatusCode::OK)
         );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_autosave_token_with_no_stored_digest_is_not_a_replay(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        let a = || vec![change(STIG_ID, RULES[0], "open", "d", "c")];
+        assert_eq!(
+            autosave_keyed(&state, &set.id, 0, KEY_A, a())
+                .await
+                .unwrap()
+                .revision,
+            1
+        );
+        sqlx::query("UPDATE checklist_sets SET last_save_body_digest = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The identical retry is refused, not acknowledged.
+        let r = autosave_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path(set.id.clone()),
+            Json(AutosaveRequest {
+                revision: 0,
+                changes: a(),
+                save_id: Some(KEY_A.into()),
+            }),
+        )
+        .await;
+        let Err(e) = r else {
+            panic!("expected a conflict");
+        };
+        let (code, body) = body_text(e).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(body.contains("\"revision\":1"), "{body}");
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            1
+        );
+        assert_eq!(audit_count_ok(&pool, "checklist_set.edit").await, 1);
+        let denied = denied_events(&pool, "checklist_set.edit").await;
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].0["reason"], "save_id_conflict");
+        assert_eq!(denied[0].0["storedDigest"], false);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_create_key_with_no_stored_digest_is_a_409_and_makes_no_set(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        assert_eq!(
+            create_with(&state, KEY_A, Some("one"), &[STIG_ID]).await,
+            Ok(StatusCode::CREATED)
+        );
+        sqlx::query("UPDATE checklist_sets SET create_body_digest = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (c, body) = create_with(&state, KEY_A, Some("one"), &[STIG_ID])
+            .await
+            .unwrap_err();
+        assert_eq!(c, StatusCode::CONFLICT);
+        assert!(body.contains("request_id_conflict"), "{body}");
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
+        let denied = denied_events(&pool, "checklist_set.create").await;
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].0["reason"], "request_id_conflict");
+        assert_eq!(denied[0].0["storedDigest"], false);
     }
 
     #[sqlx::test]
@@ -2980,7 +3453,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let stored = "SELECT COUNT(*) FROM checklist_sets WHERE last_save_body_sha256 IS NOT NULL";
+        let stored = "SELECT COUNT(*) FROM checklist_sets WHERE last_save_body_digest IS NOT NULL";
         assert_eq!(count(&pool, stored).await, 1);
         let rm = Path((set.id.clone(), STIG2.to_string()));
         assert!(
