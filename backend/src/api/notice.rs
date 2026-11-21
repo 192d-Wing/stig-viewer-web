@@ -261,6 +261,17 @@ pub(crate) async fn require_ack(
 /// Create the session and submit its `auth.notice_ack` row as one detached
 /// task, so a dropped caller cannot leave a session without its ack record.
 /// No await before the spawn.
+///
+/// Known, accepted gap: the session insert and the ack write are not one
+/// transaction. If the process dies between them, no response was sent, so
+/// nobody holds that session id. The residual case needs the ack write to
+/// stall past `WRITE_TIMEOUT` (cookie sent) followed by a hard kill before the
+/// detached write lands; a graceful shutdown drains the tracker and queue. A
+/// transaction would turn audit-table trouble into a login outage (including
+/// for the admin who must fix it) and bypass the write-queue accounting.
+/// Writing the ack first is worse: a failed session insert would leave an `ok`
+/// ack for a login that never happened. To reconcile, look for sessions with
+/// no `auth.notice_ack` row whose `detail->>'sessionId'` matches the session.
 pub(crate) async fn session_with_ack(
     tasks: &std::sync::Arc<crate::detached::Tracker>,
     pool: std::sync::Arc<PgPool>,
@@ -597,6 +608,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+        // `claim_oidc` deletes the ack row, so "claimed" means the row is gone,
+        // and a second claim finds nothing.
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM login_notice_acks WHERE id = 'a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0);
+        assert!(db_notice::claim_oidc(&pool, "a1", "s")
+            .await
+            .unwrap()
+            .is_none());
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
     }
 
     #[sqlx::test]

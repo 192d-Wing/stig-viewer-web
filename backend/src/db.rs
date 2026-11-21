@@ -55,6 +55,21 @@ pub async fn list_catalog(pool: &PgPool, category: Option<&str>) -> Result<Vec<C
 
 /// Upsert a catalog entry — inserts or updates on conflict.
 pub async fn upsert_catalog(pool: &PgPool, entry: &CatalogEntry) -> Result<()> {
+    upsert_catalog_on(pool, entry).await
+}
+
+/// [`upsert_catalog`] inside the caller's transaction.
+pub async fn upsert_catalog_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    entry: &CatalogEntry,
+) -> Result<()> {
+    upsert_catalog_on(&mut **tx, entry).await
+}
+
+async fn upsert_catalog_on<'e, E>(exec: E, entry: &CatalogEntry) -> Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query(
         r#"
         INSERT INTO stigs_catalog
@@ -77,7 +92,43 @@ pub async fn upsert_catalog(pool: &PgPool, entry: &CatalogEntry) -> Result<()> {
     .bind(&entry.release_info)
     .bind(entry.rule_count)
     .bind(&entry.json_path)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn upsert_catalog_tx_rolls_back_with_its_transaction(pool: PgPool) {
+        let entry = CatalogEntry {
+            id: "tx-test".into(),
+            title: "T".into(),
+            category: "Linux".into(),
+            version: "1".into(),
+            release_info: String::new(),
+            rule_count: 1,
+            json_path: "x".into(),
+            last_updated: Utc::now(),
+        };
+        let mut tx = pool.begin().await.unwrap();
+        upsert_catalog_tx(&mut tx, &entry).await.unwrap();
+        tx.rollback().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let mut tx = pool.begin().await.unwrap();
+        upsert_catalog_tx(&mut tx, &entry).await.unwrap();
+        tx.commit().await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stigs_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
 }

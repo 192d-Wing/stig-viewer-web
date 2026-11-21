@@ -422,6 +422,16 @@ pub async fn record_or_log_reporting(pool: &PgPool, ev: NewAuditEvent<'_>) -> Su
     record_counted(pool, ev, &GLOBAL_QUEUE, LIMITS).await
 }
 
+/// [`record_or_log_reporting`] on the given queue instead of the process-wide
+/// one, so a test can isolate itself from the shared caps.
+pub(crate) async fn record_reporting_on(
+    queue: &'static WriteQueue,
+    pool: &PgPool,
+    ev: NewAuditEvent<'_>,
+) -> Submission {
+    record_counted(pool, ev, queue, LIMITS).await
+}
+
 /// Record a system-originated event without ever failing the caller. Same
 /// guarantees as [`record_or_log`] (detached, caller waits at most
 /// [`WRITE_TIMEOUT`], counted in [`AUDIT_WRITES`], retried once without
