@@ -9,7 +9,12 @@
 //!
 //! System-originated events (no acting user, for example a scheduled DISA
 //! download stopped by its size cap) are written by [`record_system_or_log`]
-//! with a NULL `user_id` and `user_role = 'system'` (migration 045).
+//! with a NULL `user_id` and `user_role = 'system'` (migration 045). Startup
+//! with test routes on writes `audit.test_mode_enabled` directly
+//! ([`apply_test_maintenance_policy`]); a separate 5-minute task writes
+//! `audit.test_mode_unexpected` when the flag is set with test routes off
+//! ([`recheck_test_maintenance_flag`], first detection then hourly while the flag
+//! stays set, log and audit only, no shutdown).
 //!
 //! Writes are detached tasks in a bounded queue ([`WriteQueue`]): at most
 //! [`MAX_PENDING_WRITES`] (64) pending in all, of which at most
@@ -21,8 +26,16 @@
 //! a cap is shed and no row is written. There are three shed reasons: total
 //! and shared denied share (each logs an ids-only error line and counts as a
 //! failure), and the per-user denied sub-cap (counted in `shedWrites` only, not
-//! a failure: one account must not be able to degrade public health; it logs at
-//! most once per user per 60 s, with a summary of the held-back ones). Every
+//! a failure: one account must not be able to degrade public health). The
+//! log lines of both denied sheds are rate limited per acting user: one full ids-only line per user
+//! per 60 s, then a held-back count; users beyond 32 tracked ones share one
+//! overflow bucket, so log volume stays bounded however many accounts collude
+//! and a colluding group cannot use up another account's line. The overflow
+//! summary line ("beyond the tracked set") means more than 32 distinct accounts
+//! were shed within one window: alert on it as a collusion signal in its own
+//! right. Held-back
+//! counts are logged by later sheds, a 60 s flush task and shutdown
+//! ([`flush_due_shed_summaries`], [`flush_shed_summaries`]). Every
 //! shed counts in `shedWrites`. Alert on the `shedWrites` rate and the
 //! failure counter, not only on the public status. The caps are checked and
 //! taken atomically.
@@ -223,22 +236,184 @@ pub(crate) fn check_test_maintenance_flag(test_routes: bool, flag_set: bool) -> 
 }
 
 /// Startup policy. Test routes on: flag the database (needs a superuser or
-/// GRANT SET ON PARAMETER stig.audit_allow_test_mode, PostgreSQL 15+). Test
-/// routes off: refuse to start if the database is flagged. No audit_events row
-/// is written: startup has no request and no acting user (system events go
-/// through [`record_system_or_log`], which needs the migrated schema).
+/// GRANT SET ON PARAMETER stig.audit_allow_test_mode, PostgreSQL 15+) and write
+/// one `audit.test_mode_enabled` system event (NULL user, `user_role = 'system'`,
+/// migration 045; `detail.alreadySet` says whether the flag was set before this
+/// call, for example by the owner step with `DATABASE_MIGRATION_URL`). The row
+/// is written every time startup confirms the flag, synchronously and not
+/// through the queue: startup has no caller to protect, a detached best-effort
+/// write could be lost exactly when the relaxation happens, and a failed insert
+/// fails startup (only with test routes on). Test routes off: refuse to start if
+/// the database is flagged.
 pub(crate) async fn apply_test_maintenance_policy(
     pool: &PgPool,
     enable_test_routes: bool,
 ) -> Result<()> {
+    use anyhow::Context;
     if enable_test_routes {
+        let already_set = test_maintenance_allowed(pool).await?;
         allow_test_maintenance(pool).await?;
         tracing::warn!(
             "audit `test` maintenance mode is ENABLED for this database (test routes are on)"
         );
+        record_system_now(
+            pool,
+            NewSystemEvent {
+                action: "audit.test_mode_enabled",
+                outcome: "ok",
+                stig_id: None,
+                detail: json!({ "alreadySet": already_set }),
+            },
+        )
+        .await
+        .context("recording audit.test_mode_enabled")?;
         return Ok(());
     }
     check_test_maintenance_flag(false, test_maintenance_allowed(pool).await?)
+}
+
+/// How often `main` re-checks the flag (its own interval, independent of
+/// `AUDIT_RETENTION_HOURS`).
+pub(crate) const TEST_FLAG_RECHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Bound on the re-check query, so a hung pool cannot stall the task.
+const TEST_FLAG_RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// While the flag stays set, the `audit.test_mode_unexpected` row is written
+/// again at this interval: with the flag on, audit TRUNCATE is allowed, so a
+/// single row could be deleted. Volume stays at one row per interval.
+pub(crate) const TEST_MODE_REAUDIT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
+/// State of the re-check, kept by the caller's task: when the
+/// `audit.test_mode_unexpected` row was last written for the current flagged
+/// period (`None` when the flag was last seen clear, or no write succeeded yet).
+#[derive(Default)]
+pub(crate) struct RecheckState {
+    last_written: Option<std::time::Instant>,
+}
+
+/// Re-check of the flag on a running backend, every
+/// [`TEST_FLAG_RECHECK_INTERVAL`]. Startup refuses a flagged database when
+/// test routes are off, but a superuser can set the flag afterwards. Decision
+/// (#106): log and audit only, never shut down: the setter is already a
+/// superuser, and killing a serving process on a poll would add an
+/// availability lever for little gain.
+///
+/// Every detection logs an error line. The `audit.test_mode_unexpected` system
+/// event (outcome `rejected`, `detail.source = "scheduled_recheck"`; no
+/// instance identifier exists in config or state, and none was added) is
+/// written synchronously, only on the first detection and then at most once per
+/// [`TEST_MODE_REAUDIT_INTERVAL`] while the flag stays set (so a deleted row
+/// reappears, with bounded volume). `state` is marked only once the insert
+/// succeeded; a failed or timed-out write is retried on the next tick. Returns
+/// true when the flag is set with test routes off. Test routes on returns false
+/// without querying; a query error or timeout logs a warning, returns false and
+/// leaves `state` unchanged.
+pub(crate) async fn recheck_test_maintenance_flag(
+    pool: &PgPool,
+    enable_test_routes: bool,
+    state: &mut RecheckState,
+) -> bool {
+    recheck_at(pool, enable_test_routes, state, std::time::Instant::now()).await
+}
+
+async fn recheck_at(
+    pool: &PgPool,
+    enable_test_routes: bool,
+    state: &mut RecheckState,
+    now: std::time::Instant,
+) -> bool {
+    if enable_test_routes {
+        return false;
+    }
+    match tokio::time::timeout(TEST_FLAG_RECHECK_TIMEOUT, test_maintenance_allowed(pool)).await {
+        Ok(Ok(true)) => {
+            tracing::error!(
+                target: "audit",
+                "database has stig.audit_allow_test_mode=on while test routes are off; \
+                 audit UPDATE/TRUNCATE is permitted, run ALTER DATABASE <db> RESET \
+                 stig.audit_allow_test_mode"
+            );
+            let due = state
+                .last_written
+                .is_none_or(|t| now.saturating_duration_since(t) >= TEST_MODE_REAUDIT_INTERVAL);
+            if due {
+                let ev = NewSystemEvent {
+                    action: "audit.test_mode_unexpected",
+                    outcome: "rejected",
+                    stig_id: None,
+                    detail: json!({ "source": "scheduled_recheck" }),
+                };
+                match tokio::time::timeout(TEST_FLAG_RECHECK_TIMEOUT, record_system_now(pool, ev))
+                    .await
+                {
+                    Ok(Ok(())) => state.last_written = Some(now),
+                    Ok(Err(e)) => tracing::error!(
+                        target: "audit",
+                        "failed to write audit.test_mode_unexpected, retrying next check: {e:#}"
+                    ),
+                    Err(_) => tracing::error!(
+                        target: "audit",
+                        "failed to write audit.test_mode_unexpected, retrying next check: timed out"
+                    ),
+                }
+            }
+            true
+        }
+        Ok(Ok(false)) => {
+            state.last_written = None;
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "audit", "could not re-check the audit test-mode flag: {e:#}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "audit",
+                "could not re-check the audit test-mode flag: timed out after {TEST_FLAG_RECHECK_TIMEOUT:?}"
+            );
+            false
+        }
+    }
+}
+
+/// Run `tick` every `every`, first at once. The one tick loop behind both
+/// background tasks below.
+async fn tick_loop<F, Fut>(every: std::time::Duration, mut tick: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(every);
+    loop {
+        interval.tick().await;
+        tick().await;
+    }
+}
+
+/// The re-check loop `main` spawns: its own interval, first check at once.
+pub(crate) async fn run_test_flag_recheck(
+    pool: PgPool,
+    enable_test_routes: bool,
+    every: std::time::Duration,
+) {
+    let state = Arc::new(tokio::sync::Mutex::new(RecheckState::default()));
+    tick_loop(every, || {
+        let (pool, state) = (pool.clone(), Arc::clone(&state));
+        async move {
+            let mut st = state.lock().await;
+            recheck_test_maintenance_flag(&pool, enable_test_routes, &mut st).await;
+        }
+    })
+    .await;
+}
+
+/// The shed-summary flush loop `main` spawns.
+pub(crate) async fn run_shed_flush(every: std::time::Duration) {
+    tick_loop(every, || async { flush_due_shed_summaries() }).await;
 }
 
 /// How long a caller waits for its audit write (see [`submit`]), so a busy
@@ -502,9 +677,8 @@ struct QueueState {
     denied: u32,
     /// Pending counts per acting user (at most `cap` entries).
     users: Vec<UserPending>,
-    /// Log rate-limit state for per-user restricted sheds (at most
-    /// [`MAX_NOISY_USERS`] entries, oldest evicted).
-    noisy: Vec<Noisy>,
+    /// Rate-limit state for shed log lines (see [`ShedLog`]).
+    shed_log: ShedLog,
 }
 
 struct UserPending {
@@ -513,40 +687,198 @@ struct UserPending {
     denied: u32,
 }
 
-struct Noisy {
+/// Distinct users tracked for shed-log rate limiting.
+const MAX_NOISY_USERS: usize = 32;
+
+/// At most one shed log line per bucket per this window.
+const SHED_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A per-bucket "log once per window, count the rest" gate.
+struct WindowCount {
+    last_logged: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl WindowCount {
+    fn expired(&self, now: std::time::Instant) -> bool {
+        self.last_logged
+            .is_none_or(|t| now.saturating_duration_since(t) >= SHED_LOG_WINDOW)
+    }
+
+    /// `Some(n)`: log now, plus a summary if `n > 0` were held back.
+    /// `None`: held back and counted.
+    fn due(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.expired(now) {
+            self.last_logged = Some(now);
+            return Some(std::mem::take(&mut self.suppressed));
+        }
+        self.suppressed += 1;
+        None
+    }
+}
+
+struct UserShed {
     user: String,
     last_logged: std::time::Instant,
     suppressed: u64,
 }
 
-/// Distinct users tracked for shed-log rate limiting.
-const MAX_NOISY_USERS: usize = 32;
+/// Counts of held-back shed log lines, to be logged once the queue lock is
+/// released.
+#[derive(Debug, PartialEq, Eq)]
+enum ShedSummary {
+    User {
+        user: String,
+        n: u64,
+    },
+    /// Users beyond the tracked table.
+    Overflow {
+        n: u64,
+    },
+}
 
-/// At most one per-user restricted-shed log line per user per this window.
-const SHED_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+impl ShedSummary {
+    #[cfg(test)]
+    fn count(&self) -> u64 {
+        match self {
+            Self::User { n, .. } | Self::Overflow { n } => *n,
+        }
+    }
 
-impl QueueState {
-    /// Decide whether a per-user restricted shed for `user` logs now.
-    /// `Some(n)`: log it, plus a summary if `n > 0` earlier ones were held
-    /// back. `None`: held back (counted in the next summary).
-    fn shed_log_due(&mut self, user: &str, now: std::time::Instant) -> Option<u64> {
-        if let Some(n) = self.noisy.iter_mut().find(|n| n.user == user) {
-            if now.saturating_duration_since(n.last_logged) >= SHED_LOG_WINDOW {
-                n.last_logged = now;
-                return Some(std::mem::take(&mut n.suppressed));
+    /// Ids only: users pass through [`bound_id`].
+    fn log(&self) {
+        match self {
+            Self::User { user, n } => tracing::error!(
+                target: "audit",
+                user_id = bound_id(user),
+                "{n} more denied events shed for this user"
+            ),
+            Self::Overflow { n } => tracing::error!(
+                target: "audit",
+                "{n} more denied events shed for users beyond the tracked set"
+            ),
+        }
+    }
+}
+
+/// What to log for one shed, decided under the lock and logged after it.
+struct ShedLogPlan {
+    /// Log the full ids-only line for this shed.
+    line: bool,
+    /// A summary of held-back ones, logged with the line.
+    summary: Option<ShedSummary>,
+    /// Other expired buckets flushed now.
+    reclaimed: Vec<ShedSummary>,
+}
+
+/// Shed log rate limiting. Per-user entries (at most [`MAX_NOISY_USERS`]);
+/// when the table is full of live entries, further users share one overflow
+/// bucket instead of evicting (so no count is dropped and account cycling
+/// cannot force a line per shed). Both denied shed reasons (own sub-cap and
+/// shared share) use the same per-user table, so each distinct account keeps
+/// its own full line and held-back count per window and colluding accounts
+/// cannot use up a probing account's line. Worst case: at most
+/// (users + overflow) lines and as many summaries per window.
+struct ShedLog {
+    users: Vec<UserShed>,
+    overflow: WindowCount,
+}
+
+impl ShedLog {
+    const fn new() -> Self {
+        Self {
+            users: Vec::new(),
+            overflow: WindowCount {
+                last_logged: None,
+                suppressed: 0,
+            },
+        }
+    }
+
+    /// Per-user decision. `reclaimed` receives summaries of expired entries
+    /// dropped to make room. Outer `None`: held back.
+    fn user_due(
+        &mut self,
+        user: &str,
+        now: std::time::Instant,
+        reclaimed: &mut Vec<ShedSummary>,
+    ) -> Option<Option<ShedSummary>> {
+        let summary_of = |n: u64, user: &str| {
+            (n > 0).then(|| ShedSummary::User {
+                user: user.to_owned(),
+                n,
+            })
+        };
+        if let Some(e) = self.users.iter_mut().find(|e| e.user == user) {
+            if now.saturating_duration_since(e.last_logged) >= SHED_LOG_WINDOW {
+                e.last_logged = now;
+                return Some(summary_of(std::mem::take(&mut e.suppressed), user));
             }
-            n.suppressed += 1;
+            e.suppressed += 1;
             return None;
         }
-        if self.noisy.len() >= MAX_NOISY_USERS {
-            self.noisy.remove(0);
+        if self.users.len() >= MAX_NOISY_USERS {
+            self.reclaim_users(now, false, reclaimed);
         }
-        self.noisy.push(Noisy {
+        if self.users.len() >= MAX_NOISY_USERS {
+            return self
+                .overflow
+                .due(now)
+                .map(|n| (n > 0).then_some(ShedSummary::Overflow { n }));
+        }
+        self.users.push(UserShed {
             user: user.to_owned(),
             last_logged: now,
             suppressed: 0,
         });
-        Some(0)
+        Some(None)
+    }
+
+    /// Drop expired (or, with `force`, all) user entries, collecting the
+    /// summaries of those with held-back sheds.
+    fn reclaim_users(&mut self, now: std::time::Instant, force: bool, out: &mut Vec<ShedSummary>) {
+        self.users.retain_mut(|e| {
+            if !force && now.saturating_duration_since(e.last_logged) < SHED_LOG_WINDOW {
+                return true;
+            }
+            if e.suppressed > 0 {
+                out.push(ShedSummary::User {
+                    user: std::mem::take(&mut e.user),
+                    n: e.suppressed,
+                });
+            }
+            false
+        });
+    }
+
+    /// Summaries that are due: expired buckets (all of them with `force`).
+    fn take_summaries(&mut self, now: std::time::Instant, force: bool) -> Vec<ShedSummary> {
+        let mut out = Vec::new();
+        self.reclaim_users(now, force, &mut out);
+        if (force || self.overflow.expired(now)) && self.overflow.suppressed > 0 {
+            out.push(ShedSummary::Overflow {
+                n: std::mem::take(&mut self.overflow.suppressed),
+            });
+        }
+        out
+    }
+
+    fn plan(&mut self, why: ShedReason, user: &str, now: std::time::Instant) -> ShedLogPlan {
+        let mut reclaimed = Vec::new();
+        let due = match why {
+            // Only reachable through admitted or system load (denials are
+            // capped below the total), so it logs every time.
+            ShedReason::Full => Some(None),
+            ShedReason::UserDenied | ShedReason::DeniedShare => {
+                self.user_due(user, now, &mut reclaimed)
+            }
+        };
+        reclaimed.extend(self.take_summaries(now, false));
+        ShedLogPlan {
+            line: due.is_some(),
+            summary: due.flatten(),
+            reclaimed,
+        }
     }
 }
 
@@ -643,7 +975,7 @@ impl WriteQueue {
                 pending: 0,
                 denied: 0,
                 users: Vec::new(),
-                noisy: Vec::new(),
+                shed_log: ShedLog::new(),
             }),
             idle: Notify::const_new(),
             cap,
@@ -724,6 +1056,11 @@ impl WriteQueue {
         u64::from(self.lock().pending)
     }
 
+    /// Held-back shed log summaries that are due (all of them with `force`).
+    fn take_shed_summaries(&self, now: std::time::Instant, force: bool) -> Vec<ShedSummary> {
+        self.lock().shed_log.take_summaries(now, force)
+    }
+
     /// Wait until no write is pending (and so every one has been counted).
     /// Does not block new submissions.
     pub(crate) async fn drain(&self) {
@@ -755,6 +1092,28 @@ pub(crate) fn admitted_pending_gauge() -> &'static AtomicU32 {
 /// Wait for every pending audit write (shutdown).
 pub(crate) async fn drain() {
     GLOBAL_QUEUE.drain().await;
+}
+
+/// Log every held-back shed summary of the process-wide queue (shutdown), so
+/// counts are not lost when a flood stops or the process exits.
+pub(crate) fn flush_shed_summaries() {
+    flush_summaries(&GLOBAL_QUEUE, std::time::Instant::now(), true);
+}
+
+/// Log the process-wide queue's expired held-back summaries. Run every
+/// [`SHED_FLUSH_INTERVAL`] so counts show up after a flood stops. (Sheds also
+/// flush other expired buckets as they happen, in `ShedLog::plan`.)
+pub(crate) fn flush_due_shed_summaries() {
+    flush_summaries(&GLOBAL_QUEUE, std::time::Instant::now(), false);
+}
+
+/// How often `main` calls [`flush_due_shed_summaries`].
+pub(crate) const SHED_FLUSH_INTERVAL: std::time::Duration = SHED_LOG_WINDOW;
+
+fn flush_summaries(queue: &WriteQueue, now: std::time::Instant, force: bool) {
+    for summary in queue.take_shed_summaries(now, force) {
+        summary.log();
+    }
 }
 
 /// `(lateWrites, pendingWrites, shedWrites)` of the process-wide audit queue.
@@ -863,24 +1222,20 @@ async fn submit(
                 ),
             };
             queue.shed.fetch_add(1, Ordering::Relaxed);
-            if why == ShedReason::UserDenied {
-                // Not a failure: one account must not be able to degrade
-                // public health. Logs are rate limited per user.
-                let due = queue
-                    .lock()
-                    .shed_log_due(&log.user_id, std::time::Instant::now());
-                if let Some(held_back) = due {
-                    log.error(&what);
-                    if held_back > 0 {
-                        tracing::error!(
-                            target: "audit",
-                            user_id = log.user_id,
-                            "{held_back} more denied events shed for this user"
-                        );
-                    }
-                }
-            } else {
+            // Decide under the lock, log after releasing it.
+            let plan = queue
+                .lock()
+                .shed_log
+                .plan(why, &log.user_id, std::time::Instant::now());
+            if plan.line {
                 log.error(&what);
+            }
+            for summary in plan.summary.iter().chain(&plan.reclaimed) {
+                summary.log();
+            }
+            // A per-user sub-cap shed is not a failure: one account must not
+            // be able to degrade public health.
+            if why != ShedReason::UserDenied {
                 queue.counter.record_failure();
             }
             return Submission::Shed;
@@ -995,6 +1350,32 @@ async fn write_user_event(pool: &PgPool, owned: &OwnedEvent, ids: &BoundedIds) -
         insert(&mut *conn, &ev, ids, &json!({ "detailDropped": true })).await?;
     }
     Ok(())
+}
+
+/// Insert a system event on the pool now, returning a failure. Same columns
+/// and bounding as [`record_system_counted`], without the queue.
+async fn record_system_now(pool: &PgPool, ev: NewSystemEvent<'_>) -> Result<()> {
+    debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
+    let shell = NewAuditEvent {
+        user_id: "",
+        action: ev.action,
+        outcome: ev.outcome,
+        asset_id: None,
+        checklist_id: None,
+        stig_id: ev.stig_id,
+        detail: Value::Null,
+        ctx: None,
+    };
+    let ids = bounded(&shell);
+    insert_row(
+        pool,
+        None,
+        Some("system".to_owned()),
+        &shell,
+        &ids,
+        &ev.detail,
+    )
+    .await
 }
 
 async fn record_system_counted(
@@ -1651,8 +2032,12 @@ mod tests {
     const MILLIS: fn(u64) -> std::time::Duration = std::time::Duration::from_millis;
 
     fn log_fields() -> LogFields {
+        log_fields_for("u1")
+    }
+
+    fn log_fields_for(user: &str) -> LogFields {
         LogFields {
-            user_id: "u1".into(),
+            user_id: user.into(),
             action: "checklist.save",
             outcome: "ok",
             request_id: Some("req-1".into()),
@@ -1859,7 +2244,7 @@ mod tests {
         let mut call: BoxCall = Box::pin(submit(
             q,
             LONG,
-            log_fields(),
+            log_fields_for(user),
             rsv(user, restricted, admitted),
             gated_write(gate, ran, true),
         ));
@@ -1949,7 +2334,7 @@ mod tests {
         let mut call = Box::pin(submit(
             q,
             LONG,
-            log_fields(),
+            log_fields_for(user),
             rsv(user, restricted, true),
             std::future::pending::<Result<()>>(),
         ));
@@ -1978,7 +2363,14 @@ mod tests {
         assert!(own_ok.is_some(), "the flooder's own ok event is queued");
         held.extend(own_ok);
         held.push(gated_submit(&Q, "other", true).await);
-        assert_eq!(Q.pending(), 6);
+        // The flood leaves room for a third user's ok event too.
+        let other_ok = try_gated(&Q, "other", false).await;
+        assert!(
+            other_ok.is_some(),
+            "another user's event is queued during the flood"
+        );
+        held.extend(other_ok);
+        assert_eq!(Q.pending(), 7);
         for (open, call) in held {
             let _ = open.send(());
             call.await;
@@ -1996,28 +2388,401 @@ mod tests {
         Q2.drain().await;
     }
 
-    #[test]
-    fn shed_logs_are_rate_limited_per_user_and_bounded() {
-        let mut st = QueueState {
-            pending: 0,
-            denied: 0,
-            users: Vec::new(),
-            noisy: Vec::new(),
-        };
-        let t0 = std::time::Instant::now();
-        assert_eq!(st.shed_log_due("a", t0), Some(0));
-        assert_eq!(st.shed_log_due("a", t0 + SECS(1)), None);
-        assert_eq!(st.shed_log_due("a", t0 + SECS(59)), None);
-        // Another user has its own window.
-        assert_eq!(st.shed_log_due("b", t0 + SECS(2)), Some(0));
-        // After the window: log again, reporting the two held back.
-        assert_eq!(st.shed_log_due("a", t0 + SECS(60)), Some(2));
-        assert_eq!(st.shed_log_due("a", t0 + SECS(61)), None);
-        // Bounded memory under many distinct users.
-        for i in 0..1000 {
-            st.shed_log_due(&format!("u{i}"), t0);
+    #[tokio::test]
+    async fn a_drained_queue_releases_the_flooders_denied_subcap() {
+        queue!(C, Q, 64, 16, 4);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(gated_submit(&Q, "flood", true).await);
         }
-        assert!(st.noisy.len() <= MAX_NOISY_USERS);
+        assert!(try_gated(&Q, "flood", true).await.is_none());
+        assert_eq!(Q.lock().users.len(), 1);
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+        assert!(Q.lock().users.is_empty(), "no per-user entry left behind");
+        let again = try_gated(&Q, "flood", true).await;
+        assert!(again.is_some(), "the sub-cap is free again");
+        if let Some((open, call)) = again {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+    }
+
+    fn messages(cap: &crate::api::audit_capture::Captured) -> Vec<String> {
+        cap.lines()
+            .iter()
+            .map(|l| l.get("message").cloned().unwrap_or_default())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_logs_one_ids_only_error_line() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        queue!(C, Q, 64);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let call = submit(
+            &Q,
+            LONG,
+            log_fields(),
+            rsv("u1", false, true),
+            gated_write(gate, Arc::new(AtomicBool::new(false)), false),
+        );
+        let _ = open.send(());
+        call.await;
+        Q.drain().await;
+        let line = cap.take_one();
+        assert_eq!(line.get("user_id").map(String::as_str), Some("u1"));
+        assert_eq!(
+            line.get("action").map(String::as_str),
+            Some("checklist.save")
+        );
+        assert_eq!(line.get("outcome").map(String::as_str), Some("ok"));
+        assert_eq!(line.get("request_id").map(String::as_str), Some("req-1"));
+        assert!(
+            line["message"].starts_with("failed to write audit event: boom"),
+            "{line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hard_cap_logs_a_timeout_error_line() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        queue!(C, Q, 64);
+        let limits = Limits {
+            wait: SECS(5),
+            hard: MILLIS(30),
+        };
+        submit(
+            &Q,
+            limits,
+            log_fields(),
+            rsv("u1", false, true),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        Q.drain().await;
+        let line = cap.take_one();
+        assert!(
+            line["message"].starts_with("failed to write audit event: timed out after"),
+            "{line:?}"
+        );
+        assert_eq!(line.get("user_id").map(String::as_str), Some("u1"));
+    }
+
+    #[tokio::test]
+    async fn a_late_write_logs_the_late_warning_exactly_once() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        queue!(C, Q, 64);
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let limits = Limits {
+            wait: MILLIS(20),
+            hard: SECS(5),
+        };
+        submit(
+            &Q,
+            limits,
+            log_fields(),
+            rsv("u1", false, true),
+            gated_write(gate, Arc::new(AtomicBool::new(false)), true),
+        )
+        .await;
+        let msgs = messages(&cap);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].starts_with("audit write still pending after"),
+            "{msgs:?}"
+        );
+        let _ = open.send(());
+        Q.drain().await;
+        assert_eq!(messages(&cap).len(), 1, "no second line once it finished");
+    }
+
+    #[tokio::test]
+    async fn each_shed_reason_logs_its_own_line() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        // Total 3, denied share 1, per-user denied 1.
+        queue!(C, Q, 3, 1, 1);
+        let first = gated_submit(&Q, "a", true).await;
+        assert!(is_shed(&Q, "a", true).await, "own sub-cap");
+        assert!(is_shed(&Q, "b", true).await, "shared share");
+        let c1 = gated_submit(&Q, "c", false).await;
+        let c2 = gated_submit(&Q, "c", false).await;
+        assert!(is_shed(&Q, "d", false).await, "total");
+        let msgs = messages(&cap);
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert!(
+            msgs[0].ends_with("1 denied/rejected audit writes already pending for this user"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs[1].ends_with("shed: 1 denied/rejected audit writes already pending"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs[2].ends_with("shed: 3 audit writes already pending"),
+            "{msgs:?}"
+        );
+        for (open, call) in [first, c1, c2] {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+    }
+
+    fn now() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[test]
+    fn shed_logs_are_rate_limited_per_user() {
+        let mut st = ShedLog::new();
+        let mut rec = Vec::new();
+        let t0 = now();
+        let user_n = |n: u64| {
+            Some(Some(ShedSummary::User {
+                user: "a".into(),
+                n,
+            }))
+        };
+        assert_eq!(st.user_due("a", t0, &mut rec), Some(None));
+        assert_eq!(st.user_due("a", t0 + SECS(1), &mut rec), None);
+        assert_eq!(st.user_due("a", t0 + SECS(59), &mut rec), None);
+        // Another user has its own window.
+        assert_eq!(st.user_due("b", t0 + SECS(2), &mut rec), Some(None));
+        // After the window: log again, reporting the two held back.
+        assert_eq!(st.user_due("a", t0 + SECS(60), &mut rec), user_n(2));
+        assert_eq!(st.user_due("a", t0 + SECS(61), &mut rec), None);
+        assert!(rec.is_empty());
+    }
+
+    #[test]
+    fn a_full_noisy_table_never_drops_a_suppressed_count() {
+        let mut st = ShedLog::new();
+        let mut rec = Vec::new();
+        let t0 = now();
+        let (mut sheds, mut accounted) = (0u64, 0u64);
+        let mut tally = |r: Option<Option<ShedSummary>>| {
+            // A logged shed is one line (1) plus any summary it carries.
+            if let Some(summary) = r {
+                accounted += 1 + summary.map_or(0, |s| s.count());
+            }
+        };
+        // 32 users, each shed twice: one held back each.
+        for i in 0..MAX_NOISY_USERS {
+            for _ in 0..2 {
+                sheds += 1;
+                tally(st.user_due(&format!("u{i}"), t0, &mut rec));
+            }
+        }
+        // 100 more users inside the window: no eviction, one overflow bucket.
+        for i in 0..100 {
+            sheds += 1;
+            tally(st.user_due(&format!("x{i}"), t0 + SECS(1), &mut rec));
+        }
+        assert!(st.users.len() <= MAX_NOISY_USERS);
+        assert!(rec.is_empty(), "nothing was expired, nothing reclaimed");
+        let pending: u64 = st
+            .take_summaries(t0 + SECS(2), true)
+            .iter()
+            .map(ShedSummary::count)
+            .sum();
+        assert_eq!(accounted + pending, sheds);
+    }
+
+    #[test]
+    fn expired_entries_are_reclaimed_with_their_summary() {
+        let mut st = ShedLog::new();
+        let mut rec = Vec::new();
+        let t0 = now();
+        for i in 0..MAX_NOISY_USERS {
+            st.user_due(&format!("u{i}"), t0, &mut rec);
+        }
+        assert_eq!(st.user_due("u0", t0 + SECS(1), &mut rec), None);
+        // A new user after the window: the table is reclaimed, not overflowed.
+        assert_eq!(st.user_due("new", t0 + SECS(61), &mut rec), Some(None));
+        assert_eq!(
+            rec,
+            vec![ShedSummary::User {
+                user: "u0".into(),
+                n: 1
+            }]
+        );
+        assert_eq!(st.users.len(), 1);
+    }
+
+    #[test]
+    fn shared_share_sheds_log_once_per_user_per_window() {
+        let mut st = ShedLog::new();
+        let t0 = now();
+        // 5 colluding accounts shed many times each.
+        let mut lines = 0;
+        for _ in 0..10 {
+            for u in 0..5 {
+                let p = st.plan(ShedReason::DeniedShare, &format!("sock{u}"), t0 + SECS(1));
+                lines += usize::from(p.line);
+                assert!(p.summary.is_none());
+            }
+        }
+        assert_eq!(lines, 5, "one line per distinct account");
+        // A 6th, distinct probing account still gets its own full line.
+        let p = st.plan(ShedReason::DeniedShare, "prober", t0 + SECS(2));
+        assert!(p.line && p.summary.is_none());
+        // After the window each account logs again with its exact count.
+        let p = st.plan(ShedReason::DeniedShare, "sock0", t0 + SECS(61));
+        assert!(p.line);
+        assert_eq!(
+            p.summary,
+            Some(ShedSummary::User {
+                user: "sock0".into(),
+                n: 9
+            })
+        );
+    }
+
+    #[test]
+    fn force_flush_returns_every_pending_summary() {
+        let mut st = ShedLog::new();
+        let mut rec = Vec::new();
+        let t0 = now();
+        for i in 0..MAX_NOISY_USERS {
+            st.user_due(&format!("u{i}"), t0, &mut rec);
+        }
+        st.user_due("u0", t0, &mut rec);
+        st.user_due("x1", t0, &mut rec); // overflow line
+        st.user_due("x2", t0, &mut rec); // overflow held
+                                         // Not expired: nothing is due without force.
+        assert!(st.take_summaries(t0 + SECS(1), false).is_empty());
+        let all = st.take_summaries(t0 + SECS(1), true);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all.iter().map(ShedSummary::count).sum::<u64>(), 2);
+        assert!(st.take_summaries(t0 + SECS(1), true).is_empty());
+    }
+
+    #[test]
+    fn summary_lines_carry_their_text_and_fields() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        ShedSummary::User {
+            user: "bad user\n".into(),
+            n: 7,
+        }
+        .log();
+        ShedSummary::Overflow { n: 3 }.log();
+        let lines = cap.lines();
+        assert_eq!(
+            lines[0]["message"],
+            "7 more denied events shed for this user"
+        );
+        assert_eq!(lines[0]["user_id"], "bad?user?");
+        assert_eq!(
+            lines[1]["message"],
+            "3 more denied events shed for users beyond the tracked set"
+        );
+        assert!(!lines[1].contains_key("user_id"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flush_loop_runs_the_flush_on_every_tick() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        let task = tokio::spawn(tick_loop(SECS(60), move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            async {}
+        }));
+        tokio::time::sleep(SECS(185)).await;
+        // Ticks at 0, 60, 120 and 180 s.
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_recheck_loop_checks_once_per_interval() {
+        assert_eq!(TEST_FLAG_RECHECK_INTERVAL, SECS(300));
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(MILLIS(100))
+            .connect_lazy("postgres://u@127.0.0.1:1/x")
+            .expect("lazy pool");
+        // Each check against an unreachable database logs one warning.
+        let task = tokio::spawn(run_test_flag_recheck(
+            pool,
+            false,
+            TEST_FLAG_RECHECK_INTERVAL,
+        ));
+        tokio::time::sleep(SECS(650)).await;
+        task.abort();
+        let n = messages(&cap)
+            .iter()
+            .filter(|m| m.starts_with("could not re-check"))
+            .count();
+        // Ticks at 0, 300 and 600 s.
+        assert_eq!(n, 3, "{:?}", messages(&cap));
+    }
+
+    #[tokio::test]
+    async fn the_periodic_flush_logs_only_expired_summaries() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        queue!(C, Q, 64, 16, 4);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(gated_submit(&Q, "flood", true).await);
+        }
+        for _ in 0..3 {
+            assert!(try_gated(&Q, "flood", true).await.is_none());
+        }
+        // One line so far; the 2 held back are not due yet.
+        assert_eq!(messages(&cap).len(), 1);
+        flush_summaries(&Q, now(), false);
+        assert_eq!(messages(&cap).len(), 1);
+        flush_summaries(&Q, now() + SECS(61), false);
+        let msgs = messages(&cap);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[1], "2 more denied events shed for this user");
+        flush_summaries(&Q, now() + SECS(122), true);
+        assert_eq!(messages(&cap).len(), 2, "nothing left to flush");
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
+    }
+
+    #[tokio::test]
+    async fn colluding_denial_flood_logs_a_bounded_number_of_lines() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        queue!(C, Q, 64, 16, 4);
+        let mut held = Vec::new();
+        for u in 0..40 {
+            for _ in 0..8 {
+                held.extend(try_gated(&Q, &format!("user{u}"), true).await);
+            }
+        }
+        // 16 queued; 4 users hit their own sub-cap (4 sheds each); the other
+        // 36 users were all shed at the shared share (8 each).
+        assert_eq!(held.len(), 16);
+        assert_eq!(Q.shed_writes(), 16 + 36 * 8);
+        assert_eq!(C.snapshot().total, 36 * 8, "only shared-share sheds fail");
+        let msgs = messages(&cap);
+        // 32 tracked users get a line each, the other 8 share one overflow line.
+        assert_eq!(msgs.len(), MAX_NOISY_USERS + 1, "{msgs:?}");
+        let held_back: u64 = Q
+            .take_shed_summaries(now() + SECS(61), true)
+            .iter()
+            .map(ShedSummary::count)
+            .sum();
+        assert_eq!(
+            held_back,
+            Q.shed_writes() - msgs.len() as u64,
+            "no count lost"
+        );
+        for (open, call) in held {
+            let _ = open.send(());
+            call.await;
+        }
+        Q.drain().await;
     }
 
     #[sqlx::test]
@@ -2458,6 +3223,169 @@ mod tests {
         disallow_audit_test_mode(&pool).await;
         apply_test_maintenance_policy(&pool, false).await.unwrap();
         assert!(!test_maintenance_allowed(&pool).await.unwrap());
+    }
+
+    async fn test_mode_rows(
+        pool: &PgPool,
+        action: &str,
+    ) -> Vec<(Option<String>, Option<String>, String, String)> {
+        sqlx::query_as(
+            "SELECT user_id, user_role, outcome, detail::text FROM audit_events \
+             WHERE action = $1 ORDER BY id",
+        )
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn enabling_test_mode_at_startup_writes_a_system_audit_row(pool: PgPool) {
+        apply_test_maintenance_policy(&pool, false).await.unwrap();
+        assert!(test_mode_rows(&pool, "audit.test_mode_enabled")
+            .await
+            .is_empty());
+        apply_test_maintenance_policy(&pool, true).await.unwrap();
+        apply_test_maintenance_policy(&pool, true).await.unwrap();
+        let rows = test_mode_rows(&pool, "audit.test_mode_enabled").await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let detail = |r: &(Option<String>, Option<String>, String, String)| {
+            serde_json::from_str::<Value>(&r.3).unwrap()
+        };
+        for r in &rows {
+            assert_eq!(
+                (r.0.as_deref(), r.1.as_deref(), r.2.as_str()),
+                (None, Some("system"), "ok")
+            );
+        }
+        assert_eq!(detail(&rows[0]), json!({ "alreadySet": false }));
+        assert_eq!(detail(&rows[1]), json!({ "alreadySet": true }));
+        disallow_audit_test_mode(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn recheck_reports_a_flag_set_behind_a_running_backend(pool: PgPool) {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let mut st = RecheckState::default();
+        let t0 = now();
+        // Not flagged, and test routes on: no violation, no row.
+        assert!(!recheck_at(&pool, false, &mut st, t0).await);
+        allow_test_maintenance(&pool).await.unwrap();
+        assert!(!recheck_at(&pool, true, &mut st, t0).await);
+        assert!(test_mode_rows(&pool, "audit.test_mode_unexpected")
+            .await
+            .is_empty());
+        // Flagged with test routes off: logged every time, audited now and hourly.
+        assert!(recheck_at(&pool, false, &mut st, t0).await);
+        assert!(recheck_at(&pool, false, &mut st, t0 + SECS(300)).await);
+        let rows = test_mode_rows(&pool, "audit.test_mode_unexpected").await;
+        assert_eq!(rows.len(), 1, "no row on every tick: {rows:?}");
+        assert_eq!(
+            (
+                rows[0].0.as_deref(),
+                rows[0].1.as_deref(),
+                rows[0].2.as_str()
+            ),
+            (None, Some("system"), "rejected")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[0].3).unwrap(),
+            json!({ "source": "scheduled_recheck" })
+        );
+        assert!(recheck_at(&pool, false, &mut st, t0 + TEST_MODE_REAUDIT_INTERVAL).await);
+        assert_eq!(
+            test_mode_rows(&pool, "audit.test_mode_unexpected")
+                .await
+                .len(),
+            2
+        );
+        let errs = messages(&cap)
+            .iter()
+            .filter(|m| m.contains("stig.audit_allow_test_mode=on while test routes are off"))
+            .count();
+        assert_eq!(errs, 3);
+        // Cleared, then set again: audited at once.
+        disallow_audit_test_mode(&pool).await;
+        assert!(!recheck_at(&pool, false, &mut st, t0 + SECS(4000)).await);
+        assert!(st.last_written.is_none());
+        allow_test_maintenance(&pool).await.unwrap();
+        assert!(recheck_at(&pool, false, &mut st, t0 + SECS(4300)).await);
+        assert_eq!(
+            test_mode_rows(&pool, "audit.test_mode_unexpected")
+                .await
+                .len(),
+            3
+        );
+        disallow_audit_test_mode(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_recheck_write_leaves_the_state_unmarked_and_is_retried(pool: PgPool) {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        allow_test_maintenance(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE audit_events RENAME TO audit_events_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut st = RecheckState::default();
+        assert!(recheck_at(&pool, false, &mut st, now()).await);
+        assert!(st.last_written.is_none(), "a failed write is not marked");
+        assert!(messages(&cap)
+            .iter()
+            .any(|m| m.contains("retrying next check")));
+        sqlx::query("ALTER TABLE audit_events_gone RENAME TO audit_events")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recheck_at(&pool, false, &mut st, now()).await);
+        assert!(st.last_written.is_some());
+        assert_eq!(
+            test_mode_rows(&pool, "audit.test_mode_unexpected")
+                .await
+                .len(),
+            1
+        );
+        disallow_audit_test_mode(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_startup_audit_insert_fails_startup(pool: PgPool) {
+        sqlx::query("ALTER TABLE audit_events RENAME TO audit_events_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let e = apply_test_maintenance_policy(&pool, true)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("recording audit.test_mode_enabled"),
+            "{e:#}"
+        );
+        disallow_audit_test_mode(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn a_recheck_that_cannot_query_returns_false_and_warns() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(MILLIS(100))
+            .connect_lazy("postgres://u@127.0.0.1:1/x")
+            .expect("lazy pool");
+        let mut st = RecheckState {
+            last_written: Some(now()),
+        };
+        assert!(!recheck_test_maintenance_flag(&pool, false, &mut st).await);
+        assert!(
+            st.last_written.is_some(),
+            "a failed check leaves the state alone"
+        );
+        let msgs = messages(&cap);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].starts_with("could not re-check the audit test-mode flag"));
     }
 
     #[sqlx::test]

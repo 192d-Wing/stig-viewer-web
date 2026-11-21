@@ -502,8 +502,11 @@ cd backend && cargo clippy -- -D warnings
   same `failed to write audit event` line (message starting `shed:`) and counts
   as a failure, except one caused by a user's own denied/rejected limit: that
   counts only in `shedWrites` (a user can trigger it at will, so it must not
-  degrade the public health status) and logs at most once a minute per user
-  with a summary of the held-back ones. Alert on the `shedWrites` rate and the
+  degrade the public health status). Denied/rejected sheds (both kinds) log
+  at most once a minute per user, with a summary of the held-back ones; users
+  beyond 32 tracked ones share one overflow bucket, and its summary line
+  (`... shed for users beyond the tracked set`) means more than 32 distinct
+  accounts were shed within a minute: alert on it as a collusion signal. Alert on the `shedWrites` rate and the
   failure counter, not only on the public status. Shedding is a backstop: an
   admission cap (`api::admission`) refuses audited requests before they mutate
   anything once 4 are in flight for one user (429, admins included) or 32 in
@@ -619,7 +622,14 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
   after test routes are turned off, and with test routes off the backend
   refuses to start on a flagged database in every environment until it is
   cleared with `ALTER DATABASE <db> RESET stig.audit_allow_test_mode` (or test
-  routes are turned back on). The flag travels with `pg_dump --create` and
+  routes are turned back on). Startup with test routes on writes an
+  `audit.test_mode_enabled` system event (`detail.alreadySet` says whether the
+  flag was already set); a running backend with test routes off re-checks the
+  flag every 5 minutes (a fixed interval, not `AUDIT_RETENTION_HOURS`), logs an
+  error on every detection and writes an `audit.test_mode_unexpected` system
+  event (`detail.source = "scheduled_recheck"`) when the flag is first seen and
+  then hourly while it stays set (audit TRUNCATE is allowed meanwhile, so one
+  row could be deleted), without stopping. The flag travels with `pg_dump --create` and
   `pg_dumpall`, not with the app's JSON backup/restore.
 
 The one update always allowed is the collapse of a repeated denial: on a
