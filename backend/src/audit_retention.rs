@@ -22,16 +22,24 @@
 //! then published with a hard link, which never replaces an existing name
 //! (the archive filesystem must support hard links, or retention fails
 //! closed); the directory is then fsynced and a failed write leaves no
-//! partial segment. A failed
-//! directory fsync aborts the sweep (nothing is deleted) and unpublishes the
-//! file, except EINVAL/unsupported, which is a static filesystem property and
-//! is tolerated with a warning. The sidecar is published BEFORE the segment, so
-//! a visible `.jsonl` always has its complete sidecar and a concurrent scan
-//! can never see it as "sidecar missing". A crash between the two leaves an
-//! orphan `*.manifest.json`, which the scan ignores and the name pick steps
-//! over. At the start of each archiving sweep, an orphan sidecar (segment
-//! absent, mtime at least 24 h old) is renamed to `<sidecar>.orphan-<UTC ts>`
-//! and logged, never deleted: it may be the only record of a lost segment.
+//! partial segment. A failed directory fsync aborts the sweep (nothing is
+//! deleted) and unpublishes the file. That includes EINVAL/unsupported (some
+//! CIFS/SMB and FUSE mounts): the sweep fails closed unless the operator opts
+//! in with `AUDIT_ARCHIVE_ALLOW_UNSYNCED_DIR=true`, in which case the sweep
+//! proceeds, logs once, and records the degraded durability in the scheduler
+//! message and as the system audit event `audit_archive.durability_degraded`.
+//! The sidecar is published BEFORE the segment, so a visible `.jsonl` always
+//! has its complete sidecar and a concurrent scan can never see it as "sidecar
+//! missing". A crash between the two leaves an orphan `*.manifest.json`, which
+//! the scan ignores and the name pick steps over. At the start of each
+//! archiving sweep, an orphan sidecar (segment absent, mtime at least 24 h
+//! old) is renamed to `<sidecar>.orphan-<UTC ts>` and logged, never deleted:
+//! it may be the only record of a lost segment.
+//! Every file set aside (orphan sidecar or rejected segment) is also recorded
+//! in the system audit event `audit_archive.file_set_aside`; a failed move is
+//! counted there and in the scheduler message. These events are best effort
+//! (shared audit write queue, may be shed under load); the scheduler message
+//! and the `audit`-target log lines are the fallback record.
 //! Retention deletes also require the `stig.audit_retention_protocol` marker
 //! ([`RETENTION_PROTOCOL`], migration 047), so older replicas fail closed.
 //! Sweeps are also serialized per database by an advisory lock
@@ -184,26 +192,146 @@ fn lines_in(bytes: &[u8]) -> Result<Vec<(i64, String)>> {
         .collect()
 }
 
-/// Move a rejected segment (and its sidecar) aside as
-/// `<name>.rejected-<UTC timestamp>` so it is kept as evidence and never
-/// counted again.
-fn preserve_rejected(dir: &Path, name: &str) {
-    for file in [name.to_string(), format!("{name}.manifest.json")] {
-        move_aside(dir, &file, "rejected");
+/// How a directory fsync that the filesystem does not support is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DirSyncPolicy {
+    /// An unsupported directory fsync fails the archive step (the default).
+    #[default]
+    FailClosed,
+    /// Operator opt-in: proceed without a directory fsync and record it.
+    TolerateUnsupported,
+}
+
+/// Env switch that selects [`DirSyncPolicy::TolerateUnsupported`].
+const ALLOW_UNSYNCED_DIR_ENV: &str = "AUDIT_ARCHIVE_ALLOW_UNSYNCED_DIR";
+
+impl DirSyncPolicy {
+    /// Only `true` / `1` (trimmed, case-insensitive) opt in; anything else
+    /// fails closed.
+    fn from_raw(raw: Option<&str>) -> Self {
+        if crate::config::parse_flag(raw) {
+            Self::TolerateUnsupported
+        } else {
+            Self::FailClosed
+        }
+    }
+
+    fn from_env() -> Self {
+        let policy = Self::from_raw(std::env::var(ALLOW_UNSYNCED_DIR_ENV).ok().as_deref());
+        if policy == Self::TolerateUnsupported {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(target: "audit", "{ALLOW_UNSYNCED_DIR_ENV} is set: audit archive directory entries may be non-durable on filesystems without directory fsync");
+            });
+        }
+        policy
     }
 }
 
+/// One archive file set aside (or that could not be).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SetAside {
+    from: String,
+    to: Option<String>,
+    /// `"orphan"`, `"rejected"` or `"tidy_task_failed"` (the tidy task itself
+    /// died; `from` is then a placeholder, and it counts as a failed move).
+    reason: &'static str,
+    error: Option<String>,
+}
+
+/// Things a sweep did to the archive that must be reported afterwards.
+#[derive(Debug, Default)]
+struct SweepNotes {
+    set_aside: Vec<SetAside>,
+    unsynced_publishes: u32,
+}
+
+impl SweepNotes {
+    fn moved(&self) -> usize {
+        self.set_aside.iter().filter(|s| s.error.is_none()).count()
+    }
+
+    fn failed_moves(&self) -> usize {
+        self.set_aside.iter().filter(|s| s.error.is_some()).count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.set_aside.is_empty() && self.unsynced_publishes == 0
+    }
+
+    fn merge(&mut self, other: SweepNotes) {
+        self.set_aside.extend(other.set_aside);
+        self.unsynced_publishes += other.unsynced_publishes;
+    }
+}
+
+/// Archive-writing state that is not the seen-cache.
+#[derive(Debug, Default)]
+struct ArchiveIo {
+    policy: DirSyncPolicy,
+    notes: SweepNotes,
+}
+
+/// Per-sweep state. `seen` and `io` are separate fields so both can be
+/// borrowed at once.
+#[derive(Debug, Default)]
+struct SweepCtx {
+    seen: SeenCache,
+    io: ArchiveIo,
+}
+
+impl SweepCtx {
+    fn new(policy: DirSyncPolicy) -> Self {
+        Self {
+            seen: SeenCache::new(),
+            io: ArchiveIo {
+                policy,
+                notes: SweepNotes::default(),
+            },
+        }
+    }
+}
+
+/// Move a rejected segment (and its sidecar) aside as
+/// `<name>.rejected-<UTC timestamp>` so it is kept as evidence and never
+/// counted again.
+fn preserve_rejected(dir: &Path, name: &str, notes: &mut SweepNotes) {
+    for file in [name.to_string(), format!("{name}.manifest.json")] {
+        notes.set_aside.extend(move_aside(dir, &file, "rejected"));
+    }
+}
+
+/// Directories whose move-aside is forced to fail (test hook; keyed on the
+/// unique temp dir so parallel tests stay isolated).
+#[cfg(test)]
+static FAIL_MOVE_ASIDE: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Longest error text kept in a [`SetAside`].
+const MAX_SET_ASIDE_ERROR_CHARS: usize = 200;
+
 /// Rename `dir/file` to `<file>.<label>-<UTC ts>` (uuid suffix if that exists).
-/// Returns whether the file was moved; a missing file is not an error.
-fn move_aside(dir: &Path, file: &str, label: &str) -> bool {
+/// Returns what happened; a missing file is not an error (`None`).
+fn move_aside(dir: &Path, file: &str, label: &'static str) -> Option<SetAside> {
     let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
     let from = dir.join(file);
     if !from.exists() {
-        return false;
+        return None;
     }
     // Hard link then remove the source: never replaces an existing target.
     let mut to = dir.join(format!("{file}.{label}-{ts}"));
-    let mut result = std::fs::hard_link(&from, &to);
+    #[cfg(test)]
+    let forced = FAIL_MOVE_ASIDE
+        .lock()
+        .map(|set| set.iter().any(|p| p == dir))
+        .unwrap_or(false);
+    #[cfg(not(test))]
+    let forced = false;
+    let mut result = if forced {
+        Err(std::io::Error::other("injected move failure"))
+    } else {
+        std::fs::hard_link(&from, &to)
+    };
     for _ in 0..8 {
         if !matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists) {
             break;
@@ -217,13 +345,35 @@ fn move_aside(dir: &Path, file: &str, label: &str) -> bool {
     match result.and_then(|()| std::fs::remove_file(&from)) {
         Ok(()) => {
             tracing::warn!(target: "audit", from = ?file, to = ?to.file_name(), "audit archive file preserved as {label}");
-            true
+            Some(SetAside {
+                from: file.to_string(),
+                to: to.file_name().map(|n| n.to_string_lossy().into_owned()),
+                reason: label,
+                error: None,
+            })
         }
         Err(e) => {
             tracing::error!(target: "audit", file = ?file, "could not preserve {label} audit archive file: {e:#}");
-            false
+            // Store the bare io::Error text only: no path or anyhow context,
+            // because it lands in the audit event detail.
+            Some(SetAside {
+                from: file.to_string(),
+                to: None,
+                reason: label,
+                error: Some(bounded_error(&e)),
+            })
         }
     }
+}
+
+/// The bare error text, cut to [`MAX_SET_ASIDE_ERROR_CHARS`] characters
+/// (never mid-character). Callers pass the bare `io::Error` (no path, no
+/// anyhow context) because the text lands in the audit event detail.
+fn bounded_error(e: &dyn std::fmt::Display) -> String {
+    e.to_string()
+        .chars()
+        .take(MAX_SET_ASIDE_ERROR_CHARS)
+        .collect()
 }
 
 /// Minimum sidecar age before it is treated as an orphan: protects a sweep
@@ -231,12 +381,12 @@ fn move_aside(dir: &Path, file: &str, label: &str) -> bool {
 const ORPHAN_SIDECAR_MIN_AGE: Duration = Duration::from_secs(24 * 3600);
 
 /// Rename sidecars whose segment is definitely absent and that are at least
-/// `min_age` old to `<sidecar>.orphan-<ts>`. Returns how many were moved.
-fn set_aside_orphan_sidecars(dir: &Path, min_age: Duration) -> usize {
+/// `min_age` old to `<sidecar>.orphan-<ts>`. Returns every move attempted.
+fn set_aside_orphan_sidecars(dir: &Path, min_age: Duration) -> Vec<SetAside> {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return 0;
+        return Vec::new();
     };
-    let mut moved = 0;
+    let mut out = Vec::new();
     for entry in rd.flatten() {
         let Some(file) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -261,26 +411,36 @@ fn set_aside_orphan_sidecars(dir: &Path, min_age: Duration) -> usize {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age >= min_age);
-        if old_enough && move_aside(dir, &file, "orphan") {
-            moved += 1;
+        if old_enough {
+            out.extend(move_aside(dir, &file, "orphan"));
         }
     }
-    moved
+    out
 }
 
 /// Tidy the archive directory (orphan sidecars) under the sweep lock.
-/// Failures are logged and never fail the sweep.
-async fn tidy_archive(data_dir: &Path) {
+/// Failures are logged and never fail the sweep; every move (including a
+/// failed one) is added to `notes`.
+async fn tidy_archive(data_dir: &Path, notes: &mut SweepNotes) {
     let dir = data_dir.join("audit_archive");
     let res = tokio::task::spawn_blocking(move || {
         if !dir.is_dir() {
-            return 0;
+            return Vec::new();
         }
         set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE)
     })
     .await;
-    if let Err(e) = res {
-        tracing::error!(target: "audit", "audit archive tidy failed: {e:#}");
+    match res {
+        Ok(moves) => notes.set_aside.extend(moves),
+        Err(e) => {
+            tracing::error!(target: "audit", "audit archive tidy failed: {e:#}");
+            notes.set_aside.push(SetAside {
+                from: "(archive tidy task)".to_string(),
+                to: None,
+                reason: "tidy_task_failed",
+                error: Some(bounded_error(&e)),
+            });
+        }
     }
 }
 
@@ -304,6 +464,7 @@ fn archived_lines(
     stream: &str,
     date: &str,
     key: Option<&SigningState>,
+    notes: &mut SweepNotes,
 ) -> Result<HashMap<i64, HashSet<String>>> {
     let mut seen: HashMap<i64, HashSet<String>> = HashMap::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
@@ -320,7 +481,7 @@ fn archived_lines(
                     segment = ?name,
                     "audit archive segment failed verification, its rows will be archived again: {e:#}"
                 );
-                preserve_rejected(dir, &name);
+                preserve_rejected(dir, &name, notes);
                 continue;
             }
             Err(SegmentError::Transient(e)) => {
@@ -358,13 +519,32 @@ fn archived_lines(
 /// Whether a failed `fsync` of the archive directory must abort the sweep.
 ///
 /// EINVAL and "unsupported" from `fsync(dirfd)` are a static property of the
-/// filesystem (some CIFS/SMB and FUSE mounts); failing on them would stall
-/// retention forever with no operator recourse, so they are tolerated. Every
-/// other error (EIO, ENOSPC, EDQUOT, EACCES, ...) is a real durability failure.
-fn dir_sync_is_fatal(e: &std::io::Error) -> bool {
-    !matches!(
+/// filesystem (some CIFS/SMB and FUSE mounts). By default they are fatal like
+/// every other error (the archive would otherwise be silently non-durable);
+/// only with [`DirSyncPolicy::TolerateUnsupported`] are they tolerated. Every
+/// other error (EIO, ENOSPC, EDQUOT, EACCES, ...) is always a real durability
+/// failure.
+fn dir_sync_is_fatal(e: &std::io::Error, policy: DirSyncPolicy) -> bool {
+    policy == DirSyncPolicy::FailClosed
+        || !matches!(
+            e.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        )
+}
+
+/// Result of a directory sync that did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirSynced {
+    Durable,
+    /// The filesystem does not support it and the policy tolerated that.
+    Unsupported,
+}
+
+/// The error for an unsupported directory fsync under [`DirSyncPolicy::FailClosed`].
+fn fail_closed_dir_sync_error(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
         e.kind(),
-        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        format!("directory fsync is not supported on this filesystem ({e}); retention fails closed. Set {ALLOW_UNSYNCED_DIR_ENV}=true to accept non-durable archive directory entries"),
     )
 }
 
@@ -395,10 +575,36 @@ fn note_dir_sync_unsupported(dir: &Path, e: &std::io::Error) {
     });
 }
 
-/// fsync the directory so a rename in it is durable. A tolerated error is
-/// reported once and then ignored.
+/// Apply `policy` to a failed directory fsync.
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+fn classify_dir_sync(
+    dir: &Path,
+    result: std::io::Result<()>,
+    policy: DirSyncPolicy,
+) -> std::io::Result<DirSynced> {
+    match result {
+        Ok(()) => Ok(DirSynced::Durable),
+        Err(e) if !dir_sync_is_fatal(&e, policy) => {
+            note_dir_sync_unsupported(dir, &e);
+            Ok(DirSynced::Unsupported)
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Err(fail_closed_dir_sync_error(&e))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// fsync the directory so a rename in it is durable. An unsupported fsync is
+/// an error unless `policy` tolerates it (then it is reported once and
+/// returned as [`DirSynced::Unsupported`]).
+#[cfg(unix)]
+fn sync_dir(dir: &Path, policy: DirSyncPolicy) -> std::io::Result<DirSynced> {
     let result = (|| {
         #[cfg(test)]
         if let Some(e) = injected_dir_sync_failure(dir) {
@@ -406,26 +612,31 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
         }
         std::fs::File::open(dir)?.sync_all()
     })();
-    match result {
-        Err(e) if !dir_sync_is_fatal(&e) => {
-            note_dir_sync_unsupported(dir, &e);
-            Ok(())
-        }
-        other => other,
-    }
+    classify_dir_sync(dir, result, policy)
 }
 
-/// Best effort off unix: opening a directory as a file fails on Windows.
+/// Best effort off unix: opening a directory as a file fails on Windows. Only
+/// an injected (test) failure is subject to the policy.
 #[cfg(not(unix))]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+fn sync_dir(dir: &Path, policy: DirSyncPolicy) -> std::io::Result<DirSynced> {
     #[cfg(test)]
     if let Some(e) = injected_dir_sync_failure(dir) {
-        return Err(e);
+        return if !dir_sync_is_fatal(&e, policy) {
+            Ok(DirSynced::Unsupported)
+        } else if matches!(
+            e.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        ) {
+            Err(fail_closed_dir_sync_error(&e))
+        } else {
+            Err(e)
+        };
     }
+    let _ = policy;
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();
     }
-    Ok(())
+    Ok(DirSynced::Durable)
 }
 
 /// Outcome of [`publish_new`].
@@ -452,7 +663,7 @@ const MAX_NAME_ATTEMPTS: u32 = 1000;
 /// reported as `Taken` and left untouched. A directory sync failure is an
 /// error (the caller aborts before any row is deleted); the just-published
 /// name is removed again so no unsynced file stays visible.
-fn publish_new(dir: &Path, name: &str, bytes: &[u8]) -> Result<Publish> {
+fn publish_new(dir: &Path, name: &str, bytes: &[u8], io: &mut ArchiveIo) -> Result<Publish> {
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<Publish> {
         let mut f = std::fs::OpenOptions::new()
@@ -471,10 +682,16 @@ fn publish_new(dir: &Path, name: &str, bytes: &[u8]) -> Result<Publish> {
     let _ = std::fs::remove_file(&tmp);
     let published = result.with_context(|| format!("write {name}"))?;
     if published == Publish::Created {
-        if let Err(e) = sync_dir(dir) {
-            // The hard link just created this name, so it is ours to remove.
-            let _ = std::fs::remove_file(dir.join(name));
-            return Err(e).with_context(|| format!("sync directory after publishing {name}"));
+        match sync_dir(dir, io.policy) {
+            Ok(DirSynced::Durable) => {}
+            // May over-count when the sidecar was tolerated and the segment
+            // publish then fails: errs toward reporting.
+            Ok(DirSynced::Unsupported) => io.notes.unsynced_publishes += 1,
+            Err(e) => {
+                // The hard link just created this name, so it is ours to remove.
+                let _ = std::fs::remove_file(dir.join(name));
+                return Err(e).with_context(|| format!("sync directory after publishing {name}"));
+            }
         }
     }
     Ok(published)
@@ -486,8 +703,9 @@ fn write_segment(
     date: &str,
     group: &[&ArchiveLine],
     key: Option<&SigningState>,
+    io: &mut ArchiveIo,
 ) -> Result<()> {
-    write_segment_with(dir, stream, date, group, key, &|_, _| Ok(()))
+    write_segment_with(dir, stream, date, group, key, &|_, _| Ok(()), io)
 }
 
 /// Sidecar first, then segment. `hook` is a test hook called at each
@@ -499,6 +717,7 @@ fn write_segment_with(
     group: &[&ArchiveLine],
     key: Option<&SigningState>,
     hook: &dyn Fn(WriteStage, &str) -> Result<()>,
+    io: &mut ArchiveIo,
 ) -> Result<()> {
     let (Some(first), Some(last)) = (group.first(), group.last()) else {
         return Ok(());
@@ -543,7 +762,8 @@ fn write_segment_with(
             &payload,
             key,
         );
-        if publish_new(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?)? == Publish::Taken {
+        if publish_new(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?, io)? == Publish::Taken
+        {
             continue;
         }
         // Once the sidecar name is ours, no cooperating sweep can create this
@@ -551,7 +771,7 @@ fn write_segment_with(
         // failure removes the sidecar we just published.
         let published =
             hook(WriteStage::SidecarPublished, &name).and_then(|()| {
-                match publish_new(dir, &name, &body)? {
+                match publish_new(dir, &name, &body, io)? {
                     Publish::Created => Ok(()),
                     Publish::Taken => Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
@@ -576,7 +796,7 @@ fn archive_blocking(
     stream: &str,
     rows: Vec<ArchiveLine>,
     key: Option<&SigningState>,
-    cache: &mut SeenCache,
+    ctx: &mut SweepCtx,
 ) -> Result<()> {
     let dir = data_dir.join("audit_archive");
     std::fs::create_dir_all(&dir)
@@ -590,10 +810,11 @@ fn archive_blocking(
             .push(row);
     }
     for (date, mut group) in by_date {
-        if !cache.contains_key(&date) {
-            cache.insert(date.clone(), archived_lines(&dir, stream, &date, key)?);
+        if !ctx.seen.contains_key(&date) {
+            let lines = archived_lines(&dir, stream, &date, key, &mut ctx.io.notes)?;
+            ctx.seen.insert(date.clone(), lines);
         }
-        let seen = cache.entry(date.clone()).or_default();
+        let seen = ctx.seen.entry(date.clone()).or_default();
         // Skip a row only when a verified segment holds this exact line.
         group.retain(|l| {
             !seen
@@ -602,7 +823,7 @@ fn archive_blocking(
         });
         group.sort_by_key(|l| l.id);
         group.dedup_by_key(|l| l.id);
-        write_segment(&dir, stream, &date, &group, key)?;
+        write_segment(&dir, stream, &date, &group, key, &mut ctx.io)?;
         for l in &group {
             seen.entry(l.id)
                 .or_default()
@@ -617,18 +838,18 @@ async fn archive_rows(
     stream: &'static str,
     rows: Vec<ArchiveLine>,
     key: Option<&SigningState>,
-    cache: &mut SeenCache,
+    ctx: &mut SweepCtx,
 ) -> Result<()> {
     let data_dir = data_dir.to_path_buf();
     let key = key.cloned();
-    let mut local = std::mem::take(cache);
+    let mut local = std::mem::take(ctx);
     let (res, local) = tokio::task::spawn_blocking(move || {
         let r = archive_blocking(&data_dir, stream, rows, key.as_ref(), &mut local);
         (r, local)
     })
     .await
     .context("archive task")?;
-    *cache = local;
+    *ctx = local;
     res
 }
 
@@ -754,15 +975,17 @@ pub async fn run_prune(
     archive: bool,
     signing: Option<&SigningState>,
 ) -> Result<usize> {
-    run_prune_with(
+    run_prune_noted(
         pool,
         data_dir,
         retain_days,
         archive,
         signing,
         crate::db_audit::RETENTION_LOCK_WAIT,
+        DirSyncPolicy::from_env(),
     )
     .await
+    .0
 }
 
 /// Roll back the lock transaction (releasing the lock); a failure is logged.
@@ -772,20 +995,41 @@ async fn release_lock(lock: sqlx::Transaction<'static, sqlx::Postgres>) {
     }
 }
 
-async fn run_prune_with(
+/// [`run_prune`] with an explicit policy, also returning what the sweep set
+/// aside; the notes are recorded as audit events before returning.
+async fn run_prune_noted(
     pool: &PgPool,
     data_dir: &Path,
     retain_days: i64,
     archive: bool,
     signing: Option<&SigningState>,
     lock_wait: std::time::Duration,
-) -> Result<usize> {
-    let mut lock = crate::db_audit::lock_retention_sweep(pool, lock_wait)
-        .await
-        .context("take retention sweep lock")?;
-    let result = prune_rules_locked(pool, data_dir, retain_days, archive, signing, &mut lock).await;
+    policy: DirSyncPolicy,
+) -> (Result<usize>, SweepNotes) {
+    let mut lock = match crate::db_audit::lock_retention_sweep(pool, lock_wait).await {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                Err(e).context("take retention sweep lock"),
+                SweepNotes::default(),
+            )
+        }
+    };
+    let mut ctx = SweepCtx::new(policy);
+    let result = prune_rules_locked(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        signing,
+        &mut lock,
+        &mut ctx,
+    )
+    .await;
     release_lock(lock).await;
-    result
+    let notes = ctx.io.notes;
+    record_sweep_notes(pool, STREAM_RULES, &notes, result.is_ok()).await;
+    (result, notes)
 }
 
 async fn prune_rules_locked(
@@ -795,9 +1039,10 @@ async fn prune_rules_locked(
     archive: bool,
     signing: Option<&SigningState>,
     lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ctx: &mut SweepCtx,
 ) -> Result<usize> {
     if archive {
-        tidy_archive(data_dir).await;
+        tidy_archive(data_dir, &mut ctx.io.notes).await;
     }
     // Build the cutoff in Rust rather than embedding `retain_days` in
     // SQL — Postgres rejects negative INTERVAL composed via string
@@ -832,15 +1077,9 @@ async fn prune_rules_locked(
             })
             .collect::<Result<Vec<_>>>()?;
         crate::db_audit::retention_lock_alive(lock).await?;
-        archive_rows(
-            data_dir,
-            STREAM_RULES,
-            lines,
-            signing,
-            &mut SeenCache::new(),
-        )
-        .await
-        .context("write audit archive segment")?;
+        archive_rows(data_dir, STREAM_RULES, lines, signing, ctx)
+            .await
+            .context("write audit archive segment")?;
     }
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
@@ -895,13 +1134,36 @@ pub async fn run_prune_events(
     archive: bool,
     signing: Option<&SigningState>,
 ) -> Result<usize> {
-    run_prune_events_batched(
+    run_prune_events_noted(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        signing,
+        DirSyncPolicy::from_env(),
+    )
+    .await
+    .0
+}
+
+/// [`run_prune_events`] with an explicit policy, also returning the notes.
+async fn run_prune_events_noted(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    signing: Option<&SigningState>,
+    policy: DirSyncPolicy,
+) -> (Result<usize>, SweepNotes) {
+    run_prune_events_with(
         pool,
         data_dir,
         retain_days,
         archive,
         EVENT_PRUNE_BATCH,
         signing,
+        &|_| Box::pin(async {}),
+        policy,
     )
     .await
 }
@@ -910,6 +1172,7 @@ pub async fn run_prune_events(
 type AfterBatch<'a> =
     &'a (dyn Fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Sync);
 
+#[cfg(test)]
 async fn run_prune_events_batched(
     pool: &PgPool,
     data_dir: &Path,
@@ -926,10 +1189,13 @@ async fn run_prune_events_batched(
         batch,
         signing,
         &|_| Box::pin(async {}),
+        DirSyncPolicy::FailClosed,
     )
     .await
+    .0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_prune_events_with(
     pool: &PgPool,
     data_dir: &Path,
@@ -938,11 +1204,21 @@ async fn run_prune_events_with(
     batch: i64,
     signing: Option<&SigningState>,
     after_batch: AfterBatch<'_>,
-) -> Result<usize> {
+    policy: DirSyncPolicy,
+) -> (Result<usize>, SweepNotes) {
     let mut lock =
-        crate::db_audit::lock_retention_sweep(pool, crate::db_audit::RETENTION_LOCK_WAIT)
+        match crate::db_audit::lock_retention_sweep(pool, crate::db_audit::RETENTION_LOCK_WAIT)
             .await
-            .context("take retention sweep lock")?;
+        {
+            Ok(l) => l,
+            Err(e) => {
+                return (
+                    Err(e).context("take retention sweep lock"),
+                    SweepNotes::default(),
+                )
+            }
+        };
+    let mut ctx = SweepCtx::new(policy);
     let result = prune_events_locked(
         pool,
         data_dir,
@@ -952,10 +1228,13 @@ async fn run_prune_events_with(
         signing,
         &mut lock,
         after_batch,
+        &mut ctx,
     )
     .await;
     release_lock(lock).await;
-    result
+    let notes = ctx.io.notes;
+    record_sweep_notes(pool, STREAM_EVENTS, &notes, result.is_ok()).await;
+    (result, notes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -968,11 +1247,11 @@ async fn prune_events_locked(
     signing: Option<&SigningState>,
     lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     after_batch: AfterBatch<'_>,
+    ctx: &mut SweepCtx,
 ) -> Result<usize> {
     let mut total = 0usize;
-    let mut cache = SeenCache::new();
     if archive {
-        tidy_archive(data_dir).await;
+        tidy_archive(data_dir, &mut ctx.io.notes).await;
     }
     loop {
         let rows: Vec<EventRow> = sqlx::query_as::<_, EventRow>(
@@ -1000,7 +1279,7 @@ async fn prune_events_locked(
         if archive {
             let lines = rows.iter().map(event_line).collect::<Result<Vec<_>>>()?;
             crate::db_audit::retention_lock_alive(lock).await?;
-            archive_rows(data_dir, STREAM_EVENTS, lines, signing, &mut cache)
+            archive_rows(data_dir, STREAM_EVENTS, lines, signing, ctx)
                 .await
                 .context("write audit events archive segment")?;
         }
@@ -1036,11 +1315,42 @@ pub async fn run_scheduled(
     archive: bool,
     signing: Option<&SigningState>,
 ) -> Result<String> {
-    let rules = run_prune(pool, data_dir, retain_days, archive, signing).await;
-    let events = run_prune_events(pool, data_dir, retain_days, archive, signing).await;
+    run_scheduled_with(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        signing,
+        DirSyncPolicy::from_env(),
+    )
+    .await
+}
+
+async fn run_scheduled_with(
+    pool: &PgPool,
+    data_dir: &Path,
+    retain_days: i64,
+    archive: bool,
+    signing: Option<&SigningState>,
+    policy: DirSyncPolicy,
+) -> Result<String> {
+    let (rules, mut notes) = run_prune_noted(
+        pool,
+        data_dir,
+        retain_days,
+        archive,
+        signing,
+        crate::db_audit::RETENTION_LOCK_WAIT,
+        policy,
+    )
+    .await;
+    let (events, event_notes) =
+        run_prune_events_noted(pool, data_dir, retain_days, archive, signing, policy).await;
+    notes.merge(event_notes);
+    let suffix = notes_suffix(&notes);
     match (rules, events) {
         (Ok(n), Ok(e)) => Ok(format!(
-            "pruned {n} rows and {e} events (retain_days={retain_days}, archive={archive})"
+            "pruned {n} rows and {e} events (retain_days={retain_days}, archive={archive}){suffix}"
         )),
         (r, e) => {
             let show = |x: Result<usize>| match x {
@@ -1048,11 +1358,115 @@ pub async fn run_scheduled(
                 Err(err) => format!("failed: {err:#}"),
             };
             anyhow::bail!(
-                "audit retention: rule_audit {}; audit_events {}",
+                "audit retention: rule_audit {}; audit_events {}{suffix}",
                 show(r),
                 show(e)
             )
         }
+    }
+}
+
+/// Scheduler-message suffix for what the sweeps set aside; empty when nothing.
+fn notes_suffix(notes: &SweepNotes) -> String {
+    let mut out = String::new();
+    if notes.moved() > 0 {
+        out.push_str(&format!("; archive files set aside: {}", notes.moved()));
+    }
+    if notes.failed_moves() > 0 {
+        out.push_str(&format!("; archive moves FAILED: {}", notes.failed_moves()));
+    }
+    if notes.unsynced_publishes > 0 {
+        out.push_str(&format!(
+            "; DEGRADED durability: {} archive files published without a directory fsync ({ALLOW_UNSYNCED_DIR_ENV})",
+            notes.unsynced_publishes
+        ));
+    }
+    out
+}
+
+/// Detail of `audit_archive.file_set_aside`: at most `cap` files, failed
+/// entries first; the totals count every entry.
+fn set_aside_detail(sweep: &str, notes: &SweepNotes, cap: usize) -> serde_json::Value {
+    let mut ordered: Vec<&SetAside> = notes.set_aside.iter().collect();
+    ordered.sort_by_key(|s| s.error.is_none());
+    let files: Vec<serde_json::Value> = ordered
+        .iter()
+        .take(cap)
+        .map(|s| {
+            let mut v = serde_json::json!({
+                "from": s.from,
+                "to": s.to,
+                "reason": s.reason,
+                "outcome": if s.error.is_none() { "moved" } else { "failed" },
+            });
+            if let (Some(err), Some(obj)) = (&s.error, v.as_object_mut()) {
+                obj.insert("error".into(), serde_json::Value::String(err.clone()));
+            }
+            v
+        })
+        .collect();
+    serde_json::json!({
+        "sweep": sweep,
+        "moved": notes.moved(),
+        "failed": notes.failed_moves(),
+        "truncated": ordered.len() > cap,
+        "files": files,
+    })
+}
+
+/// Detail of `audit_archive.durability_degraded`.
+fn degraded_detail(sweep: &str, unsynced_publishes: u32, sweep_ok: bool) -> serde_json::Value {
+    serde_json::json!({
+        "sweep": sweep,
+        "reason": "dir_fsync_unsupported",
+        "unsynced_publishes": unsynced_publishes,
+        "env_flag": ALLOW_UNSYNCED_DIR_ENV,
+        "sweep_ok": sweep_ok,
+    })
+}
+
+/// Record what a sweep set aside / relied on as system audit events. Called
+/// after the sweep lock is released, on success and failure; nothing is
+/// written when there is nothing to report. Best effort: the writes go through
+/// the shared audit write queue and may be shed under load (logged on
+/// failure); the scheduler message suffix and the `audit`-target log lines are
+/// the fallback record.
+async fn record_sweep_notes(
+    pool: &PgPool,
+    sweep: &'static str,
+    notes: &SweepNotes,
+    sweep_ok: bool,
+) {
+    if notes.is_empty() {
+        return;
+    }
+    if !notes.set_aside.is_empty() {
+        let failed = notes.failed_moves();
+        if failed > 0 {
+            tracing::error!(target: "audit", sweep, failed, "audit archive files could not be set aside");
+        }
+        crate::db_audit::record_system_or_log(
+            pool,
+            crate::db_audit::NewSystemEvent {
+                action: "audit_archive.file_set_aside",
+                outcome: if failed == 0 { "ok" } else { "partial" },
+                stig_id: None,
+                detail: set_aside_detail(sweep, notes, crate::db_audit::MAX_REJECTED_LISTED),
+            },
+        )
+        .await;
+    }
+    if notes.unsynced_publishes > 0 {
+        crate::db_audit::record_system_or_log(
+            pool,
+            crate::db_audit::NewSystemEvent {
+                action: "audit_archive.durability_degraded",
+                outcome: "partial",
+                stig_id: None,
+                detail: degraded_detail(sweep, notes.unsynced_publishes, sweep_ok),
+            },
+        )
+        .await;
     }
 }
 
@@ -1363,7 +1777,7 @@ mod tests {
             STREAM_RULES,
             vec![line(3, "2024-01-01"), line(1, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let ad = dir.join("audit_archive");
@@ -1406,7 +1820,7 @@ mod tests {
             STREAM_EVENTS,
             vec![line(5, "2024-02-02")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let ad = dir.join("audit_archive");
@@ -1448,11 +1862,25 @@ mod tests {
                 line(9, "2024-01-02"),
             ]
         };
-        archive_blocking(&dir, STREAM_RULES, rows(), Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            rows(),
+            Some(&k),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
         let before = std::fs::read_dir(dir.join("audit_archive"))
             .unwrap()
             .count();
-        archive_blocking(&dir, STREAM_RULES, rows(), Some(&k), &mut SeenCache::new()).unwrap();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            rows(),
+            Some(&k),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_dir(dir.join("audit_archive"))
                 .unwrap()
@@ -1465,7 +1893,7 @@ mod tests {
             STREAM_RULES,
             vec![line(2, "2024-01-01"), line(7, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1495,7 +1923,7 @@ mod tests {
             STREAM_RULES,
             vec![line(2, "2024-01-01"), line(3, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(
@@ -1519,7 +1947,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let seg = "rules-2024-01-01.5-5.jsonl";
@@ -1534,7 +1962,7 @@ mod tests {
             STREAM_RULES,
             vec![line(6, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         for f in [
@@ -1548,7 +1976,7 @@ mod tests {
             STREAM_RULES,
             vec![line(6, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         // The unsigned segment is left in place; a signed sibling holds the row.
@@ -1573,7 +2001,7 @@ mod tests {
             STREAM_RULES,
             vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let seg = "rules-2024-01-01.1-2.jsonl";
@@ -1585,7 +2013,7 @@ mod tests {
             STREAM_RULES,
             vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(verify_segment(&ad, seg, None).is_ok());
@@ -1606,7 +2034,7 @@ mod tests {
             STREAM_RULES,
             vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(verify_segment(&ad, seg, None).is_ok());
@@ -1659,7 +2087,7 @@ mod tests {
             STREAM_RULES,
             vec![forged_line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         plant(&forged, &dir);
@@ -1668,7 +2096,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let ad = dir.join("audit_archive");
@@ -1693,7 +2121,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         plant(&genuine, &dir);
@@ -1702,7 +2130,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
@@ -1720,7 +2148,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&a),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         plant(&other, &dir);
@@ -1730,7 +2158,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(rejected(&dir).is_empty());
@@ -1740,7 +2168,7 @@ mod tests {
             STREAM_RULES,
             vec![forged_line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(ad_has(&dir, "rules-2024-01-01.5-5.r1.jsonl"));
@@ -1751,7 +2179,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&a),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         plant(&other2, &dir2);
@@ -1760,7 +2188,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&b),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         // Nothing is renamed; the key-A segment stays, and the row lands in a sibling.
@@ -1796,7 +2224,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
@@ -1813,7 +2241,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(ad.join("rules-2024-01-01.5-5.jsonl").is_dir());
@@ -1832,7 +2260,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             None,
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let before = std::fs::read(ad.join("rules-2024-01-01.5-5.jsonl")).unwrap();
@@ -1841,7 +2269,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(rejected(&dir).is_empty());
@@ -1861,7 +2289,7 @@ mod tests {
             STREAM_RULES,
             vec![line(5, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(segments(&dir).len(), 2);
@@ -1878,7 +2306,7 @@ mod tests {
             STREAM_RULES,
             vec![line(1, "2024-01-01"), line(3, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         let orig = "rules-2024-01-01.1-3.jsonl";
@@ -1889,7 +2317,7 @@ mod tests {
             STREAM_RULES,
             vec![forged_line(1, "2024-01-01"), forged_line(3, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert_eq!(std::fs::read(ad.join(orig)).unwrap(), before);
@@ -2020,13 +2448,56 @@ mod tests {
     }
 
     #[test]
+    fn dir_sync_policy_parses_only_true_or_1() {
+        for on in ["true", "TRUE ", "1"] {
+            assert_eq!(
+                DirSyncPolicy::from_raw(Some(on)),
+                DirSyncPolicy::TolerateUnsupported,
+                "{on:?}"
+            );
+        }
+        for off in [None, Some(""), Some("yes"), Some("0")] {
+            assert_eq!(DirSyncPolicy::from_raw(off), DirSyncPolicy::FailClosed);
+        }
+    }
+
+    #[test]
     fn dir_sync_fatality_truth_table() {
         use std::io::{Error, ErrorKind};
-        assert!(!dir_sync_is_fatal(&Error::from(ErrorKind::InvalidInput)));
-        assert!(!dir_sync_is_fatal(&Error::from(ErrorKind::Unsupported)));
-        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::Other)));
-        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::PermissionDenied)));
-        assert!(dir_sync_is_fatal(&Error::from(ErrorKind::StorageFull)));
+        use DirSyncPolicy::{FailClosed, TolerateUnsupported};
+        for kind in [ErrorKind::InvalidInput, ErrorKind::Unsupported] {
+            assert!(dir_sync_is_fatal(&Error::from(kind), FailClosed));
+            assert!(!dir_sync_is_fatal(&Error::from(kind), TolerateUnsupported));
+        }
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+        ] {
+            assert!(dir_sync_is_fatal(&Error::from(kind), FailClosed));
+            assert!(dir_sync_is_fatal(&Error::from(kind), TolerateUnsupported));
+        }
+    }
+
+    #[test]
+    fn an_unsupported_directory_sync_fails_closed_by_default() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        let rows = [line(1, "2024-01-01")];
+        let group: Vec<&ArchiveLine> = rows.iter().collect();
+        arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
+        let mut io = ArchiveIo::default();
+        let res = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None, &mut io);
+        disarm_dir_sync_failure(&ad);
+        let err = res.unwrap_err();
+        assert!(
+            format!("{err:#}").contains(ALLOW_UNSYNCED_DIR_ENV),
+            "{err:#}"
+        );
+        assert!(entries(&ad).is_empty());
+        assert_eq!(io.notes.unsynced_publishes, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2037,11 +2508,27 @@ mod tests {
         let rows = [line(1, "2024-01-01")];
         let group: Vec<&ArchiveLine> = rows.iter().collect();
         arm_dir_sync_failure(&ad);
-        let err = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None).unwrap_err();
+        let err = write_segment(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            &group,
+            None,
+            &mut ArchiveIo::default(),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("sync directory after publishing"));
         assert!(entries(&ad).is_empty());
         disarm_dir_sync_failure(&ad);
-        write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None).unwrap();
+        write_segment(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            &group,
+            None,
+            &mut ArchiveIo::default(),
+        )
+        .unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.1-1.jsonl"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2055,10 +2542,15 @@ mod tests {
         let rows = [line(1, "2024-01-01")];
         let group: Vec<&ArchiveLine> = rows.iter().collect();
         arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
-        let res = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None);
+        let mut io = ArchiveIo {
+            policy: DirSyncPolicy::TolerateUnsupported,
+            ..ArchiveIo::default()
+        };
+        let res = write_segment(&ad, STREAM_RULES, "2024-01-01", &group, None, &mut io);
         disarm_dir_sync_failure(&ad);
         res.unwrap();
         assert_eq!(segments(&dir), ["rules-2024-01-01.1-1.jsonl"]);
+        assert_eq!(io.notes.unsynced_publishes, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2081,6 +2573,7 @@ mod tests {
                 }
                 Ok(())
             },
+            &mut ArchiveIo::default(),
         );
         disarm_dir_sync_failure(&ad);
         assert!(res.is_err());
@@ -2136,15 +2629,30 @@ mod tests {
             Some(&k),
             &|stage, _| {
                 if stage == WriteStage::SidecarPublished {
-                    archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
+                    archived_lines(
+                        &ad,
+                        STREAM_RULES,
+                        "2024-01-01",
+                        Some(&k),
+                        &mut SweepNotes::default(),
+                    )
+                    .unwrap();
                     assert!(rejected(&dir).is_empty());
                 }
                 Ok(())
             },
+            &mut ArchiveIo::default(),
         )
         .unwrap();
         assert!(rejected(&dir).is_empty());
-        let seen = archived_lines(&ad, STREAM_RULES, "2024-01-01", Some(&k)).unwrap();
+        let seen = archived_lines(
+            &ad,
+            STREAM_RULES,
+            "2024-01-01",
+            Some(&k),
+            &mut SweepNotes::default(),
+        )
+        .unwrap();
         assert!(seen.contains_key(&1) && seen.contains_key(&2));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2162,7 +2670,7 @@ mod tests {
             STREAM_RULES,
             vec![line(1, "2024-01-01"), line(2, "2024-01-01")],
             Some(&k),
-            &mut SeenCache::new(),
+            &mut SweepCtx::default(),
         )
         .unwrap();
         assert!(rejected(&dir).is_empty());
@@ -2281,15 +2789,17 @@ mod tests {
             crate::db_audit::lock_retention_sweep(&app.pool, crate::db_audit::RETENTION_LOCK_WAIT)
                 .await
                 .unwrap();
-        let err = run_prune_with(
+        let err = run_prune_noted(
             &app.pool,
             &dir,
             5,
             true,
             None,
             std::time::Duration::from_millis(300),
+            DirSyncPolicy::default(),
         )
         .await
+        .0
         .unwrap_err();
         assert!(
             format!("{err:#}").contains("another retention sweep holds the lock"),
@@ -2330,9 +2840,19 @@ mod tests {
                 kill_retention_lock_holder(&admin).await;
             })
         };
-        let err = run_prune_events_with(&pool, &dir, 5, true, 4, Some(&k), &hook)
-            .await
-            .unwrap_err();
+        let err = run_prune_events_with(
+            &pool,
+            &dir,
+            5,
+            true,
+            4,
+            Some(&k),
+            &hook,
+            DirSyncPolicy::default(),
+        )
+        .await
+        .0
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("retention sweep lock lost"),
             "{err:#}"
@@ -2542,7 +3062,15 @@ mod tests {
         hook: &dyn Fn(WriteStage, &str) -> Result<()>,
     ) -> Result<()> {
         let group: Vec<&ArchiveLine> = lines.iter().collect();
-        write_segment_with(dir, STREAM_RULES, "2024-01-01", &group, None, hook)
+        write_segment_with(
+            dir,
+            STREAM_RULES,
+            "2024-01-01",
+            &group,
+            None,
+            hook,
+            &mut ArchiveIo::default(),
+        )
     }
 
     #[test]
@@ -2550,11 +3078,11 @@ mod tests {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(
-            publish_new(&dir, "a.jsonl", b"first").unwrap(),
+            publish_new(&dir, "a.jsonl", b"first", &mut ArchiveIo::default()).unwrap(),
             Publish::Created
         );
         assert_eq!(
-            publish_new(&dir, "a.jsonl", b"second").unwrap(),
+            publish_new(&dir, "a.jsonl", b"second", &mut ArchiveIo::default()).unwrap(),
             Publish::Taken
         );
         assert_eq!(std::fs::read(dir.join("a.jsonl")).unwrap(), b"first");
@@ -2582,12 +3110,19 @@ mod tests {
             Some(&k),
             &|stage, _| {
                 if stage == WriteStage::NamePicked && !ran.replace(true) {
-                    write_segment_with(&ad, STREAM_RULES, "2024-01-01", &b, Some(&k), &|_, _| {
-                        Ok(())
-                    })?;
+                    write_segment_with(
+                        &ad,
+                        STREAM_RULES,
+                        "2024-01-01",
+                        &b,
+                        Some(&k),
+                        &|_, _| Ok(()),
+                        &mut ArchiveIo::default(),
+                    )?;
                 }
                 Ok(())
             },
+            &mut ArchiveIo::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2625,7 +3160,15 @@ mod tests {
                     rows[0].line.push_str(&" ".repeat(i));
                     let group: Vec<&ArchiveLine> = rows.iter().collect();
                     barrier.wait();
-                    write_segment(ad, STREAM_RULES, "2024-01-01", &group, Some(k)).unwrap();
+                    write_segment(
+                        ad,
+                        STREAM_RULES,
+                        "2024-01-01",
+                        &group,
+                        Some(k),
+                        &mut ArchiveIo::default(),
+                    )
+                    .unwrap();
                 });
             }
         });
@@ -2673,7 +3216,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let name = "rules-2024-01-01.1-2.jsonl.manifest.json";
         std::fs::write(dir.join(name), b"orphan").unwrap();
-        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO), 1);
+        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO).len(), 1);
         assert!(!dir.join(name).exists());
         let left = entries(&dir);
         assert_eq!(left.len(), 1);
@@ -2688,7 +3231,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let name = "events-2024-01-01.1-2.jsonl.manifest.json";
         std::fs::write(dir.join(name), b"orphan").unwrap();
-        assert_eq!(set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE), 0);
+        assert_eq!(
+            set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE).len(),
+            0
+        );
         assert_eq!(entries(&dir), [name]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2707,7 +3253,7 @@ mod tests {
             std::fs::write(dir.join(n), b"x").unwrap();
         }
         let before = entries(&dir);
-        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO), 0);
+        assert_eq!(set_aside_orphan_sidecars(&dir, Duration::ZERO).len(), 0);
         assert_eq!(entries(&dir), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2728,7 +3274,10 @@ mod tests {
         std::fs::write(dir.join(old), b"o").unwrap();
         age_file(&dir.join(young), 23);
         age_file(&dir.join(old), 25);
-        assert_eq!(set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE), 1);
+        assert_eq!(
+            set_aside_orphan_sidecars(&dir, ORPHAN_SIDECAR_MIN_AGE).len(),
+            1
+        );
         assert!(dir.join(young).exists());
         assert!(!dir.join(old).exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2788,6 +3337,375 @@ mod tests {
             assert!(ad.join(n).exists());
         }
         assert_eq!(entries(&ad).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_move_aside_is_reported_and_leaves_the_file() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "rules-2024-01-01.1-2.jsonl.manifest.json";
+        std::fs::write(dir.join(name), b"orphan").unwrap();
+        FAIL_MOVE_ASIDE.lock().unwrap().push(dir.clone());
+        let moves = set_aside_orphan_sidecars(&dir, Duration::ZERO);
+        FAIL_MOVE_ASIDE.lock().unwrap().retain(|p| p != &dir);
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].from, name);
+        assert_eq!(moves[0].to, None);
+        assert_eq!(moves[0].reason, "orphan");
+        assert!(moves[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("injected move failure"));
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"orphan");
+        assert_eq!(entries(&dir), [name]);
+        let notes = SweepNotes {
+            set_aside: moves,
+            unsynced_publishes: 0,
+        };
+        assert_eq!((notes.moved(), notes.failed_moves()), (0, 1));
+        assert!(notes_suffix(&notes).contains("archive moves FAILED: 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_segment_is_noted_with_old_and_new_names() {
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        // A segment without a sidecar is a definite verification failure.
+        std::fs::write(ad.join("rules-2024-01-01.5-5.jsonl"), "{\"id\":5}\n").unwrap();
+        let mut ctx = SweepCtx::default();
+        archive_blocking(
+            &dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            None,
+            &mut ctx,
+        )
+        .unwrap();
+        let notes = &ctx.io.notes;
+        assert_eq!(notes.moved(), 1);
+        assert_eq!(notes.failed_moves(), 0);
+        let note = &notes.set_aside[0];
+        assert_eq!(note.from, "rules-2024-01-01.5-5.jsonl");
+        assert_eq!(note.reason, "rejected");
+        let to = note.to.as_deref().unwrap();
+        assert!(
+            to.starts_with("rules-2024-01-01.5-5.jsonl.rejected-"),
+            "{to}"
+        );
+        assert!(ad.join(to).exists());
+        assert!(notes_suffix(notes).contains("archive files set aside: 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scheduler_suffix_is_empty_without_notes() {
+        assert_eq!(notes_suffix(&SweepNotes::default()), "");
+        let degraded = SweepNotes {
+            set_aside: Vec::new(),
+            unsynced_publishes: 2,
+        };
+        let msg = notes_suffix(&degraded);
+        assert!(msg.contains("DEGRADED durability: 2"), "{msg}");
+        assert!(msg.contains(ALLOW_UNSYNCED_DIR_ENV), "{msg}");
+    }
+
+    async fn archive_events(pool: &PgPool, action: &str) -> Vec<(String, serde_json::Value)> {
+        crate::db_audit::drain().await;
+        sqlx::query_as::<_, (String, serde_json::Value)>(
+            "SELECT outcome, detail FROM audit_events WHERE action = $1 ORDER BY id",
+        )
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_one_expired_rule(pool: &PgPool) {
+        seed_user(pool, "u1").await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'a', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn rule_audit_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM rule_audit")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_unsupported_directory_sync_deletes_nothing_by_default(pool: PgPool) {
+        seed_one_expired_rule(&pool).await;
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
+        let (res, notes) = run_prune_noted(
+            &pool,
+            &dir,
+            5,
+            true,
+            None,
+            crate::db_audit::RETENTION_LOCK_WAIT,
+            DirSyncPolicy::default(),
+        )
+        .await;
+        disarm_dir_sync_failure(&ad);
+        let err = res.unwrap_err();
+        assert!(
+            format!("{err:#}").contains(ALLOW_UNSYNCED_DIR_ENV),
+            "{err:#}"
+        );
+        assert_eq!(rule_audit_count(&pool).await, 1);
+        assert!(entries(&ad).is_empty());
+        assert_eq!(notes.unsynced_publishes, 0);
+        assert!(archive_events(&pool, "audit_archive.durability_degraded")
+            .await
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_opt_in_flag_proceeds_and_records_degraded_durability(pool: PgPool) {
+        seed_one_expired_rule(&pool).await;
+        seed_expired_event(&pool, 10).await;
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
+        let policy = DirSyncPolicy::TolerateUnsupported;
+        let (rules, rule_notes) = run_prune_noted(
+            &pool,
+            &dir,
+            5,
+            true,
+            None,
+            crate::db_audit::RETENTION_LOCK_WAIT,
+            policy,
+        )
+        .await;
+        let (events, event_notes) =
+            run_prune_events_noted(&pool, &dir, 5, true, None, policy).await;
+        disarm_dir_sync_failure(&ad);
+        assert_eq!(rules.unwrap(), 1);
+        assert!(events.unwrap() >= 1);
+        assert_eq!(rule_notes.unsynced_publishes, 2);
+        assert_eq!(event_notes.unsynced_publishes, 2);
+        assert_eq!(rule_audit_count(&pool).await, 0);
+        let rows = archive_events(&pool, "audit_archive.durability_degraded").await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let sweeps: Vec<&str> = rows
+            .iter()
+            .map(|(o, d)| {
+                assert_eq!(o, "partial");
+                assert_eq!(d["reason"], "dir_fsync_unsupported");
+                assert_eq!(d["env_flag"], ALLOW_UNSYNCED_DIR_ENV);
+                assert_eq!(d["unsynced_publishes"], 2);
+                assert_eq!(d["sweep_ok"], true);
+                d["sweep"].as_str().unwrap()
+            })
+            .collect();
+        assert!(
+            sweeps.contains(&"rules") && sweeps.contains(&"events"),
+            "{sweeps:?}"
+        );
+        let mut merged = rule_notes;
+        merged.merge(event_notes);
+        assert!(notes_suffix(&merged).contains("DEGRADED durability: 4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_sweep_audits_orphan_sidecars_it_sets_aside(pool: PgPool) {
+        let dir = temp_dir();
+        let names = plant_old_orphans(&dir).await;
+        run_prune(&pool, &dir, 5, true, None).await.unwrap();
+        let rows = archive_events(&pool, "audit_archive.file_set_aside").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (outcome, d) = &rows[0];
+        assert_eq!(outcome, "ok");
+        assert_eq!(d["sweep"], "rules");
+        assert_eq!(d["failed"], 0);
+        assert_eq!(d["truncated"], false);
+        let files = d["files"].as_array().unwrap();
+        assert_eq!(files.len(), d["moved"].as_u64().unwrap() as usize);
+        assert!(files.iter().any(|f| f["from"] == names[0]
+            && f["reason"] == "orphan"
+            && f["outcome"] == "moved"
+            && f["to"].as_str().unwrap().contains(".orphan-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failing_archive_move_is_counted_in_the_event_and_the_scheduler_message(
+        pool: PgPool,
+    ) {
+        let dir = temp_dir();
+        let names = plant_old_orphans(&dir).await;
+        let ad = dir.join("audit_archive");
+        FAIL_MOVE_ASIDE.lock().unwrap().push(ad.clone());
+        let res = run_scheduled(&pool, &dir, 5, true, None).await;
+        FAIL_MOVE_ASIDE.lock().unwrap().retain(|p| p != &ad);
+        let msg = res.unwrap();
+        assert!(msg.contains("archive moves FAILED: 4"), "{msg}");
+        for n in names {
+            assert!(ad.join(n).exists());
+        }
+        let rows = archive_events(&pool, "audit_archive.file_set_aside").await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (outcome, d) in &rows {
+            assert_eq!(outcome, "partial");
+            assert_eq!(d["failed"], 2);
+            assert_eq!(d["files"][0]["outcome"], "failed");
+            assert!(d["files"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("injected move failure"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_clean_sweep_writes_no_archive_audit_events(pool: PgPool) {
+        seed_one_expired_rule(&pool).await;
+        let dir = temp_dir();
+        let msg = run_scheduled(&pool, &dir, 5, true, None).await.unwrap();
+        for part in ["set aside", "FAILED", "DEGRADED"] {
+            assert!(!msg.contains(part), "{msg}");
+        }
+        assert!(msg.starts_with("pruned 1 rows and "), "{msg}");
+        for action in [
+            "audit_archive.file_set_aside",
+            "audit_archive.durability_degraded",
+        ] {
+            assert!(archive_events(&pool, action).await.is_empty(), "{action}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn aside(i: usize, failed: bool) -> SetAside {
+        SetAside {
+            from: format!("f{i}"),
+            to: (!failed).then(|| format!("t{i}")),
+            reason: "orphan",
+            error: failed.then(|| "boom".to_string()),
+        }
+    }
+
+    #[test]
+    fn the_set_aside_detail_is_capped_failed_first_and_totals_count_everything() {
+        let mut notes = SweepNotes::default();
+        for i in 0..150 {
+            notes.set_aside.push(aside(i, false));
+        }
+        for i in 150..155 {
+            notes.set_aside.push(aside(i, true));
+        }
+        let d = set_aside_detail("rules", &notes, crate::db_audit::MAX_REJECTED_LISTED);
+        assert_eq!(d["truncated"], true);
+        assert_eq!(d["moved"], 150);
+        assert_eq!(d["failed"], 5);
+        let files = d["files"].as_array().unwrap();
+        assert_eq!(files.len(), crate::db_audit::MAX_REJECTED_LISTED);
+        assert!(files[..5]
+            .iter()
+            .all(|f| f["outcome"] == "failed" && f["error"] == "boom"));
+        assert!(files[5..]
+            .iter()
+            .all(|f| f["outcome"] == "moved" && f.get("error").is_none()));
+        let all = set_aside_detail("events", &notes, 1000);
+        assert_eq!(all["truncated"], false);
+        assert_eq!(all["files"].as_array().unwrap().len(), 155);
+    }
+
+    #[test]
+    fn a_long_error_is_truncated_on_a_char_boundary() {
+        let long = "\u{e9}".repeat(MAX_SET_ASIDE_ERROR_CHARS * 2);
+        let out = bounded_error(&std::io::Error::other(long));
+        assert_eq!(out.chars().count(), MAX_SET_ASIDE_ERROR_CHARS);
+        assert_eq!(bounded_error(&std::io::Error::other("short")), "short");
+    }
+
+    #[test]
+    fn the_degraded_detail_records_sweep_ok_both_ways() {
+        for ok in [true, false] {
+            let d = degraded_detail("events", 3, ok);
+            assert_eq!(d["sweep_ok"], ok);
+            assert_eq!(d["unsynced_publishes"], 3);
+            assert_eq!(d["reason"], "dir_fsync_unsupported");
+        }
+    }
+
+    #[test]
+    fn a_failed_tidy_task_counts_as_a_failed_move_with_its_own_reason() {
+        let notes = SweepNotes {
+            set_aside: vec![SetAside {
+                from: "(archive tidy task)".into(),
+                to: None,
+                reason: "tidy_task_failed",
+                error: Some("panicked".into()),
+            }],
+            unsynced_publishes: 0,
+        };
+        assert_eq!(notes.failed_moves(), 1);
+        let d = set_aside_detail("rules", &notes, 10);
+        assert_eq!(d["files"][0]["reason"], "tidy_task_failed");
+    }
+
+    #[test]
+    fn a_failed_move_of_a_rejected_segment_is_counted_and_leaves_the_file() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "rules-2024-01-01.5-5.jsonl";
+        std::fs::write(dir.join(name), b"x").unwrap();
+        FAIL_MOVE_ASIDE.lock().unwrap().push(dir.clone());
+        let mut notes = SweepNotes::default();
+        preserve_rejected(&dir, name, &mut notes);
+        FAIL_MOVE_ASIDE.lock().unwrap().retain(|p| p != &dir);
+        assert_eq!(notes.failed_moves(), 1);
+        assert_eq!(notes.set_aside[0].reason, "rejected");
+        assert_eq!(notes.set_aside[0].from, name);
+        assert!(dir.join(name).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn run_scheduled_reports_degraded_durability_under_the_tolerant_policy(pool: PgPool) {
+        seed_one_expired_rule(&pool).await;
+        let dir = temp_dir();
+        let ad = dir.join("audit_archive");
+        std::fs::create_dir_all(&ad).unwrap();
+        arm_dir_sync_failure_kind(&ad, std::io::ErrorKind::InvalidInput);
+        let res = run_scheduled_with(
+            &pool,
+            &dir,
+            5,
+            true,
+            None,
+            DirSyncPolicy::TolerateUnsupported,
+        )
+        .await;
+        disarm_dir_sync_failure(&ad);
+        let msg = res.unwrap();
+        assert!(msg.contains("DEGRADED durability"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

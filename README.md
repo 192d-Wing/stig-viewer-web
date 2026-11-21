@@ -680,14 +680,38 @@ otherwise retention fails closed and deletes nothing); its sidecar
 `<segment>.manifest.json` is published first, so a visible segment always has
 its sidecar (an orphan sidecar from a crash is ignored by the scan). At the start of each
 archiving sweep, a sidecar whose segment is absent and that is at least 24 hours
-old is renamed to `<sidecar>.orphan-<UTC timestamp>` and logged on the `audit`
-target; it is never deleted automatically, because it may be the only record of
+old is renamed to `<sidecar>.orphan-<UTC timestamp>`, logged on the `audit`
+target and recorded in the system audit event `audit_archive.file_set_aside`;
+it is never deleted automatically, because it may be the only record of
 a lost segment. An operator may delete an `.orphan-*` file once its id range is
 still in the table or held by a verified segment; otherwise treat it as a lost
 segment. Sweeps are serialized
 per database by an advisory lock; a sweep that cannot get it within five
 minutes fails (recorded in the scheduler log) and retries on the next tick. Rows are archived before the delete runs, and a
 failed archive write deletes nothing.
+
+After each publish the archive directory is fsynced. If the filesystem does not
+support that (EINVAL or "unsupported", as on some CIFS/SMB and FUSE mounts), the
+sweep fails closed: it deletes nothing and the error is recorded in the
+scheduler log. Setting `AUDIT_ARCHIVE_ALLOW_UNSYNCED_DIR=true` (or `1`; any
+other value leaves it off) accepts non-durable archive directory entries
+instead. Each sweep that relies on it appends `DEGRADED durability` to the
+`audit_retention` scheduler message and writes the system audit event
+`audit_archive.durability_degraded`; prefer a filesystem that supports
+directory fsync. Upgrade note: a deployment that previously ran on such a
+filesystem (the old behaviour tolerated it with a log line) now fails closed
+until the flag is set or the archive moves. Failing closed on an unsupported
+directory fsync applies on unix only.
+
+A file set aside as above (orphan sidecar or rejected segment) is listed, with
+its old and new name, in the `audit_archive.file_set_aside` event. A move that
+fails is listed there too (outcome `partial`) and counted in the scheduler
+message as `archive moves FAILED: N`; the sweep itself still succeeds.
+A failure of the archive tidy task itself is listed with reason
+`tidy_task_failed` and counts as a failed move. These events are best effort:
+they go through the shared audit write queue and may be shed under load, so the
+scheduler message suffix and the `audit`-target log lines are the fallback
+record.
 
 Rolling upgrades: run `migrate` first. Once migration 047 is applied, sweeps
 from older replicas fail with `42501` until those replicas are replaced; that is
@@ -708,9 +732,10 @@ verification, or holds a different line, is logged on the `audit` target and its
 rows are archived again (a duplicate is harmless, a lost row is not). Only a definite
 verification failure (bad signature, digest, row-count or id-range mismatch, a
 missing or unparseable sidecar) renames the segment and its sidecar to
-`<name>.rejected-<UTC timestamp>`, keeping them as evidence; such files are
-never counted. An I/O error, or a segment that is `unsigned` or `unknown_key`
-while a key is configured, is logged and not counted but left untouched. A
+`<name>.rejected-<UTC timestamp>`, keeping them as evidence (recorded in the
+`audit_archive.file_set_aside` event); such files are never counted. An I/O
+error, or a segment that is `unsigned` or `unknown_key` while a key is
+configured, is logged and not counted but left untouched. A
 verified or left-in-place file is never replaced: new rows that would collide
 with an existing name go to `<stream>-<date>.<first>-<last>.r<n>.jsonl`. Each
 segment is read once, and the verified bytes are the bytes used. Without a key,
