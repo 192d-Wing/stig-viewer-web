@@ -28,18 +28,17 @@ export default defineConfig({
       // opt-in test hooks (X-User-Id auth and /api/test/*), and the compose
       // `postgres` and `db-roles` services (the restricted `stig_app` role must
       // exist; otherwise `migrate` exits 75 with a clear message). Override
-      // the URLs/password via the environment for another database.
+      // the URLs via the environment for another database. No password is
+      // set here: export PGPASSWORD (for the local compose stack, the dev
+      // value in docker-compose.yml) or use ~/.pgpass; Playwright passes the
+      // inherited environment through to this command.
       env: {
         ALLOW_TEST_AUTH_HEADER: "true",
         STIG_ENABLE_TEST_ROUTES: "true",
         DATABASE_URL:
           process.env.DATABASE_URL ?? "postgres://stig_app@127.0.0.1:5433/stig_viewer",
         DATABASE_MIGRATION_URL:
-          process.env.DATABASE_MIGRATION_URL ?? "postgres://stig@127.0.0.1:5433/stig_viewer",
-        // `stig_local` is the local-compose-only dev password (same as
-        // docker-compose.yml); never reuse it outside the local stack.
-        PGPASSWORD: process.env.PGPASSWORD ?? "stig_local",
-      },
+          process.env.DATABASE_MIGRATION_URL ?? "postgres://stig@127.0.0.1:5433/stig_viewer",      },
       port: 8080,
       timeout: 120_000,
       reuseExistingServer: true,
