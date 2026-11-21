@@ -142,12 +142,8 @@ pub async fn save_handler(
     Path(asset_id): Path<String>,
     Json(req): Json<SaveRequest>,
 ) -> Result<Json<SaveResponse>, StatusCode> {
-    tokio::spawn(save_work(state, user, ctx, asset_id, req))
-        .await
-        .map_err(|e| {
-            tracing::error!("save task failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+    let tasks = state.tasks.clone();
+    crate::detached::run(&tasks, "save", save_work(state, user, ctx, asset_id, req)).await?
 }
 
 async fn save_work(
@@ -157,10 +153,14 @@ async fn save_work(
     asset_id: String,
     req: SaveRequest,
 ) -> Result<Json<SaveResponse>, StatusCode> {
-    let asset = db_assets::get_asset(state.pool.as_ref(), &asset_id)
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(map_db)?;
+    let asset = db_assets::get_asset_on(&mut tx, &asset_id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     save_to_asset(&state, &user, &ctx, &asset, &req, SaveOrigin::Direct)
         .await
         .map(Json)
@@ -213,7 +213,15 @@ pub(crate) async fn save_to_asset(
             },
         )
     };
-    if !asset_acl::user_can(pool, &asset.id, user, "write").await {
+    // Bounded transactions below each commit before the next audit record or
+    // pool call (see `crate::db::STATEMENT_TIMEOUT_MS`).
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    // A database error (a timeout included) is not a denial: 503, no event.
+    let can_write = asset_acl::user_can_on(&mut tx, &asset.id, user, "write")
+        .await
+        .map_err(map_db)?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
+    if !can_write {
         request_event("denied", json!({ "reason": "forbidden" })).await;
         return Err(StatusCode::FORBIDDEN);
     }
@@ -260,9 +268,11 @@ pub(crate) async fn save_to_asset(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let (checklist, created) = find_or_create(pool, &asset.id, &req.stig_id, &user.id)
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let (checklist, created) = find_or_create(&mut tx, &asset.id, &req.stig_id, &user.id)
         .await
         .map_err(map_db)?;
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
     if created {
         // Separate event so every checklist creation is searchable by action,
         // whichever endpoint made it (also noted as `created` in the save event).
@@ -282,13 +292,15 @@ pub(crate) async fn save_to_asset(
         .await;
     }
 
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
     let existing: HashMap<String, ChecklistRuleRow> =
-        db_checklists::list_rule_overrides(pool, &checklist.id)
+        db_checklists::list_rule_overrides(&mut *tx, &checklist.id)
             .await
             .map_err(map_db)?
             .into_iter()
             .map(|r| (r.rule_id.clone(), r))
             .collect();
+    tx.commit().await.map_err(|e| map_db(e.into()))?;
 
     let results = apply_entries(
         pool,
@@ -370,15 +382,16 @@ pub(crate) async fn save_to_asset(
 /// only a genuine failure surfaces as an error. The flag is true when this
 /// call created the checklist.
 async fn find_or_create(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     asset_id: &str,
     stig_id: &str,
     created_by: &str,
 ) -> anyhow::Result<(db_checklists::ChecklistRow, bool)> {
-    if let Some(c) = db_checklists::find_checklist(pool, asset_id, stig_id).await? {
+    if let Some(c) = db_checklists::find_checklist(&mut *conn, asset_id, stig_id).await? {
         return Ok((c, false));
     }
-    let (applied_version, applied_release) = db_checklists::catalog_version(pool, stig_id).await?;
+    let (applied_version, applied_release) =
+        db_checklists::catalog_version(&mut *conn, stig_id).await?;
     let now = chrono::Utc::now();
     let row = db_checklists::ChecklistRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -391,12 +404,12 @@ async fn find_or_create(
         applied_release,
         created_by: Some(created_by.to_string()),
     };
-    let inserted = db_checklists::insert_checklist_if_absent(pool, &row).await?;
+    let inserted = db_checklists::insert_checklist_if_absent(&mut *conn, &row).await?;
     if inserted {
         return Ok((row, true));
     }
     // Lost the race: the winner's row is the checklist.
-    db_checklists::find_checklist(pool, asset_id, stig_id)
+    db_checklists::find_checklist(&mut *conn, asset_id, stig_id)
         .await?
         .map(|c| (c, false))
         .ok_or_else(|| anyhow::anyhow!("checklist vanished after concurrent create"))
@@ -565,6 +578,10 @@ async fn apply_entries(
 }
 
 fn map_db(e: anyhow::Error) -> StatusCode {
+    if crate::db::is_timeout(&e) {
+        tracing::warn!("checklist save DB statement timed out: {e:#}");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     tracing::error!("checklist save DB error: {e:#}");
     StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -1021,7 +1038,10 @@ mod tests {
     async fn find_or_create_returns_the_existing_checklist(pool: PgPool) {
         base(&pool, false).await;
         seed_checklist(&pool, "orig", "a1", STIG_ID).await;
-        let (c, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
+        let (c, created) =
+            find_or_create(&mut pool.acquire().await.unwrap(), "a1", STIG_ID, "owner")
+                .await
+                .unwrap();
         assert_eq!((c.id.as_str(), created), ("orig", false));
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 1);
     }
@@ -1030,9 +1050,15 @@ mod tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn find_or_create_creates_once_then_finds(pool: PgPool) {
         base(&pool, false).await;
-        let (first, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
+        let (first, created) =
+            find_or_create(&mut pool.acquire().await.unwrap(), "a1", STIG_ID, "owner")
+                .await
+                .unwrap();
         assert!(created);
-        let (again, created) = find_or_create(&pool, "a1", STIG_ID, "owner").await.unwrap();
+        let (again, created) =
+            find_or_create(&mut pool.acquire().await.unwrap(), "a1", STIG_ID, "owner")
+                .await
+                .unwrap();
         assert_eq!((again.id, created), (first.id, false));
     }
 
@@ -1046,7 +1072,10 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..8 {
             let pool = pool.clone();
-            tasks.spawn(async move { find_or_create(&pool, "a1", STIG_ID, "owner").await });
+            tasks.spawn(async move {
+                let mut conn = pool.acquire().await?;
+                find_or_create(&mut conn, "a1", STIG_ID, "owner").await
+            });
         }
         let mut ids = HashSet::new();
         let mut created = 0;
@@ -1410,38 +1439,27 @@ mod tests {
         assert_eq!(listed, ["?", "q?b????", "x".repeat(64).as_str()]);
     }
 
-    /// Relies on the current-thread runtime `#[sqlx::test]` uses (one `yield_now`
-    /// lets the handler task reach its `tokio::spawn` before `abort()`).
-    /// See the bulk-status twin: the future is dropped after its first poll;
-    /// the checklist, the rule write, the create event and the save event must
-    /// all still land.
+    /// The handler future is dropped once its task is spawned; the checklist,
+    /// the rule write, the create event and the save event must all still land.
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn save_work_and_events_survive_the_handler_future_being_dropped(pool: PgPool) {
         base(&pool, false).await;
         let (state, _dir) = app_state(pool.clone());
-        let st = state.clone();
-        let h = tokio::spawn(async move {
-            let _ = call(
-                &st,
+        crate::detached::abort_once_spawned(
+            &state.tasks,
+            call(
+                &state,
                 "owner",
                 "author",
                 STIG_ID,
                 vec![rule(RULES[0], "open", "", "")],
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut seen = 0i64;
-        for _ in 0..200 {
-            seen = count(&pool, "SELECT COUNT(*) FROM audit_events").await;
-            if seen >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(seen, 2);
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events").await, 2);
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
             1

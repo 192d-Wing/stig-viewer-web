@@ -23,7 +23,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 
 use crate::api::auth::AuthUser;
 use crate::db_assets::AssetRow;
@@ -147,27 +146,24 @@ fn policy_matches(
 /// given user + asset. Deny wins over Allow when multiple rows match.
 ///
 /// Returns `NoOpinion` when nothing matches so the caller can keep its
-/// pre-ABAC fallback (today: deny). DB errors are logged and treated
-/// as `NoOpinion` so a transient lookup failure can't accidentally
-/// elevate privileges.
+/// pre-ABAC fallback (today: deny). A DB error is returned, not folded into
+/// `NoOpinion`, so a caller on a bounded transaction can tell a timeout from
+/// a denial; callers that only need allow/deny must treat `Err` as deny.
 pub async fn evaluate(
-    pool: &PgPool,
+    pool: impl sqlx::PgExecutor<'_>,
     user: &AuthUser,
     asset: &AssetRow,
     requested_level: &str,
-) -> Decision {
-    let rows = match load_policies(pool, requested_level).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("abac::evaluate lookup failed: {e:#}");
-            return Decision::NoOpinion;
-        }
-    };
-    decide(&rows, user, &asset.classification, &asset.tags)
+) -> Result<Decision, sqlx::Error> {
+    let rows = load_policies(pool, requested_level).await?;
+    Ok(decide(&rows, user, &asset.classification, &asset.tags))
 }
 
 /// Every enabled policy targeting `level`.
-pub async fn load_policies(pool: &PgPool, level: &str) -> Result<Vec<PolicyRow>, sqlx::Error> {
+pub async fn load_policies(
+    pool: impl sqlx::PgExecutor<'_>,
+    level: &str,
+) -> Result<Vec<PolicyRow>, sqlx::Error> {
     sqlx::query_as::<_, PolicyRow>(
         r#"
         SELECT id, name, effect, level,

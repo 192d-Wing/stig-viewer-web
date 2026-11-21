@@ -147,12 +147,8 @@ pub async fn bulk_handler(
     Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<BulkRequest>,
 ) -> Result<Json<BulkResponse>, StatusCode> {
-    tokio::spawn(bulk_work(state, user, ctx, req))
-        .await
-        .map_err(|e| {
-            tracing::error!("findings bulk task failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+    let tasks = state.tasks.clone();
+    crate::detached::run(&tasks, "findings bulk", bulk_work(state, user, ctx, req)).await?
 }
 
 /// Which patch keys the request carried (values are never recorded).
@@ -1239,32 +1235,23 @@ mod tests {
         }
     }
 
-    /// Relies on the current-thread runtime `#[sqlx::test]` uses (see the
-    /// matching test in `checklists.rs`).
+    /// Drops the handler future once its task is spawned.
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn findings_bulk_work_and_events_survive_the_handler_future_being_dropped(pool: PgPool) {
         let (state, _d) = setup(&pool, false).await;
-        let st = state.clone();
-        let h = tokio::spawn(async move {
-            let _ = call(
-                &st,
+        crate::detached::abort_once_spawned(
+            &state.tasks,
+            call(
+                &state,
                 targets(&[("c1", RULES[0]), ("c2", RULES[0])]),
                 json!({ "status": "open" }),
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut seen = 0i64;
-        for _ in 0..200 {
-            seen = count(&pool, "SELECT COUNT(*) FROM audit_events").await;
-            if seen >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(seen, 2);
+            ),
+        )
+        .await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM audit_events").await, 2);
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
             2

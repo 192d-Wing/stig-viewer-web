@@ -158,12 +158,13 @@ pub async fn bulk_status_handler(
     Path(checklist_id): Path<String>,
     Json(req): Json<BulkStatusRequest>,
 ) -> Result<Json<BulkStatusResponse>, StatusCode> {
-    tokio::spawn(bulk_status_work(state, user, ctx, checklist_id, req))
-        .await
-        .map_err(|e| {
-            tracing::error!("bulk status task failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+    let tasks = state.tasks.clone();
+    crate::detached::run(
+        &tasks,
+        "bulk status",
+        bulk_status_work(state, user, ctx, checklist_id, req),
+    )
+    .await?
 }
 
 async fn bulk_status_work(
@@ -1095,9 +1096,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// Relies on the current-thread runtime `#[sqlx::test]` uses (one `yield_now`
-    /// lets the handler task reach its `tokio::spawn` before `abort()`).
-    /// Drops the handler future right after its first poll, as hyper does on a
+    /// Drops the handler future once its task is spawned, as hyper does on a
     /// client disconnect. The spawned work must still commit the rule write
     /// and the audit event. (Without the spawn, the abort would cancel the
     /// request before either happened.) This proves the work survives the
@@ -1106,23 +1105,17 @@ mod tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn bulk_work_and_event_survive_the_handler_future_being_dropped(pool: PgPool) {
         let (state, _dir) = setup(&pool).await;
-        let st = state.clone();
-        let h = tokio::spawn(async move {
-            let _ = call(&st, "owner", "c1", &[RULES[0]], "open", "").await;
-        });
-        tokio::task::yield_now().await;
-        h.abort();
-        let mut seen = 0i64;
-        for _ in 0..200 {
-            seen = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            if seen > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        crate::detached::abort_once_spawned(
+            &state.tasks,
+            call(&state, "owner", "c1", &[RULES[0]], "open", ""),
+        )
+        .await;
+        state.tasks.idle().await;
+        crate::db_audit::drain().await;
+        let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(seen, 1);
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_rules")
             .fetch_one(&pool)

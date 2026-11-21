@@ -21,31 +21,52 @@ pub struct SetRow {
     pub last_attached_at: Option<DateTime<Utc>>,
     /// Client token of the most recent autosave that bumped the revision.
     pub last_save_id: Option<String>,
-    /// Hash of the request content that stored `last_save_id`; `None` for
-    /// rows written before the hash existed.
-    pub last_save_body_sha256: Option<String>,
+    /// Tagged digest (`<alg>:<hex>`) of the request content that stored
+    /// `last_save_id`; `None` for rows written before the digest existed.
+    pub last_save_body_digest: Option<String>,
 }
 
-/// A client retry token with the hash of the request content it arrived with.
+/// A client retry token with the digest of the request content it arrived with.
 #[derive(Debug, Clone, Copy)]
 pub struct Token<'a> {
     pub id: &'a str,
-    pub body_sha256: &'a str,
+    pub body_digest: &'a str,
+}
+
+/// Bare hex of a `sha256:` digest, for the superseded 048 columns that are
+/// still written (for rollback) until a later migration drops them. `None`
+/// for any other algorithm.
+fn legacy_sha256(digest: &str) -> Option<&str> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// True when a request is a retry of the autosave that produced the set's
 /// current revision: same token, the set sits exactly one revision past the
-/// request's base, and the content hash matches (a row with no stored hash
-/// predates it and matches any). Any later write breaks the condition.
+/// request's base, and the stored digest is present and equal to the
+/// request's (a row with no stored digest predates it and is not a replay).
+/// Any later write breaks the condition.
 pub fn is_replay(set: &SetRow, base_revision: i64, token: Option<&Token>) -> bool {
     match (token, set.last_save_id.as_deref()) {
         (Some(req), Some(stored)) => {
             req.id == stored
                 && set.revision == base_revision + 1
-                && set
-                    .last_save_body_sha256
-                    .as_deref()
-                    .is_none_or(|h| h == req.body_sha256)
+                && set.last_save_body_digest.as_deref() == Some(req.body_digest)
+        }
+        _ => false,
+    }
+}
+
+/// True when a request reuses the token of the autosave that produced the
+/// set's current revision (same id, one revision past the base) without being
+/// a replay: the token is being refused, which is worth an audit event.
+pub fn is_token_reuse(set: &SetRow, base_revision: i64, token: Option<&Token>) -> bool {
+    match (token, set.last_save_id.as_deref()) {
+        (Some(req), Some(stored)) => {
+            req.id == stored
+                && set.revision == base_revision + 1
+                && !is_replay(set, base_revision, token)
         }
         _ => false,
     }
@@ -114,6 +135,11 @@ pub enum WriteOutcome {
     NotFound,
     Conflict {
         revision: i64,
+        /// The request's token is the one that produced the current revision
+        /// but its content differs (a refused reuse, not a plain stale write).
+        token_reused: bool,
+        /// Whether the stored row carries a digest to compare against.
+        stored_digest: bool,
     },
     TooManyRules,
     /// The set as a whole would exceed its row or byte budget.
@@ -135,8 +161,12 @@ pub enum CreateOutcome {
     Created,
     /// The owner already created a set with this key; its id.
     Existing(String),
-    /// The key was used before with different request content.
-    KeyConflict,
+    /// The key was used before with different request content (or with no
+    /// stored digest to compare). `set_id` is the set that holds the key.
+    KeyConflict {
+        set_id: String,
+        stored_digest: bool,
+    },
     Limit,
 }
 
@@ -148,38 +178,18 @@ pub enum AddStig {
     Exists,
 }
 
-/// Longest a write statement may run or wait for a lock, in milliseconds.
-/// Postgres cuts a stalled write and rolls it back before the server
-/// deadline in `detached` has to abandon it.
-const STATEMENT_TIMEOUT_MS: i64 = 8_000;
-
-async fn bound_ms(tx: &mut sqlx::PgConnection, ms: i64) -> Result<()> {
-    sqlx::query(
-        "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $1, true)",
-    )
-    .bind(ms.to_string())
-    .execute(tx)
-    .await?;
-    Ok(())
-}
+pub use crate::db::is_timeout;
+use crate::db::{bound_ms, STATEMENT_TIMEOUT_MS};
 
 /// Transaction-local statement and lock timeouts; the first call in a writer.
 async fn bound(tx: &mut sqlx::PgConnection) -> Result<()> {
     bound_ms(tx, STATEMENT_TIMEOUT_MS).await
 }
 
-/// True when the error is Postgres cutting a statement (`57014`) or a lock
-/// wait (`55P03`) short.
-pub fn is_timeout(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        matches!(
-            c.downcast_ref::<sqlx::Error>(),
-            Some(sqlx::Error::Database(d)) if matches!(d.code().as_deref(), Some("57014" | "55P03"))
-        )
-    })
-}
-
-pub async fn list_sets(pool: &PgPool, owner_id: &str) -> Result<Vec<SetSummaryRow>> {
+pub async fn list_sets(
+    db: impl sqlx::PgExecutor<'_>,
+    owner_id: &str,
+) -> Result<Vec<SetSummaryRow>> {
     Ok(sqlx::query_as::<_, SetSummaryRow>(
         "SELECT c.id, c.name, c.asset_id, a.name AS asset_name, c.revision, c.updated_at,
                 (SELECT COUNT(*) FROM checklist_set_stigs s WHERE s.set_id = c.id) AS stig_count,
@@ -189,23 +199,31 @@ pub async fn list_sets(pool: &PgPool, owner_id: &str) -> Result<Vec<SetSummaryRo
          ORDER BY c.updated_at DESC, c.id",
     )
     .bind(owner_id)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?)
 }
 
-pub async fn get_set(pool: &PgPool, owner_id: &str, id: &str) -> Result<Option<SetRow>> {
+pub async fn get_set(
+    db: impl sqlx::PgExecutor<'_>,
+    owner_id: &str,
+    id: &str,
+) -> Result<Option<SetRow>> {
     Ok(sqlx::query_as::<_, SetRow>(
         "SELECT id, name, asset_id, revision, created_at, updated_at, last_attached_at, last_save_id,
-                last_save_body_sha256
+                last_save_body_digest
          FROM checklist_sets WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
     .bind(owner_id)
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await?)
 }
 
-pub async fn list_stigs(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<Vec<SetStigRow>> {
+pub async fn list_stigs(
+    db: impl sqlx::PgExecutor<'_>,
+    owner_id: &str,
+    set_id: &str,
+) -> Result<Vec<SetStigRow>> {
     Ok(sqlx::query_as::<_, SetStigRow>(
         "SELECT s.stig_id, s.applied_version, s.applied_release
          FROM checklist_set_stigs s JOIN checklist_sets c ON c.id = s.set_id
@@ -214,11 +232,15 @@ pub async fn list_stigs(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<V
     )
     .bind(set_id)
     .bind(owner_id)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?)
 }
 
-pub async fn list_rules(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<Vec<SetRuleRow>> {
+pub async fn list_rules(
+    db: impl sqlx::PgExecutor<'_>,
+    owner_id: &str,
+    set_id: &str,
+) -> Result<Vec<SetRuleRow>> {
     Ok(sqlx::query_as::<_, SetRuleRow>(
         "SELECT r.stig_id, r.rule_id, r.status, r.finding_details, r.comments
          FROM checklist_set_rules r JOIN checklist_sets c ON c.id = r.set_id
@@ -227,7 +249,7 @@ pub async fn list_rules(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<V
     )
     .bind(set_id)
     .bind(owner_id)
-    .fetch_all(pool)
+    .fetch_all(db)
     .await?)
 }
 
@@ -236,7 +258,7 @@ pub async fn list_rules(pool: &PgPool, owner_id: &str, set_id: &str) -> Result<V
 /// `max_sets`. The owner's user row is locked so concurrent creates cannot
 /// both pass the limit, and so a `create_key` lookup cannot race. When
 /// `create_key` matches one of the owner's sets, that set's id is returned if
-/// the content hash also matches (or none was stored), else `KeyConflict`.
+/// the stored digest is present and equal, else `KeyConflict`.
 pub async fn insert_set(
     pool: &PgPool,
     owner_id: &str,
@@ -254,7 +276,7 @@ pub async fn insert_set(
         .await?;
     if let Some(key) = create_key {
         let existing: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT id, create_body_sha256 FROM checklist_sets WHERE owner_id = $1 AND create_key = $2",
+            "SELECT id, create_body_digest FROM checklist_sets WHERE owner_id = $1 AND create_key = $2",
         )
         .bind(owner_id)
         .bind(key.id)
@@ -262,8 +284,11 @@ pub async fn insert_set(
         .await?;
         if let Some((existing_id, stored)) = existing {
             return Ok(match stored {
-                Some(h) if h != key.body_sha256 => CreateOutcome::KeyConflict,
-                _ => CreateOutcome::Existing(existing_id),
+                Some(ref h) if h == key.body_digest => CreateOutcome::Existing(existing_id),
+                _ => CreateOutcome::KeyConflict {
+                    set_id: existing_id,
+                    stored_digest: stored.is_some(),
+                },
             });
         }
     }
@@ -275,14 +300,16 @@ pub async fn insert_set(
         return Ok(CreateOutcome::Limit);
     }
     sqlx::query(
-        "INSERT INTO checklist_sets (id, owner_id, name, create_key, create_body_sha256)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO checklist_sets
+             (id, owner_id, name, create_key, create_body_digest, create_body_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(id)
     .bind(owner_id)
     .bind(name)
     .bind(create_key.map(|t| t.id))
-    .bind(create_key.map(|t| t.body_sha256))
+    .bind(create_key.map(|t| t.body_digest))
+    .bind(create_key.and_then(|t| legacy_sha256(t.body_digest)))
     .execute(&mut *tx)
     .await?;
     for (i, (stig_id, version, release)) in stigs.iter().enumerate() {
@@ -342,14 +369,27 @@ pub async fn unlink_asset(
 
 /// Record that the set was saved to `asset_id`.
 pub async fn link_asset(pool: &PgPool, owner_id: &str, id: &str, asset_id: &str) -> Result<bool> {
+    link_asset_within(pool, owner_id, id, asset_id, STATEMENT_TIMEOUT_MS).await
+}
+
+async fn link_asset_within(
+    pool: &PgPool,
+    owner_id: &str,
+    id: &str,
+    asset_id: &str,
+    timeout_ms: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    bound_ms(&mut tx, timeout_ms).await?;
     let r = sqlx::query(
         "UPDATE checklist_sets SET asset_id = $3, last_attached_at = NOW() WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
     .bind(owner_id)
     .bind(asset_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -452,7 +492,8 @@ pub async fn remove_stig(
     if removed {
         sqlx::query(
             "UPDATE checklist_sets SET revision = revision + 1, last_save_id = NULL,
-                last_save_body_sha256 = NULL, updated_at = NOW() WHERE id = $1",
+                last_save_body_digest = NULL, last_save_body_sha256 = NULL,
+                updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .execute(&mut *tx)
@@ -515,7 +556,8 @@ pub async fn write_rules(
              revision = c.revision + 1,
              updated_at = NOW(),
              last_save_id = $4,
-             last_save_body_sha256 = $5,
+             last_save_body_digest = $5,
+             last_save_body_sha256 = $6,
              last_edit_event_at = CASE
                  WHEN old.last_edit_event_at IS NULL OR old.last_edit_event_at < NOW() - INTERVAL '{EDIT_EVENT_WINDOW}'
                  THEN NOW() ELSE old.last_edit_event_at END
@@ -528,18 +570,20 @@ pub async fn write_rules(
     .bind(owner_id)
     .bind(base_revision)
     .bind(save.map(|t| t.id))
-    .bind(save.map(|t| t.body_sha256))
+    .bind(save.map(|t| t.body_digest))
+    .bind(save.and_then(|t| legacy_sha256(t.body_digest)))
     .fetch_optional(&mut *tx)
     .await?;
     let Some((revision, updated_at, edit_event_due)) = bumped else {
-        drop(tx);
-        return Ok(match get_set(pool, owner_id, id).await? {
+        return Ok(match get_set(&mut *tx, owner_id, id).await? {
             Some(s) if is_replay(&s, base_revision, save.as_ref()) => WriteOutcome::Replayed {
                 revision: s.revision,
                 updated_at: s.updated_at,
             },
             Some(s) => WriteOutcome::Conflict {
                 revision: s.revision,
+                token_reused: is_token_reuse(&s, base_revision, save.as_ref()),
+                stored_digest: s.last_save_body_digest.is_some(),
             },
             None => WriteOutcome::NotFound,
         });
@@ -648,11 +692,14 @@ pub async fn write_rules(
 
 /// `(version, release)` of a catalog STIG, or `None` when it is not in the
 /// catalog.
-pub async fn catalog_entry(pool: &PgPool, stig_id: &str) -> Result<Option<(String, String)>> {
+pub async fn catalog_entry(
+    db: impl sqlx::PgExecutor<'_>,
+    stig_id: &str,
+) -> Result<Option<(String, String)>> {
     Ok(
         sqlx::query_as("SELECT version, release_info FROM stigs_catalog WHERE id = $1")
             .bind(stig_id)
-            .fetch_optional(pool)
+            .fetch_optional(db)
             .await?,
     )
 }
@@ -672,5 +719,211 @@ mod tests {
             .unwrap_err();
         assert!(is_timeout(&anyhow::Error::from(err)));
         assert!(!is_timeout(&anyhow::anyhow!("something else")));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_read_on_a_bounded_transaction_is_cut_by_a_lock(pool: PgPool) {
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        bound_ms(&mut tx, 100).await.unwrap();
+        let err = list_sets(&mut *tx, "u1").await.unwrap_err();
+        assert!(is_timeout(&err));
+        drop(tx);
+        lock.rollback().await.unwrap();
+        // The connection went back to the pool; a query succeeds promptly.
+        let n: i64 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query_scalar("SELECT 1::bigint").fetch_one(&pool),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn link_asset_is_bounded_by_the_statement_timeout(pool: PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO checklist_sets (id, owner_id, name) VALUES ('s1', 'u1', 'n')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut lock = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE checklist_sets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let err = link_asset_within(&pool, "u1", "s1", "a1", 100)
+            .await
+            .unwrap_err();
+        assert!(is_timeout(&err));
+        lock.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn digests_are_tagged_and_the_check_refuses_a_bare_hash(pool: PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        let tagged = format!("sha256:{}", "ab".repeat(32));
+        sqlx::query(
+            "INSERT INTO checklist_sets (id, owner_id, name, create_key, create_body_digest)
+             VALUES ('s1', 'u1', 'n', 'k', $1)",
+        )
+        .bind(&tagged)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let got = get_set(&pool, "u1", "s1").await.unwrap().unwrap();
+        assert_eq!(got.last_save_body_digest, None);
+        let stored: String =
+            sqlx::query_scalar("SELECT create_body_digest FROM checklist_sets WHERE id = 's1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, tagged);
+        for bad in ["ab".repeat(32), "SHA256:abab".to_string(), String::new()] {
+            let err = sqlx::query(
+                "INSERT INTO checklist_sets (id, owner_id, name, last_save_body_digest)
+                 VALUES ('s2', 'u1', 'n', $1)",
+            )
+            .bind(&bad)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, sqlx::Error::Database(d) if d.is_check_violation()),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn begin_bounded_sets_both_timeouts_to_eight_seconds(pool: PgPool) {
+        let mut tx = crate::db::begin_bounded(&pool).await.unwrap();
+        let (st, lt): (String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!((st.as_str(), lt.as_str()), ("8s", "8s"));
+        tx.commit().await.unwrap();
+        // Transaction-local: a plain pooled connection is unbounded again.
+        let st: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(st, "0");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_refused_token_reuse_in_write_rules_reports_token_reused(pool: PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO checklist_sets (id, owner_id, name) VALUES ('s1', 'u1', 'n')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let budget = SetBudget {
+            max_rows_per_stig: 500,
+            max_rows: 10_000,
+            max_bytes: 4 << 20,
+        };
+        let d1 = format!("sha256:{}", "a".repeat(64));
+        let d2 = format!("sha256:{}", "b".repeat(64));
+        let tok = |digest: &'static str| Token {
+            id: "11111111-1111-4111-8111-111111111111",
+            body_digest: digest,
+        };
+        let d1: &'static str = Box::leak(d1.into_boxed_str());
+        let d2: &'static str = Box::leak(d2.into_boxed_str());
+        let first = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
+            .await
+            .unwrap();
+        assert!(matches!(first, WriteOutcome::Written { revision: 1, .. }));
+        // Same token, other content, stale base: refused, and flagged as a reuse.
+        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d2)))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            WriteOutcome::Conflict {
+                revision: 1,
+                token_reused: true,
+                stored_digest: true
+            }
+        );
+        // The identical retry is a replay; another token is a plain conflict.
+        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
+            .await
+            .unwrap();
+        assert!(matches!(out, WriteOutcome::Replayed { revision: 1, .. }));
+        let other = Token {
+            id: "22222222-2222-4222-8222-222222222222",
+            body_digest: d1,
+        };
+        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(other))
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            WriteOutcome::Conflict {
+                token_reused: false,
+                ..
+            }
+        ));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_superseded_sha256_columns_are_dual_written_for_rollback(pool: PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        let hex = "ab".repeat(32);
+        let digest = format!("sha256:{hex}");
+        let key = Token {
+            id: "11111111-1111-4111-8111-111111111111",
+            body_digest: &digest,
+        };
+        let out = insert_set(&pool, "u1", "s1", "n", &[], 50, Some(key))
+            .await
+            .unwrap();
+        assert_eq!(out, CreateOutcome::Created);
+        let budget = SetBudget {
+            max_rows_per_stig: 500,
+            max_rows: 10_000,
+            max_bytes: 4 << 20,
+        };
+        write_rules(&pool, "u1", "s1", 0, &[], budget, Some(key))
+            .await
+            .unwrap();
+        let q =
+            "SELECT create_body_sha256, last_save_body_sha256 FROM checklist_sets WHERE id = 's1'";
+        let (c, l): (Option<String>, Option<String>) =
+            sqlx::query_as(q).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            (c.as_deref(), l.as_deref()),
+            (Some(hex.as_str()), Some(hex.as_str()))
+        );
+        // Another algorithm leaves the old columns empty (no tagged value fits them).
+        let other = Token {
+            id: "22222222-2222-4222-8222-222222222222",
+            body_digest: &format!("blake3:{hex}"),
+        };
+        insert_set(&pool, "u1", "s2", "n", &[], 50, Some(other))
+            .await
+            .unwrap();
+        let c: Option<String> =
+            sqlx::query_scalar("SELECT create_body_sha256 FROM checklist_sets WHERE id = 's2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(c, None);
     }
 }

@@ -17,7 +17,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::HashSet;
 
 use crate::api::abac::{self, Decision};
@@ -54,76 +54,82 @@ fn rank(level: &str) -> u8 {
 /// NOTE: [`writable_asset_ids`] re-implements the `"write"` decision in bulk.
 /// Change the two together; the control is the parity test
 /// `writable_asset_ids_matches_user_can_write`.
-pub async fn user_can(pool: &PgPool, asset_id: &str, user: &AuthUser, level: &str) -> bool {
+///
+/// `user_can_on` reports a database failure as `Err` so a caller on a bounded
+/// transaction can tell a timeout (503) from a denial; [`user_can`] maps `Err`
+/// to deny. `abac::evaluate` likewise returns its lookup errors.
+pub async fn user_can_on(
+    conn: &mut PgConnection,
+    asset_id: &str,
+    user: &AuthUser,
+    level: &str,
+) -> anyhow::Result<bool> {
     if user.role == "admin" {
-        return true;
+        return Ok(true);
     }
 
     // Owner short-circuit. We don't need the full AssetRow — just the
     // owner_id — and we want to keep the call cheap for the hot path.
-    let owner_id: Option<String> =
-        match sqlx::query_scalar("SELECT owner_id FROM assets WHERE id = $1")
-            .bind(asset_id)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("user_can owner lookup failed: {e:#}");
-                return false;
-            }
-        };
+    let owner_id: Option<String> = sqlx::query_scalar("SELECT owner_id FROM assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(&mut *conn)
+        .await?;
     let Some(owner_id) = owner_id else {
-        return false;
+        return Ok(false);
     };
     if owner_id == user.id {
-        return true;
+        return Ok(true);
     }
 
     let needed = rank(level);
     if needed == 0 {
         // Defensive — caller passed an unknown level. Treat as deny.
-        return false;
+        return Ok(false);
     }
 
-    let granted: Option<String> = match sqlx::query_scalar(
-        "SELECT permission FROM asset_acl WHERE asset_id = $1 AND user_id = $2",
-    )
-    .bind(asset_id)
-    .bind(&user.id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("user_can acl lookup failed: {e:#}");
-            return false;
-        }
-    };
-
+    let granted: Option<String> =
+        sqlx::query_scalar("SELECT permission FROM asset_acl WHERE asset_id = $1 AND user_id = $2")
+            .bind(asset_id)
+            .bind(&user.id)
+            .fetch_optional(&mut *conn)
+            .await?;
     if matches!(granted.as_deref().map(rank), Some(g) if g >= needed) {
-        return true;
+        return Ok(true);
     }
 
     // All three legacy paths (admin role, owner, ACL row) declined.
     // Fall through to attribute-based access control: load the full
     // asset row (with tags) once and evaluate the policy set.
     //
-    // With zero rows in `abac_policies`, `evaluate` returns
-    // `NoOpinion` and we keep today's `false` — preserving the
-    // contract that default behaviour is unchanged.
-    let asset = match db_assets::get_asset(pool, asset_id).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return false,
+    // With zero rows in `abac_policies` there is no opinion and we keep
+    // today's `false` — preserving the contract that default behaviour is
+    // unchanged.
+    let Some(asset) = db_assets::get_asset_on(&mut *conn, asset_id).await? else {
+        return Ok(false);
+    };
+    let decision = abac::evaluate(&mut *conn, user, &asset, level).await?;
+    Ok(matches!(decision, Decision::Allow))
+}
+
+/// [`user_can_on`] on a connection acquired from `pool`. A failed acquire or
+/// any database error is logged and denies.
+pub async fn user_can(pool: &PgPool, asset_id: &str, user: &AuthUser, level: &str) -> bool {
+    if user.role == "admin" {
+        return true;
+    }
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
         Err(e) => {
-            tracing::error!("user_can asset lookup for ABAC failed: {e:#}");
+            tracing::error!("user_can connection acquire failed: {e:#}");
             return false;
         }
     };
-    match abac::evaluate(pool, user, &asset, level).await {
-        Decision::Allow => true,
-        Decision::Deny => false,
-        Decision::NoOpinion => false,
+    match user_can_on(&mut conn, asset_id, user, level).await {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            tracing::error!("user_can lookup failed: {e:#}");
+            false
+        }
     }
 }
 
@@ -619,5 +625,29 @@ mod tests {
         assert!(writable_asset_ids(&pool, &auth("own", "author"), &[])
             .await
             .is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_database_error_denies_in_user_can_but_is_an_error_in_user_can_on(pool: PgPool) {
+        seed_user(&pool, "own").await;
+        seed_user(&pool, "other").await;
+        seed_asset(&pool, "a1", "own", false).await;
+        seed_acl(&pool, "a1", "other", "read").await;
+        let other = auth("other", "author");
+        assert!(user_can(&pool, "a1", &other, "read").await);
+        // The ACL lookup now fails: a non-admin is denied, an admin is not.
+        sqlx::query("DROP TABLE asset_acl CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!user_can(&pool, "a1", &other, "read").await);
+        assert!(user_can(&pool, "a1", &auth("root", "admin"), "read").await);
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(user_can_on(&mut conn, "a1", &other, "read").await.is_err());
+        drop(conn);
+        // A failed acquire denies too.
+        pool.close().await;
+        assert!(!user_can(&pool, "a1", &auth("own", "author"), "write").await);
     }
 }

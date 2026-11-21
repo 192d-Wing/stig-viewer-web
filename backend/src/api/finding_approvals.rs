@@ -419,7 +419,7 @@ async fn request_chunk(
     lock_timeout: &str,
 ) -> anyhow::Result<Vec<ApprovalOutcome>> {
     let mut tx = pool.begin().await?;
-    db_checklists::set_lock_timeout(&mut tx, lock_timeout).await?;
+    db_checklists::set_chunk_timeouts(&mut tx, lock_timeout).await?;
     db_checklists::lock_checklist(&mut tx, checklist_id).await?;
     let wanted: Vec<&str> = chunk.iter().map(|r| r.rule_id).collect();
     let pending: HashSet<String> = sqlx::query_scalar(
