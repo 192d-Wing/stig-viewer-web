@@ -164,13 +164,12 @@ enum Swept {
 }
 
 async fn sweep_one(stigs_dir: &Path, pool: &PgPool, c: &Candidate) -> Swept {
-    // Held across the lookup and the rename so a concurrent publish of the same
-    // id cannot interleave.
-    // Why held: a concurrent upload of this id must not commit or rename
-    // between our lookup and our rename/delete.
+    // Held across the lookup and the rename/delete so a concurrent upload of
+    // this id cannot commit or rename in between.
     let _guard = publish_lock().await;
     let dest = stigs_dir.join(format!("{}.json", c.id));
-    let newer_published = std::fs::metadata(&dest)
+    let newer_published = tokio::fs::metadata(&dest)
+        .await
         .and_then(|m| m.modified())
         .is_ok_and(|m| m >= c.mtime);
     let mut reason = "no_matching_row";
@@ -348,7 +347,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
         std::fs::write(d.join("newer.json"), "PUBLISHED").unwrap();
         sweep_stale(&d, &pool, Duration::ZERO).await;
         assert_eq!(
