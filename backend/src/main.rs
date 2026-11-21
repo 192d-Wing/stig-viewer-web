@@ -273,11 +273,11 @@ fn warn_enabled_test_hooks(test_hooks: &TestHooks) {
 /// Connect (migrating as the owner if configured), apply the audit test-mode
 /// policy, and enforce the owner/app role boundary before anything is served.
 async fn open_database(config: &Config, test_hooks: &TestHooks) -> Result<sqlx::PgPool> {
-    if test_hooks.production && config.database_migration_url.is_some() {
-        tracing::warn!(
-            "DATABASE_MIGRATION_URL is set on the serving process: code execution in the server \
-             could read the owner credential. Prefer running `migrate` as a separate job."
-        );
+    if let Some(w) = db_roles::owner_url_on_server_warning(
+        test_hooks.production,
+        config.database_migration_url.is_some(),
+    ) {
+        tracing::warn!("{w}");
     }
     let pool = connect_database(config, test_hooks).await?;
     db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
