@@ -41,9 +41,9 @@
 //! polling while the body is Pending (for example `select!`-ing away) is still
 //! charged, and an abandoned body is charged at most `slow_wait`. The
 //! first byte is due
-//! within `ADMITTED_BODY_FIRST_BYTE` (5 s); after that the body is cut off
-//! once `first_byte_at + ADMITTED_BODY_GRACE (10 s) + bytes_received /
-//! ADMITTED_BODY_MIN_RATE (64 KiB/s)` has passed, so a 500 MiB upload is fine
+//! within `DEFAULT_ADMISSION_BODY_FIRST_BYTE` (5 s); after that the body is cut off
+//! once `first_byte_at + DEFAULT_ADMISSION_BODY_GRACE (10 s) + bytes_received /
+//! DEFAULT_ADMISSION_BODY_MIN_RATE (64 KiB/s)` has passed, so a 500 MiB upload is fine
 //! while it averages 64 KiB/s. A cut-off makes the body extractor answer 400
 //! and release the permit. Each cut-off is counted (`bodyDeadline`), logged
 //! with the holder's user id (throttled per user), and after
@@ -56,7 +56,7 @@
 //! its waiting on the client (time the inner body spent Pending, in stretches
 //! each ended by a frame, the end, an error or a drop) is excessive. Each
 //! stretch of length `d` that ends with a data frame of `n` bytes earns a rate
-//! credit of `n / ADMITTED_BODY_MIN_RATE` for that stretch only (credit is
+//! credit of `n / DEFAULT_ADMISSION_BODY_MIN_RATE` for that stretch only (credit is
 //! never banked across the body, so a burst cannot pay for later stalls or a
 //! trickle); its `excess` is `max(0, d - n / min_rate)`, and a stretch ending
 //! in the end, an error or a drop has `n = 0`. The body is slow when the summed
@@ -130,17 +130,6 @@ pub const MAX_USER_IN_FLIGHT: u32 = 4;
 /// Of [`MAX_IN_FLIGHT`], how many only admins can use, so incident response is
 /// not locked out when ordinary accounts fill the rest.
 pub const ADMIN_RESERVE: u32 = 4;
-/// Time a body reader gets to receive its first byte, from the first time the
-/// handler reads the body (a handler that does other work first is not
-/// charged for it). Past it the body yields an error (the extractor answers
-/// 400) and the handler returns, releasing the permit.
-pub const ADMITTED_BODY_FIRST_BYTE: Duration = Duration::from_secs(5);
-/// After the first byte: time allowed on top of the rate rule. The deadline
-/// is `first_byte_at + ADMITTED_BODY_GRACE + bytes / ADMITTED_BODY_MIN_RATE`.
-pub const ADMITTED_BODY_GRACE: Duration = Duration::from_secs(10);
-/// Minimum average body rate in bytes per second; each byte received extends
-/// the deadline by `1 / ADMITTED_BODY_MIN_RATE` seconds.
-pub const ADMITTED_BODY_MIN_RATE: u64 = 64 * 1024;
 /// Body cut-offs within [`BODY_PENALTY_WINDOW`] after which a user is refused
 /// admission for [`BODY_PENALTY_BLOCK`].
 pub const BODY_PENALTY_CUTS: u32 = 3;
@@ -211,9 +200,9 @@ impl From<crate::config::AdmissionBody> for BodyLimits {
 impl Default for BodyLimits {
     fn default() -> Self {
         Self {
-            first_byte: ADMITTED_BODY_FIRST_BYTE,
-            grace: ADMITTED_BODY_GRACE,
-            min_rate: ADMITTED_BODY_MIN_RATE,
+            first_byte: crate::config::DEFAULT_ADMISSION_BODY_FIRST_BYTE,
+            grace: crate::config::DEFAULT_ADMISSION_BODY_GRACE,
+            min_rate: crate::config::DEFAULT_ADMISSION_BODY_MIN_RATE,
             penalty_cuts: BODY_PENALTY_CUTS,
             penalty_window: BODY_PENALTY_WINDOW,
             penalty_block: BODY_PENALTY_BLOCK,
@@ -246,8 +235,7 @@ const _: () = assert!(
     "the backlog mark must leave the unadmitted reserve free"
 );
 
-/// GET routes (as `MatchedPath` templates) that record an `audit.read` event.
-pub const AUDITED_READ_ROUTES: [&str; 2] = ["/api/audit/search", "/api/audit/events"];
+pub use crate::api::audit::AUDITED_READ_ROUTES;
 
 const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -2334,17 +2322,19 @@ mod tests {
         assert_eq!(l["pending"], AUDIT_BACKLOG_LOW.to_string());
     }
 
-    /// Axum 0.7 cannot list a router's routes, so this scans the sources:
-    /// the `audit.read` action is recorded only in `audit.rs`, by exactly as
-    /// many call sites as there are entries in [`AUDITED_READ_ROUTES`].
-    // A cheap text tripwire that compares a count, not the route set. The
-    // DB-backed `audited_read_routes_match_the_real_router` test in `main.rs`
-    // is authoritative for the listed routes.
+    /// Axum 0.7 cannot list a router's routes, so this scans the sources.
+    /// The path-to-handler binding is by construction in the `audited_reads!`
+    /// macro (`audit.rs`) and is NOT checked by this scan. The handlers are
+    /// private to `audit.rs`, so the macro router is the only possible mount.
+    /// This scan covers handler-to-`record_audit_read`: the `audit.read`
+    /// action is recorded only in `audit.rs`, from exactly the handlers in
+    /// `AUDITED_READ_HANDLERS`. `audited_read_routes_match_the_real_router` in
+    /// `main.rs` is the authoritative behavioural check.
     #[test]
     fn audit_read_is_recorded_only_by_the_listed_handlers() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
         let literal = ["\"audit", ".read\""].concat();
-        let mut sites = 0;
+        let mut audit_src = String::new();
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -2355,23 +2345,72 @@ mod tests {
             match name.as_str() {
                 // This file names the literal in its own docs and tests.
                 "admission.rs" => {}
-                "audit.rs" => {
-                    sites = src.matches("record_audit_read(").count()
-                        - src.matches("fn record_audit_read(").count();
-                }
+                "audit.rs" => audit_src = src,
                 _ => assert!(
                     !src.contains(&literal),
-                    "{name} records audit.read: add its route to AUDITED_READ_ROUTES \
-                     (api/admission.rs) so it is admitted, and update this test"
+                    "{name} records audit.read: add its route to the audited_reads! table \
+                     (api/audit.rs) so it is admitted, and update this test"
                 ),
             }
         }
+        // The macro in `audit.rs` has a `#[cfg(test)]` of its own, so cut at
+        // the sentinel comment placed before the test module.
+        const SENTINEL: &str = "// --- end of non-test code (tripwire boundary) ---";
+        let prod = audit_src
+            .split_once(SENTINEL)
+            .unwrap_or_else(|| panic!("audit.rs lost its `{SENTINEL}` comment"))
+            .0
+            .to_string();
+
+        // Handlers (top-level fns) that call record_audit_read.
+        let mut current = String::new();
+        let mut callers = std::collections::BTreeSet::new();
+        for line in prod.lines() {
+            let t = line.trim_start();
+            if line.len() == t.len() {
+                for pre in ["pub async fn ", "pub fn ", "async fn ", "fn "] {
+                    if let Some(rest) = t.strip_prefix(pre) {
+                        current = rest
+                            .split(['(', '<'])
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        break;
+                    }
+                }
+            }
+            if line.contains("record_audit_read(") && !line.contains("fn record_audit_read(") {
+                callers.insert(current.clone());
+            }
+        }
+        let listed: std::collections::BTreeSet<String> = crate::api::audit::AUDITED_READ_HANDLERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(
-            sites,
-            AUDITED_READ_ROUTES.len(),
-            "audit.rs records audit.read from {sites} handlers but AUDITED_READ_ROUTES lists {}: \
-             update the list (and the routes in main.rs)",
-            AUDITED_READ_ROUTES.len()
+            callers, listed,
+            "handlers calling record_audit_read must equal the audited_reads! table"
+        );
+
+        // The literal occurs once, inside record_audit_read.
+        assert_eq!(
+            prod.matches(&literal).count(),
+            1,
+            "audit.read literal count"
+        );
+        let def = prod
+            .find("fn record_audit_read(")
+            .expect("record_audit_read");
+        let lit = prod.find(&literal).unwrap();
+        assert!(
+            lit > def,
+            "audit.read literal must be inside record_audit_read"
+        );
+        // The fn ends at the first `}` in column 0 after its definition.
+        let end = prod[def..].find("\n}\n").map_or(prod.len(), |e| def + e);
+        assert!(
+            lit < end,
+            "audit.read literal must be inside record_audit_read"
         );
     }
 
@@ -2792,6 +2831,11 @@ mod flood_tests {
             .unwrap()
     }
 
+    // #175 decision: no Playwright spec for the viewer-at-cap 403. A viewer's
+    // refused mutation takes no permit and always gets 403, which
+    // `e2e/51-viewer-role.spec.js` covers; the at-the-cap variant needs permits
+    // held in flight, which a browser cannot arrange without a new test hook
+    // (new attack surface), and the UI shows nothing cap-specific.
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_viewer_over_its_cap_is_403_with_an_authz_denied_row(pool: PgPool) {

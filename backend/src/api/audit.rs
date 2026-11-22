@@ -1,7 +1,8 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Extension, Json,
+    routing::get,
+    Extension, Json, Router,
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,23 @@ use crate::api::auth::AuthUser;
 use crate::api::request_ctx::RequestCtx;
 use crate::db_audit::{self, audit_safe_id, NewAuditEvent};
 use crate::AppState;
+
+macro_rules! audited_reads {
+    ($($path:literal => $handler:ident),+ $(,)?) => {
+        /// GET routes (as `MatchedPath` templates) that record an `audit.read` event.
+        pub const AUDITED_READ_ROUTES: &[&str] = &[$($path),+];
+        #[cfg(test)]
+        pub(crate) const AUDITED_READ_HANDLERS: &[&str] = &[$(stringify!($handler)),+];
+        /// The only place these handlers are routed; merge it into the protected router.
+        pub fn audited_reads_router() -> Router<AppState> {
+            Router::new() $(.route($path, get($handler)))+
+        }
+    };
+}
+audited_reads! {
+    "/api/audit/search" => search_handler,
+    "/api/audit/events" => events_handler,
+}
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -229,7 +247,7 @@ async fn record_audit_read(
     .await;
 }
 
-pub async fn search_handler(
+async fn search_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
@@ -428,7 +446,7 @@ pub struct AuditEventsQuery {
 struct AuditEventDbRow {
     id: i64,
     occurred_at: DateTime<Utc>,
-    by_name: String,
+    by_name: Option<String>,
     is_system: bool,
     asset_name: Option<String>,
     stig_title: Option<String>,
@@ -448,7 +466,8 @@ struct AuditEventDbRow {
 pub struct AuditEventRow {
     pub id: i64,
     pub occurred_at: DateTime<Utc>,
-    pub by_name: String,
+    /// `null` for system rows; `is_system` is authoritative.
+    pub by_name: Option<String>,
     /// True when the event has no acting user (`user_id IS NULL`).
     pub is_system: bool,
     pub asset_name: Option<String>,
@@ -523,7 +542,7 @@ fn push_event_filters<'a>(
     }
 }
 
-pub async fn events_handler(
+async fn events_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
@@ -558,11 +577,11 @@ pub async fn events_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // `by_name` is display-only (a user's display name can be "system");
-    // `is_system` is authoritative.
+    // `by_name` is display-only (a user's display name can be "system") and
+    // NULL exactly when `user_id IS NULL`; `is_system` is authoritative.
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT e.id, e.occurred_at, \
-                COALESCE(u.display_name, e.user_id, 'system') AS by_name, \
+                COALESCE(u.display_name, e.user_id) AS by_name, \
                 (e.user_id IS NULL) AS is_system, \
                 ast.name AS asset_name, \
                 COALESCE(sc.title, e.stig_id) AS stig_title, \
@@ -639,6 +658,7 @@ pub async fn events_handler(
     }))
 }
 
+// --- end of non-test code (tripwire boundary) ---
 #[cfg(test)]
 mod events_tests {
     use super::*;
@@ -735,7 +755,7 @@ mod events_tests {
         let (state, _dir) = app_state(pool.clone());
         let Json(all) = call(&state, "admin", query(None)).await.unwrap();
         assert_eq!(all.total_count, 1);
-        assert_eq!(all.rows[0].by_name, "system");
+        assert_eq!(all.rows[0].by_name, None);
         assert!(all.rows[0].is_system);
         assert_eq!(all.rows[0].action, "catalog.sync");
     }
@@ -822,7 +842,9 @@ mod events_tests {
         assert_eq!(all.total_count, 2);
         let named: Vec<_> = all.rows.iter().filter(|r| !r.is_system).collect();
         assert_eq!(named.len(), 1);
-        assert_eq!(named[0].by_name, "system");
+        assert_eq!(named[0].by_name.as_deref(), Some("system"));
+        // `byName` is null exactly for system rows.
+        assert!(all.rows.iter().all(|r| r.by_name.is_none() == r.is_system));
 
         let mut q = query(Some("catalog.sync"));
         q.actor = Some("system".into());

@@ -240,6 +240,19 @@ pub const ADMISSION_BODY_GRACE_SECS_BOUNDS: (u64, u64) = (1, 120);
 /// `ADMISSION_BODY_FIRST_BYTE_SECS` bounds.
 pub const ADMISSION_BODY_FIRST_BYTE_SECS_BOUNDS: (u64, u64) = (1, 60);
 
+/// Time a body reader gets to receive its first byte, from the first time the
+/// handler reads the body (a handler that does other work first is not
+/// charged for it). Past it the body yields an error (the extractor answers
+/// 400) and the handler returns, releasing the permit.
+pub const DEFAULT_ADMISSION_BODY_FIRST_BYTE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+/// After the first byte: time allowed on top of the rate rule. The deadline
+/// is `first_byte_at + grace + bytes / min_rate`.
+pub const DEFAULT_ADMISSION_BODY_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Minimum average body rate in bytes per second; each byte received extends
+/// the deadline by `1 / min_rate` seconds.
+pub const DEFAULT_ADMISSION_BODY_MIN_RATE: u64 = 64 * 1024;
+
 /// Request-body deadlines for admitted requests (see `api::admission`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionBody {
@@ -253,11 +266,19 @@ pub struct AdmissionBody {
 
 impl AdmissionBody {
     pub fn from_env() -> Result<Self> {
-        let var = |name: &str| std::env::var(name).ok();
+        Self::from_lookup(|n| std::env::var(n).ok())
+    }
+
+    /// Reads the three `ADMISSION_BODY_*` variables through `get`.
+    ///
+    /// `main` calls `from_env()?` before the database is opened or a port
+    /// bound, so an `Err` here stops startup; that `?` is the only untested
+    /// step (#175).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         Self::from_vars(
-            var("ADMISSION_BODY_FIRST_BYTE_SECS").as_deref(),
-            var("ADMISSION_BODY_GRACE_SECS").as_deref(),
-            var("ADMISSION_BODY_MIN_RATE_KIB").as_deref(),
+            get("ADMISSION_BODY_FIRST_BYTE_SECS").as_deref(),
+            get("ADMISSION_BODY_GRACE_SECS").as_deref(),
+            get("ADMISSION_BODY_MIN_RATE_KIB").as_deref(),
         )
     }
 
@@ -266,28 +287,27 @@ impl AdmissionBody {
         grace_secs: Option<&str>,
         min_rate_kib: Option<&str>,
     ) -> Result<Self> {
-        use crate::api::admission as a;
         let (fb_min, fb_max) = ADMISSION_BODY_FIRST_BYTE_SECS_BOUNDS;
         let (gr_min, gr_max) = ADMISSION_BODY_GRACE_SECS_BOUNDS;
         let (rt_min, rt_max) = ADMISSION_BODY_MIN_RATE_KIB_BOUNDS;
         let first_byte = parse_bounded(
             "ADMISSION_BODY_FIRST_BYTE_SECS",
             first_byte_secs,
-            a::ADMITTED_BODY_FIRST_BYTE.as_secs(),
+            DEFAULT_ADMISSION_BODY_FIRST_BYTE.as_secs(),
             fb_min,
             fb_max,
         )?;
         let grace = parse_bounded(
             "ADMISSION_BODY_GRACE_SECS",
             grace_secs,
-            a::ADMITTED_BODY_GRACE.as_secs(),
+            DEFAULT_ADMISSION_BODY_GRACE.as_secs(),
             gr_min,
             gr_max,
         )?;
         let rate_kib = parse_bounded(
             "ADMISSION_BODY_MIN_RATE_KIB",
             min_rate_kib,
-            a::ADMITTED_BODY_MIN_RATE / 1024,
+            DEFAULT_ADMISSION_BODY_MIN_RATE / 1024,
             rt_min,
             rt_max,
         )?;
@@ -313,13 +333,42 @@ mod tests {
 
     #[test]
     fn admission_body_defaults_when_unset_or_blank() {
-        use crate::api::admission as a;
         for raw in [None, Some(""), Some("  ")] {
             let b = AdmissionBody::from_vars(raw, raw, raw).unwrap();
-            assert_eq!(b.first_byte, a::ADMITTED_BODY_FIRST_BYTE);
-            assert_eq!(b.grace, a::ADMITTED_BODY_GRACE);
-            assert_eq!(b.min_rate, a::ADMITTED_BODY_MIN_RATE);
+            assert_eq!(b.first_byte, DEFAULT_ADMISSION_BODY_FIRST_BYTE);
+            assert_eq!(b.grace, DEFAULT_ADMISSION_BODY_GRACE);
+            assert_eq!(b.min_rate, DEFAULT_ADMISSION_BODY_MIN_RATE);
         }
+    }
+
+    #[test]
+    fn a_bad_admission_body_env_value_is_an_error_naming_the_variable() {
+        use std::collections::HashMap;
+        let names = [
+            "ADMISSION_BODY_FIRST_BYTE_SECS",
+            "ADMISSION_BODY_GRACE_SECS",
+            "ADMISSION_BODY_MIN_RATE_KIB",
+        ];
+        for bad_name in names {
+            for bad in ["0", "abc"] {
+                let m: HashMap<&str, String> = [(bad_name, bad.to_string())].into();
+                let err = AdmissionBody::from_lookup(|n| m.get(n).cloned()).unwrap_err();
+                assert!(
+                    format!("{err:#}").contains(bad_name),
+                    "{bad_name}={bad}: {err:#}"
+                );
+            }
+        }
+        let m: HashMap<&str, String> = [
+            (names[0], "2".to_string()),
+            (names[1], "30".to_string()),
+            (names[2], "128".to_string()),
+        ]
+        .into();
+        let b = AdmissionBody::from_lookup(|n| m.get(n).cloned()).unwrap();
+        assert_eq!(b.first_byte, std::time::Duration::from_secs(2));
+        assert_eq!(b.grace, std::time::Duration::from_secs(30));
+        assert_eq!(b.min_rate, 128 * 1024);
     }
 
     #[test]
