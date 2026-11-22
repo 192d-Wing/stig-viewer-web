@@ -467,6 +467,7 @@ mod id_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::{td_operator, Run};
 
     fn asset() -> db_assets::AssetRow {
         let now = Utc::now();
@@ -537,6 +538,119 @@ mod tests {
                     r.y_mm
                 );
             }
+        }
+    }
+
+    fn section(title: &str, n: usize, special: bool) -> ChecklistSection {
+        let rules: Vec<RuleSummary> = (0..n)
+            .map(|i| RuleSummary {
+                id: format!("SV-{i}r1_rule"),
+                title: if special && i == 1 {
+                    "Rule 漢字 😀 title".into()
+                } else {
+                    format!("Rule {i} title")
+                },
+                severity: "medium".into(),
+                status: "open".into(),
+                finding_details: if special && i == 2 {
+                    "long finding detail ".repeat(15)
+                } else {
+                    "short".into()
+                },
+                attachments: 0,
+                weighted_score: 1.0,
+            })
+            .collect();
+        ChecklistSection {
+            stig_id: "S".into(),
+            stig_title: title.into(),
+            total: n,
+            open: n,
+            naf: 0,
+            na: 0,
+            not_reviewed: 0,
+            rules,
+        }
+    }
+
+    fn fixed_ts() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn rendered_td_coordinates_follow_layout_constants() {
+        let mut a = asset();
+        a.hostname = "web-01.example".into();
+        a.description = "word ".repeat(40);
+        let sections = [
+            section("First STIG", 25, false),
+            section("Second", 25, false),
+        ];
+        let doc = layout_report(&a, "Owner", &sections, fixed_ts());
+        let runs: Vec<Run> = (0..doc.page_count())
+            .flat_map(|p| doc.page_runs(p).to_vec())
+            .collect();
+        let pages = doc.page_count();
+        assert!(pages >= 2);
+        let first_page_y = PAGE_H - MARGIN_T;
+        assert_eq!(doc.page_runs(1)[0].y_mm, first_page_y);
+
+        // Wrapped description: consecutive lines differ by LH_BODY * 0.85.
+        let lines: Vec<&Run> = runs
+            .iter()
+            .filter(|r| r.text.starts_with("word word"))
+            .collect();
+        assert!(lines.len() >= 2);
+        assert_eq!(lines[1].y_mm, lines[0].y_mm - LH_BODY * 0.85);
+
+        let bytes = doc.finish();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains(&td_operator(MARGIN_L, PAGE_H - MARGIN_T)));
+        assert!(s.contains(&td_operator(
+            MARGIN_L + 28.0,
+            PAGE_H - MARGIN_T - 8.0 - LH_BODY
+        )));
+        assert!(s.contains(&td_operator(lines[1].x_mm, lines[1].y_mm)));
+        for r in &runs {
+            assert!(s.contains(&td_operator(r.x_mm, r.y_mm)), "{r:?}");
+        }
+    }
+
+    /// Sample generator for the real-viewer checks (#98).
+    ///
+    /// Always builds and asserts on the bytes; writes `asset-report-sample.pdf` only when
+    /// `PDF_SAMPLE_DIR` is set. From `backend/`:
+    /// `PDF_SAMPLE_DIR=/some/dir cargo test --locked pdf_sample`
+    ///
+    /// Look for: em dash, middle dot and ellipsis render as glyphs; CJK and
+    /// emoji show as `?`; the Title metadata keeps Unicode.
+    #[test]
+    fn pdf_sample_asset_report() {
+        let mut a = asset();
+        a.name = "web-01 — 漢字 😀".into();
+        a.description = "Primary host … · — notes".into();
+        let sections = [
+            section("First STIG", 25, true),
+            section("Second", 25, false),
+        ];
+        let mut doc = layout_report(&a, "Owner", &sections, fixed_ts());
+        doc.text("—·…漢😀", SIZE_SMALL, MARGIN_L, 10.0, Face::Regular);
+        assert!(doc.page_count() >= 2);
+        assert!(all_text(&doc).contains('…'));
+        let bytes = doc.finish();
+        assert!(bytes.starts_with(b"%PDF-"));
+        let s = String::from_utf8_lossy(&bytes).to_lowercase();
+        assert!(
+            s.contains("<97b7853f3f> tj"),
+            "unmappable chars not encoded"
+        );
+        if let Some(dir) = std::env::var_os("PDF_SAMPLE_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join("asset-report-sample.pdf"),
+                &bytes,
+            )
+            .unwrap();
         }
     }
 

@@ -100,6 +100,33 @@ jobs:
       # tests against the server started above.
       - run: cargo test --locked -- --ignored
 
+  # Enforces the `rust-version` declared in backend/Cargo.toml: the MSRV is
+  # read from the manifest so the two cannot drift.
+  backend-msrv:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the declared minimum Rust version
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          [ -n "$msrv" ] || { echo "no rust-version in backend/Cargo.toml" >&2; exit 1; }
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+
+      - run: cargo "+$MSRV" check --locked --all-targets
+
   # Decides whether a pull request touches anything e2e exercises. Pushes to
   # main always run e2e, whatever changed.
   changes:

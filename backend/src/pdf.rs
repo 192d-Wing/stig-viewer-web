@@ -182,6 +182,22 @@ fn win_ansi(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Test helper: the `Td` operator `finish()` emits for a run at the given
+/// millimetre position. pdf-writer prints integral f32 values without a
+/// fraction and everything else as the shortest round-trip decimal, which
+/// matches `Display` for these magnitudes.
+#[cfg(test)]
+pub(crate) fn td_operator(x_mm: f32, y_mm: f32) -> String {
+    fn num(v: f32) -> String {
+        if (v as i32) as f32 == v {
+            (v as i32).to_string()
+        } else {
+            v.to_string()
+        }
+    }
+    format!("{} {} Td", num(x_mm * MM), num(y_mm * MM))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,11 +218,16 @@ mod tests {
         assert_eq!(win_ansi("a\tb\nc"), b"abc");
     }
 
+    const SECOND_Y: f32 = 277.0 - 4.8;
+    const BOLD_X: f32 = 30.0;
+    const BOLD_Y: f32 = 250.5;
+
     fn sample() -> Vec<u8> {
         let mut d = TextDoc::new("T", 210.0, 297.0);
         d.text("Hello", 10.0, 18.0, 277.0, Face::Regular);
+        d.text("Second", 10.0, 18.0, SECOND_Y, Face::Regular);
         d.add_page();
-        d.text("Bold", 10.0, 18.0, 277.0, Face::Bold);
+        d.text("Bold", 10.0, BOLD_X, BOLD_Y, Face::Bold);
         d.add_page();
         d.text("Ital", 10.0, 18.0, 277.0, Face::Italic);
         d.finish()
@@ -235,6 +256,11 @@ mod tests {
         assert!(s.contains("/Encoding /WinAnsiEncoding"));
         assert!(s.contains("(Hello) Tj"));
         assert!(s.contains("51.023624 785.1969 Td"));
+        assert_eq!(td_operator(18.0, 277.0), "51.023624 785.1969 Td");
+        let second = td_operator(18.0, SECOND_Y);
+        assert!(s.contains(&format!("{second}\n(Second) Tj")), "{s}");
+        assert!(s.contains(&td_operator(BOLD_X, BOLD_Y)));
+        assert_eq!(count(&b, b" Td"), 4);
     }
 
     #[test]

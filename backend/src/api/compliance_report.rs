@@ -477,6 +477,7 @@ pub async fn download_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::td_operator;
 
     fn summary() -> ReportSummary {
         ReportSummary {
@@ -524,5 +525,72 @@ mod tests {
         let doc = layout_report(&summary(), &assets, &[], 30, Utc::now());
         assert!(doc.page_count() >= 2);
         assert!(all_text(&doc).iter().any(|s| s == "Classification"));
+    }
+
+    /// Sample generator for the real-viewer checks (#98).
+    ///
+    /// Always builds and asserts on the bytes; writes `fleet-compliance-sample.pdf` only when
+    /// `PDF_SAMPLE_DIR` is set. From `backend/`:
+    /// `PDF_SAMPLE_DIR=/some/dir cargo test --locked pdf_sample`
+    ///
+    /// Look for: em dash, middle dot and ellipsis render as glyphs; CJK and
+    /// emoji show as `?`; the Title metadata keeps Unicode.
+    ///
+    /// The fixture passes 45 rows straight to `layout_report`, more than the
+    /// production top-20 cap, so the 2-page layout is exercised. The heading
+    /// saying "top 20" above 45 rows is expected.
+    #[test]
+    fn pdf_sample_fleet_report() {
+        let mut sum = summary();
+        sum.assets = 45;
+        sum.top_asset_name = Some("db-01 — 漢 😀".into());
+        sum.top_asset_score = Some(7);
+        let assets: Vec<AssetLine> = (0..45)
+            .map(|i| AssetLine {
+                name: if i == 3 {
+                    "a-very-long-system-name-that-needs-truncation".into()
+                } else {
+                    format!("asset-{i}")
+                },
+                classification: "U".into(),
+                owner_name: match i {
+                    4 => "Owner With A Very Long Name".into(),
+                    5 => "漢字 😀 owner".into(),
+                    _ => "Owner".into(),
+                },
+                open_count: i,
+                compliance_score: 50.0,
+            })
+            .collect();
+        let rules = [
+            TopRuleLine {
+                rule_id: "SV-1r1_rule".into(),
+                affected: 12,
+            },
+            TopRuleLine {
+                rule_id: "SV-2r1_rule".into(),
+                affected: 3,
+            },
+        ];
+        let ts = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut doc = layout_report(&sum, &assets, &rules, 30, ts);
+        assert!(doc.page_count() >= 2);
+        assert!(all_text(&doc).iter().any(|s| s.contains('…')));
+        doc.text("—·…漢😀", SIZE_SMALL, MARGIN_L, 10.0, Face::Regular);
+        let bytes = doc.finish();
+        assert!(bytes.starts_with(b"%PDF-"));
+        let s = String::from_utf8_lossy(&bytes);
+        let kpi_y = PAGE_H - MARGIN_T - LH * 1.6 - LH * 0.8 - LH * 2.0 - LH * 1.4;
+        assert!(s.contains(&td_operator(MARGIN_L + 32.0, kpi_y)));
+        let lower = s.to_lowercase();
+        assert!(lower.contains("<97b7853f3f> tj"));
+        if let Some(dir) = std::env::var_os("PDF_SAMPLE_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join("fleet-compliance-sample.pdf"),
+                &bytes,
+            )
+            .unwrap();
+        }
     }
 }
