@@ -548,10 +548,12 @@ test.describe("Audit log search", () => {
       userRole: "system",
     });
     expect(sys.rows[0].detail.reasonCode).toBe("download_too_large");
+    expect(sys.rows[0].byName).toBeNull();
 
     const byAction = await (await request.get(`${BACKEND}/api/audit/events?action=catalog.sync`, h)).json();
     expect(byAction.totalCount).toBe(1);
     expect(byAction.rows[0].isSystem).toBe(true);
+    expect(byAction.rows[0].byName).toBeNull();
   });
 
   test("UI: a system event shows the System badge under Requests", async ({ page, request }) => {

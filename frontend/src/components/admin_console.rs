@@ -372,7 +372,8 @@ struct AuditSearch {
 #[serde(rename_all = "camelCase", default)]
 struct AuditEventRow {
     occurred_at: Option<String>,
-    by_name: String,
+    /// `null` for system rows; `is_system` is authoritative.
+    by_name: Option<String>,
     /// Server-computed: the event has no acting user. The UI keys on this,
     /// never on the `by_name` text.
     is_system: bool,
@@ -1298,7 +1299,7 @@ fn actor_cell(r: &AuditEventRow) -> ActorCell<'_> {
     if r.is_system {
         ActorCell::System
     } else {
-        ActorCell::Name(&r.by_name)
+        ActorCell::Name(r.by_name.as_deref().unwrap_or("—"))
     }
 }
 
@@ -1310,6 +1311,23 @@ const AUDIT_ACTOR_SYSTEM: &str = "__actor:system__";
 /// silently list everything. Requests accepts System, so it is kept there.
 fn view_switch_clears_user(selected: Option<&str>, target_view: &str) -> bool {
     target_view != "requests" && selected == Some(AUDIT_ACTOR_SYSTEM)
+}
+
+/// The audit view-switch handler: drops a lingering "System" actor selection
+/// (via `clear_user`) when the target view cannot honour it, then always
+/// resets the view state (via `reset`). A free function over `Callback`s so
+/// it runs in native tests; the component passes thin setters.
+fn view_switch_callback(
+    selected_user: Option<String>,
+    clear_user: Callback<()>,
+    reset: Callback<AttrValue>,
+) -> Callback<AttrValue> {
+    Callback::from(move |id: AttrValue| {
+        if view_switch_clears_user(selected_user.as_deref(), &id) {
+            clear_user.emit(());
+        }
+        reset.emit(id);
+    })
 }
 
 /// Query pairs (unencoded) for the audit endpoints. `actor=system` is sent
@@ -1473,13 +1491,7 @@ fn AuditSection(props: &SectionProps) -> Html {
             error.clone(),
             loading.clone(),
         );
-        let user = user.clone();
-        Callback::from(move |id: AttrValue| {
-            // The rules endpoint ignores `actor`, so a lingering "System"
-            // selection would silently list everything.
-            if view_switch_clears_user(user.as_ref().map(|o| o.value.as_str()), &id) {
-                user.set(None);
-            }
+        let reset = Callback::from(move |id: AttrValue| {
             view.set(id.to_string());
             rows.set(Vec::new());
             event_rows.set(Vec::new());
@@ -1488,7 +1500,16 @@ fn AuditSection(props: &SectionProps) -> Html {
             search_tick.set(0);
             error.set(None);
             loading.set(false);
-        })
+        });
+        // The one-line `user.set(None)` adapter is covered only by the e2e
+        // tail in `65-audit-search.spec.js`; `view_switch_callback` is
+        // unit-tested natively.
+        let selected = user.as_ref().map(|o| o.value.to_string());
+        let clear_user = {
+            let user = user.clone();
+            Callback::from(move |_: ()| user.set(None))
+        };
+        view_switch_callback(selected, clear_user, reset)
     };
     let on_user = {
         let user = user.clone();
@@ -2798,8 +2819,9 @@ mod audit_event_tests {
     #[test]
     fn is_system_comes_from_the_flag_not_the_name() {
         let r: AuditEventRow =
-            serde_json::from_value(json!({ "byName": "system", "isSystem": true })).unwrap();
+            serde_json::from_value(json!({ "byName": null, "isSystem": true })).unwrap();
         assert!(r.is_system);
+        assert_eq!(r.by_name, None);
         let r: AuditEventRow = serde_json::from_value(json!({ "byName": "system" })).unwrap();
         assert!(!r.is_system);
     }
@@ -2808,15 +2830,47 @@ mod audit_event_tests {
     fn the_by_cell_keys_on_the_flag_only() {
         let sys = AuditEventRow {
             is_system: true,
-            by_name: "system".into(),
+            by_name: None,
             ..AuditEventRow::default()
         };
         assert_eq!(actor_cell(&sys), ActorCell::System);
         let spoof = AuditEventRow {
-            by_name: "system".into(),
+            by_name: Some("system".into()),
             ..AuditEventRow::default()
         };
         assert_eq!(actor_cell(&spoof), ActorCell::Name("system"));
+        // A non-system row with no name falls back to the dash.
+        let nameless = AuditEventRow::default();
+        assert!(!nameless.is_system && nameless.by_name.is_none());
+        assert_eq!(actor_cell(&nameless), ActorCell::Name("—"));
+    }
+
+    #[test]
+    fn view_switch_callback_clears_a_system_actor_then_resets() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let run = |selected: Option<&str>, id: &str| {
+            let log: Rc<RefCell<Vec<String>>> = Rc::default();
+            let (l1, l2) = (log.clone(), log.clone());
+            let cb = view_switch_callback(
+                selected.map(str::to_string),
+                Callback::from(move |_: ()| l1.borrow_mut().push("clear".into())),
+                Callback::from(move |v: AttrValue| l2.borrow_mut().push(format!("reset:{v}"))),
+            );
+            cb.emit(AttrValue::from(id.to_string()));
+            let out = log.borrow().clone();
+            out
+        };
+        assert_eq!(
+            run(Some(AUDIT_ACTOR_SYSTEM), "rules"),
+            ["clear", "reset:rules"]
+        );
+        assert_eq!(
+            run(Some(AUDIT_ACTOR_SYSTEM), "requests"),
+            ["reset:requests"]
+        );
+        assert_eq!(run(Some("some-user-id"), "rules"), ["reset:rules"]);
+        assert_eq!(run(None, "rules"), ["reset:rules"]);
     }
 
     #[test]

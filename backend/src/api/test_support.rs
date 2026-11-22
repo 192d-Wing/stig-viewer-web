@@ -1,7 +1,7 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{get, post, MethodRouter},
     Json, Router,
 };
 use axum_extra::extract::cookie::{CookieJar, SameSite};
@@ -579,29 +579,49 @@ pub async fn system_audit_event_handler(State(state): State<AppState>) -> Status
     StatusCode::NO_CONTENT
 }
 
-/// Every path [`mount`] registers. Keep in step with `mount`: the router tests
-/// use it to prove each one is absent when the flag is off and present when on.
+/// Every test route and its method router: the single table [`mount`] folds
+/// and the router tests read their paths from.
+fn routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+    vec![
+        ("/api/test/reset", post(reset_handler)),
+        ("/api/test/set-role", post(set_role_handler)),
+        ("/api/test/snapshot", post(snapshot_handler)),
+        ("/api/test/backdate-rule", post(backdate_handler)),
+        (
+            "/api/test/backdate-baseline",
+            post(backdate_baseline_handler),
+        ),
+        ("/api/test/bump-stig", post(bump_stig_handler)),
+        ("/api/test/run-digest", post(run_digest_handler)),
+        ("/api/test/run-report", post(run_report_handler)),
+        ("/api/test/run-retention", post(run_retention_handler)),
+        (
+            "/api/test/run-asset-email-schedules",
+            post(run_asset_email_schedules_handler),
+        ),
+        ("/api/test/backdate-audit", post(backdate_audit_handler)),
+        ("/api/test/run-scheduler", post(run_scheduler_handler)),
+        (
+            "/api/test/inject-scheduler-error",
+            post(inject_scheduler_error_handler),
+        ),
+        ("/api/test/saml-login", post(saml_login_handler)),
+        ("/api/test/seed-archive", post(seed_archive_handler)),
+        ("/api/test/reset-ratelimit", post(reset_ratelimit_handler)),
+        ("/api/test/login-acks", get(login_acks_handler)),
+        (
+            "/api/test/system-audit-event",
+            post(system_audit_event_handler),
+        ),
+    ]
+}
+
+/// Every path [`mount`] registers; the router tests use it to prove each one
+/// is absent when the flag is off and present when on.
 #[cfg(test)]
-pub(crate) const ROUTE_PATHS: &[&str] = &[
-    "/api/test/reset",
-    "/api/test/set-role",
-    "/api/test/snapshot",
-    "/api/test/backdate-rule",
-    "/api/test/backdate-baseline",
-    "/api/test/bump-stig",
-    "/api/test/run-digest",
-    "/api/test/run-report",
-    "/api/test/run-retention",
-    "/api/test/run-asset-email-schedules",
-    "/api/test/backdate-audit",
-    "/api/test/run-scheduler",
-    "/api/test/inject-scheduler-error",
-    "/api/test/saml-login",
-    "/api/test/seed-archive",
-    "/api/test/reset-ratelimit",
-    "/api/test/login-acks",
-    "/api/test/system-audit-event",
-];
+pub(crate) fn route_paths() -> Vec<&'static str> {
+    routes().into_iter().map(|(p, _)| p).collect()
+}
 
 /// Merge the unauthenticated test-only routes into `app` when `enabled`
 /// (`STIG_ENABLE_TEST_ROUTES=true`); otherwise return `app` unchanged.
@@ -610,37 +630,9 @@ pub fn mount(app: Router, enabled: bool, state: AppState) -> Router {
     if !enabled {
         return app;
     }
-    let test_router: Router = Router::new()
-        .route("/api/test/reset", post(reset_handler))
-        .route("/api/test/set-role", post(set_role_handler))
-        .route("/api/test/snapshot", post(snapshot_handler))
-        .route("/api/test/backdate-rule", post(backdate_handler))
-        .route(
-            "/api/test/backdate-baseline",
-            post(backdate_baseline_handler),
-        )
-        .route("/api/test/bump-stig", post(bump_stig_handler))
-        .route("/api/test/run-digest", post(run_digest_handler))
-        .route("/api/test/run-report", post(run_report_handler))
-        .route("/api/test/run-retention", post(run_retention_handler))
-        .route(
-            "/api/test/run-asset-email-schedules",
-            post(run_asset_email_schedules_handler),
-        )
-        .route("/api/test/backdate-audit", post(backdate_audit_handler))
-        .route("/api/test/run-scheduler", post(run_scheduler_handler))
-        .route(
-            "/api/test/inject-scheduler-error",
-            post(inject_scheduler_error_handler),
-        )
-        .route("/api/test/saml-login", post(saml_login_handler))
-        .route("/api/test/seed-archive", post(seed_archive_handler))
-        .route("/api/test/reset-ratelimit", post(reset_ratelimit_handler))
-        .route("/api/test/login-acks", get(login_acks_handler))
-        .route(
-            "/api/test/system-audit-event",
-            post(system_audit_event_handler),
-        )
+    let test_router: Router = routes()
+        .into_iter()
+        .fold(Router::new(), |r, (p, m)| r.route(p, m))
         .with_state(state);
     app.merge(test_router)
 }
@@ -656,11 +648,11 @@ mod tests {
     async fn login_acks_route_is_404_when_test_routes_disabled() {
         let (state, _dir) = crate::test_fixtures::lazy_state();
         let app = mount(Router::new(), false, state);
-        for uri in ROUTE_PATHS {
+        for uri in route_paths() {
             for method in ["GET", "POST", "DELETE"] {
                 let req = Request::builder()
                     .method(method)
-                    .uri(*uri)
+                    .uri(uri)
                     .body(Body::empty())
                     .unwrap();
                 let resp = app.clone().oneshot(req).await.unwrap();
@@ -669,23 +661,19 @@ mod tests {
         }
     }
 
-    /// `ROUTE_PATHS` must list exactly the paths `mount` registers: read the
-    /// path literals out of `mount`'s own source.
+    /// An addition to the table is deliberate: bump the pinned count with it.
     #[test]
-    fn route_paths_match_the_routes_mount_registers() {
-        let src = include_str!("test_support.rs");
-        let start = src.find("pub fn mount(").unwrap();
-        let end = src.find("#[cfg(test)]\nmod tests").unwrap();
-        let mut found: Vec<&str> = src[start..end]
-            .split('"')
-            .skip(1)
-            .step_by(2)
-            .filter(|s| s.starts_with("/api/test/"))
-            .collect();
-        found.sort_unstable();
-        let mut listed = ROUTE_PATHS.to_vec();
-        listed.sort_unstable();
-        assert_eq!(found, listed);
+    fn the_route_table_is_well_formed() {
+        let paths = route_paths();
+        assert!(paths.iter().all(|p| p.starts_with("/api/test/")));
+        let unique: std::collections::BTreeSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "duplicate test route");
+        assert_eq!(
+            paths.len(),
+            18,
+            "test route added or removed: confirm the flag-off 404 gating tests \
+             (CM-7) cover it, then update this count"
+        );
     }
 
     #[sqlx::test]

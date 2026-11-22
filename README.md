@@ -484,9 +484,12 @@ cd backend && cargo clippy -- -D warnings
   `X-Request-Id` is ignored) and the source IP. Reading the audit log is itself
   recorded, as `audit.read` (view, bounded filters, page and rows returned).
   System-originated events have no user; `/api/audit/events` flags them
-  `isSystem` and filters them with `actor=system`. `isSystem` is the
-  authoritative field; `byName` is display-only (a user's display name can be
-  "system").
+  `isSystem` and filters them with `actor=system`. System rows have
+  `"byName": null`; `isSystem` is the authoritative field. A user whose display
+  name is "system" still appears with `byName: "system"` and
+  `isSystem: false`. API change (#160): `byName` used to be the literal
+  `"system"` for system rows; consumers must key on `isSystem` and treat
+  `byName` as nullable.
 - Audit writes fail open: if a row cannot be written, the request still
   completes and the backend logs an error on the `audit` target containing
   `failed to write audit event`, with the user, action, outcome and ids. Alert
@@ -518,7 +521,10 @@ cd backend && cargo clippy -- -D warnings
   admins (who are still limited to 4 each). `HEAD` on the audit read routes
   counts like `GET`. A mutation by a `viewer` that the read-only gate will
   refuse takes no permit: it always gets 403 (with its `authz.denied` record,
-  bounded by the rate limiter and the per-user denied limit), never 429 or 503. The bound is strict only while the database pool is
+  bounded by the rate limiter and the per-user denied limit), never 429 or 503
+  (backend DB tests cover this, including at the cap; there is no browser test
+  for the at-the-cap case, which would need permits held in flight and so a new
+  test hook, #175). The bound is strict only while the database pool is
   healthy: a stalled audit insert can leave a request's late writes pending
   under its permit. A permit is also held while a request body is still being
   received, so bodies are rate-checked once the handler starts reading them:

@@ -79,10 +79,7 @@ use api::{
         list_for_rule_handler as list_attachments_for_rule_handler,
         upload_handler as upload_attachment_handler,
     },
-    audit::{
-        activity_handler, events_handler as audit_events_handler, rule_history_handler,
-        search_handler as audit_search_handler,
-    },
+    audit::{activity_handler, rule_history_handler},
     auth::{
         auth_middleware, build_oidc_context, callback_handler, list_users_handler, login_handler,
         logout_handler, me_handler, AppAuthState, OidcEnv,
@@ -520,14 +517,7 @@ fn build_app(
                 get(download_attachment_handler).delete(delete_attachment_handler),
             )
             .route("/api/activity", get(activity_handler))
-            .route(
-                api::admission::AUDITED_READ_ROUTES[0],
-                get(audit_search_handler),
-            )
-            .route(
-                api::admission::AUDITED_READ_ROUTES[1],
-                get(audit_events_handler),
-            )
+            .merge(api::audit::audited_reads_router())
             .route(
                 "/api/drafts",
                 get(list_drafts_handler).post(create_draft_handler),
@@ -731,6 +721,8 @@ async fn main() -> Result<()> {
         std::env::var("STIG_ENV").ok().as_deref(),
         config.seed_dir.as_deref(),
     )?;
+    // A bad ADMISSION_BODY_* value stops startup here; wiring is tested in
+    // `config::tests::a_bad_admission_body_env_value_is_an_error_naming_the_variable`.
     let admission_body = config::AdmissionBody::from_env()?;
     info!(
         first_byte_secs = admission_body.first_byte.as_secs(),
@@ -1318,7 +1310,7 @@ mod router_tests {
             allow_test_auth_header: true,
         };
         let (app, _dir) = app(&hooks);
-        for path in api::test_support::ROUTE_PATHS {
+        for path in api::test_support::route_paths() {
             for method in ["POST", "GET", "DELETE"] {
                 assert_eq!(
                     status(&app, method, path, None).await,
@@ -1341,7 +1333,7 @@ mod router_tests {
             allow_test_auth_header: false,
         };
         let (app, _dir) = app(&hooks);
-        for path in api::test_support::ROUTE_PATHS {
+        for path in api::test_support::route_paths() {
             assert_eq!(
                 status(&app, "DELETE", path, None).await,
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -1372,12 +1364,17 @@ mod router_tests {
     /// The assembled router with the test auth header on: `X-User-Id` names
     /// the caller (the user must be seeded; its id is the header value).
     fn db_app(state: AppState) -> Router {
+        db_app_with(state, false)
+    }
+
+    /// [`db_app`] with the test routes mounted when `enable_test_routes`.
+    fn db_app_with(state: AppState, enable_test_routes: bool) -> Router {
         let mut auth = test_fixtures::auth_state(&state);
         auth.oidc.allow_test_auth_header = true;
         let saml = test_fixtures::saml_state(&state);
         let hooks = TestHooks {
             production: false,
-            enable_test_routes: false,
+            enable_test_routes,
             allow_test_auth_header: true,
         };
         build_app(state, auth, saml, CorsLayer::new(), &hooks)
@@ -1562,6 +1559,33 @@ mod router_tests {
             stats,
             "health neither takes nor refuses a permit"
         );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_system_audit_event_test_route_works_through_the_full_router(pool: PgPool) {
+        let rows = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_events WHERE user_id IS NULL \
+                 AND user_role = 'system' AND action = 'catalog.sync'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let (state, _dir) = test_fixtures::app_state(pool.clone());
+        let on = db_app_with(state, true);
+        let r = send(&on, "POST", "/api/test/system-audit-event", None, None).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        crate::db_audit::drain().await;
+        assert_eq!(rows().await, 1);
+
+        let (state, _dir2) = test_fixtures::app_state(pool.clone());
+        let off = db_app_with(state, false);
+        let r = send(&off, "POST", "/api/test/system-audit-event", None, None).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        crate::db_audit::drain().await;
+        assert_eq!(rows().await, 1);
     }
 
     #[sqlx::test]
