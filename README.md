@@ -491,7 +491,15 @@ cd backend && cargo clippy -- -D warnings
   completes and the backend logs an error on the `audit` target containing
   `failed to write audit event`, with the user, action, outcome and ids. Alert
   on that line, and ship the application logs to a retained store, since it is
-  the only record of an event that missed the database (AU-5).
+  the only record of an event that missed the database (AU-5). On
+  `GET /api/health`, `checks.audit` is `degraded` after any such failure in the
+  last 15 minutes and also reports `sustained: true` when failures span at
+  least 3 distinct minutes of that window (an outage, not a blip); neither
+  changes the HTTP status. Both are per replica. Check `shedWrites` on
+  `GET /api/admin/failure-counters` and the "beyond the tracked set" log line
+  before paging on `sustained` (colluding accounts flooding denied events, or
+  a full queue, can raise it), and a replica with little audit traffic may
+  never reach it, so also page on the `failed to write audit event` log line.
 - Audit writes run as detached tasks, so a client that disconnects does not
   lose its event. A caller waits at most 5 s; a write still running then
   finishes on its own (counted as `lateWrites` on
