@@ -111,8 +111,7 @@ pub async fn prune_acks(pool: &PgPool) -> Result<u64> {
 pub async fn prune_acks_tick(pool: &PgPool, counter: &FailureCounter) {
     match prune_acks(pool).await {
         Ok(_) => {
-            let streak = counter.snapshot().consecutive;
-            counter.record_success();
+            let streak = counter.record_success();
             if streak > 0 {
                 tracing::info!("login ack prune recovered after {streak} failures");
             }

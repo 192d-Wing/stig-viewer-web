@@ -91,7 +91,8 @@ test.describe("Deep /api/health", () => {
     // timestamps are admin-only (see the admin test below).
     expect(["ok", "degraded"]).toContain(body.checks.audit.status);
     expect(["ok", "degraded"]).toContain(body.checks.loginAckPrune.status);
-    expect(Object.keys(body.checks.audit)).toEqual(["status"]);
+    expect(Object.keys(body.checks.audit).sort()).toEqual(["status", "sustained"]);
+    expect(typeof body.checks.audit.sustained).toBe("boolean");
     expect(Object.keys(body.checks.loginAckPrune)).toEqual(["status"]);
   });
 
@@ -102,6 +103,19 @@ test.describe("Deep /api/health", () => {
     await ensureUser(request, "bob");
     await setUserRole("alice", "admin");
     await setUserRole("bob", "author");
+    await ensureUser(request, "vera");
+    await setUserRole("vera", "viewer");
+
+    const anon = await request.fetch(`${BACKEND}/api/admin/failure-counters`, {
+      method: "GET",
+      headers: {},
+    });
+    expect(anon.status()).toBe(401);
+
+    const viewerDenied = await request.get(`${BACKEND}/api/admin/failure-counters`, {
+      headers: { "X-User-Id": "vera" },
+    });
+    expect(viewerDenied.status()).toBe(403);
 
     const denied = await request.get(`${BACKEND}/api/admin/failure-counters`, {
       headers: { "X-User-Id": "bob" },
@@ -117,6 +131,8 @@ test.describe("Deep /api/health", () => {
     expect(typeof body.audit.lateWrites).toBe("number");
     expect(typeof body.audit.pendingWrites).toBe("number");
     expect(typeof body.audit.shedWrites).toBe("number");
+    expect(typeof body.audit.sustained).toBe("boolean");
+    expect(typeof body.audit.failureMinutes).toBe("number");
     expect(typeof body.admission.inFlight).toBe("number");
     expect(typeof body.admission.refusedUser).toBe("number");
     expect(typeof body.admission.refusedGlobal).toBe("number");
