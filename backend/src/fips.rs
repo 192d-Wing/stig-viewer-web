@@ -28,7 +28,7 @@ pub enum PendingAlg {
 }
 
 impl PendingAlg {
-    pub const ALL: &'static [PendingAlg] = &[
+    pub const ALL: &[PendingAlg] = &[
         PendingAlg::MlDsa87,
         PendingAlg::MlKem768,
         PendingAlg::MlKem1024,
