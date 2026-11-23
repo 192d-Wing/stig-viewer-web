@@ -44,6 +44,7 @@ use axum::{
 };
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -769,8 +770,27 @@ fn build_app(
 
     let app = api::test_support::mount(app, test_hooks.enable_test_routes, state.clone());
 
+    // Inside CORS (so the 500 carries CORS headers) and outside every route and
+    // middleware (so a panic anywhere below becomes a 500, not a dropped connection).
     app.layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
+        .layer(CatchPanicLayer::custom(panic_response))
         .layer(cors)
+}
+
+/// 500 for a caught panic. The payload is logged, never returned.
+fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let msg = err
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| err.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    tracing::error!(panic = msg, "request handler panicked");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({"error": "internal error"})),
+    )
+        .into_response()
 }
 
 #[tokio::main]
@@ -1343,6 +1363,25 @@ mod router_tests {
     use super::*;
     use axum::{body::Body, http::Request, http::StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn a_panicking_route_becomes_a_generic_500_with_cors() {
+        async fn boom() -> &'static str {
+            panic!("secret-detail");
+        }
+        let app = Router::new()
+            .route("/boom", get(boom))
+            .layer(CatchPanicLayer::custom(panic_response))
+            .layer(CorsLayer::permissive());
+        let res = app
+            .oneshot(Request::get("/boom").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(res.headers().contains_key("access-control-allow-origin"));
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"internal error"}"#);
+    }
 
     fn app(hooks: &TestHooks) -> (Router, test_fixtures::StigDir) {
         let (state, dir) = test_fixtures::lazy_state();

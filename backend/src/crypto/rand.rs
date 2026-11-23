@@ -27,7 +27,8 @@ pub fn try_uuid_v4() -> Result<uuid::Uuid, RandError> {
 
 /// v4 UUID from the module DRBG. A DRBG failure is unrecoverable (the process
 /// cannot mint an unpredictable identifier), so this panics rather than fall
-/// back to a weaker source; a panic in a request task is a 500.
+/// back to a weaker source; the router's `CatchPanicLayer` turns a panic in
+/// a request into a 500.
 pub fn uuid_v4() -> uuid::Uuid {
     match try_uuid_v4() {
         Ok(u) => u,
