@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { randomBytes } from "node:crypto";
 import { resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 // Address that's guaranteed to fail to connect (port 1 reserved/unused
@@ -128,7 +129,7 @@ test.describe("Outbound webhooks", () => {
     await ensureUser(request, "alice");
     await setUserRole("alice", "admin");
     const url = `https://example.invalid/hook/${Date.now()}-path-credential`;
-    const secret = `s-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const secret = `s-${randomBytes(16).toString("hex")}`;
     const created = await request
       .post(`${BACKEND}/api/webhooks`, {
         headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
