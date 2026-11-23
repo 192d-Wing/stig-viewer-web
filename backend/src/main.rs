@@ -775,10 +775,12 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Refuse to start when the FIPS build cannot confirm the validated module
-    // is in FIPS mode. Must stay before the migrate dispatch, DB access and
-    // bind (fail-closed, #64).
-    let _fips_policy = fips::startup_guard()?;
+    // Refuse to start when the FIPS build cannot confirm the FIPS module is
+    // in FIPS mode, or STIG_REQUIRE_FIPS is set on a non-FIPS build. Must stay
+    // before the migrate dispatch, DB access and bind (fail-closed, #64). The
+    // guard applies to `migrate`; the audit event is written only on server
+    // startup.
+    let fips_startup = fips::startup_guard()?;
 
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -817,6 +819,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(config.data_dir.join("stigs")).await?;
 
     let pool = Arc::new(open_database(&config, &test_hooks).await?);
+    fips::record_policy_event(&pool, &fips_startup).await;
     let _ = stig_id::warn_non_conforming(&pool).await;
 
     if let Some(seed_dir) = &config.seed_dir {
