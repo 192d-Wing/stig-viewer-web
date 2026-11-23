@@ -488,10 +488,24 @@ refuses to start unless it reports FIPS mode. Building it needs CMake, Go, Perl
 and a C compiler. On macOS the module is a dylib (cargo run/test find it) and
 macOS is not a validated environment.
 
-What this does and does not establish: the `fips` binary shows the validated
-module is linked and in FIPS mode. No application crypto uses it yet
+What this does and does not establish: the `fips` binary shows the AWS-LC FIPS
+module is linked and in FIPS mode. AWS-LC-FIPS 4.x is in process with CMVP and
+no certificate is confirmed, so the whole module is pending validation, not
+only the post-quantum algorithms. No application crypto uses it yet
 (`ed25519-dalek`, `sha2`, `hmac` and `rsa` remain; tracked in #65) and TLS
 still runs on ring. It is not a FIPS-compliance claim for the application.
+
+`STIG_REQUIRE_FIPS=1` (or `true`) makes a build without the `fips` feature
+refuse to start; `0`, `false` or unset leaves it off, and any other value stops
+startup. It also applies to `migrate`. Set it in production only on images
+built with `--features fips`.
+
+At server startup (not for `migrate`) one `system.fips_policy` audit event is
+written with the detail keys `fipsCompiled`, `fipsModeActive`, `requireFips`,
+`appCryptoInModule` (always `false` until #65) and `pendingAlgs` (the validated
+`STIG_FIPS_PENDING_ALGS` list). A refused start has no audit row, only a
+`target: "audit"` log line; if the audit write itself fails, it is logged the
+same way and startup continues.
 
 ## Operations: audit
 
