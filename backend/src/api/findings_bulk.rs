@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use sqlx::PgPool;
 
 use crate::api::asset_acl;
 use crate::api::auth::AuthUser;
@@ -179,31 +180,38 @@ struct Resolved {
     requires_approval: bool,
 }
 
-async fn bulk_work(
-    state: AppState,
-    user: AuthUser,
-    ctx: RequestCtx,
-    req: BulkRequest,
-) -> Result<Json<BulkResponse>, StatusCode> {
-    let pool = state.pool.as_ref();
-    let rejected_event = |reason: &'static str| {
+/// The caller and request context, borrowed by the phase helpers so each
+/// can emit the same audit events as the handler.
+struct Actor<'a> {
+    pool: &'a PgPool,
+    user: &'a AuthUser,
+    ctx: &'a RequestCtx,
+    requested: usize,
+}
+
+impl Actor<'_> {
+    async fn rejected(&self, reason: &'static str) {
         db_audit::record_or_log(
-            pool,
+            self.pool,
             NewAuditEvent {
-                user_id: &user.id,
-                ctx: Some(&ctx),
+                user_id: &self.user.id,
+                ctx: Some(self.ctx),
                 action: "findings.bulk_update",
                 outcome: "rejected",
                 asset_id: None,
                 checklist_id: None,
                 stig_id: None,
-                detail: json!({ "reason": reason, "requested": req.targets.len() }),
+                detail: json!({ "reason": reason, "requested": self.requested }),
             },
         )
-    };
+        .await;
+    }
+}
 
+/// First request-shape problem, in precedence order, if any.
+fn bad_request_reason(req: &BulkRequest) -> Option<&'static str> {
     let patch = &req.patch;
-    let bad_request = if req.targets.is_empty() {
+    if req.targets.is_empty() {
         Some("no_targets")
     } else if patch
         .status
@@ -232,16 +240,16 @@ async fn bulk_work(
         Some("comments_invalid")
     } else {
         None
-    };
-    if let Some(reason) = bad_request {
-        rejected_event(reason).await;
-        return Err(StatusCode::BAD_REQUEST);
     }
+}
 
-    // Resolve every target's checklist to its asset in one query. Ids that
-    // cannot exist (NUL, over-long) are never sent to the database.
-    let lookup_ids: Vec<&str> = req
-        .targets
+/// Resolve every target's checklist to its asset in one query. Ids that
+/// cannot exist (NUL, over-long) are never sent to the database.
+async fn resolve_checklists(
+    pool: &PgPool,
+    targets: &[BulkTarget],
+) -> Result<HashMap<String, Resolved>, StatusCode> {
+    let lookup_ids: Vec<&str> = targets
         .iter()
         .map(|t| t.checklist_id.as_str())
         .filter(|id| id.len() <= MAX_CHECKLIST_ID_BYTES && !has_nul(id))
@@ -258,7 +266,7 @@ async fn bulk_work(
         tracing::error!("findings bulk checklist lookup failed: {e:#}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let resolved: HashMap<String, Resolved> = rows
+    Ok(rows
         .into_iter()
         .map(|(id, asset_id, stig_id, requires_approval)| {
             (
@@ -270,51 +278,60 @@ async fn bulk_work(
                 },
             )
         })
-        .collect();
+        .collect())
+}
 
-    // Request-order walk; the write check runs lazily, once per distinct
-    // asset, and the first unknown or forbidden target ends the request.
+/// Request-order walk; the write check runs lazily, once per distinct
+/// asset, and the first unknown or forbidden target ends the request.
+async fn authorize_targets(
+    actor: &Actor<'_>,
+    targets: &[BulkTarget],
+    resolved: &HashMap<String, Resolved>,
+) -> Result<(), StatusCode> {
     let mut can_write: HashMap<&str, bool> = HashMap::new();
-    for t in &req.targets {
+    for t in targets {
         let Some(r) = resolved.get(&t.checklist_id) else {
-            rejected_event("unknown_checklist").await;
+            actor.rejected("unknown_checklist").await;
             return Err(StatusCode::NOT_FOUND);
         };
         let ok = match can_write.get(r.asset_id.as_str()) {
             Some(v) => *v,
             None => {
-                let v = asset_acl::user_can(pool, &r.asset_id, &user, "write").await;
+                let v = asset_acl::user_can(actor.pool, &r.asset_id, actor.user, "write").await;
                 can_write.insert(r.asset_id.as_str(), v);
                 v
             }
         };
         if !ok {
             db_audit::record_or_log(
-                pool,
+                actor.pool,
                 NewAuditEvent {
-                    user_id: &user.id,
-                    ctx: Some(&ctx),
+                    user_id: &actor.user.id,
+                    ctx: Some(actor.ctx),
                     action: "findings.bulk_update",
                     outcome: "denied",
                     asset_id: Some(&r.asset_id),
                     checklist_id: Some(&t.checklist_id),
                     stig_id: Some(&r.stig_id),
-                    detail: json!({ "reason": "forbidden", "requested": req.targets.len() }),
+                    detail: json!({ "reason": "forbidden", "requested": actor.requested }),
                 },
             )
             .await;
             return Err(StatusCode::FORBIDDEN);
         }
     }
+    Ok(())
+}
 
-    // An unknown assignee would fail every chunk on the foreign key.
+/// An unknown assignee would fail every chunk on the foreign key.
+async fn check_assignee(actor: &Actor<'_>, patch: &BulkPatch) -> Result<(), StatusCode> {
     if let Some(Some(assignee)) = &patch.assignee_id {
         let exists = if assignee.len() > MAX_CHECKLIST_ID_BYTES || has_nul(assignee) {
             false
         } else {
             sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
                 .bind(assignee)
-                .fetch_one(pool)
+                .fetch_one(actor.pool)
                 .await
                 .map_err(|e| {
                     tracing::error!("findings bulk assignee lookup failed: {e:#}");
@@ -322,16 +339,19 @@ async fn bulk_work(
                 })?
         };
         if !exists {
-            rejected_event("unknown_assignee").await;
+            actor.rejected("unknown_assignee").await;
             return Err(StatusCode::BAD_REQUEST);
         }
     }
+    Ok(())
+}
 
-    // Group the distinct targets by checklist, in first-seen order.
+/// Group the distinct targets by checklist, in first-seen order.
+fn group_targets(targets: &[BulkTarget]) -> Vec<(&str, Vec<&str>)> {
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     let mut group_of: HashMap<&str, usize> = HashMap::new();
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
-    for t in &req.targets {
+    for t in targets {
         if !seen.insert((t.checklist_id.as_str(), t.rule_id.as_str())) {
             continue;
         }
@@ -341,7 +361,229 @@ async fn bulk_work(
         });
         groups[i].1.push(t.rule_id.as_str());
     }
+    groups
+}
 
+/// The rule ids of a STIG, or `None` when the STIG cannot be loaded.
+async fn known_rule_ids(
+    state: &AppState,
+    stig_id: &str,
+    checklist_id: &str,
+) -> Option<HashSet<String>> {
+    match load_stig_json(state, stig_id).await {
+        Ok(mut v) => Some(
+            take_rules(&mut v)
+                .iter()
+                .filter_map(|x| x.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect::<HashSet<String>>(),
+        ),
+        Err(code) => {
+            tracing::warn!(
+                "findings bulk: STIG {stig_id} unavailable ({code}) for checklist {checklist_id}"
+            );
+            None
+        }
+    }
+}
+
+/// Per-target result of one checklist: Ok(applied status, note) or Err(reason).
+type TargetResult = Result<(&'static str, bool), String>;
+
+async fn apply_group(
+    pool: &PgPool,
+    user_id: &str,
+    checklist_id: &str,
+    rule_ids: &[&str],
+    known: Option<&HashSet<String>>,
+    requires_approval: bool,
+    patch: &BulkPatch,
+) -> Vec<TargetResult> {
+    let Some(known) = known else {
+        return rule_ids
+            .iter()
+            .map(|_| Err("STIG unavailable for this checklist".to_string()))
+            .collect();
+    };
+    let existing = match db_checklists::list_rule_overrides(pool, checklist_id).await {
+        Err(e) => {
+            tracing::error!("findings bulk rule snapshot failed: {e:#}");
+            return rule_ids
+                .iter()
+                .map(|_| Err("failed to read checklist state".to_string()))
+                .collect();
+        }
+        Ok(existing) => existing,
+    };
+    let existing: HashMap<String, ChecklistRuleRow> = existing
+        .into_iter()
+        .map(|r| (r.rule_id.clone(), r))
+        .collect();
+    let planned: Vec<(Plan, Option<String>)> = rule_ids
+        .iter()
+        .map(|id| {
+            plan_target(
+                known.contains(*id),
+                existing.get(*id),
+                patch,
+                requires_approval,
+            )
+        })
+        .collect();
+    let (plans, expects): (Vec<Plan>, Vec<Option<String>>) = planned.into_iter().unzip();
+    let ops: Vec<RuleOp<'_>> = rule_ids
+        .iter()
+        .zip(plans)
+        .zip(&expects)
+        .map(|((&rule_id, plan), expect)| RuleOp {
+            rule_id,
+            status: patch.status.as_deref().unwrap_or(""),
+            write_status: patch.status.is_some(),
+            expect_status: expect.as_deref(),
+            finding_details: patch
+                .finding_details
+                .as_deref()
+                .filter(|d| !d.trim().is_empty()),
+            comments: patch.comments.as_deref(),
+            assignee_id: patch.assignee_id.as_ref().map(|o| o.as_deref()),
+            due_date: patch.due_date,
+            plan,
+        })
+        .collect();
+    apply_plans(pool, checklist_id, user_id, &ops)
+        .await
+        .into_iter()
+        .map(|o| o.map(|a| (a.status, a.note.is_some())))
+        .collect()
+}
+
+/// Counts and rejected targets of one checklist.
+struct GroupTally {
+    requested: usize,
+    applied: usize,
+    queued: usize,
+    already: usize,
+    errors: usize,
+    rejected: Vec<(String, String)>,
+}
+
+/// Fold per-target results into counts, pushing each error onto `errors_out`.
+fn tally_group(
+    checklist_id: &str,
+    rule_ids: &[&str],
+    results: Vec<TargetResult>,
+    errors_out: &mut Vec<BulkTargetError>,
+) -> GroupTally {
+    let mut t = GroupTally {
+        requested: rule_ids.len(),
+        applied: 0,
+        queued: 0,
+        already: 0,
+        errors: 0,
+        rejected: Vec::new(),
+    };
+    for (rule_id, res) in rule_ids.iter().zip(results) {
+        match res {
+            Ok((STATUS_PENDING_APPROVAL, true)) => t.already += 1,
+            Ok((STATUS_PENDING_APPROVAL, false)) => t.queued += 1,
+            Ok(_) => t.applied += 1,
+            Err(error) => {
+                t.errors += 1;
+                t.rejected.push((short_id(rule_id), error.clone()));
+                errors_out.push(BulkTargetError {
+                    checklist_id: checklist_id.to_string(),
+                    rule_id: short_id(rule_id),
+                    error,
+                });
+            }
+        }
+    }
+    t
+}
+
+/// Audit one checklist's outcome: the log line is the fallback when the
+/// durable write fails.
+async fn record_group(
+    actor: &Actor<'_>,
+    r: &Resolved,
+    checklist_id: &str,
+    patch: &BulkPatch,
+    fields: &[&'static str],
+    tally: &GroupTally,
+    checklists_in_request: usize,
+) {
+    let GroupTally {
+        requested,
+        applied,
+        queued,
+        already,
+        errors,
+        rejected,
+    } = tally;
+    tracing::info!(
+        target: "audit",
+        user_id = %actor.user.id,
+        asset_id = %r.asset_id,
+        stig_id = %r.stig_id,
+        checklist_id = %checklist_id,
+        applied,
+        pending = queued + already,
+        already_pending = already,
+        errors,
+        "findings bulk update"
+    );
+    let (rejected_list, rejected_truncated) = db_audit::rejected_detail(rejected);
+    db_audit::record_or_log(
+        actor.pool,
+        NewAuditEvent {
+            user_id: &actor.user.id,
+            ctx: Some(actor.ctx),
+            action: "findings.bulk_update",
+            outcome: if *errors > 0 { "partial" } else { "ok" },
+            asset_id: Some(&r.asset_id),
+            checklist_id: Some(checklist_id),
+            stig_id: Some(&r.stig_id),
+            detail: json!({
+                "targetStatus": patch.status,
+                "fields": fields,
+                "requested": requested,
+                "applied": applied,
+                // As in bulk-status, `pending` includes `alreadyPending`;
+                // the response counts are disjoint.
+                "pending": queued + already,
+                "alreadyPending": already,
+                "errors": errors,
+                "rejected": rejected_list,
+                "rejectedTruncated": rejected_truncated,
+                "checklistsInRequest": checklists_in_request,
+            }),
+        },
+    )
+    .await;
+}
+
+async fn bulk_work(
+    state: AppState,
+    user: AuthUser,
+    ctx: RequestCtx,
+    req: BulkRequest,
+) -> Result<Json<BulkResponse>, StatusCode> {
+    let pool = state.pool.as_ref();
+    let actor = Actor {
+        pool,
+        user: &user,
+        ctx: &ctx,
+        requested: req.targets.len(),
+    };
+    let patch = &req.patch;
+    if let Some(reason) = bad_request_reason(&req) {
+        actor.rejected(reason).await;
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let resolved = resolve_checklists(pool, &req.targets).await?;
+    authorize_targets(&actor, &req.targets, &resolved).await?;
+    check_assignee(&actor, patch).await?;
+
+    let groups = group_targets(&req.targets);
     let fields = patch_fields(patch);
     let mut response = BulkResponse {
         updated: 0,
@@ -356,147 +598,33 @@ async fn bulk_work(
             continue;
         };
         if !stigs.contains_key(&r.stig_id) {
-            let known = match load_stig_json(&state, &r.stig_id).await {
-                Ok(mut v) => Some(
-                    take_rules(&mut v)
-                        .iter()
-                        .filter_map(|x| x.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                        .collect::<HashSet<String>>(),
-                ),
-                Err(code) => {
-                    tracing::warn!(
-                        "findings bulk: STIG {} unavailable ({code}) for checklist {checklist_id}",
-                        r.stig_id
-                    );
-                    None
-                }
-            };
+            let known = known_rule_ids(&state, &r.stig_id, checklist_id).await;
             stigs.insert(r.stig_id.clone(), known);
         }
-        // Per-target results of this checklist: Ok(applied status, note) or Err(reason).
-        let results: Vec<Result<(&'static str, bool), String>> =
-            match stigs.get(&r.stig_id).and_then(Option::as_ref) {
-                None => rule_ids
-                    .iter()
-                    .map(|_| Err("STIG unavailable for this checklist".to_string()))
-                    .collect(),
-                Some(known) => match db_checklists::list_rule_overrides(pool, checklist_id).await {
-                    Err(e) => {
-                        tracing::error!("findings bulk rule snapshot failed: {e:#}");
-                        rule_ids
-                            .iter()
-                            .map(|_| Err("failed to read checklist state".to_string()))
-                            .collect()
-                    }
-                    Ok(existing) => {
-                        let existing: HashMap<String, ChecklistRuleRow> = existing
-                            .into_iter()
-                            .map(|r| (r.rule_id.clone(), r))
-                            .collect();
-                        let planned: Vec<(Plan, Option<String>)> = rule_ids
-                            .iter()
-                            .map(|id| {
-                                plan_target(
-                                    known.contains(*id),
-                                    existing.get(*id),
-                                    patch,
-                                    r.requires_approval,
-                                )
-                            })
-                            .collect();
-                        let (plans, expects): (Vec<Plan>, Vec<Option<String>>) =
-                            planned.into_iter().unzip();
-                        let ops: Vec<RuleOp<'_>> = rule_ids
-                            .iter()
-                            .zip(plans)
-                            .zip(&expects)
-                            .map(|((&rule_id, plan), expect)| RuleOp {
-                                rule_id,
-                                status: patch.status.as_deref().unwrap_or(""),
-                                write_status: patch.status.is_some(),
-                                expect_status: expect.as_deref(),
-                                finding_details: patch
-                                    .finding_details
-                                    .as_deref()
-                                    .filter(|d| !d.trim().is_empty()),
-                                comments: patch.comments.as_deref(),
-                                assignee_id: patch.assignee_id.as_ref().map(|o| o.as_deref()),
-                                due_date: patch.due_date,
-                                plan,
-                            })
-                            .collect();
-                        apply_plans(pool, checklist_id, &user.id, &ops)
-                            .await
-                            .into_iter()
-                            .map(|o| o.map(|a| (a.status, a.note.is_some())))
-                            .collect()
-                    }
-                },
-            };
-
-        let (mut applied, mut queued, mut already, mut errors) = (0usize, 0usize, 0usize, 0usize);
-        let mut rejected: Vec<(String, String)> = Vec::new();
-        for (rule_id, res) in rule_ids.iter().zip(results) {
-            match res {
-                Ok((STATUS_PENDING_APPROVAL, true)) => already += 1,
-                Ok((STATUS_PENDING_APPROVAL, false)) => queued += 1,
-                Ok(_) => applied += 1,
-                Err(error) => {
-                    errors += 1;
-                    rejected.push((short_id(rule_id), error.clone()));
-                    response.errors.push(BulkTargetError {
-                        checklist_id: checklist_id.to_string(),
-                        rule_id: short_id(rule_id),
-                        error,
-                    });
-                }
-            }
-        }
-        response.updated += applied;
-        response.pending_approval += queued;
-        response.already_pending += already;
-        response.error_count += errors;
-
-        // The durable record is written below; this line stays as the
-        // fallback when that write fails.
-        tracing::info!(
-            target: "audit",
-            user_id = %user.id,
-            asset_id = %r.asset_id,
-            stig_id = %r.stig_id,
-            checklist_id = %checklist_id,
-            applied,
-            pending = queued + already,
-            already_pending = already,
-            errors,
-            "findings bulk update"
-        );
-        let (rejected_list, rejected_truncated) = db_audit::rejected_detail(&rejected);
-        db_audit::record_or_log(
+        let known = stigs.get(&r.stig_id).and_then(Option::as_ref);
+        let results = apply_group(
             pool,
-            NewAuditEvent {
-                user_id: &user.id,
-                ctx: Some(&ctx),
-                action: "findings.bulk_update",
-                outcome: if errors > 0 { "partial" } else { "ok" },
-                asset_id: Some(&r.asset_id),
-                checklist_id: Some(checklist_id),
-                stig_id: Some(&r.stig_id),
-                detail: json!({
-                    "targetStatus": patch.status,
-                    "fields": fields,
-                    "requested": rule_ids.len(),
-                    "applied": applied,
-                    // As in bulk-status, `pending` includes `alreadyPending`;
-                    // the response counts are disjoint.
-                    "pending": queued + already,
-                    "alreadyPending": already,
-                    "errors": errors,
-                    "rejected": rejected_list,
-                    "rejectedTruncated": rejected_truncated,
-                    "checklistsInRequest": groups.len(),
-                }),
-            },
+            &user.id,
+            checklist_id,
+            rule_ids,
+            known,
+            r.requires_approval,
+            patch,
+        )
+        .await;
+        let tally = tally_group(checklist_id, rule_ids, results, &mut response.errors);
+        response.updated += tally.applied;
+        response.pending_approval += tally.queued;
+        response.already_pending += tally.already;
+        response.error_count += tally.errors;
+        record_group(
+            &actor,
+            r,
+            checklist_id,
+            patch,
+            &fields,
+            &tally,
+            groups.len(),
         )
         .await;
     }
@@ -529,6 +657,96 @@ mod tests {
 
     fn patch(v: serde_json::Value) -> BulkPatch {
         serde_json::from_value(v).unwrap()
+    }
+
+    // ── phase helpers ───────────────────────────────────────────────────────
+
+    fn request(v: serde_json::Value) -> BulkRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn bad_request_reason_follows_precedence() {
+        let t = json!([{ "checklistId": "c", "ruleId": "r" }]);
+        assert_eq!(
+            bad_request_reason(&request(
+                json!({ "targets": [], "patch": { "status": "bogus" } })
+            )),
+            Some("no_targets")
+        );
+        assert_eq!(
+            bad_request_reason(&request(
+                json!({ "targets": t, "patch": { "status": "bogus" } })
+            )),
+            Some("invalid_status")
+        );
+        let many: Vec<_> = (0..=MAX_RULES)
+            .map(|i| json!({ "checklistId": "c", "ruleId": format!("r{i}") }))
+            .collect();
+        assert_eq!(
+            bad_request_reason(&request(
+                json!({ "targets": many, "patch": { "status": "bogus" } })
+            )),
+            Some("invalid_status")
+        );
+        assert_eq!(
+            bad_request_reason(&request(json!({ "targets": many, "patch": {} }))),
+            Some("too_many_targets")
+        );
+        assert_eq!(
+            bad_request_reason(&request(
+                json!({ "targets": t, "patch": { "comments": "a\u{0}b" } })
+            )),
+            Some("comments_invalid")
+        );
+        assert_eq!(
+            bad_request_reason(&request(
+                json!({ "targets": t, "patch": { "comments": "ok" } })
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn group_targets_drops_duplicates_and_keeps_first_seen_order() {
+        let r = request(json!({ "targets": [
+            { "checklistId": "b", "ruleId": "r1" },
+            { "checklistId": "a", "ruleId": "r1" },
+            { "checklistId": "b", "ruleId": "r2" },
+            { "checklistId": "b", "ruleId": "r1" },
+        ], "patch": {} }));
+        assert_eq!(
+            group_targets(&r.targets),
+            vec![("b", vec!["r1", "r2"]), ("a", vec!["r1"])]
+        );
+    }
+
+    #[test]
+    fn tally_group_counts_are_disjoint_and_errors_are_shortened() {
+        let long = "x".repeat(100);
+        let rule_ids = ["a", "b", "c", "d", long.as_str()];
+        let results: Vec<TargetResult> = vec![
+            Ok((STATUS_PENDING_APPROVAL, true)),
+            Ok((STATUS_PENDING_APPROVAL, false)),
+            Ok(("applied", false)),
+            Ok(("applied", true)),
+            Err("nope".into()),
+        ];
+        let mut errors = Vec::new();
+        let t = tally_group("c1", &rule_ids, results, &mut errors);
+        assert_eq!(
+            (t.requested, t.applied, t.queued, t.already, t.errors),
+            (5, 2, 1, 1, 1)
+        );
+        assert_eq!(t.rejected, vec![("x".repeat(64), "nope".to_string())]);
+        assert_eq!(
+            errors,
+            vec![BulkTargetError {
+                checklist_id: "c1".into(),
+                rule_id: "x".repeat(64),
+                error: "nope".into(),
+            }]
+        );
     }
 
     // ── plan_target ─────────────────────────────────────────────────────────
