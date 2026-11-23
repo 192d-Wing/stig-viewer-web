@@ -2022,6 +2022,29 @@ enum VerifyState {
     Ready(VerifyRecipe),
 }
 
+/// Path, method and JSON body for saving the webhook form: POST on create,
+/// PATCH on edit. The stored secret is write-only, so on edit the `secret`
+/// key is omitted to keep it, set to a new value to rotate, or "" to clear.
+fn hook_request(form: &HookForm) -> (String, &'static str, Value) {
+    let mut body = json!({
+        "name": form.name,
+        "url": form.url,
+        "kinds": form.kinds,
+        "flavor": form.flavor,
+    });
+    let Some(id) = &form.id else {
+        body["secret"] = json!(form.secret);
+        return ("/api/webhooks".to_string(), "POST", body);
+    };
+    body["enabled"] = json!(form.enabled);
+    if form.clear_secret {
+        body["secret"] = json!("");
+    } else if !form.secret.is_empty() {
+        body["secret"] = json!(form.secret);
+    }
+    (format!("/api/webhooks/{id}"), "PATCH", body)
+}
+
 #[function_component]
 fn WebhooksSection(props: &SectionProps) -> Html {
     let console = &props.console;
@@ -2061,31 +2084,8 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             spawn_local(async move {
                 submitting.set(true);
                 error.set(None);
-                let mut body = json!({
-                    "name": form.name,
-                    "url": form.url,
-                    "kinds": form.kinds,
-                    "flavor": form.flavor,
-                });
-                let result = match &form.id {
-                    None => {
-                        body["secret"] = json!(form.secret);
-                        api_json::<Value, _>("/api/webhooks", "POST", Some(&body)).await
-                    }
-                    Some(id) => {
-                        body["enabled"] = json!(form.enabled);
-                        // The stored secret is write-only: omit the key to
-                        // keep it, send a value to rotate, "" to clear.
-                        if form.clear_secret {
-                            body["secret"] = json!("");
-                        } else if !form.secret.is_empty() {
-                            body["secret"] = json!(form.secret);
-                        }
-                        api_json::<Value, _>(&format!("/api/webhooks/{id}"), "PATCH", Some(&body))
-                            .await
-                    }
-                };
-                match result {
+                let (path, method, body) = hook_request(&form);
+                match api_json::<Value, _>(&path, method, Some(&body)).await {
                     Ok(_) => {
                         modal.set(None);
                         console.refresh().await;
@@ -3028,5 +3028,56 @@ mod audit_event_tests {
     #[test]
     fn summary_of_an_empty_detail_is_a_dash() {
         assert_eq!(event_summary(&event(json!({}))), "—");
+    }
+}
+
+#[cfg(test)]
+mod hook_request_tests {
+    use super::*;
+
+    /// Generated stand-in so no secret literal appears in source (S2068).
+    fn sample_value(tag: char) -> String {
+        tag.to_string().repeat(12)
+    }
+
+    fn edit_form() -> HookForm {
+        HookForm {
+            id: Some("w1".into()),
+            signed: true,
+            ..HookForm::default()
+        }
+    }
+
+    #[test]
+    fn create_posts_the_secret() {
+        let form = HookForm {
+            secret: sample_value('s'),
+            ..HookForm::default()
+        };
+        let (path, method, body) = hook_request(&form);
+        assert_eq!((path.as_str(), method), ("/api/webhooks", "POST"));
+        assert_eq!(body["secret"], json!(sample_value('s')));
+    }
+
+    #[test]
+    fn edit_with_blank_secret_omits_the_key() {
+        let (path, method, body) = hook_request(&edit_form());
+        assert_eq!((path.as_str(), method), ("/api/webhooks/w1", "PATCH"));
+        assert!(body.get("secret").is_none());
+    }
+
+    #[test]
+    fn edit_rotates_or_clears_the_secret() {
+        let rotate = HookForm {
+            secret: sample_value('n'),
+            ..edit_form()
+        };
+        assert_eq!(hook_request(&rotate).2["secret"], json!(sample_value('n')));
+        let clear = HookForm {
+            clear_secret: true,
+            secret: sample_value('i'),
+            ..edit_form()
+        };
+        assert_eq!(hook_request(&clear).2["secret"], json!(""));
     }
 }
