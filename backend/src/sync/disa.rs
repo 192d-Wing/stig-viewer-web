@@ -373,8 +373,8 @@ async fn sync_one_with(
         Ok(r) => r,
         Err(e) => {
             if e.is_redirect() {
-                if let Some(d) =
-                    std::error::Error::source(&e).and_then(|s| s.downcast_ref::<DisallowedOrigin>())
+                if let Some(d) = std::error::Error::source(&e)
+                    .and_then(<dyn std::error::Error>::downcast_ref::<DisallowedOrigin>)
                 {
                     return Err(reject_origin(pool, &source.id, d.stage).await);
                 }
