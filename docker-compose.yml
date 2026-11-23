@@ -25,7 +25,7 @@ services:
       start_period: 60s
 
   postgres:
-    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    image: postgres:19-alpine@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
     environment:
       POSTGRES_USER: stig
       POSTGRES_PASSWORD: stig_local
@@ -45,7 +45,7 @@ services:
   # the migrations (DATABASE_MIGRATION_URL); `stig_app` gets only the DML
   # grants the backend applies after migrating. Dev-only password.
   db-roles:
-    image: postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    image: postgres:19-alpine@sha256:8b0ff4cdf221f0c53d7fcda681d3b461be725c492cd881c5ec9c0ad25023f188
     restart: "no"
     environment:
       PGPASSWORD: stig_local
