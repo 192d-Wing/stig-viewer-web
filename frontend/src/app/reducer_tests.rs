@@ -3,8 +3,10 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use super::*;
-use crate::model::Rule;
+use yew::Reducible;
+
+use super::{TabsAction, TabsState};
+use crate::model::{AssetInfo, ChecklistSet, Rule, ServerRule, Stig, StigTab};
 
 fn rule(id: &str) -> Rule {
     Rule {

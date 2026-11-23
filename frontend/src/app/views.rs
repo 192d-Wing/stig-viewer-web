@@ -25,7 +25,7 @@ use crate::components::stig_view::StigView;
 use crate::components::stig_writer::StigWriter;
 use crate::data::sample_stig::generate_sample_stig;
 use crate::model::{ChecklistSet, Rule, RuleUpdate, Stig, StigTab};
-use crate::ui::*;
+use crate::ui::{icon, Alert, Badge, Button, Modal, SpaceBetween, UiBox};
 use crate::util::{console_error, download_text, file_list_to_vec, spawn_local, window};
 use crate::utils::export_ckl::export_ckl;
 

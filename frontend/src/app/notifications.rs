@@ -5,7 +5,7 @@ use yew::prelude::*;
 
 use crate::api::{api_fetch, api_get, api_send};
 use crate::hooks::use_interval;
-use crate::ui::*;
+use crate::ui::{Button, Modal, SpaceBetween, Toggle, UiBox};
 use crate::util::{spawn_local, to_locale_string};
 
 #[derive(Clone, PartialEq, Default, Deserialize)]
