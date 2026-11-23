@@ -1177,9 +1177,9 @@ where
 }
 
 /// Total shutdown budget, measured from the signal: the server's graceful
-/// phase plus detached work and audit writes. The dev
-/// containers set no `STOPSIGNAL` or `stop_grace_period`, so docker/podman send
-/// SIGTERM and SIGKILL after their default 10 s; stay below that, leaving room
+/// phase plus detached work and audit writes. The dev compose file sets
+/// `stop_grace_period: 15s` (production should allow at least 15 s) and its
+/// entrypoint delivers SIGTERM to this process; stay below that, leaving room
 /// for the HTTP server's own graceful shutdown. A write still running at the
 /// expiry is logged here and lost (the 30 s hard write cap is longer on purpose:
 /// it bounds a hung database, not a normal stop).
