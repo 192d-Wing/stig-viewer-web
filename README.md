@@ -126,6 +126,14 @@ for local work. The ones you may want to change:
   production CSP `connect-src`). Set when the backend isn't on
   `localhost:8080` (for example when developing from a second machine).
   `VITE_API_URL` is still read as a fallback.
+- `STIG_FIPS_PENDING_ALGS` — comma-separated allow-list of post-quantum
+  algorithms that are not yet FIPS-validated and may still be used in a
+  `--features fips` build: `ML-DSA-87`, `ML-KEM-768`, `ML-KEM-1024`,
+  `X25519MLKEM768` (case-insensitive). `X25519MLKEM768` is the hybrid group for
+  the transition period; CNSA 2.0 deployments need `ML-KEM-1024`. Default
+  empty. In a build without the `fips` feature the list does not change which
+  algorithms are used (a warning is logged if set), but it is still validated
+  and an unknown token stops startup.
 - `OIDC_INTERNAL_URL` / `OIDC_PUBLIC_URL` / `OIDC_CLIENT_ID` /
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
@@ -459,7 +467,18 @@ cd frontend && cargo test          # parsers, exporters, markdown, diff
 npm ci && npm run test:e2e         # Playwright suite (requires the stack running)
 cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
+cd backend && cargo test --features fips   # FIPS build (see below)
 ```
+
+The `fips` feature links the AWS-LC FIPS module (`aws-lc-rs`) and the backend
+refuses to start unless it reports FIPS mode. Building it needs CMake, Go, Perl
+and a C compiler. On macOS the module is a dylib (cargo run/test find it) and
+macOS is not a validated environment.
+
+What this does and does not establish: the `fips` binary shows the validated
+module is linked and in FIPS mode. No application crypto uses it yet
+(`ed25519-dalek`, `sha2`, `hmac` and `rsa` remain; tracked in #65) and TLS
+still runs on ring. It is not a FIPS-compliance claim for the application.
 
 ## Operations: audit
 
