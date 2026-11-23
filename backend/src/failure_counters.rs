@@ -12,6 +12,8 @@
 //! authoritative AU-5 signal across replicas and restarts is the
 //! `failed to write audit event` error log line (target `audit`), which needs
 //! a log-based alert; these counters are an in-process aid, not AU-5(1)/(2).
+//! The alert definition and thresholds live in `docs/deployment.md` ("Runbook:
+//! alerts").
 //!
 //! Counting rule for audit writes (`db_audit`): each write runs as a detached
 //! task, so it is counted whether or not the request that submitted it is
