@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { randomBytes } from "node:crypto";
-import { resetDb, setUserRole, BACKEND } from "./helpers.js";
+import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 // Address that's guaranteed to fail to connect (port 1 reserved/unused
 // on every dev box we care about). The reqwest POST errors out and the
@@ -121,6 +121,117 @@ test.describe("Outbound webhooks", () => {
       })
       .then((r) => r.json());
     expect(after.length).toBe(0);
+  });
+
+  test("API: webhook responses never carry the secret; signed tracks set, kept and cleared", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const secret = `s-${randomBytes(16).toString("hex")}`;
+    const headers = { "X-User-Id": "alice", "Content-Type": "application/json" };
+    const createRes = await request.post(`${BACKEND}/api/webhooks`, {
+      headers,
+      data: { name: "Write-only secret", url: "https://example.invalid/wo", secret },
+    });
+    expect(createRes.status()).toBe(201);
+    const createdText = await createRes.text();
+    expect(createdText).not.toContain(secret);
+    const created = JSON.parse(createdText);
+    expect(created.signed).toBe(true);
+    expect(created).not.toHaveProperty("secret");
+
+    const listText = await request
+      .get(`${BACKEND}/api/webhooks`, { headers })
+      .then((r) => r.text());
+    expect(listText).not.toContain(secret);
+    expect(JSON.parse(listText)[0].signed).toBe(true);
+
+    const kept = await request.patch(`${BACKEND}/api/webhooks/${created.id}`, {
+      headers,
+      data: { enabled: false },
+    });
+    const keptText = await kept.text();
+    expect(keptText).not.toContain(secret);
+    expect(JSON.parse(keptText).signed).toBe(true);
+
+    const cleared = await request.patch(`${BACKEND}/api/webhooks/${created.id}`, {
+      headers,
+      data: { secret: "" },
+    });
+    expect(JSON.parse(await cleared.text()).signed).toBe(false);
+  });
+
+  async function seedSignedHook(request, name) {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const secret = randomBytes(16).toString("hex");
+    const hook = await request
+      .post(`${BACKEND}/api/webhooks`, {
+        headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+        data: { name, url: "https://example.invalid/ui", secret },
+      })
+      .then((r) => r.json());
+    return hook;
+  }
+
+  async function openEdit(page, name) {
+    await loginAs(page, "alice");
+    await page.goto("/?view=admin");
+    await expect(page.getByText(name).first()).toBeVisible();
+    await page.getByRole("button", { name: "Edit" }).first().click();
+  }
+
+  const signedNow = async (request, id) =>
+    (
+      await request
+        .get(`${BACKEND}/api/webhooks`, { headers: { "X-User-Id": "alice" } })
+        .then((r) => r.json())
+    ).find((w) => w.id === id).signed;
+
+  const isPatch = (r) => r.method() === "PATCH" && r.url().includes("/api/webhooks/");
+
+  test("UI: editing a signed webhook without a new secret keeps it signed", async ({
+    page,
+    request,
+  }) => {
+    const hook = await seedSignedHook(request, "Keep me signed");
+    await openEdit(page, "Keep me signed");
+    await page.getByLabel("Name", { exact: true }).fill("Renamed hook");
+    const patched = page.waitForRequest(isPatch);
+    await page.getByRole("button", { name: "Save" }).click();
+    expect(Object.keys((await patched).postDataJSON())).not.toContain("secret");
+    await expect(page.getByText("Renamed hook")).toBeVisible();
+    expect(await signedNow(request, hook.id)).toBe(true);
+  });
+
+  test("UI: removing the secret on edit makes the webhook unsigned", async ({
+    page,
+    request,
+  }) => {
+    const hook = await seedSignedHook(request, "Drop my secret");
+    await openEdit(page, "Drop my secret");
+    await page.getByTestId("webhook-clear-secret").locator("input").check();
+    const patched = page.waitForRequest(isPatch);
+    await page.getByRole("button", { name: "Save" }).click();
+    expect((await patched).postDataJSON().secret).toBe("");
+    await expect(page.getByTestId(`webhook-signed-${hook.id}`)).toHaveText("Unsigned");
+    expect(await signedNow(request, hook.id)).toBe(false);
+  });
+
+  test("UI: entering a new secret on edit rotates it and stays signed", async ({
+    page,
+    request,
+  }) => {
+    const hook = await seedSignedHook(request, "Rotate my secret");
+    await openEdit(page, "Rotate my secret");
+    const fresh = randomBytes(16).toString("hex");
+    await page.getByLabel("Secret", { exact: true }).fill(fresh);
+    const patched = page.waitForRequest(isPatch);
+    await page.getByRole("button", { name: "Save" }).click();
+    expect((await patched).postDataJSON().secret).toBe(fresh);
+    await expect(page.getByTestId(`webhook-signed-${hook.id}`)).toHaveText("Signed");
+    expect(await signedNow(request, hook.id)).toBe(true);
   });
 
   test("API: webhook create, update and delete leave audit rows without the URL or secret", async ({

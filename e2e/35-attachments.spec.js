@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { loginAs, resetDb, BACKEND } from "./helpers.js";
+import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 /**
  * Seed: alice's asset + 'edge' checklist, returning the first rule id.
@@ -159,6 +159,61 @@ test.describe("Evidence attachments — API", () => {
     expect(listed).toHaveLength(1);
   });
 
+  test("user without asset access cannot list, count, download or bundle (403), and it is audited", async ({
+    request,
+  }) => {
+    const { assetId, checklistId, ruleId } = await seedChecklist(request);
+    const marker = `evidence-${Date.now()}-bytes`;
+    const row = await request
+      .post(
+        `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/attachments`,
+        {
+          headers: { "X-User-Id": "alice" },
+          multipart: {
+            file: { name: "secret-evidence.txt", mimeType: "text/plain", buffer: Buffer.from(marker) },
+          },
+        },
+      )
+      .then((r) => r.json());
+    const as = (user) => ({ headers: { "X-User-Id": user } });
+    const urls = {
+      list: `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/attachments`,
+      counts: `${BACKEND}/api/checklists/${checklistId}/attachments`,
+      download: `${BACKEND}/api/attachments/${row.id}`,
+      bundle: `${BACKEND}/api/assets/${assetId}/bundle.zip`,
+    };
+
+    for (const [name, url] of Object.entries(urls)) {
+      const res = await request.get(url, as("mallory"));
+      expect(res.status(), name).toBe(403);
+      expect((await res.body()).toString()).not.toContain(marker);
+    }
+    expect((await request.get(`${BACKEND}/api/attachments/does-not-exist`, as("mallory"))).status()).toBe(404);
+
+    const grant = await request.post(`${BACKEND}/api/assets/${assetId}/acl`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: { userId: "mallory", permission: "read" },
+    });
+    expect(grant.ok()).toBe(true);
+    for (const [name, url] of Object.entries(urls)) {
+      expect((await request.get(url, as("mallory"))).status(), name).toBe(200);
+    }
+
+    await setUserRole("audit-admin", "admin");
+    const events = async (action) =>
+      (await request.get(`${BACKEND}/api/audit/events?action=${action}`, as("audit-admin")).then((r) => r.json())).rows;
+    const downloads = await events("attachment.download");
+    expect(downloads.length).toBeGreaterThan(0);
+    expect(downloads[0].outcome).toBe("ok");
+    expect(downloads[0].detail.attachmentId).toBe(row.id);
+    expect(JSON.stringify(downloads)).not.toContain("secret-evidence");
+    const denied = await events("authz.denied");
+    const routes = denied.map((r) => r.detail.route);
+    expect(routes).toContain("/api/attachments/:id");
+    expect(routes.some((r) => r.endsWith("/attachments"))).toBe(true);
+    expect(JSON.stringify(denied)).not.toContain(row.id);
+  });
+
   test("file over 25 MB returns 413", async ({ request }) => {
     const { checklistId, ruleId } = await seedChecklist(request);
 
@@ -228,5 +283,33 @@ test.describe("Evidence attachments — UI", () => {
       timeout: 10_000,
     });
     await expect(page.getByText("No attachments yet.")).toBeVisible();
+  });
+
+  test("a user without read access sees a no-access note, not an error or controls", async ({
+    page,
+    request,
+  }) => {
+    const { checklistId, ruleId } = await seedChecklist(request);
+    // Auto-create mallory (no grant on alice's asset).
+    await request.get(`${BACKEND}/api/users/me`, { headers: { "X-User-Id": "mallory" } });
+    const counts = await request.get(`${BACKEND}/api/checklists/${checklistId}/attachments`, {
+      headers: { "X-User-Id": "mallory" },
+    });
+    expect(counts.status()).toBe(403);
+
+    await loginAs(page, "mallory");
+    await page.goto("/");
+    await page.getByRole("button", { name: "Systems", exact: true }).click();
+    await page.getByRole("button", { name: "evidence-host" }).click();
+    await page.getByRole("button", { name: /edge/i }).first().click();
+    await page.getByRole("button", { name: ruleId }).first().click();
+
+    await expect(
+      page.getByText("You do not have access to this system's evidence."),
+    ).toBeVisible();
+    await expect(page.getByText("No attachments yet.")).toHaveCount(0);
+    await expect(page.getByTestId("attachment-file-input")).toHaveCount(0);
+    await expect(page.getByTestId("attachment-delete")).toHaveCount(0);
+    await expect(page.getByText("Forbidden")).toHaveCount(0);
   });
 });

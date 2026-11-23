@@ -232,7 +232,8 @@ struct Webhook {
     id: String,
     name: String,
     url: String,
-    secret: Option<String>,
+    /// Whether a signing secret is set. The secret itself is never returned.
+    signed: bool,
     kinds: Option<Vec<String>>,
     enabled: bool,
     flavor: Option<String>,
@@ -1962,7 +1963,12 @@ struct HookForm {
     id: Option<String>,
     name: String,
     url: String,
+    /// New secret to set. Empty on edit means keep the stored one.
     secret: String,
+    /// Whether the webhook being edited currently has a secret.
+    signed: bool,
+    /// Edit only: remove the stored secret (send unsigned).
+    clear_secret: bool,
     kinds: Vec<String>,
     flavor: String,
     enabled: bool,
@@ -1975,6 +1981,8 @@ impl Default for HookForm {
             name: String::new(),
             url: String::new(),
             secret: String::new(),
+            signed: false,
+            clear_secret: false,
             kinds: vec!["assigned".into()],
             flavor: "slack".into(),
             enabled: true,
@@ -1988,7 +1996,9 @@ impl HookForm {
             id: Some(w.id.clone()),
             name: w.name.clone(),
             url: w.url.clone(),
-            secret: w.secret.clone().unwrap_or_default(),
+            secret: String::new(),
+            signed: w.signed,
+            clear_secret: false,
             kinds: w.kinds.clone().unwrap_or_else(|| vec!["assigned".into()]),
             flavor: w.flavor.clone().unwrap_or_else(|| "slack".into()),
             enabled: w.enabled,
@@ -2054,14 +2064,23 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                 let mut body = json!({
                     "name": form.name,
                     "url": form.url,
-                    "secret": form.secret,
                     "kinds": form.kinds,
                     "flavor": form.flavor,
                 });
                 let result = match &form.id {
-                    None => api_json::<Value, _>("/api/webhooks", "POST", Some(&body)).await,
+                    None => {
+                        body["secret"] = json!(form.secret);
+                        api_json::<Value, _>("/api/webhooks", "POST", Some(&body)).await
+                    }
                     Some(id) => {
                         body["enabled"] = json!(form.enabled);
+                        // The stored secret is write-only: omit the key to
+                        // keep it, send a value to rotate, "" to clear.
+                        if form.clear_secret {
+                            body["secret"] = json!("");
+                        } else if !form.secret.is_empty() {
+                            body["secret"] = json!(form.secret);
+                        }
                         api_json::<Value, _>(&format!("/api/webhooks/{id}"), "PATCH", Some(&body))
                             .await
                     }
@@ -2161,9 +2180,9 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         let panel = deliveries.clone();
         Callback::from(move |_: ()| panel.set(None))
     };
-    // Fetch and open the verify-recipe modal. The backend pre-fills the
-    // secret + sample HMAC so an operator can paste a snippet and have it
-    // validate end-to-end without further substitution.
+    // Fetch and open the verify-recipe modal. The backend pre-fills the URL
+    // and a sample HMAC; the Python/Node snippets read the secret from the
+    // WEBHOOK_SECRET environment variable (it is never returned).
     let open_verify = {
         let (verify, verify_error) = (verify.clone(), verify_error.clone());
         Callback::from(move |hook: Webhook| {
@@ -2229,6 +2248,13 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                 <Badge color={flavor_badge(&flavor)} testid={format!("webhook-flavor-{}", w.id)}>{flavor}</Badge>
             }
         }),
+        Column::new("signed", "Signing", |w: &Webhook| {
+            html! {
+                <Badge color={if w.signed { "green" } else { "grey" }} testid={format!("webhook-signed-{}", w.id)}>
+                    {if w.signed { "Signed" } else { "Unsigned" }}
+                </Badge>
+            }
+        }),
         Column::new("enabled", "Enabled", move |w: &Webhook| {
             let id = w.id.clone();
             let on_change = toggle_enabled.reform(move |next: bool| (id.clone(), next));
@@ -2260,6 +2286,26 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         "Edit webhook"
     } else {
         "Add webhook"
+    };
+    let editing = form.as_ref().is_some_and(|f| f.id.is_some());
+    let editing_signed = editing && form.as_ref().is_some_and(|f| f.signed);
+    let clear_secret = form.as_ref().is_some_and(|f| f.clear_secret);
+    let secret_description = match (editing, editing_signed) {
+        (true, true) => "A secret is set. Leave blank to keep it; enter a new value to rotate. It is never shown.",
+        (true, false) => "No secret set (deliveries are unsigned). Enter a value to sign deliveries.",
+        _ => "Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned.",
+    };
+    let on_clear_secret = {
+        let modal = hook_modal.clone();
+        Callback::from(move |v: bool| {
+            if let Some(mut form) = (*modal).clone() {
+                form.clear_secret = v;
+                if v {
+                    form.secret.clear();
+                }
+                modal.set(Some(form));
+            }
+        })
     };
     let flavor = form
         .as_ref()
@@ -2299,7 +2345,7 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             html! {
                 <SpaceBetween direction="vertical" size="m">
                     <UiBox variant="p">
-                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The secret is pre-filled, so you can paste and run without further substitution."}
+                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The Python and Node snippets read the signing secret from the WEBHOOK_SECRET environment variable; it is never shown here."}
                     </UiBox>
                     <Tabs tabs={vec![
                         tab("curl", "curl", &recipe.snippets.curl),
@@ -2354,9 +2400,14 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                                placeholder="https://hooks.slack.com/services/…" />
                     </FormField>
                     <FormField label="Secret"
-                               description="Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned.">
-                        <Input value={field(|f| &f.secret)} kind="password" on_change={edit(|f, v| f.secret = v)} />
+                               description={secret_description}>
+                        <Input value={field(|f| &f.secret)} kind="password" disabled={clear_secret} on_change={edit(|f, v| f.secret = v)} />
                     </FormField>
+                    if editing_signed {
+                        <Toggle testid="webhook-clear-secret" checked={clear_secret} on_change={on_clear_secret}>
+                            {"Remove secret (send unsigned)"}
+                        </Toggle>
+                    }
                     <FormField label="Events">
                         <Multiselect selected={selected_kinds} on_change={set_kinds}
                                      options={select_options(KIND_OPTIONS)} placeholder="Select event kinds" />

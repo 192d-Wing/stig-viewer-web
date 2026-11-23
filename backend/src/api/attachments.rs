@@ -50,6 +50,21 @@ async fn load_checklist_and_asset(
     Ok((checklist, asset))
 }
 
+/// Like `load_checklist_and_asset`, but also requires `read` on the owning
+/// asset. A missing checklist is 404; an existing but unreadable one is 403
+/// (same split as the rest of the codebase; `authz_audit` records the 403).
+async fn require_read(
+    state: &AppState,
+    user: &AuthUser,
+    checklist_id: &str,
+) -> Result<(db_checklists::ChecklistRow, db_assets::AssetRow), StatusCode> {
+    let (checklist, asset) = load_checklist_and_asset(state, checklist_id).await?;
+    if !asset_acl::user_can(state.pool.as_ref(), &asset.id, user, "read").await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok((checklist, asset))
+}
+
 /// POST /api/checklists/:id/rules/:rule_id/attachments
 ///
 /// Multipart upload. Owner-only.
@@ -202,13 +217,15 @@ async fn insert_audited(
 }
 
 /// GET /api/checklists/:id/rules/:rule_id/attachments — list rows for a rule.
+/// Requires `read` on the owning asset (403 otherwise). Metadata listings are
+/// not audited; denials are recorded by `authz_audit`.
 pub async fn list_for_rule_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     Path((checklist_id, rule_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<AttachmentRow>>, StatusCode> {
-    // Confirm the checklist exists so non-existent ids 404 rather than
-    // silently returning an empty list.
-    let _ = load_checklist_and_asset(&state, &checklist_id).await?;
+    // 404 for a missing checklist, 403 when the caller cannot read its asset.
+    let _ = require_read(&state, &user, &checklist_id).await?;
     let rows = db_attachments::list_for_rule(state.pool.as_ref(), &checklist_id, &rule_id)
         .await
         .map_err(map_db)?;
@@ -217,11 +234,13 @@ pub async fn list_for_rule_handler(
 
 /// GET /api/checklists/:id/attachments — counts per rule for one checklist.
 /// Lets the rule list show a paperclip indicator without N round-trips.
+/// Requires `read` on the owning asset (403 otherwise); not audited.
 pub async fn counts_for_checklist_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     Path(checklist_id): Path<String>,
 ) -> Result<Json<Vec<db_attachments::AttachmentCountRow>>, StatusCode> {
-    let _ = load_checklist_and_asset(&state, &checklist_id).await?;
+    let _ = require_read(&state, &user, &checklist_id).await?;
     let rows = db_attachments::counts_for_checklist(state.pool.as_ref(), &checklist_id)
         .await
         .map_err(map_db)?;
@@ -229,15 +248,20 @@ pub async fn counts_for_checklist_handler(
 }
 
 /// GET /api/attachments/:id — stream blob with correct content-type +
-/// content-disposition.
+/// content-disposition. Requires `read` on the owning asset (403 otherwise)
+/// and records an `attachment.download` audit event (fail-open). The event
+/// means the bytes were served, not necessarily received by the client.
 pub async fn download_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<Response, StatusCode> {
     let row = db_attachments::get_by_id(state.pool.as_ref(), &id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    let (_checklist, asset) = require_read(&state, &user, &row.checklist_id).await?;
 
     let path = blob_path(&state, &row.id);
     let bytes = match tokio::fs::read(&path).await {
@@ -248,7 +272,35 @@ pub async fn download_handler(
         }
     };
 
+    // Evidence reads are recorded (AU-2) after the blob is in hand. The
+    // filename and MIME type are client text and are not recorded.
+    db_audit::record_or_log(
+        state.pool.as_ref(),
+        db_audit::NewAuditEvent {
+            user_id: &user.id,
+            action: "attachment.download",
+            outcome: "ok",
+            asset_id: Some(&asset.id),
+            checklist_id: Some(&row.checklist_id),
+            stig_id: None,
+            detail: serde_json::json!({
+                "attachmentId": row.id,
+                "ruleId": db_audit::audit_safe_id(&row.rule_id),
+                "sizeBytes": row.size_bytes,
+                "sha256": row.sha256,
+            }),
+            ctx: Some(&ctx),
+        },
+    )
+    .await;
+
     let mut headers = HeaderMap::new();
+    // Evidence is user-supplied content: never let a browser sniff it into
+    // an executable type.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     if let Ok(v) = HeaderValue::from_str(&row.mime_type) {
         headers.insert(header::CONTENT_TYPE, v);
     } else {
@@ -333,7 +385,7 @@ fn sanitize_filename(s: &str) -> String {
 mod audit_tests {
     use super::*;
     use crate::test_fixtures::{
-        app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_asset, seed_checklist,
+        app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_acl, seed_asset, seed_checklist,
         seed_user, STIG_ID,
     };
     use axum::extract::FromRequest;
@@ -507,5 +559,109 @@ mod audit_tests {
         assert_eq!(missing, Err(StatusCode::NOT_FOUND));
         assert_eq!(audit_rows(&pool, "attachment.upload").await.len(), 1);
         assert!(audit_rows(&pool, "attachment.delete").await.is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_reads_require_asset_read_acl(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        seed_user(&pool, "nosy").await;
+        let (_, Json(row)) = upload(&state, "e.txt").await.unwrap();
+
+        async fn all(
+            state: &AppState,
+            who: crate::api::auth::AuthUser,
+            id: &str,
+        ) -> [Result<(), StatusCode>; 3] {
+            let l = list_for_rule_handler(
+                State(state.clone()),
+                Extension(who.clone()),
+                Path(("c1".into(), RULE.into())),
+            )
+            .await
+            .map(|_| ());
+            let c = counts_for_checklist_handler(
+                State(state.clone()),
+                Extension(who.clone()),
+                Path("c1".into()),
+            )
+            .await
+            .map(|_| ());
+            let d = download_handler(
+                State(state.clone()),
+                Extension(who),
+                Extension(ctx()),
+                Path(id.into()),
+            )
+            .await
+            .map(|_| ());
+            [l, c, d]
+        }
+
+        for role in ["author", "viewer"] {
+            let r = all(&state, auth("nosy", role), &row.id).await;
+            assert_eq!(r, [Err(StatusCode::FORBIDDEN); 3], "role {role}");
+        }
+        assert!(audit_rows(&pool, "attachment.download").await.is_empty());
+
+        seed_acl(&pool, "a1", "nosy", "read").await;
+        assert_eq!(
+            all(&state, auth("nosy", "viewer"), &row.id).await,
+            [Ok(()); 3]
+        );
+        assert_eq!(
+            all(&state, auth("admin1", "admin"), &row.id).await,
+            [Ok(()); 3]
+        );
+
+        let missing = download_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path("missing".into()),
+        )
+        .await;
+        assert_eq!(missing.err(), Some(StatusCode::NOT_FOUND));
+        let missing = counts_for_checklist_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Path("nope".into()),
+        )
+        .await;
+        assert_eq!(missing.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    async fn download(state: &AppState, id: &str) -> Result<Response, StatusCode> {
+        download_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path(id.into()),
+        )
+        .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_download_is_recorded(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let (_, Json(row)) = upload(&state, "private-evidence-name.txt").await.unwrap();
+        download(&state, &row.id).await.unwrap();
+        let ev = audit_rows(&pool, "attachment.download").await;
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            ev[0].detail_keys(),
+            ["attachmentId", "ruleId", "sha256", "sizeBytes"]
+        );
+        assert!(!ev[0].detail.to_string().contains("private-evidence-name"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_download_fails_open_when_audit_insert_fails(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let (_, Json(row)) = upload(&state, "e.txt").await.unwrap();
+        fail_audit_inserts(&pool, &["attachment.download"]).await;
+        assert!(download(&state, &row.id).await.is_ok());
     }
 }
