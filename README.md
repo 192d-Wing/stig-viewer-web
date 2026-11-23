@@ -1084,8 +1084,11 @@ only.
 │   ├── migrations/       sqlx migrations
 │   └── stig-sources.toml STIG ZIPs to sync from DISA
 ├── dev/keycloak/         Dev realm import
+├── docs/                 Deployment notes, runbook alerts, SSP notes
 └── docker-compose.yml    Local dev stack
 ```
+
+Deployment notes, runbook alerts and SSP notes are in [docs/deployment.md](docs/deployment.md).
 
 ## Login emblem
 

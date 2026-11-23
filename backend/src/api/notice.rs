@@ -107,7 +107,9 @@ pub fn log_proxy_trust_config() {
         tracing::warn!(
             "STIG_TRUST_PROXY_HEADERS is not enabled: client IPs (and the auth rate limit) use the \
              socket peer address, so all clients behind a reverse proxy share one bucket. Set it \
-             (and STIG_TRUSTED_PROXY_HOPS) only behind a proxy that overwrites X-Forwarded-For."
+             (and STIG_TRUSTED_PROXY_HOPS) only behind a proxy that appends the client address \
+             to X-Forwarded-For; the entry STIG_TRUSTED_PROXY_HOPS places from the right is \
+             used."
         );
     }
 }
