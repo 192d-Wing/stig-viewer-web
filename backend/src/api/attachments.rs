@@ -1,3 +1,4 @@
+use crate::crypto;
 use axum::{
     body::Body,
     extract::{Multipart, Path, State},
@@ -5,7 +6,6 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::api::asset_acl;
@@ -86,13 +86,13 @@ pub async fn upload_handler(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let attachment_id = uuid::Uuid::new_v4().to_string();
+    let attachment_id = crate::crypto::rand::uuid_v4().to_string();
     let dest = blob_path(&state, &attachment_id);
 
     let mut filename: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut size_bytes: i64 = 0;
-    let mut hasher = Sha256::new();
+    let mut hasher = crypto::digest::Sha256Stream::new();
     let mut wrote_file = false;
 
     while let Some(mut field) = multipart.next_field().await.map_err(|e| {
@@ -167,7 +167,7 @@ pub async fn upload_handler(
         filename: filename.unwrap_or_else(|| "attachment".into()),
         mime_type: mime_type.unwrap_or_else(|| "application/octet-stream".into()),
         size_bytes,
-        sha256: hex::encode(hasher.finalize()),
+        sha256: hex::encode(hasher.finish()),
         uploaded_by: user.id.clone(),
         uploaded_at: chrono::Utc::now(),
     };

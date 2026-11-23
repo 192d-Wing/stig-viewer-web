@@ -66,9 +66,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      # The default build must stay free of aws-lc; only `--features fips` pulls it in (#70).
-      - name: Check the default build has no aws-lc
-        run: "! cargo tree --locked -e normal | grep -q aws-lc"
+      # The default build links the non-FIPS aws-lc-sys and never the FIPS module (#65).
+      - name: Check the default build links aws-lc-sys and not aws-lc-fips-sys
+        run: |
+          tree=$(cargo tree --locked -e normal)
+          grep -q aws-lc-sys <<<"$tree"
+          ! grep -q aws-lc-fips-sys <<<"$tree"
+      # RustCrypto stays in the graph via openidconnect and sqlx, but this crate
+      # must not call it directly: application crypto goes through src/crypto.
+      - name: Check the backend has no direct RustCrypto dependency
+        run: |
+          tree=$(cargo tree --locked -e normal --depth 1)
+          ! grep -E ' (sha2|hmac|rsa|ed25519-dalek) v' <<<"$tree"
       # sqlx::test creates a throwaway database per test, so the user must be
       # allowed to CREATE DATABASE (the image's POSTGRES_USER is a superuser).
       # The server lives only for this job, listens on loopback only, and gets
@@ -156,9 +165,16 @@ jobs:
         with:
           workspaces: backend
 
-      - run: cargo clippy --locked --features fips --all-targets -- -D warnings
+      # `--no-default-features` drops `non-fips`, so only the FIPS module links.
+      - name: Check the FIPS build links aws-lc-fips-sys and not aws-lc-sys
+        run: |
+          tree=$(cargo tree --locked --no-default-features --features fips -e normal)
+          grep -q aws-lc-fips-sys <<<"$tree"
+          ! grep -q 'aws-lc-sys' <<<"$tree"
 
-      - run: cargo test --locked --features fips
+      - run: cargo clippy --locked --no-default-features --features fips --all-targets -- -D warnings
+
+      - run: cargo test --locked --no-default-features --features fips
 
   # Decides whether a pull request touches anything e2e exercises. Pushes to
   # main always run e2e, whatever changed.

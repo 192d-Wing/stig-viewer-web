@@ -161,7 +161,7 @@ pub(crate) async fn issue_ack(
     }
     // Security depends on this being a CSPRNG-backed UUIDv4 (122 random bits);
     // it must not become v7, a counter, or any guessable id.
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     db_notice::insert_ack(
         pool,
         &id,
@@ -512,7 +512,7 @@ mod tests {
         let cases = [
             (from(None), false),
             (from(Some("not-a-uuid".into())), true),
-            (from(Some(uuid::Uuid::new_v4().to_string())), true),
+            (from(Some(crate::crypto::rand::uuid_v4().to_string())), true),
         ];
         for (jar, cleared) in cases {
             let (jar, redirect) = *require_ack(&pool, jar, FE, &TEST_BINDING, "")

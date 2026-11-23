@@ -1331,7 +1331,7 @@ mod integrity_tests {
     }
 
     pub(super) fn build(key: Option<&SigningState>) -> Vec<u8> {
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("att-1"), b"blob").unwrap();
         let mut rows = HashMap::new();
@@ -2274,9 +2274,12 @@ mod tests {
 
     #[test]
     fn backup_round_trips_rows_and_attachment_blobs() {
-        let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "stig-backup-test-{}",
+            crate::crypto::rand::uuid_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         std::fs::write(dir.join(&id), b"blob bytes \x00\x01\x02").unwrap();
 
         let row = json!({"id": 1, "name": "alice"});
@@ -2396,7 +2399,10 @@ mod tests {
 
     #[test]
     fn built_backups_pass_header_validation_signed_and_unsigned() {
-        let dir = std::env::temp_dir().join(format!("stig-backup-test-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "stig-backup-test-{}",
+            crate::crypto::rand::uuid_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let tables = || HashMap::from([("users".to_string(), vec![json!({"id": 1})])]);
         let unsigned = build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();

@@ -2,10 +2,10 @@
 //! consume at login start (storing the protocol binding), and claim at login
 //! completion. A completed login must claim the row or it gets no session.
 
+use crate::crypto;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::failure_counters::FailureCounter;
@@ -47,7 +47,7 @@ impl LoginBinding<'_> {
 /// or caller-chosen state. Must match the SQL `encode(sha256(convert_to(s,'UTF8')),'hex')`
 /// used by migration 046.
 pub(crate) fn state_digest(state: &str) -> String {
-    hex::encode(Sha256::digest(state.as_bytes()))
+    crypto::digest::sha256_hex(state.as_bytes())
 }
 
 /// Lowercase hex SHA-256 of an ack id; same value `list_ack_probes` computes in SQL.

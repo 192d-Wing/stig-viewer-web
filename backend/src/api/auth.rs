@@ -601,7 +601,7 @@ pub(crate) async fn upsert_user(
     }
 
     // Otherwise create. id = UUID for OIDC users.
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     sqlx::query(
         "INSERT INTO users (id, display_name, email, sub, provider) VALUES ($1, $2, $3, $4, $5)",
     )
@@ -626,7 +626,10 @@ pub(crate) async fn create_session(
     ip: &str,
     user_agent: &str,
 ) -> Result<String> {
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // A DRBG failure surfaces as an error (callers return 500), never a panic.
+    let session_id = crate::crypto::rand::try_uuid_v4()
+        .context("session id generation failed")?
+        .to_string();
     let expires_at: DateTime<Utc> = Utc::now() + Duration::hours(SESSION_LIFETIME_HOURS);
     sqlx::query(
         "INSERT INTO sessions (id, user_id, expires_at, ip, user_agent) \
@@ -908,7 +911,7 @@ mod claim_tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(cleared(jar));
         // Valid UUID against an unreachable DB: a distinct reason from a plain refusal.
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         let (jar, code) = claim_step(&lim, &pool, jar_with(Some(&id)), "s", "198.51.100.1")
             .await
             .err()
@@ -934,7 +937,7 @@ mod claim_tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn wrong_state_logs_ack_not_claimed(pool: PgPool) {
         let (cap, _g) = crate::api::audit_capture::capture();
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         insert_ack(&pool, &id, "v1", "", "", 300).await.unwrap();
         consume_ack(
             &pool,
@@ -967,7 +970,7 @@ mod claim_tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn state_cookie_claim_requires_matching_ack_and_state(pool: PgPool) {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         insert_ack(&pool, &id, "v1", "", "", 300).await.unwrap();
         consume_ack(
             &pool,
@@ -981,7 +984,7 @@ mod claim_tests {
         )
         .await
         .unwrap();
-        let other = uuid::Uuid::new_v4().to_string();
+        let other = crate::crypto::rand::uuid_v4().to_string();
         assert_eq!(
             claim_from_state_cookie(&pool, None, "st").await.err(),
             Some("no_state_cookie")
@@ -1038,7 +1041,7 @@ mod callback_flow_tests {
     const ISS: &str = "https://idp.test/realms/x";
     /// Per-run random nonce, so no fixed value stands in for one.
     static NONCE: std::sync::LazyLock<String> =
-        std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+        std::sync::LazyLock::new(|| crate::crypto::rand::uuid_v4().to_string());
 
     fn jwks() -> CoreJsonWebKeySet {
         let pk = key().1.to_public_key();
@@ -1127,7 +1130,7 @@ mod callback_flow_tests {
     }
 
     async fn claim(pool: &PgPool) -> OidcClaim {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         insert_ack(pool, &id, "v1", "", "", 300).await.unwrap();
         let b = LoginBinding::Oidc {
             state: "st",
@@ -1185,7 +1188,7 @@ mod callback_flow_tests {
         step("id_token");
 
         // Bad signature, then wrong nonce (the claims-validation site).
-        let other = uuid::Uuid::new_v4().to_string();
+        let other = crate::crypto::rand::uuid_v4().to_string();
         for tok in [id_token(&NONCE, true), id_token(&other, false)] {
             let a = stub(200, token_resp(Some(tok))).await;
             let c = claim(&pool).await;

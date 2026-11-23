@@ -284,7 +284,7 @@ pub async fn import_handler(
         let now = chrono::Utc::now();
         let mut created_ids: Vec<String> = Vec::with_capacity(to_insert.len());
         for row in &to_insert {
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = crate::crypto::rand::uuid_v4().to_string();
             sqlx::query(
                 r#"
                 INSERT INTO assets

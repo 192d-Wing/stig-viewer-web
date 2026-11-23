@@ -43,7 +43,10 @@ pub(crate) struct Staged {
 
 /// Write `json` to a fresh temp file next to its destination and sync it.
 pub(crate) async fn stage(stigs_dir: &Path, id: &str, json: &str) -> io::Result<Staged> {
-    let tmp = stigs_dir.join(format!(".upload-{id}.{}.tmp", uuid::Uuid::new_v4()));
+    let tmp = stigs_dir.join(format!(
+        ".upload-{id}.{}.tmp",
+        crate::crypto::rand::uuid_v4()
+    ));
     let mut f = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -262,7 +265,7 @@ mod tests {
     use super::*;
 
     fn tempdir() -> PathBuf {
-        let d = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let d = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -281,7 +284,7 @@ mod tests {
 
     #[test]
     fn tmp_names_are_parsed_strictly() {
-        let u = uuid::Uuid::new_v4();
+        let u = crate::crypto::rand::uuid_v4();
         assert_eq!(
             parse_tmp_name(&format!(".upload-abc-1.{u}.tmp")),
             Some("abc-1")
@@ -391,7 +394,10 @@ mod tests {
         std::fs::write(d.join(".seed-x.tmp"), "x").unwrap();
         std::fs::write(d.join("real.json"), "x").unwrap();
         let target = d.join("real.json");
-        let link = d.join(format!(".upload-link.{}.tmp", uuid::Uuid::new_v4()));
+        let link = d.join(format!(
+            ".upload-link.{}.tmp",
+            crate::crypto::rand::uuid_v4()
+        ));
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let before = names(&d);
         sweep_stale(&d, &pool, STALE_AFTER).await;

@@ -28,7 +28,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use std::path::PathBuf;
-use uuid::Uuid;
 
 use crate::pdf::{Face, TextDoc};
 use crate::AppState;
@@ -178,7 +177,7 @@ pub async fn run_report(
     let pdf_bytes = render_pdf(&summary, &asset_rows, &top_rules, range_days)?;
 
     // ── Persist ─────────────────────────────────────────────────────────────
-    let id = Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     let dir = data_dir.join("compliance_reports");
     tokio::fs::create_dir_all(&dir).await?;
     let pdf_path_rel = format!("compliance_reports/{id}.pdf");

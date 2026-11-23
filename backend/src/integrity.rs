@@ -19,11 +19,10 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use ed25519_dalek::{Signature as EdSignature, Signer};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
 
 use crate::api::signing::SigningState;
+use crate::crypto;
 
 pub const ALGORITHM: &str = "ed25519";
 /// Domain-separation prefix for audit archive segment manifests.
@@ -63,7 +62,7 @@ pub struct Envelope {
 
 /// Lowercase hex SHA-512.
 pub fn sha512_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha512::digest(bytes))
+    crypto::digest::sha512_hex(bytes)
 }
 
 /// The signer list to embed in a manifest: one entry per configured key, or
@@ -93,11 +92,7 @@ pub fn seal(domain: &[u8], kind: &str, payload: &[u8], key: Option<&SigningState
             vec![EnvelopeSignature {
                 algorithm: ALGORITHM.into(),
                 key_id: k.key_id.clone(),
-                signature: BASE64.encode(
-                    k.signing_key
-                        .sign(&signing_input(domain, payload))
-                        .to_bytes(),
-                ),
+                signature: BASE64.encode(k.signing_key.sign(&signing_input(domain, payload))),
             }]
         })
         .unwrap_or_default();
@@ -238,12 +233,14 @@ pub fn verify_envelope(
                 let raw = BASE64
                     .decode(sig.signature.as_bytes())
                     .map_err(|_| IntegrityError::BadSignatureEncoding)?;
-                let ed = EdSignature::from_slice(&raw)
-                    .map_err(|_| IntegrityError::BadSignatureEncoding)?;
-                k.signing_key
-                    .verifying_key()
-                    .verify_strict(&input, &ed)
-                    .map_err(|_| IntegrityError::SignatureInvalid)?;
+                crypto::ed25519::verify(&k.signing_key.public_key(), &input, &raw).map_err(
+                    |e| match e {
+                        crypto::ed25519::VerifyError::BadLength => {
+                            IntegrityError::BadSignatureEncoding
+                        }
+                        crypto::ed25519::VerifyError::Invalid => IntegrityError::SignatureInvalid,
+                    },
+                )?;
             }
         }
     }

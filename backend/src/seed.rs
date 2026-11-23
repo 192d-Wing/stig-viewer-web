@@ -50,7 +50,7 @@ fn copy_one(src: &Path, stigs_dir: &Path, name: &str) -> std::io::Result<bool> {
     if dest.exists() {
         return Ok(false);
     }
-    let tmp = stigs_dir.join(format!(".seed-{}.tmp", uuid::Uuid::new_v4()));
+    let tmp = stigs_dir.join(format!(".seed-{}.tmp", crate::crypto::rand::uuid_v4()));
     let result = (|| {
         let mut out = std::fs::OpenOptions::new()
             .write(true)
@@ -287,7 +287,7 @@ mod tests {
     struct Tmp(std::path::PathBuf);
     impl Tmp {
         fn new() -> Self {
-            let d = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+            let d = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
             std::fs::create_dir_all(&d).unwrap();
             Tmp(d)
         }

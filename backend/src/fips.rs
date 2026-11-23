@@ -1,10 +1,13 @@
 //! FIPS startup guard and pending-algorithm policy (#64, #70).
 //!
-//! With `--features fips` the backend refuses to start unless the AWS-LC FIPS
+//! With `--no-default-features --features fips` the backend refuses to start unless the AWS-LC FIPS
 //! module is linked and reports FIPS mode. The AWS-LC-FIPS 4.x module as a
 //! whole is pending CMVP validation (in process, no certificate claimed); the
-//! per-algorithm list below is an additional gate. Application crypto and TLS
-//! do not use the module yet.
+//! per-algorithm list below is an additional gate. The application's own
+//! Ed25519, HMAC-SHA-256, SHA-2, SAML RSA verification and session/identifier
+//! RNG run in the module (`crate::crypto`, #65). TLS (rustls on ring), OIDC
+//! ID-token verification and state/nonce (openidconnect, RustCrypto) and
+//! Postgres SCRAM do not; see [`OUTSIDE_MODULE`].
 //!
 //! `STIG_REQUIRE_FIPS` makes a non-`fips` build refuse to start. One
 //! `system.fips_policy` audit event is written at server startup.
@@ -19,11 +22,20 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::crypto;
 use crate::db_audit::{record_system_now, NewSystemEvent};
 
 pub const PENDING_ALGS_ENV: &str = "STIG_FIPS_PENDING_ALGS";
 pub const REQUIRE_FIPS_ENV: &str = "STIG_REQUIRE_FIPS";
 pub const POLICY_ACTION: &str = "system.fips_policy";
+
+/// Crypto that still runs outside the FIPS module even in a `fips` build.
+pub const OUTSIDE_MODULE: [&str; 4] = [
+    "tls",
+    "oidc-id-token-verify",
+    "oidc-state-nonce",
+    "postgres-scram",
+];
 
 /// Bound on the startup audit write, so a hung pool cannot stall startup.
 const POLICY_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,7 +55,7 @@ pub fn parse_require_fips(raw: Option<&str>) -> Result<bool> {
     }
 }
 
-/// True when built with `--features fips`.
+/// True when built with `--no-default-features --features fips`.
 pub const fn compiled() -> bool {
     cfg!(feature = "fips")
 }
@@ -127,12 +139,12 @@ impl FipsPolicy {
         self.allowed_pending.iter().copied()
     }
 
-    #[allow(dead_code)] // first caller is #65
+    #[allow(dead_code)] // first caller is the ML-DSA / v2 envelope work (#66-#69)
     pub fn permits(&self, alg: PendingAlg) -> bool {
         !self.enforced || self.allowed_pending.contains(&alg)
     }
 
-    #[allow(dead_code)] // first caller is #65
+    #[allow(dead_code)] // first caller is the ML-DSA / v2 envelope work (#66-#69)
     pub fn require(&self, alg: PendingAlg) -> Result<()> {
         if self.permits(alg) {
             Ok(())
@@ -181,6 +193,9 @@ pub struct FipsStartup {
     pub mode_active: bool,
     /// `STIG_REQUIRE_FIPS` was set.
     pub require_fips: bool,
+    /// The primitives the application calls directly run in the FIPS module:
+    /// compiled with `fips` and the probe passed. Excludes [`OUTSIDE_MODULE`].
+    pub app_crypto_in_module: bool,
 }
 
 impl FipsStartup {
@@ -194,9 +209,10 @@ impl FipsStartup {
             "fipsCompiled": self.compiled,
             "fipsModeActive": self.mode_active,
             "requireFips": self.require_fips,
-            // Static until #65 moves application crypto into the module:
-            // fipsModeActive does not mean app crypto is FIPS-covered.
-            "appCryptoInModule": false,
+            // Primitives this application calls directly; not dependency
+            // crypto, which `cryptoOutsideModule` lists.
+            "appCryptoInModule": self.app_crypto_in_module,
+            "cryptoOutsideModule": OUTSIDE_MODULE,
             "pendingAlgs": algs,
         })
     }
@@ -214,7 +230,7 @@ fn guard(
     let policy = FipsPolicy::from_vars(compiled, raw_pending)?;
     if require_fips && !compiled {
         anyhow::bail!(
-            "refusing to start: {REQUIRE_FIPS_ENV} is set but this binary was built without the fips feature; deploy a --features fips build or unset {REQUIRE_FIPS_ENV}"
+            "refusing to start: {REQUIRE_FIPS_ENV} is set but this binary was built without the fips feature; deploy a --no-default-features --features fips build or unset {REQUIRE_FIPS_ENV}"
         );
     }
     let mode_active = check_module(compiled, probe)?;
@@ -223,6 +239,7 @@ fn guard(
         compiled,
         mode_active,
         require_fips,
+        app_crypto_in_module: mode_active && crypto::app_primitives_in_module(),
     })
 }
 
@@ -267,7 +284,8 @@ pub fn startup_guard() -> Result<FipsStartup> {
             "the linked AWS-LC-FIPS 4.x module is pending CMVP validation (in process); no CMVP certificate is claimed for this build"
         );
         tracing::warn!(
-            "application crypto and TLS do not yet use the FIPS module; this is not a compliance claim"
+            outside_module = ?OUTSIDE_MODULE,
+            "TLS, OIDC ID-token verification and state/nonce, and Postgres SCRAM do not use the FIPS module; this is not a compliance claim"
         );
     } else {
         tracing::info!(require_fips = false, "FIPS mode: not compiled in");
@@ -319,6 +337,8 @@ async fn record_policy_event_with_timeout(
         fips_compiled = s.compiled,
         fips_mode_active = s.mode_active,
         require_fips = s.require_fips,
+        app_crypto_in_module = s.app_crypto_in_module,
+        outside_module = ?OUTSIDE_MODULE,
         pending_algs = ?s.policy.allowed_pending().map(PendingAlg::token).collect::<Vec<_>>(),
         "audit write failed: {err}"
     );
@@ -516,17 +536,33 @@ mod tests {
         let s = guard(false, None, None, || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "pendingAlgs": []})
+            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": []})
         );
         let s = guard(false, None, Some("ML-DSA-87"), || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "pendingAlgs": ["ML-DSA-87"]})
+            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": ["ML-DSA-87"]})
         );
         let s = guard(true, Some("1"), Some("X25519MLKEM768,ml-dsa-87"), || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": true, "fipsModeActive": true, "requireFips": true, "appCryptoInModule": false, "pendingAlgs": ["ML-DSA-87", "X25519MLKEM768"]})
+            json!({"fipsCompiled": true, "fipsModeActive": true, "requireFips": true, "appCryptoInModule": cfg!(feature = "fips"), "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": ["ML-DSA-87", "X25519MLKEM768"]})
+        );
+    }
+
+    #[test]
+    fn app_crypto_in_module_needs_the_module_active() {
+        // Compiled with the probe failing never reaches a FipsStartup.
+        let s = guard(true, None, None, || Ok(())).unwrap();
+        assert_eq!(s.app_crypto_in_module, cfg!(feature = "fips"));
+        let s = guard(false, None, None, || Ok(())).unwrap();
+        assert!(!s.mode_active && !s.app_crypto_in_module);
+        assert_eq!(
+            s.audit_detail()["cryptoOutsideModule"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
         );
     }
 
@@ -549,6 +585,7 @@ mod tests {
             compiled: true,
             mode_active: true,
             require_fips: true,
+            app_crypto_in_module: true,
         };
         try_record_policy_event(&pool, &s, POLICY_EVENT_TIMEOUT)
             .await
@@ -572,6 +609,15 @@ mod tests {
     fn fips_build_module_is_in_fips_mode() {
         assert!(compiled());
         assert!(real_probe().is_ok());
+        assert!(crypto::app_primitives_in_module());
+        let s = guard(true, None, None, real_probe).unwrap();
+        assert!(s.app_crypto_in_module);
+        // The primitives work inside the module. The crypto::* known-answer
+        // tests also run in the FIPS CI job and are the in-module evidence.
+        assert_eq!(
+            crypto::digest::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert!(aws_lc_rs::try_fips_mode().is_ok());
     }
 

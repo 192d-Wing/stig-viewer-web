@@ -9,10 +9,16 @@ name = "stig-viewer-backend"
 path = "src/main.rs"
 
 [features]
-default = []
-# Refuse to start unless the AWS-LC FIPS module is linked and in FIPS mode (#70).
-# Needs CMake, Go, Perl and a C compiler to build.
-fips = ["dep:aws-lc-rs"]
+default = ["non-fips"]
+# Non-FIPS AWS-LC (aws-lc-sys); needs only a C compiler. Makes no FIPS claim.
+non-fips = ["aws-lc-rs/aws-lc-sys"]
+# Refuse to start unless the AWS-LC FIPS module is linked and in FIPS mode (#70),
+# and run the application's own Ed25519, HMAC, SHA-2, SAML RSA verify and RNG
+# inside it (#65). Needs CMake, Go, Perl and a C compiler to build. Without it
+# the same code runs on the non-FIPS aws-lc-sys (C compiler only).
+# Build with `--no-default-features --features fips`: with `non-fips` also on,
+# both aws-lc-sys and aws-lc-fips-sys would link (checked at compile time).
+fips = ["aws-lc-rs/fips"]
 
 [dependencies]
 axum               = { version = "0.7", features = ["macros", "multipart"] }
@@ -30,25 +36,21 @@ chrono             = { version = "0.4", features = ["serde"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow             = "1"
-uuid               = { version = "1", features = ["v4", "v5"] }
+uuid               = { version = "1", features = ["v5"] }
 openidconnect      = { version = "4", features = ["reqwest", "rustls-tls"], default-features = false }
 axum-extra         = { version = "0.9", features = ["cookie"] }
 url                = "2"
 time               = "0.3"
 pdf-writer         = "0.15"
-sha2               = "0.10"
-hmac               = "0.12"
 hex                = "0.4"
 csv                = "1"
 base64             = "0.22"
 flate2             = "1"
 lettre             = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
-rsa                = { version = "0.9", features = ["sha2"] }
 x509-parser        = "0.16"
-ed25519-dalek      = "2"
-# Only compiled with `--features fips`; default-features off keeps the non-FIPS
-# aws-lc-sys out of the graph.
-aws-lc-rs          = { version = "1.19", optional = true, default-features = false, features = ["fips", "alloc"] }
+# All application-level crypto goes through src/crypto (#65). The sys crate is
+# chosen by the `non-fips` / `fips` features above, never both.
+aws-lc-rs          = { version = "1.19", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # Paused clocks for the request-body deadline tests.
@@ -56,5 +58,10 @@ tokio              = { version = "1", features = ["test-util"] }
 rcgen              = "0.13"
 # `oneshot` for router-level tests.
 tower              = { version = "0.5", features = ["util"] }
-# Keep this rsa on the same version as the main [dependencies] rsa.
+# RustCrypto crates are test-only here: differential tests against src/crypto,
+# and RSA key generation/signing for the fake IdP and SAML fixtures. (They stay
+# in the lock file transitively via openidconnect and sqlx.)
 rsa                = { version = "0.9", features = ["sha2", "getrandom"] }
+sha2               = "0.10"
+hmac               = "0.12"
+ed25519-dalek      = "2"

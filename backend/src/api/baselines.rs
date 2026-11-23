@@ -48,7 +48,7 @@ pub async fn create_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     let pool = state.pool.as_ref();
 
     let mut tx = pool.begin().await.map_err(|e| {

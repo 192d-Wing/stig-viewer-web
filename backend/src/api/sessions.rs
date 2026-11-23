@@ -136,7 +136,7 @@ mod tests {
     async fn base(pool: &PgPool) -> String {
         seed_user(pool, "root").await;
         seed_user(pool, "u1").await;
-        let sid = uuid::Uuid::new_v4().to_string();
+        let sid = crate::crypto::rand::uuid_v4().to_string();
         sqlx::query(
             "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, 'u1', NOW() + INTERVAL '1 day')",
         )

@@ -41,19 +41,16 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
 
 use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
 use crate::api::request_ctx::RequestCtx;
+use crate::crypto;
 use crate::AppState;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Signature scheme label: the digest name and the header-value prefix
 /// (`<name>=<hex>`). The signer and the verify recipes both derive from it.
@@ -66,14 +63,9 @@ fn sign_body(secret: &str, body: &[u8]) -> Option<String> {
     if secret.is_empty() {
         return None;
     }
-    // Hmac::new_from_slice is infallible for HMAC-SHA256 — any byte
-    // length is valid as a key — so the unwrap can never fire.
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
-    mac.update(body);
     Some(format!(
         "{SIG_ALGO}={}",
-        hex::encode(mac.finalize().into_bytes())
+        hex::encode(crypto::hmac::hmac_sha256(secret.as_bytes(), body))
     ))
 }
 
@@ -283,7 +275,7 @@ pub async fn create_handler(
     let flavor = req.flavor.unwrap_or_else(|| "slack".to_string());
     validate_flavor(&flavor)?;
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
 
     // The webhook and its `webhook.create` row commit together. The detail
     // never carries the URL, name or secret (Slack/Teams URLs embed a
@@ -1360,8 +1352,11 @@ mod audit_tests {
     /// A URL with a path credential and a secret, both random per test.
     fn creds() -> (String, String) {
         (
-            format!("https://hooks.example.test/{}", uuid::Uuid::new_v4()),
-            uuid::Uuid::new_v4().to_string(),
+            format!(
+                "https://hooks.example.test/{}",
+                crate::crypto::rand::uuid_v4()
+            ),
+            crate::crypto::rand::uuid_v4().to_string(),
         )
     }
 
@@ -1444,7 +1439,7 @@ mod audit_tests {
         assert_eq!(c.source_ip.as_deref(), Some("198.51.100.4"));
 
         // `changed` lists exactly the fields that differ.
-        let new_secret = uuid::Uuid::new_v4().to_string();
+        let new_secret = crate::crypto::rand::uuid_v4().to_string();
         patch(
             &state,
             &hook.id,
@@ -1698,7 +1693,7 @@ mod audit_tests {
             &state,
             &hook.id,
             UpdateRequest {
-                secret: Some(uuid::Uuid::new_v4().to_string()),
+                secret: Some(crate::crypto::rand::uuid_v4().to_string()),
                 ..no_change()
             },
         )
@@ -1747,7 +1742,7 @@ mod recipe_tests {
 
     #[test]
     fn signed_recipe_omits_the_secret_but_keeps_the_curl_signature() {
-        let secret = uuid::Uuid::new_v4().to_string();
+        let secret = crate::crypto::rand::uuid_v4().to_string();
         let r = build_verify_recipe(&row(&secret));
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains(&secret));

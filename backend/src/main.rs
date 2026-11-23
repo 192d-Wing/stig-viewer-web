@@ -1,6 +1,14 @@
+#[cfg(all(feature = "fips", feature = "non-fips"))]
+compile_error!(
+    "features `fips` and `non-fips` are mutually exclusive; build the FIPS binary with `--no-default-features --features fips`"
+);
+#[cfg(not(any(feature = "fips", feature = "non-fips")))]
+compile_error!("enable exactly one of the `non-fips` (default) or `fips` features");
+
 mod api;
 mod audit_retention;
 mod config;
+mod crypto;
 mod db;
 mod db_assets;
 mod db_attachments;

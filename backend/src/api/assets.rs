@@ -110,7 +110,7 @@ pub async fn create_asset_handler(
     let tags = normalize_tags(&req.tags)?;
     let now = chrono::Utc::now();
     let asset = db_assets::AssetRow {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: crate::crypto::rand::uuid_v4().to_string(),
         name: name.into(),
         hostname: req.hostname,
         description: req.description,

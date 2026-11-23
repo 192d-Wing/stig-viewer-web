@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
+use crate::crypto;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
@@ -32,7 +33,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Postgres, Transaction};
 
 use crate::api::asset_acl;
@@ -248,7 +248,7 @@ fn body_digest(v: &impl Serialize) -> ApiResult<String> {
     })?;
     Ok(format!(
         "{DIGEST_ALG}:{}",
-        hex::encode(Sha256::digest(bytes))
+        crypto::digest::sha256_hex(bytes.as_ref())
     ))
 }
 
@@ -621,7 +621,7 @@ async fn create_work(
             default.chars().take(MAX_NAME_CHARS).collect()
         }
     };
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     let hold = shield.hold();
     let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
     match db::insert_set(
