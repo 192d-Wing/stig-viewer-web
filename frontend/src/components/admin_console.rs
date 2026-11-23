@@ -2022,6 +2022,25 @@ enum VerifyState {
     Ready(VerifyRecipe),
 }
 
+impl DeliveriesPanel {
+    /// Panel state once the deliveries fetch finishes: the latest ten rows,
+    /// or the error.
+    fn loaded(webhook_name: String, result: Result<Vec<Delivery>, String>) -> Self {
+        match result {
+            Ok(rows) => Self {
+                webhook_name,
+                rows: rows.into_iter().take(10).collect(),
+                ..Default::default()
+            },
+            Err(e) => Self {
+                webhook_name,
+                error: Some(e),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 /// Path, method and JSON body for saving the webhook form: POST on create,
 /// PATCH on edit. The stored secret is write-only, so on edit the `secret`
 /// key is omitted to keep it, set to a new value to rotate, or "" to clear.
@@ -2155,24 +2174,10 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                 ..Default::default()
             }));
             spawn_local(async move {
-                let next = match api_get::<Vec<Delivery>>(&format!(
-                    "/api/webhooks/{}/deliveries",
-                    hook.id
-                ))
-                .await
-                {
-                    Ok(rows) => DeliveriesPanel {
-                        webhook_name,
-                        rows: rows.into_iter().take(10).collect(),
-                        ..Default::default()
-                    },
-                    Err(e) => DeliveriesPanel {
-                        webhook_name,
-                        error: Some(e),
-                        ..Default::default()
-                    },
-                };
-                panel.set(Some(next));
+                let result =
+                    api_get::<Vec<Delivery>>(&format!("/api/webhooks/{}/deliveries", hook.id))
+                        .await;
+                panel.set(Some(DeliveriesPanel::loaded(webhook_name, result)));
             });
         })
     };
