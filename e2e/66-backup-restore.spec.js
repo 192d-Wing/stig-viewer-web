@@ -219,12 +219,16 @@ test.describe("Backup + restore — API", () => {
     const after = await listEvents();
     expect(after.map((e) => e.id)).toEqual(before.map((e) => e.id));
 
-    // New events are numbered after the restored ones.
+    // New events are numbered after the restored ones. Creating the asset
+    // (asset.create, #151) and applying the STIG (checklist.create) each
+    // write one event.
+    const maxBefore = Math.max(...before.map((e) => e.id));
     const asset2 = await createAsset(request, "backup-host-events-2");
     await applyStig(request, asset2.id);
     const later = await listEvents();
-    expect(later.length).toBe(before.length + 1);
-    expect(Math.max(...later.map((e) => e.id))).toBeGreaterThan(Math.max(...before.map((e) => e.id)));
+    const added = later.filter((e) => e.id > maxBefore);
+    expect(added.map((e) => e.action).sort()).toEqual(["asset.create", "checklist.create"]);
+    expect(later.length).toBe(before.length + added.length);
   });
 
   test("checklist sets survive a backup round trip", async ({ request }) => {
