@@ -144,7 +144,8 @@ for local work. The ones you may want to change:
   e2e run never contacts DISA. (A large interval alone does not skip the
   boot sync.) A source URL that answers 404/410 is logged as a warning naming
   the entry and counted as a stale URL in the scheduler summary; update
-  `backend/stig-sources.toml` when you see one.
+  `backend/stig-sources.toml` when you see one. An entry may carry an optional
+  `sha256` pin of the ZIP; a mismatch fails closed.
 - `ADMISSION_BODY_MIN_RATE_KIB` (default `64`, 8 to 8192),
   `ADMISSION_BODY_GRACE_SECS` (default `10`, 1 to 120) and
   `ADMISSION_BODY_FIRST_BYTE_SECS` (default `5`, 1 to 60) — the request-body
@@ -238,6 +239,16 @@ recorded as a `catalog.sync` audit event with `outcome = 'rejected'`,
 `stig_id` = the source id and `detail = {reasonCode: "download_too_large",
 limitBytes, declaredBytes}`. It has no acting user: `user_id` is NULL,
 `user_role` is `system`, and the audit view shows it as "system".
+
+The sync only talks to `https://dl.dod.cyber.mil` (default port), and
+re-checks that origin on every redirect hop; a source URL or redirect that
+leaves it fails closed. That is recorded as `catalog.sync` /
+`outcome = 'rejected'` with `detail = {reasonCode: "disallowed_origin",
+stage: "source" | "redirect"}` (no URL or host). The SHA-256 of each
+downloaded ZIP is logged. When the source has a `sha256` pin in
+`stig-sources.toml` and the digest differs, nothing is extracted or written and
+the event is `detail = {reasonCode: "checksum_mismatch", expectedSha256,
+actualSha256}`.
 
 ### Signing envelope (v2)
 

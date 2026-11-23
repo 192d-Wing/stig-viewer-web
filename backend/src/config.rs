@@ -4,11 +4,15 @@ use std::{fs, path::PathBuf};
 
 /// One entry from stig-sources.toml — the curated DISA download manifest.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StigSource {
     pub id: String,
     pub title: String,
     pub category: String,
     pub url: String,
+    /// Optional SHA-256 pin of the ZIP (64 lower-case hex digits once loaded).
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// Top-level structure of stig-sources.toml.
@@ -323,7 +327,25 @@ impl AdmissionBody {
 pub fn load_sources() -> Result<Vec<StigSource>> {
     let raw = fs::read_to_string("stig-sources.toml")
         .context("Cannot read stig-sources.toml — run from the backend/ directory")?;
-    let parsed: SourcesFile = toml::from_str(&raw).context("Failed to parse stig-sources.toml")?;
+    parse_sources(&raw)
+}
+
+/// Parse the manifest text and normalise each optional `sha256` pin.
+pub(crate) fn parse_sources(raw: &str) -> Result<Vec<StigSource>> {
+    let mut parsed: SourcesFile =
+        toml::from_str(raw).context("Failed to parse stig-sources.toml")?;
+    for s in &mut parsed.stigs {
+        if let Some(pin) = s.sha256.take() {
+            let pin = pin.trim();
+            if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+                anyhow::bail!(
+                    "stig-sources.toml: source '{}' has an invalid sha256 (expected 64 hex characters)",
+                    s.id
+                );
+            }
+            s.sha256 = Some(pin.to_ascii_lowercase());
+        }
+    }
     Ok(parsed.stigs)
 }
 
@@ -434,10 +456,54 @@ mod tests {
         for s in &sources {
             assert!(crate::stig_id::is_valid_new(&s.id), "bad id {}", s.id);
             assert!(seen.insert(s.id.clone()), "duplicate id {}", s.id);
-            assert!(s.url.starts_with("https://dl.dod.cyber.mil/"), "{}", s.url);
+            let url = reqwest::Url::parse(&s.url).expect("source url parses");
+            assert!(crate::sync::disa::DISA_ORIGIN.permits(&url), "{}", s.url);
+            if let Some(p) = &s.sha256 {
+                assert!(
+                    p.len() == 64 && p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                    "{}",
+                    s.id
+                );
+            }
         }
         // The e2e suite reads these two from the seed.
         assert!(seen.contains("edge") && seen.contains("windows-10"));
+    }
+
+    fn manifest(extra: &str) -> String {
+        format!(
+            "[[stigs]]\nid = \"a-b\"\ntitle = \"t\"\ncategory = \"c\"\nurl = \"https://dl.dod.cyber.mil/x.zip\"\n{extra}\n"
+        )
+    }
+
+    #[test]
+    fn sha256_pin_is_optional_and_normalised() {
+        assert_eq!(parse_sources(&manifest("")).unwrap()[0].sha256, None);
+        let hex = "AB".repeat(32);
+        let got = parse_sources(&manifest(&format!("sha256 = \" {hex} \""))).unwrap();
+        assert_eq!(got[0].sha256.as_deref(), Some("ab".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn a_malformed_sha256_pin_is_rejected_without_echoing_it() {
+        for bad in [
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}g", "a".repeat(63)),
+        ] {
+            let e = parse_sources(&manifest(&format!("sha256 = \"{bad}\""))).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("a-b") && msg.contains("invalid sha256"),
+                "{msg}"
+            );
+            assert!(!msg.contains(&bad), "{msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_source_keys_are_rejected() {
+        assert!(parse_sources(&manifest("sha265 = \"x\"")).is_err());
     }
 
     #[test]

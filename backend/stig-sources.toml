@@ -9,6 +9,11 @@
 # the ZIP name, so a synced STIG replaces the imported one instead of adding a
 # duplicate. Exceptions kept on purpose: `windows-10` and `edge` are read by the
 # e2e suite, and their URLs stay on the release the tracked seed holds.
+# DISA publishes no checksums. The sync logs the SHA-256 of every ZIP it
+# downloads. To pin an entry, verify the ZIP out of band, then add
+# `sha256 = "<64 hex digits>"`. A pinned entry fails closed on a mismatch (audit
+# event `checksum_mismatch`) and nothing is written. Update the pin together
+# with the URL each release. Do not add pins to the shipped entries.
 # Not listed: Cisco IOS XE Router NDM (no current download name found).
 
 [[stigs]]
