@@ -346,6 +346,7 @@ mod tests {
             title: "t".into(),
             category: "c".into(),
             url: "u".into(),
+            sha256: None,
         };
         let seed: HashSet<String> = ["from-seed".to_string()].into();
         let ids: Vec<String> = ["in-manifest", "from-seed", "windows-11"]
@@ -396,12 +397,14 @@ mod tests {
                 title: "t".into(),
                 category: "Browser".into(),
                 url: "u".into(),
+                sha256: None,
             },
             StigSource {
                 id: "bad-json-cat".into(),
                 title: "t".into(),
                 category: "Network".into(),
                 url: "u".into(),
+                sha256: None,
             },
         ];
 

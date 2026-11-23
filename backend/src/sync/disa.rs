@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
 use tracing::{error, info, warn};
@@ -109,6 +110,188 @@ pub(crate) fn download_too_large_event(
     }
 }
 
+/// The one origin a source URL (and every redirect hop) may name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AllowedOrigin {
+    scheme: &'static str,
+    host: &'static str,
+    port: u16,
+}
+
+/// The only origin production syncs may talk to.
+pub(crate) const DISA_ORIGIN: AllowedOrigin = AllowedOrigin {
+    scheme: "https",
+    host: "dl.dod.cyber.mil",
+    port: 443,
+};
+
+impl AllowedOrigin {
+    /// Test-only: a plain-HTTP loopback origin for a local fake server.
+    #[cfg(test)]
+    fn loopback_http(port: u16) -> Self {
+        Self {
+            scheme: "http",
+            host: "127.0.0.1",
+            port,
+        }
+    }
+
+    /// True when `url` has exactly this scheme, host and port and no userinfo.
+    pub(crate) fn permits(&self, url: &reqwest::Url) -> bool {
+        url.scheme() == self.scheme
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.host_str() == Some(self.host)
+            && url.port_or_known_default() == Some(self.port)
+    }
+}
+
+/// Where a disallowed origin was seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginStage {
+    Source,
+    Redirect,
+}
+
+impl OriginStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Redirect => "redirect",
+        }
+    }
+}
+
+/// A source URL or redirect target outside the allowed origin. The Display
+/// text carries no URL.
+#[derive(Debug)]
+struct DisallowedOrigin {
+    stage: OriginStage,
+}
+
+impl std::fmt::Display for DisallowedOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} URL is outside the allowed DISA origin",
+            self.stage.as_str()
+        )
+    }
+}
+
+impl std::error::Error for DisallowedOrigin {}
+
+/// The downloaded ZIP's SHA-256 differs from the source's pin.
+#[derive(Debug)]
+struct ChecksumMismatch {
+    expected: String,
+    actual: String,
+}
+
+impl std::fmt::Display for ChecksumMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "downloaded ZIP sha256 {} does not match the pinned {}",
+            self.actual, self.expected
+        )
+    }
+}
+
+impl std::error::Error for ChecksumMismatch {}
+
+/// Parse a manifest URL and require it to be inside `origin`.
+fn check_source_origin(
+    raw: &str,
+    origin: &AllowedOrigin,
+) -> Result<reqwest::Url, DisallowedOrigin> {
+    match reqwest::Url::parse(raw) {
+        Ok(u) if origin.permits(&u) => Ok(u),
+        _ => Err(DisallowedOrigin {
+            stage: OriginStage::Source,
+        }),
+    }
+}
+
+/// Lower-case hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Redirects followed before giving up: a 5-hop chain succeeds, a 6th fails.
+/// `attempt.previous()` holds the URLs already visited (the original included),
+/// so deciding the k-th redirect sees `previous().len() == k`.
+const MAX_REDIRECTS: usize = 5;
+
+/// The sync HTTP client: every redirect hop must stay inside `origin`.
+fn build_client(origin: AllowedOrigin) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("stig-viewer-backend/0.1")
+        .timeout(std::time::Duration::from_secs(120))
+        .https_only(origin.scheme == "https")
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > MAX_REDIRECTS {
+                attempt.error("too many redirects")
+            } else if !origin.permits(attempt.url()) {
+                attempt.error(DisallowedOrigin {
+                    stage: OriginStage::Redirect,
+                })
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+}
+
+/// Audit event for a source URL or redirect outside the allowed origin: no
+/// acting user, no URL or host.
+fn disallowed_origin_event(
+    stig_id: &str,
+    stage: OriginStage,
+) -> crate::db_audit::NewSystemEvent<'_> {
+    crate::db_audit::NewSystemEvent {
+        action: "catalog.sync",
+        outcome: "rejected",
+        stig_id: Some(stig_id),
+        detail: serde_json::json!({
+            "reasonCode": "disallowed_origin",
+            "stage": stage.as_str(),
+        }),
+    }
+}
+
+/// Audit event for a ZIP whose digest differs from the source's pin.
+fn checksum_mismatch_event<'a>(
+    stig_id: &'a str,
+    expected: &str,
+    actual: &str,
+) -> crate::db_audit::NewSystemEvent<'a> {
+    crate::db_audit::NewSystemEvent {
+        action: "catalog.sync",
+        outcome: "rejected",
+        stig_id: Some(stig_id),
+        detail: serde_json::json!({
+            "reasonCode": "checksum_mismatch",
+            "expectedSha256": expected,
+            "actualSha256": actual,
+        }),
+    }
+}
+
+/// Audit and log a disallowed origin, returning the typed error.
+async fn reject_origin(pool: &PgPool, stig_id: &str, stage: OriginStage) -> anyhow::Error {
+    warn!(
+        target: "audit",
+        action = "catalog.sync",
+        reason_code = "disallowed_origin",
+        stig_id = %stig_id,
+        stage = stage.as_str(),
+        "DISA sync refused: URL outside the allowed origin"
+    );
+    crate::db_audit::record_system_or_log(pool, disallowed_origin_event(stig_id, stage)).await;
+    DisallowedOrigin { stage }.into()
+}
+
 /// Read a response body, refusing more than `limit` bytes. A declared
 /// `Content-Length` over the limit is refused before any body is read; a
 /// body without one (or lying about it) is cut off as it streams.
@@ -158,7 +341,15 @@ async fn sync_one(
     pool: &PgPool,
     data_dir: &Path,
 ) -> Result<Outcome> {
-    sync_one_with(source, client, pool, data_dir, MAX_DISA_DOWNLOAD_BYTES).await
+    sync_one_with(
+        source,
+        client,
+        pool,
+        data_dir,
+        MAX_DISA_DOWNLOAD_BYTES,
+        &DISA_ORIGIN,
+    )
+    .await
 }
 
 /// [`sync_one`] with an explicit download cap (a seam for tests).
@@ -168,16 +359,29 @@ async fn sync_one_with(
     pool: &PgPool,
     data_dir: &Path,
     limit: usize,
+    origin: &AllowedOrigin,
 ) -> Result<Outcome> {
     validate_source(source)?;
-    info!("Syncing STIG '{}' from {}", source.id, source.url);
+    let url = match check_source_origin(&source.url, origin) {
+        Ok(u) => u,
+        Err(e) => return Err(reject_origin(pool, &source.id, e.stage).await),
+    };
+    info!("Syncing STIG '{}' from {}", source.id, url);
 
     // 1. Download ZIP
-    let resp = client
-        .get(&source.url)
-        .send()
-        .await
-        .context("HTTP request failed")?;
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            if e.is_redirect() {
+                if let Some(d) =
+                    std::error::Error::source(&e).and_then(|s| s.downcast_ref::<DisallowedOrigin>())
+                {
+                    return Err(reject_origin(pool, &source.id, d.stage).await);
+                }
+            }
+            return Err(anyhow::Error::new(e).context("HTTP request failed"));
+        }
+    };
 
     if is_stale_status(resp.status().as_u16()) {
         warn!(
@@ -213,6 +417,40 @@ async fn sync_one_with(
             return Err(e);
         }
     };
+
+    // Hash off the async workers, log it, and enforce the optional pin before
+    // anything is extracted or written.
+    let (zip_bytes, digest) = tokio::task::spawn_blocking(move || {
+        let digest = sha256_hex(&zip_bytes);
+        (zip_bytes, digest)
+    })
+    .await
+    .context("ZIP hashing task failed")?;
+    info!(
+        "Downloaded '{}': {} bytes, sha256 {}",
+        source.id,
+        zip_bytes.len(),
+        digest
+    );
+    if let Some(expected) = source.sha256.as_deref().filter(|e| *e != digest) {
+        warn!(
+            target: "audit",
+            action = "catalog.sync",
+            reason_code = "checksum_mismatch",
+            stig_id = %source.id,
+            "DISA download does not match the pinned sha256"
+        );
+        crate::db_audit::record_system_or_log(
+            pool,
+            checksum_mismatch_event(&source.id, expected, &digest),
+        )
+        .await;
+        return Err(ChecksumMismatch {
+            expected: expected.to_string(),
+            actual: digest,
+        }
+        .into());
+    }
 
     // 2. Extract XCCDF XML from ZIP (handles double-zipped STIGs)
     // Both steps are CPU-bound, so they run off the async workers.
@@ -370,7 +608,6 @@ async fn archive_previous_catalog(
 /// release are readable but lossy (`1.2` and `1-2` agree), so a hash of the
 /// raw pair keeps distinct versions from overwriting each other.
 pub(crate) fn archive_file_name(stig_id: &str, version: &str, release_info: &str) -> String {
-    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(version.as_bytes());
     h.update([0u8]);
@@ -416,10 +653,7 @@ pub async fn run_sync(
     sources: &Arc<Vec<StigSource>>,
     pool: &PgPool,
 ) -> Result<SyncSummary> {
-    let client = reqwest::Client::builder()
-        .user_agent("stig-viewer-backend/0.1")
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+    let client = build_client(DISA_ORIGIN)?;
 
     let mut summary = SyncSummary::default();
     for source in sources.as_ref() {
@@ -455,6 +689,7 @@ mod id_tests {
             title: "t".into(),
             category: "c".into(),
             url: "u".into(),
+            sha256: None,
         }
     }
 
@@ -624,6 +859,7 @@ mod id_tests {
             title: "t".into(),
             category: "Linux".into(),
             url,
+            sha256: None,
         }
     }
 
@@ -654,11 +890,12 @@ mod id_tests {
         )
         .await;
         let e = sync_one_with(
-            &source_for("big-src", url),
+            &source_for("big-src", url.clone()),
             &reqwest::Client::new(),
             &pool,
             &data_dir,
             10,
+            &origin_of(&url),
         )
         .await
         .unwrap_err();
@@ -686,11 +923,12 @@ mod id_tests {
         )
         .await;
         let e = sync_one_with(
-            &source_for("stream-src", url),
+            &source_for("stream-src", url.clone()),
             &reqwest::Client::new(),
             &pool,
             &data_dir,
             10,
+            &origin_of(&url),
         )
         .await
         .unwrap_err();
@@ -715,15 +953,343 @@ mod id_tests {
         )
         .await;
         let e = sync_one_with(
-            &source_for("small-src", url),
+            &source_for("small-src", url.clone()),
             &reqwest::Client::new(),
             &pool,
             &data_dir,
             10,
+            &origin_of(&url),
         )
         .await
         .unwrap_err();
         assert!(e.downcast_ref::<DownloadTooLarge>().is_none(), "{e:#}");
         assert!(sync_rows(&pool).await.is_empty());
+    }
+
+    // ── Origin lock and checksum pin ──
+
+    fn origin_of(url: &str) -> AllowedOrigin {
+        let port = reqwest::Url::parse(url).unwrap().port().unwrap();
+        AllowedOrigin::loopback_http(port)
+    }
+
+    /// Listener that answers `n` connections: the first with a 302 to
+    /// `location` (when given), the rest with an empty 200.
+    async fn serve_redirect(location: Option<String>, n: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let loc = location.map(|l| l.replace("{self}", &base));
+        tokio::spawn(async move {
+            for i in 0..n {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = match (&loc, i) {
+                    (Some(l), 0) => format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {l}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    _ => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                };
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("{base}/")
+    }
+
+    /// Listener whose first `hops` answers redirect to `/next`; then 200.
+    async fn serve_chain(hops: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let b = base.clone();
+        tokio::spawn(async move {
+            for i in 0..=hops {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let head = if i < hops {
+                    format!("HTTP/1.1 302 Found\r\nLocation: {b}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("{base}/")
+    }
+
+    #[tokio::test]
+    async fn exactly_max_redirects_are_followed() {
+        let url = serve_chain(MAX_REDIRECTS).await;
+        let client = build_client(origin_of(&url)).unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status().as_u16(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn one_redirect_too_many_fails_without_a_disallowed_origin() {
+        let url = serve_chain(MAX_REDIRECTS + 1).await;
+        let client = build_client(origin_of(&url)).unwrap();
+        let e = client.get(&url).send().await.unwrap_err();
+        assert!(e.is_redirect(), "{e}");
+        let src = std::error::Error::source(&e);
+        assert!(src.is_some_and(|s| s.downcast_ref::<DisallowedOrigin>().is_none()));
+        assert!(
+            src.is_some_and(|s| s.to_string().contains("too many redirects")),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_production_client_refuses_http_without_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let client = build_client(DISA_ORIGIN).unwrap();
+        assert!(client.get(&url).send().await.is_err());
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "a connection was made");
+    }
+
+    #[test]
+    fn sha256_hex_matches_a_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn disa_origin_is_https_dl_dod_cyber_mil_443() {
+        assert_eq!(DISA_ORIGIN.scheme, "https");
+        assert_eq!(DISA_ORIGIN.host, "dl.dod.cyber.mil");
+        assert_eq!(DISA_ORIGIN.port, 443);
+    }
+
+    fn permits(u: &str) -> bool {
+        reqwest::Url::parse(u).is_ok_and(|u| DISA_ORIGIN.permits(&u))
+    }
+
+    #[test]
+    fn permits_only_the_exact_origin() {
+        for ok in [
+            "https://dl.dod.cyber.mil/a.zip",
+            "https://dl.dod.cyber.mil:443/a.zip",
+            "https://DL.DOD.CYBER.MIL/a.zip",
+        ] {
+            assert!(permits(ok), "{ok}");
+        }
+        for bad in [
+            "http://dl.dod.cyber.mil/a.zip",
+            "https://dl.dod.cyber.mil:8443/a.zip",
+            "https://user@dl.dod.cyber.mil/a.zip",
+            "https://user:pw@dl.dod.cyber.mil/a.zip",
+            "https://dl.dod.cyber.mil.evil.com/a.zip",
+            "https://evil.com/dl.dod.cyber.mil",
+            "https://dl.dod.cyber.mil./a.zip",
+            "https://192.0.2.1/a.zip",
+            "ftp://dl.dod.cyber.mil/a.zip",
+            "garbage",
+            "",
+        ] {
+            assert!(!permits(bad), "{bad}");
+        }
+        assert!(check_source_origin("garbage", &DISA_ORIGIN).is_err());
+    }
+
+    #[test]
+    fn event_details_have_the_exact_shape_and_no_url() {
+        let e = disallowed_origin_event("x", OriginStage::Redirect);
+        assert_eq!(
+            (e.action, e.outcome, e.stig_id),
+            ("catalog.sync", "rejected", Some("x"))
+        );
+        assert_eq!(
+            e.detail,
+            serde_json::json!({"reasonCode": "disallowed_origin", "stage": "redirect"})
+        );
+        let e = disallowed_origin_event("x", OriginStage::Source);
+        assert_eq!(e.detail["stage"], "source");
+        let e = checksum_mismatch_event("x", "aa", "bb");
+        assert_eq!(
+            e.detail,
+            serde_json::json!({"reasonCode": "checksum_mismatch", "expectedSha256": "aa", "actualSha256": "bb"})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_off_origin_redirect_is_refused_with_a_typed_error() {
+        let other = serve_redirect(None, 1).await;
+        let url = serve_redirect(Some(other), 1).await;
+        let client = build_client(origin_of(&url)).unwrap();
+        let e = client.get(&url).send().await.unwrap_err();
+        assert!(e.is_redirect(), "{e}");
+        let d = std::error::Error::source(&e)
+            .and_then(|s| s.downcast_ref::<DisallowedOrigin>())
+            .expect("typed source");
+        assert_eq!(d.stage, OriginStage::Redirect);
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_redirect_is_followed() {
+        let url = serve_redirect(Some("{self}/next".into()), 2).await;
+        let client = build_client(origin_of(&url)).unwrap();
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    fn minimal_zip() -> Vec<u8> {
+        use std::io::Write;
+        let xml = br#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>T</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>r</title></Rule></Group></Benchmark>"#;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file("b-xccdf.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(xml).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    async fn serve_zip(body: Vec<u8>) -> String {
+        serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            body,
+        )
+        .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_disallowed_source_origin_is_audited_and_nothing_is_fetched(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let e = sync_one_with(
+            &source_for("evil-src", "http://127.0.0.1:1/x.zip".into()),
+            &build_client(AllowedOrigin::loopback_http(2)).unwrap(),
+            &pool,
+            &data_dir,
+            10,
+            &AllowedOrigin::loopback_http(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<DisallowedOrigin>().is_some(), "{e:#}");
+        let rows = sync_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, None);
+        assert_eq!(rows[0].2.as_deref(), Some("evil-src"));
+        assert_eq!(rows[0].3["reasonCode"], "disallowed_origin");
+        assert_eq!(rows[0].3["stage"], "source");
+        assert!(
+            !rows[0].3.to_string().contains("127.0.0.1"),
+            "{}",
+            rows[0].3
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_redirect_off_origin_is_audited_as_disallowed_origin(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let other = serve_redirect(None, 1).await;
+        let url = serve_redirect(Some(other), 1).await;
+        let origin = origin_of(&url);
+        let e = sync_one_with(
+            &source_for("redir-src", url),
+            &build_client(origin).unwrap(),
+            &pool,
+            &data_dir,
+            10,
+            &origin,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<DisallowedOrigin>().is_some(), "{e:#}");
+        let rows = sync_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].3["reasonCode"], "disallowed_origin");
+        assert_eq!(rows[0].3["stage"], "redirect");
+        assert!(
+            !rows[0].3.to_string().contains("127.0.0.1"),
+            "{}",
+            rows[0].3
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_checksum_mismatch_is_audited_and_nothing_is_written(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let zip = minimal_zip();
+        let actual = sha256_hex(&zip);
+        let expected = "0".repeat(64);
+        let url = serve_zip(zip).await;
+        let mut src = source_for("pin-src", url.clone());
+        src.sha256 = Some(expected.clone());
+        let e = sync_one_with(
+            &src,
+            &reqwest::Client::new(),
+            &pool,
+            &data_dir,
+            1 << 20,
+            &origin_of(&url),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.downcast_ref::<ChecksumMismatch>().is_some(), "{e:#}");
+        let rows = sync_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, None);
+        assert_eq!(rows[0].3["reasonCode"], "checksum_mismatch");
+        assert_eq!(rows[0].3["expectedSha256"], expected.as_str());
+        assert_eq!(rows[0].3["actualSha256"], actual.as_str());
+        assert!(!data_dir.join("stigs").join("pin-src.json").exists());
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM stigs_catalog WHERE id = 'pin-src'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_pinned_source_with_a_matching_checksum_syncs(pool: PgPool) {
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let data_dir = state.config.data_dir.clone();
+        let zip = minimal_zip();
+        let pin = sha256_hex(&zip);
+        let url = serve_zip(zip).await;
+        let mut src = source_for("ok-src", url.clone());
+        src.sha256 = Some(pin);
+        let out = sync_one_with(
+            &src,
+            &reqwest::Client::new(),
+            &pool,
+            &data_dir,
+            1 << 20,
+            &origin_of(&url),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, Outcome::Synced);
+        assert!(sync_rows(&pool).await.is_empty());
+        assert!(data_dir.join("stigs").join("ok-src.json").exists());
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM stigs_catalog WHERE id = 'ok-src'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }
