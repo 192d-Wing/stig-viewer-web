@@ -21,9 +21,16 @@
 //!
 //! Restore uses `jsonb_populate_recordset` to map JSON rows back into
 //! their target row type — that's how we avoid hand-writing N column
-//! lists per table. For BIGSERIAL-keyed tables (rule_audit,
-//! webhook_deliveries) we explicitly `setval()` after the bulk insert so
-//! a subsequent INSERT doesn't collide with restored ids.
+//! lists per table. For BIGSERIAL-keyed tables (webhook_deliveries, ...) we
+//! explicitly `setval()` after the bulk insert so a subsequent INSERT doesn't
+//! collide with restored ids.
+//!
+//! The application role cannot truncate or insert explicit ids into the audit
+//! tables (#109). A forced restore truncates through `audit_restore_truncate`
+//! and the audit rows load through `audit_restore_load` (migration 050); both
+//! refuse (custom SQLSTATE SV001, or SV002 for a non-empty audit table; HTTP 409, recorded as a rejected `backup.restore` event) unless the database owner has opened a
+//! restore window (`audit_policy.restore_allowed_until`), and the load only
+//! fills an empty table and moves the audit sequences itself.
 
 use axum::{
     body::Bytes,
@@ -109,6 +116,11 @@ async fn reset_serial_sequences(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), sqlx::Error> {
     for (table, col) in serial_columns(tx).await? {
+        // The audit sequences are moved by `audit_restore_load`; the
+        // application role cannot `setval` them.
+        if crate::db_roles::AUDIT_TABLES.contains(&table.as_str()) {
+            continue;
+        }
         let sql = format!(
             "SELECT setval(pg_get_serial_sequence(quote_ident($1), $2), \
              COALESCE(MAX(\"{col}\"), 1), MAX(\"{col}\") IS NOT NULL) FROM \"{table}\""
@@ -120,6 +132,43 @@ async fn reset_serial_sequences(
             .await?;
     }
     Ok(())
+}
+
+const RESTORE_WINDOW_CLOSED: &str =
+    "restore window is closed: the database owner must open it (see README, Database guard)";
+const AUDIT_TABLES_NOT_EMPTY: &str =
+    "audit tables are not empty: a restore that carries audit rows needs force=true";
+
+/// SQLSTATE raised by `audit_restore_*` when the owner has not opened the window.
+const SQLSTATE_WINDOW_CLOSED: &str = "SV001";
+/// SQLSTATE raised by `audit_restore_load` when an audit table is not empty.
+const SQLSTATE_AUDIT_NOT_EMPTY: &str = "SV002";
+
+/// A restore step that failed: either a policy refusal (409, recorded as a
+/// rejected event) or a ready HTTP error.
+enum StepError {
+    Policy {
+        code: &'static str,
+        message: &'static str,
+    },
+    Http((StatusCode, Json<RestoreError>)),
+}
+
+/// The policy refusal a database error stands for, if it is one. Any other
+/// error (including a plain 42501) is not a policy refusal.
+fn policy_refusal(e: &sqlx::Error) -> Option<StepError> {
+    let code = e.as_database_error()?.code()?;
+    match code.as_ref() {
+        SQLSTATE_WINDOW_CLOSED => Some(StepError::Policy {
+            code: "restore_window_closed",
+            message: RESTORE_WINDOW_CLOSED,
+        }),
+        SQLSTATE_AUDIT_NOT_EMPTY => Some(StepError::Policy {
+            code: "audit_tables_not_empty",
+            message: AUDIT_TABLES_NOT_EMPTY,
+        }),
+        _ => None,
+    }
 }
 
 fn ensure_admin(user: &AuthUser) -> Result<(), StatusCode> {
@@ -544,54 +593,137 @@ pub async fn restore_handler(
                 err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             })?;
 
-    if q.force {
-        // The truncate reaches the audit tables, whose guard triggers need the
-        // `restore` maintenance mode (transaction-local).
-        crate::db_audit::set_maintenance(&mut tx, "restore")
+    // The audit-table steps run through owner-owned functions that enforce the
+    // owner-opened restore window and the empty-table rule. A policy refusal
+    // (custom SQLSTATE) is recorded as a rejected `backup.restore` event after
+    // the transaction is rolled back, so the record is not lost with it.
+    let step: Result<HashMap<String, i64>, StepError> = async {
+        if q.force {
+            // The truncate reaches the audit tables: the function checks the
+            // window, declares the guard's `restore` mode and records the
+            // truncate with the acting user.
+            // Plus every table that references one of them: the function
+            // refuses a CASCADE into tables outside its list.
+            let tables: Vec<String> = sqlx::query_scalar(
+                "WITH RECURSIVE t(oid) AS ( \
+                     SELECT c.oid FROM pg_class c \
+                      WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($1) \
+                     UNION \
+                     SELECT k.conrelid FROM pg_constraint k JOIN t ON k.confrelid = t.oid \
+                      WHERE k.contype = 'f') \
+                 SELECT c.relname::text FROM t JOIN pg_class c ON c.oid = t.oid \
+                  WHERE c.relkind = 'r' AND c.relnamespace = 'public'::regnamespace \
+                  ORDER BY 1",
+            )
+            .bind(
+                TABLES
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>(),
+            )
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
-                tracing::error!("restore maintenance mode: {e:#}");
-                err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                tracing::error!("restore table list: {e:#}");
+                StepError::Http(err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to truncate",
+                ))
             })?;
-        // CASCADE so children get cleared too. Quoted to keep the
-        // identifier list safe even if a name ever collides with a
-        // reserved word.
-        let list = TABLES
-            .iter()
-            .map(|t| format!("\"{t}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("TRUNCATE {list} CASCADE");
-        sqlx::query(&sql).execute(&mut *tx).await.map_err(|e| {
-            tracing::error!("restore truncate: {e:#}");
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to truncate")
-        })?;
-    }
-
-    let mut restored: HashMap<String, i64> = HashMap::new();
-    for &t in TABLES {
-        let rows = tables.get(t).cloned().unwrap_or_default();
-        if rows.is_empty() {
-            restored.insert(t.to_string(), 0);
-            continue;
+            sqlx::query("SELECT audit_restore_truncate($1::text[], $2)")
+                .bind(&tables)
+                .bind(&user.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    policy_refusal(&e).unwrap_or_else(|| {
+                        tracing::error!("restore truncate: {e:#}");
+                        StepError::Http(err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to truncate",
+                        ))
+                    })
+                })?;
         }
-        let arr = Value::Array(rows);
-        let sql = format!(
-            "INSERT INTO \"{t}\" SELECT * FROM jsonb_populate_recordset(NULL::\"{t}\", $1)"
-        );
-        let res = sqlx::query(&sql)
-            .bind(&arr)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                tracing::error!("restore insert {t}: {e:#}");
-                err_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to insert {t}: {e}"),
-                )
-            })?;
-        restored.insert(t.to_string(), res.rows_affected() as i64);
+        let mut restored: HashMap<String, i64> = HashMap::new();
+        for &t in TABLES {
+            let rows = tables.get(t).cloned().unwrap_or_default();
+            let is_audit = crate::db_roles::AUDIT_TABLES.contains(&t);
+            // A forced restore always calls the audit load (even with no rows):
+            // the load of the last audit table closes a finite window.
+            if rows.is_empty() && !(q.force && is_audit) {
+                restored.insert(t.to_string(), 0);
+                continue;
+            }
+            let arr = Value::Array(rows);
+            let inserted: i64 = if is_audit {
+                sqlx::query_scalar("SELECT audit_restore_load($1, $2, $3)")
+                    .bind(t)
+                    .bind(&arr)
+                    .bind(&user.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        policy_refusal(&e).unwrap_or_else(|| {
+                            tracing::error!("restore insert {t}: {e:#}");
+                            StepError::Http(err_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("failed to insert {t}"),
+                            ))
+                        })
+                    })?
+            } else {
+                let sql = format!(
+                    "INSERT INTO \"{t}\" SELECT * FROM jsonb_populate_recordset(NULL::\"{t}\", $1)"
+                );
+                sqlx::query(&sql)
+                    .bind(&arr)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("restore insert {t}: {e:#}");
+                        StepError::Http(err_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("failed to insert {t}"),
+                        ))
+                    })?
+                    .rows_affected() as i64
+            };
+            restored.insert(t.to_string(), inserted);
+        }
+        Ok(restored)
     }
+    .await;
+    let restored = match step {
+        Ok(r) => r,
+        Err(StepError::Http(resp)) => return Err(resp),
+        Err(StepError::Policy { code, message }) => {
+            // Roll back first: the load holds a table lock the audit write needs.
+            if let Err(e) = tx.rollback().await {
+                tracing::error!("restore rollback: {e:#}");
+            }
+            tracing::warn!(target: "audit", actor = %user.id, reason_code = code, "restore refused: {message}");
+            crate::db_audit::record_or_log(
+                pool,
+                crate::db_audit::NewAuditEvent {
+                    user_id: &user.id,
+                    ctx: Some(&ctx),
+                    action: "backup.restore",
+                    outcome: "rejected",
+                    asset_id: None,
+                    checklist_id: None,
+                    stig_id: None,
+                    detail: json!({
+                        "reasonCode": code,
+                        "forced": q.force,
+                        "signatureStatus": signature_status.as_str(),
+                    }),
+                },
+            )
+            .await;
+            return Err(err_response(StatusCode::CONFLICT, message));
+        }
+    };
 
     // Reset the serial sequences so future inserts don't collide.
     reset_serial_sequences(&mut tx).await.map_err(|e| {
@@ -1563,6 +1695,10 @@ mod restore_integrity_db_tests {
     }
 
     async fn post_restore(base: &str, zip: &[u8]) -> (u16, Value) {
+        post_restore_with(base, zip, true).await
+    }
+
+    async fn post_restore_with(base: &str, zip: &[u8], force: bool) -> (u16, Value) {
         let boundary = "XBOUNDARYX";
         let mut body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.zip\"\r\nContent-Type: application/zip\r\n\r\n"
@@ -1571,7 +1707,7 @@ mod restore_integrity_db_tests {
         body.extend_from_slice(zip);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let r = reqwest::Client::new()
-            .post(format!("{base}/api/admin/restore?force=true"))
+            .post(format!("{base}/api/admin/restore?force={force}"))
             .header(
                 "content-type",
                 format!("multipart/form-data; boundary={boundary}"),
@@ -1598,6 +1734,7 @@ mod restore_integrity_db_tests {
         seed_asset(&pool, "a1", "admin1", false).await;
         let (mut state, _dir) = app_state(pool.clone());
         state.signing = Some(test_key(7));
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(state.clone()).await;
         let zip = backup_of(&state).await;
 
@@ -1677,6 +1814,7 @@ mod restore_integrity_db_tests {
             .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (state, _dir) = app_state(pool.clone());
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(state).await;
 
         let mut w = ZipWriter::new(Cursor::new(Vec::new()));
@@ -1710,6 +1848,7 @@ mod restore_integrity_db_tests {
             .unwrap();
         seed_asset(&pool, "a1", "admin1", false).await;
         let (state, _dir) = app_state(pool.clone());
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(state.clone()).await;
         let mut zip = backup_of(&state).await;
         // Rename the first central-directory entry; its local header keeps the old name.
@@ -1738,6 +1877,7 @@ mod restore_integrity_db_tests {
             .await
             .unwrap();
         let (state, _dir) = app_state(pool.clone());
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(state.clone()).await;
         let zip = backup_of(&state).await;
         let (status, body) = post_restore(&base, &zip).await;
@@ -1765,6 +1905,7 @@ mod restore_integrity_db_tests {
             .unwrap();
         let app = crate::test_fixtures::app_role_pool(&pool, false).await;
         let (state, _dir) = app_state(app.pool.clone());
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(state.clone()).await;
         let zip = backup_of(&state).await;
         let (status, body) = post_restore(&base, &zip).await;
@@ -1788,13 +1929,239 @@ mod restore_integrity_db_tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_forced_restore_with_the_window_closed_is_409_and_changes_nothing(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('admin1','c','r1','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        let (state, _dir) = app_state(app.pool.clone());
+        let base = serve(state.clone()).await;
+        let zip = backup_of(&state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 409, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("restore window is closed"),
+            "{body}"
+        );
+        // The refusal is recorded outside the rolled-back transaction.
+        let (outcome, detail): (String, Value) = sqlx::query_as(
+            "SELECT outcome, detail FROM audit_events WHERE action = 'backup.restore'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outcome, "rejected");
+        assert_eq!(detail["reasonCode"], "restore_window_closed");
+        // Nothing was truncated or loaded.
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit WHERE rule_id = 'r1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE id = 'admin1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, 1);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_finite_window_closes_after_one_restore_and_the_ledger_names_the_actor(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('admin1','c','r1','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        let (state, _dir) = app_state(app.pool.clone());
+        let base = serve(state.clone()).await;
+        let zip = backup_of(&state).await;
+        sqlx::query("UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        let window: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT restore_allowed_until FROM audit_policy")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(window.is_none(), "the load closes a finite window");
+        let actors: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT DISTINCT actor FROM audit_restore_log")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actors, [Some("admin1".to_string())]);
+        // A second forced restore is refused and changes nothing.
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 409, "{body}");
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_non_forced_restore_with_audit_rows_into_a_non_empty_audit_table_is_409(
+        pool: PgPool,
+    ) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('admin1','c','from-backup','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        let (state, _dir) = app_state(app.pool.clone());
+        let zip = backup_of(&state).await;
+        // The target now holds other users and audit rows only: users load
+        // cleanly, then the audit load meets a non-empty table.
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE users CASCADE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        seed_user(&pool, "other").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('other','c','existing','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
+        let base = serve(state.clone()).await;
+        let (status, body) = post_restore_with(&base, &zip, false).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"], AUDIT_TABLES_NOT_EMPTY);
+        // Rolled back: the audit rows and users are as before.
+        let rules: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rules, ["existing"]);
+        let users: Vec<String> = sqlx::query_scalar("SELECT id FROM users")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(users, ["other"]);
+        // No rejected event is expected here: its actor row (audit_events.user_id
+        // is a foreign key) was rolled back with the restore, so the event
+        // insert cannot succeed in this scenario.
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_forced_restore_empties_tables_that_reference_restored_ones(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Created before the app role's grants, so it may truncate this table.
+        sqlx::query("CREATE TABLE public.refs_users (u text REFERENCES users(id))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        let (state, _dir) = app_state(app.pool.clone());
+        let zip = backup_of(&state).await;
+        sqlx::query("INSERT INTO refs_users VALUES ('admin1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
+        let base = serve(state.clone()).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM refs_users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the referencing table was emptied with its parent");
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_forced_restore_is_refused_when_a_referencing_table_cannot_be_truncated(
+        pool: PgPool,
+    ) {
+        seed_user(&pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = crate::test_fixtures::app_role_pool(&pool, false).await;
+        // Created after the grants: the app role has no privilege on it.
+        sqlx::query("CREATE TABLE public.refs_users (u text REFERENCES users(id))")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO refs_users VALUES ('admin1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
+        // A pool that really logs in as the app role (SET SESSION AUTHORIZATION),
+        // so the function's session_user privilege check sees it.
+        let name = app.name.clone();
+        let login_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(move |conn, _| {
+                let stmt = format!("SET SESSION AUTHORIZATION \"{name}\"");
+                Box::pin(async move {
+                    sqlx::query(&stmt).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let (state, _dir) = app_state(login_pool.clone());
+        let base = serve(state.clone()).await;
+        let zip = backup_of(&state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(body["error"], "failed to truncate");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM refs_users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1, "nothing was truncated");
+        login_pool.close().await;
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn every_serial_column_is_found_and_reset_to_the_next_free_id(pool: PgPool) {
         let mut tx = pool.begin().await.unwrap();
         let cols = serial_columns(&mut tx).await.unwrap();
         let expected = ["audit_events", "rule_audit", "webhook_deliveries"];
         let tables: Vec<&str> = cols.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(tables, expected, "{cols:?}");
-        // Advance every sequence, then reset: empty tables restart at 1.
+        // Advance every sequence, then reset: empty non-audit tables restart at 1.
         for (t, c) in &cols {
             sqlx::query("SELECT setval(pg_get_serial_sequence(quote_ident($1), $2), 500)")
                 .bind(t)
@@ -1812,7 +2179,13 @@ mod restore_integrity_db_tests {
                     .fetch_one(&mut *tx)
                     .await
                     .unwrap();
-            assert_eq!(next, 1, "{t}.{c}");
+            // The audit sequences are moved by `audit_restore_load`, not here.
+            let want = if crate::db_roles::AUDIT_TABLES.contains(&t.as_str()) {
+                501
+            } else {
+                1
+            };
+            assert_eq!(next, want, "{t}.{c}");
         }
         tx.rollback().await.unwrap();
     }
@@ -1831,6 +2204,7 @@ mod restore_integrity_db_tests {
 
         let mut keyed = plain.clone();
         keyed.signing = Some(test_key(7));
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(keyed.clone()).await;
         let (status, body) = post_restore(&base, &unsigned).await;
         assert_eq!(status, 400, "{body}");
@@ -1850,6 +2224,7 @@ mod restore_integrity_db_tests {
         let mut cfg = (*keyed.config).clone();
         cfg.backup_require_signature = Some(false);
         keyed.config = std::sync::Arc::new(cfg);
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
         let base = serve(keyed).await;
         let (status, body) = post_restore(&base, &unsigned).await;
         assert_eq!(status, 200, "{body}");
