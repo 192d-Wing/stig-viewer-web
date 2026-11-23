@@ -48,7 +48,9 @@ use sha2::Sha256;
 use sqlx::PgPool;
 use std::time::Duration;
 
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -222,6 +224,7 @@ pub async fn list_handler(
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreateRequest>,
 ) -> Result<(StatusCode, Json<WebhookRow>), StatusCode> {
     ensure_admin(&user)?;
@@ -245,6 +248,12 @@ pub async fn create_handler(
 
     let id = uuid::Uuid::new_v4().to_string();
 
+    // The webhook and its `webhook.create` row commit together. The detail
+    // never carries the URL, name or secret (Slack/Teams URLs embed a
+    // credential in the path).
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
     let row = sqlx::query_as::<_, WebhookRow>(
         r#"
         INSERT INTO webhooks (id, name, url, secret, kinds, enabled, flavor, created_by)
@@ -259,9 +268,25 @@ pub async fn create_handler(
     .bind(&kinds)
     .bind(&flavor)
     .bind(&user.id)
-    .fetch_one(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_sqlx)?;
+    let ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "webhook.create",
+        json!({
+            "webhookId": row.id,
+            "kinds": row.kinds,
+            "flavor": row.flavor,
+            "enabled": row.enabled,
+            "signed": !row.secret.is_empty(),
+        }),
+    );
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
     Ok((StatusCode::CREATED, Json(row)))
 }
@@ -271,20 +296,27 @@ pub async fn create_handler(
 pub async fn update_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<WebhookRow>, StatusCode> {
     ensure_admin(&user)?;
 
+    // The update and its `webhook.update` row commit together; the existing
+    // row is read under a lock so `changed` names the fields really replaced.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
     let existing = sqlx::query_as::<_, WebhookRow>(
         "SELECT id, name, url, secret, kinds, enabled, flavor, created_by, created_at \
-         FROM webhooks WHERE id = $1",
+         FROM webhooks WHERE id = $1 FOR NO KEY UPDATE",
     )
     .bind(&id)
-    .fetch_optional(state.pool.as_ref())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_sqlx)?
     .ok_or(StatusCode::NOT_FOUND)?;
+    let before = existing.clone();
 
     let name = match req.name {
         Some(n) => {
@@ -329,28 +361,88 @@ pub async fn update_handler(
     .bind(enabled)
     .bind(&flavor)
     .bind(&id)
-    .fetch_one(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_sqlx)?;
 
+    let changed = changed_fields(&before, &row);
+    let ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "webhook.update",
+        json!({
+            "webhookId": row.id,
+            "changed": changed,
+            "kinds": row.kinds,
+            "flavor": row.flavor,
+            "enabled": row.enabled,
+            "signed": !row.secret.is_empty(),
+        }),
+    );
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
+
     Ok(Json(row))
+}
+
+/// Names (never values) of the fields an update replaced. The URL, name and
+/// secret are compared but only their field names are recorded.
+fn changed_fields(before: &WebhookRow, after: &WebhookRow) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if before.name != after.name {
+        changed.push("name");
+    }
+    if before.url != after.url {
+        changed.push("url");
+    }
+    if before.secret != after.secret {
+        changed.push("secret");
+    }
+    if before.kinds != after.kinds {
+        changed.push("kinds");
+    }
+    if before.enabled != after.enabled {
+        changed.push("enabled");
+    }
+    if before.flavor != after.flavor {
+        changed.push("flavor");
+    }
+    changed
 }
 
 /// DELETE /api/webhooks/:id — admin-only. Deliveries cascade away.
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     ensure_admin(&user)?;
-    let res = sqlx::query("DELETE FROM webhooks WHERE id = $1")
-        .bind(&id)
-        .execute(state.pool.as_ref())
+    // The delete and its `webhook.delete` row commit together.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
         .await
-        .map_err(map_sqlx)?;
-    if res.rows_affected() == 0 {
+        .map_err(audit_tx::failed)?;
+    let deleted: Option<String> =
+        sqlx::query_scalar("DELETE FROM webhooks WHERE id = $1 RETURNING id")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+    let Some(deleted) = deleted else {
         return Err(StatusCode::NOT_FOUND);
-    }
+    };
+    let ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "webhook.delete",
+        json!({ "webhookId": deleted }),
+    );
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -395,6 +487,7 @@ pub async fn list_deliveries_handler(
 pub async fn test_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     ensure_admin(&user)?;
@@ -417,6 +510,24 @@ pub async fn test_handler(
         severity: "CAT II".to_string(),
         due_date: None,
     });
+
+    // Nothing is mutated here (the send writes its own `webhook_deliveries`
+    // row), so the record is its own one-statement transaction, committed
+    // before the send is spawned (as `signing.sign`): when it cannot be
+    // written the request fails and nothing is sent.
+    let ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "webhook.test",
+        json!({ "webhookId": webhook.id }),
+    );
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
     let pool = state.pool.clone();
     tokio::spawn(async move {
@@ -1194,5 +1305,332 @@ async fn record_delivery(
     .await;
     if let Err(e) = res {
         tracing::error!("webhook delivery insert failed: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_user};
+
+    const HOOK_NAME: &str = "pager-integration";
+
+    fn admin() -> Extension<AuthUser> {
+        Extension(auth("root", "admin"))
+    }
+
+    /// A URL with a path credential and a secret, both random per test.
+    fn creds() -> (String, String) {
+        (
+            format!("https://hooks.example.test/{}", uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    async fn make(state: &AppState, url: &str, secret: &str) -> Result<WebhookRow, StatusCode> {
+        create_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Json(CreateRequest {
+                name: HOOK_NAME.into(),
+                url: url.into(),
+                secret: Some(secret.into()),
+                kinds: None,
+                flavor: None,
+            }),
+        )
+        .await
+        .map(|(_, Json(r))| r)
+    }
+
+    async fn patch(
+        state: &AppState,
+        id: &str,
+        req: UpdateRequest,
+    ) -> Result<WebhookRow, StatusCode> {
+        update_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path(id.into()),
+            Json(req),
+        )
+        .await
+        .map(|Json(r)| r)
+    }
+
+    fn no_change() -> UpdateRequest {
+        UpdateRequest {
+            name: None,
+            url: None,
+            secret: None,
+            kinds: None,
+            enabled: None,
+            flavor: None,
+        }
+    }
+
+    async fn all_detail_text(pool: &sqlx::PgPool) -> String {
+        sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(string_agg(detail::text, ' '), '') FROM audit_events WHERE action LIKE 'webhook.%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn webhook_create_update_delete_are_recorded_without_the_url_or_secret(
+        pool: sqlx::PgPool,
+    ) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let (url, secret) = creds();
+        let hook = make(&state, &url, &secret).await.unwrap();
+
+        let rows = audit_rows(&pool, "webhook.create").await;
+        assert_eq!(rows.len(), 1);
+        let c = &rows[0];
+        assert_eq!(c.outcome, "ok");
+        assert_eq!(c.user_id.as_deref(), Some("root"));
+        assert_eq!(c.asset_id, None);
+        assert_eq!(
+            c.detail_keys(),
+            ["enabled", "flavor", "kinds", "signed", "webhookId"]
+        );
+        assert_eq!(c.detail["webhookId"], hook.id.as_str());
+        assert_eq!(c.detail["signed"], true);
+        assert_eq!(c.request_id.as_deref(), Some("test-request"));
+        assert_eq!(c.source_ip.as_deref(), Some("198.51.100.4"));
+
+        // `changed` lists exactly the fields that differ.
+        let new_secret = uuid::Uuid::new_v4().to_string();
+        patch(
+            &state,
+            &hook.id,
+            UpdateRequest {
+                enabled: Some(false),
+                secret: Some(new_secret.clone()),
+                name: Some(HOOK_NAME.into()),
+                ..no_change()
+            },
+        )
+        .await
+        .unwrap();
+        let rows = audit_rows(&pool, "webhook.update").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].detail_keys(),
+            [
+                "changed",
+                "enabled",
+                "flavor",
+                "kinds",
+                "signed",
+                "webhookId"
+            ]
+        );
+        assert_eq!(
+            rows[0].detail["changed"],
+            serde_json::json!(["secret", "enabled"])
+        );
+        assert_eq!(rows[0].detail["enabled"], false);
+        // Unknown id: 404, no row.
+        assert_eq!(
+            patch(&state, "missing", no_change()).await.err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+
+        let res = delete_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path(hook.id.clone()),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+        let rows = audit_rows(&pool, "webhook.delete").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail_keys(), ["webhookId"]);
+        assert_eq!(audit_rows(&pool, "webhook.update").await.len(), 1);
+
+        let text = all_detail_text(&pool).await;
+        for forbidden in [
+            url.as_str(),
+            secret.as_str(),
+            new_secret.as_str(),
+            HOOK_NAME,
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} leaked: {text}");
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn webhook_changes_fail_closed_when_the_audit_row_cannot_be_written(pool: sqlx::PgPool) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let (url, secret) = creds();
+        fail_audit_inserts(
+            &pool,
+            &["webhook.create", "webhook.update", "webhook.delete"],
+        )
+        .await;
+        assert_eq!(
+            make(&state, &url, &secret).await.err(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhooks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        sqlx::query("INSERT INTO webhooks (id, name, url, secret, kinds, enabled, flavor, created_by) VALUES ('w1', 'n', $1, '', ARRAY['assigned'], TRUE, 'slack', 'root')")
+            .bind(&url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let res = patch(
+            &state,
+            "w1",
+            UpdateRequest {
+                enabled: Some(false),
+                ..no_change()
+            },
+        )
+        .await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM webhooks WHERE id = 'w1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(enabled);
+        let res = delete_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path("w1".into()),
+        )
+        .await;
+        assert_eq!(res, Err(StatusCode::INTERNAL_SERVER_ERROR));
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhooks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn webhook_test_send_is_recorded(pool: sqlx::PgPool) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        // Nothing listens here: the delivery fails fast and is only logged.
+        let hook = make(&state, "http://127.0.0.1:1/hook", "").await.unwrap();
+        let res = test_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path(hook.id.clone()),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::ACCEPTED));
+        let rows = audit_rows(&pool, "webhook.test").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].detail_keys(), ["webhookId"]);
+        assert_eq!(rows[0].detail["webhookId"], hook.id.as_str());
+        assert_eq!(rows[0].request_id.as_deref(), Some("test-request"));
+        // Let the spawned delivery finish before the database goes away.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn webhook_test_fails_closed_and_sends_nothing_when_the_row_cannot_be_written(
+        pool: sqlx::PgPool,
+    ) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let hook = make(&state, "http://127.0.0.1:1/hook", "").await.unwrap();
+        fail_audit_inserts(&pool, &["webhook.test"]).await;
+        let res = test_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path(hook.id.clone()),
+        )
+        .await;
+        assert_eq!(res, Err(StatusCode::INTERNAL_SERVER_ERROR));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let sent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_webhook_requests_write_no_audit_row(pool: sqlx::PgPool) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let denied = create_handler(
+            State(state.clone()),
+            Extension(auth("u1", "author")),
+            Extension(ctx()),
+            Json(CreateRequest {
+                name: "n".into(),
+                url: "https://example.test/h".into(),
+                secret: None,
+                kinds: None,
+                flavor: None,
+            }),
+        )
+        .await;
+        assert_eq!(denied.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(
+            make(&state, "ftp://nope", "").await.err(),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            patch(&state, "missing", no_change()).await.err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+        let gone = delete_handler(
+            State(state.clone()),
+            admin(),
+            Extension(ctx()),
+            Path("missing".into()),
+        )
+        .await;
+        assert_eq!(gone, Err(StatusCode::NOT_FOUND));
+        let test_denied = test_handler(
+            State(state.clone()),
+            Extension(auth("u1", "author")),
+            Extension(ctx()),
+            Path("missing".into()),
+        )
+        .await;
+        assert_eq!(test_denied, Err(StatusCode::FORBIDDEN));
+        let test_missing = test_handler(
+            State(state),
+            admin(),
+            Extension(ctx()),
+            Path("missing".into()),
+        )
+        .await;
+        assert_eq!(test_missing, Err(StatusCode::NOT_FOUND));
+        for a in [
+            "webhook.create",
+            "webhook.update",
+            "webhook.delete",
+            "webhook.test",
+        ] {
+            assert!(audit_rows(&pool, a).await.is_empty(), "{a}");
+        }
     }
 }

@@ -199,6 +199,37 @@ test.describe("Granular per-asset ACL", () => {
     expect(after.status()).toBe(403);
   });
 
+  test("API: grant and revoke leave asset_acl.grant / asset_acl.revoke audit rows", async ({
+    request,
+  }) => {
+    const asset = await seedAsset(request);
+    const bobId = await userId(request, "bob");
+    expect((await grant(request, "alice", asset.id, bobId, "write")).status()).toBe(
+      201,
+    );
+    expect((await revoke(request, "alice", asset.id, bobId)).status()).toBe(204);
+
+    await setUserRole("root", "admin");
+    const rowsFor = async (action) =>
+      (
+        await request
+          .get(`${BACKEND}/api/audit/events?action=${action}`, {
+            headers: { "X-User-Id": "root" },
+          })
+          .then((r) => r.json())
+      ).rows;
+    const grants = await rowsFor("asset_acl.grant");
+    expect(grants.length).toBe(1);
+    expect(grants[0].outcome).toBe("ok");
+    expect(grants[0].detail.targetUserId).toBe(bobId);
+    expect(grants[0].detail.permission).toBe("write");
+    expect(grants[0].detail.previousPermission).toBeNull();
+    const revokes = await rowsFor("asset_acl.revoke");
+    expect(revokes.length).toBe(1);
+    expect(revokes[0].detail.targetUserId).toBe(bobId);
+    expect(revokes[0].detail.permission).toBe("write");
+  });
+
   test("API: global admin role bypasses ACL on read paths (no grant needed)", async ({
     request,
   }) => {

@@ -40,8 +40,13 @@
 //! counted there and in the scheduler message. These events are best effort
 //! (shared audit write queue, may be shed under load); the scheduler message
 //! and the `audit`-target log lines are the fallback record.
-//! Retention deletes also require the `stig.audit_retention_protocol` marker
-//! ([`RETENTION_PROTOCOL`], migration 047), so older replicas fail closed.
+//! Retention deletes run through the owner-owned `audit_prune_*` functions
+//! (migration 050): they declare the maintenance mode and the
+//! `stig.audit_retention_protocol` marker (migration 047) themselves, refuse
+//! rows younger than the database retention floor (`audit_policy`), and the
+//! application role cannot DELETE audit rows directly. Older replicas that
+//! still delete directly fail closed. [`check_floor`] makes a sweep fail
+//! before archiving when `AUDIT_RETENTION_DAYS` is below the floor.
 //! Sweeps are also serialized per database by an advisory lock
 //! ([`crate::db_audit::lock_retention_sweep`]); a sweep that cannot get the
 //! lock within five minutes fails and retries on the next tick. If the segment
@@ -97,11 +102,39 @@ struct AuditRow {
 
 // ── Archive segments ────────────────────────────────────────────────────────
 
+/// `AUDIT_RETENTION_DAYS` (default 365), shared by the scheduler and the owner step.
+pub fn retain_days_from_env() -> i64 {
+    std::env::var("AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(365)
+}
+
+/// Fail when `retain_days` is below the database retention floor, before
+/// anything is archived: the prune function would refuse the rows anyway.
+async fn check_floor(pool: &PgPool, retain_days: i64) -> Result<()> {
+    let floor: i32 = sqlx::query_scalar("SELECT min_retain_days FROM audit_policy")
+        .fetch_one(pool)
+        .await
+        .context("read the audit retention floor")?;
+    if retain_days < i64::from(floor) {
+        anyhow::bail!(
+            "AUDIT_RETENTION_DAYS ({retain_days}) is below the database retention floor \
+             ({floor}); run `migrate` with AUDIT_RETENTION_DAYS={retain_days} as the owner \
+             to lower it"
+        );
+    }
+    Ok(())
+}
+
 /// Value of `stig.audit_retention_protocol` the DB guard (migration 047)
-/// requires for a retention DELETE. Older versions never set it.
+/// requires for a retention DELETE. Older versions never set it. Production
+/// code no longer declares it: the prune functions do.
+#[cfg(test)]
 pub(crate) const RETENTION_PROTOCOL: &str = "2";
 
 /// Declare retention mode plus the protocol marker for this transaction.
+#[cfg(test)]
 pub(crate) async fn declare_retention_delete(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<()> {
@@ -1041,6 +1074,7 @@ async fn prune_rules_locked(
     lock: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ctx: &mut SweepCtx,
 ) -> Result<usize> {
+    check_floor(pool, retain_days).await?;
     if archive {
         tidy_archive(data_dir, &mut ctx.io.notes).await;
     }
@@ -1084,17 +1118,11 @@ async fn prune_rules_locked(
 
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     crate::db_audit::retention_lock_alive(lock).await?;
-    let mut tx = pool.begin().await.context("begin rule_audit prune tx")?;
-    declare_retention_delete(&mut tx)
-        .await
-        .context("set audit maintenance mode")?;
-    let deleted = sqlx::query("DELETE FROM rule_audit WHERE id = ANY($1::bigint[])")
+    let deleted: i64 = sqlx::query_scalar("SELECT audit_prune_rule_audit($1::bigint[])")
         .bind(&ids)
-        .execute(&mut *tx)
+        .fetch_one(pool)
         .await
-        .context("delete pruned rule_audit rows")?
-        .rows_affected();
-    tx.commit().await.context("commit rule_audit prune")?;
+        .context("delete pruned rule_audit rows")?;
 
     Ok(deleted as usize)
 }
@@ -1250,6 +1278,7 @@ async fn prune_events_locked(
     ctx: &mut SweepCtx,
 ) -> Result<usize> {
     let mut total = 0usize;
+    check_floor(pool, retain_days).await?;
     if archive {
         tidy_archive(data_dir, &mut ctx.io.notes).await;
     }
@@ -1286,17 +1315,11 @@ async fn prune_events_locked(
 
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         crate::db_audit::retention_lock_alive(lock).await?;
-        let mut tx = pool.begin().await.context("begin audit_events prune tx")?;
-        declare_retention_delete(&mut tx)
-            .await
-            .context("set audit maintenance mode")?;
-        let deleted = sqlx::query("DELETE FROM audit_events WHERE id = ANY($1::bigint[])")
+        let deleted = sqlx::query_scalar::<_, i64>("SELECT audit_prune_events($1::bigint[])")
             .bind(&ids)
-            .execute(&mut *tx)
+            .fetch_one(pool)
             .await
-            .context("delete pruned audit_events rows")?
-            .rows_affected() as usize;
-        tx.commit().await.context("commit audit_events prune")?;
+            .context("delete pruned audit_events rows")? as usize;
         total += deleted;
         after_batch(total).await;
         if deleted == 0 || (rows.len() as i64) < batch {
@@ -1506,6 +1529,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_rule_audit_deletes_and_archives_under_the_guard(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for (rule, age) in [("old", "10 days"), ("new", "0 days")] {
             sqlx::query(&format!(
@@ -1530,6 +1554,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_rule_audit_works_as_the_restricted_app_role(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         let app = crate::test_fixtures::app_role_pool(&pool, false).await;
         for (rule, age) in [("old", "10 days"), ("new", "0 days")] {
@@ -1538,7 +1563,7 @@ mod tests {
                  VALUES ('u1', 'c', $1, 'status', NOW() - INTERVAL '{age}')"
             ))
             .bind(rule)
-            .execute(&app.pool)
+            .execute(&pool)
             .await
             .unwrap();
         }
@@ -1554,7 +1579,38 @@ mod tests {
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_sweep_below_the_floor_fails_before_archiving(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        crate::test_fixtures::set_audit_retention_floor(&pool, 365).await;
+        sqlx::query(
+            "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
+             VALUES ('u1', 'c', 'r', 'status', NOW() - INTERVAL '10 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let err = run_prune(&pool, &dir, 5, true, None).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("below the database retention floor"),
+            "{err:#}"
+        );
+        assert!(!dir.exists(), "nothing may be archived");
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        // The same holds for the events sweep.
+        let err = run_prune_events(&pool, &dir, 5, true, None).await;
+        assert!(err.is_err());
+        assert!(!dir.exists());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_events_keys_on_the_last_repeat_and_archives_the_counter(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         // Both rows were first seen 10 days ago; only one was repeated recently.
         for (reason, last) in [("stale", "NOW() - INTERVAL '10 days'"), ("fresh", "NOW()")] {
@@ -1591,6 +1647,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_events_deletes_and_archives_only_expired_rows(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for (outcome, days) in [("ok", 400), ("denied", 10)] {
             sqlx::query(
@@ -1639,6 +1696,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_events_archives_a_system_event_with_a_null_user(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         sqlx::query(
             "INSERT INTO audit_events (user_id, user_role, action, outcome, occurred_at, detail) \
              VALUES (NULL, 'system', 'catalog.sync', 'rejected', NOW() - INTERVAL '400 days', \
@@ -1680,6 +1738,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn prune_events_runs_in_batches_until_none_remain(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for _ in 0..5 {
             seed_expired_event(&pool, 400).await;
@@ -1709,6 +1768,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn scheduled_run_prunes_expired_events_and_reports_them(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         seed_expired_event(&pool, 400).await;
         let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -1724,6 +1784,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_failing_rule_audit_prune_does_not_skip_the_event_prune(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         seed_expired_event(&pool, 400).await;
         sqlx::query("DROP TABLE rule_audit")
@@ -2347,6 +2408,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_failed_delete_followed_by_a_retry_archives_each_id_once(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         let k = test_key(1);
         for rule in ["a", "b"] {
@@ -2404,6 +2466,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_failed_archive_write_deletes_nothing(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         sqlx::query(
             "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
@@ -2584,6 +2647,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_failed_directory_sync_deletes_nothing(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         sqlx::query(
             "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
@@ -2683,6 +2747,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_sweep_waits_for_the_lock_and_touches_nothing_until_it_is_free(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         use crate::test_fixtures::app_role_pool;
         seed_user(&pool, "u1").await;
         sqlx::query(
@@ -2741,6 +2806,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn concurrent_event_sweeps_lose_no_row_and_reject_no_segment(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for _ in 0..25 {
             seed_expired_event(&pool, 10).await;
@@ -2774,6 +2840,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_sweep_gives_up_on_a_held_lock_and_deletes_nothing(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         use crate::test_fixtures::app_role_pool;
         seed_user(&pool, "u1").await;
         sqlx::query(
@@ -2819,6 +2886,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_lost_lock_stops_the_sweep_with_every_deleted_row_already_archived(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for _ in 0..25 {
             seed_expired_event(&pool, 10).await;
@@ -2959,6 +3027,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_lost_lock_stops_the_rules_sweep_before_anything_is_archived(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let (err, dir) = lose_lock_during_rules_select(&pool, true).await;
         assert!(err.contains("retention sweep lock lost"), "{err}");
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
@@ -2973,6 +3042,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_lost_lock_stops_the_rules_sweep_before_the_delete(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let (err, dir) = lose_lock_during_rules_select(&pool, false).await;
         assert!(err.contains("retention sweep lock lost"), "{err}");
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
@@ -2986,6 +3056,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn concurrent_rule_sweeps_lose_no_row_and_reject_no_segment(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         for _ in 0..25 {
             sqlx::query(
@@ -3023,6 +3094,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_retention_delete_without_the_protocol_marker_is_refused(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         sqlx::query(
             "INSERT INTO rule_audit (user_id, checklist_id, rule_id, field, occurred_at) \
@@ -3300,6 +3372,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn an_archiving_sweep_sets_old_orphan_sidecars_aside(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let dir = temp_dir();
         let names = plant_old_orphans(&dir).await;
         let ad = dir.join("audit_archive");
@@ -3328,6 +3401,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_non_archiving_sweep_leaves_orphan_sidecars_alone(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let dir = temp_dir();
         let names = plant_old_orphans(&dir).await;
         let ad = dir.join("audit_archive");
@@ -3446,6 +3520,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn an_unsupported_directory_sync_deletes_nothing_by_default(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_one_expired_rule(&pool).await;
         let dir = temp_dir();
         let ad = dir.join("audit_archive");
@@ -3480,6 +3555,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn the_opt_in_flag_proceeds_and_records_degraded_durability(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_one_expired_rule(&pool).await;
         seed_expired_event(&pool, 10).await;
         let dir = temp_dir();
@@ -3531,6 +3607,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_sweep_audits_orphan_sidecars_it_sets_aside(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let dir = temp_dir();
         let names = plant_old_orphans(&dir).await;
         run_prune(&pool, &dir, 5, true, None).await.unwrap();
@@ -3555,6 +3632,7 @@ mod tests {
     async fn a_failing_archive_move_is_counted_in_the_event_and_the_scheduler_message(
         pool: PgPool,
     ) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         let dir = temp_dir();
         let names = plant_old_orphans(&dir).await;
         let ad = dir.join("audit_archive");
@@ -3583,6 +3661,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn a_clean_sweep_writes_no_archive_audit_events(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_one_expired_rule(&pool).await;
         let dir = temp_dir();
         let msg = run_scheduled(&pool, &dir, 5, true, None).await.unwrap();
@@ -3689,6 +3768,7 @@ mod tests {
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn run_scheduled_reports_degraded_durability_under_the_tolerant_policy(pool: PgPool) {
+        crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_one_expired_rule(&pool).await;
         let dir = temp_dir();
         let ad = dir.join("audit_archive");

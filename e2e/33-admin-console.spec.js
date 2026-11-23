@@ -92,6 +92,32 @@ test.describe("Admin console", () => {
     expect(forbidden.status()).toBe(403);
   });
 
+  test("API: a role change leaves a user.role_change audit row", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    const bobId = await ensureUser(request, "bob");
+    await setUserRole("alice", "admin");
+    const res = await request.patch(`${BACKEND}/api/admin/users/${bobId}/role`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: { role: "reviewer" },
+    });
+    expect(res.status()).toBe(204);
+
+    const events = await request
+      .get(`${BACKEND}/api/audit/events?action=user.role_change`, {
+        headers: { "X-User-Id": "alice" },
+      })
+      .then((r) => r.json());
+    expect(events.rows.length).toBe(1);
+    const row = events.rows[0];
+    expect(row.outcome).toBe("ok");
+    expect(row.detail.targetUserId).toBe(bobId);
+    expect(row.detail.toRole).toBe("reviewer");
+    expect(typeof row.detail.fromRole).toBe("string");
+    expect(row.detail.fromRole).not.toBe("reviewer");
+  });
+
   test("UI: Admin nav button is only visible when alice has the admin role", async ({
     page,
     request,

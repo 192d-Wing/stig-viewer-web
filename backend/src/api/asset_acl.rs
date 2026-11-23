@@ -17,12 +17,16 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use std::collections::HashSet;
 
 use crate::api::abac::{self, Decision};
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_assets::{self, AssetSummary};
+use crate::db_audit;
 use crate::AppState;
 
 /// Valid permission levels, low → high.
@@ -299,6 +303,7 @@ pub async fn list_handler(
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(asset_id): Path<String>,
     Json(req): Json<GrantRequest>,
 ) -> Result<(StatusCode, Json<AclRow>), StatusCode> {
@@ -332,6 +337,31 @@ pub async fn create_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Grant and its `asset_acl.grant` row commit together; the previous level
+    // is read under a row lock so the recorded before-value is the replaced one.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
+    // `FOR NO KEY UPDATE` on a missing row locks nothing, so two first grants
+    // for one (asset, user) are serialised by a transaction-scoped advisory
+    // lock instead (two-key form, separate from the single-key constants in
+    // `db_audit`).
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(hashtext('asset_acl.grant'), hashtext($1 || ':' || $2))",
+    )
+    .bind(&asset_id)
+    .bind(&req.user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT permission FROM asset_acl WHERE asset_id = $1 AND user_id = $2 FOR NO KEY UPDATE",
+    )
+    .bind(&asset_id)
+    .bind(&req.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
     sqlx::query(
         r#"
         INSERT INTO asset_acl (asset_id, user_id, permission, granted_by)
@@ -346,9 +376,24 @@ pub async fn create_handler(
     .bind(&req.user_id)
     .bind(&req.permission)
     .bind(&user.id)
-    .execute(state.pool.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(map_sqlx)?;
+    let mut ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "asset_acl.grant",
+        json!({
+            "targetUserId": db_audit::audit_safe_id(&req.user_id),
+            "permission": req.permission,
+            "previousPermission": previous,
+        }),
+    );
+    ev.asset_id = Some(&asset_id);
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
     let row = sqlx::query_as::<_, AclRow>(
         r#"
@@ -375,20 +420,40 @@ pub async fn create_handler(
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path((asset_id, target_user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, StatusCode> {
     require_acl_admin(state.pool.as_ref(), &asset_id, &user).await?;
 
-    let result = sqlx::query("DELETE FROM asset_acl WHERE asset_id = $1 AND user_id = $2")
-        .bind(&asset_id)
-        .bind(&target_user_id)
-        .execute(state.pool.as_ref())
+    // The revoke and its `asset_acl.revoke` row commit together.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
         .await
-        .map_err(map_sqlx)?;
-
-    if result.rows_affected() == 0 {
+        .map_err(audit_tx::failed)?;
+    let removed: Option<String> = sqlx::query_scalar(
+        "DELETE FROM asset_acl WHERE asset_id = $1 AND user_id = $2 RETURNING permission",
+    )
+    .bind(&asset_id)
+    .bind(&target_user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+    let Some(permission) = removed else {
         return Err(StatusCode::NOT_FOUND);
-    }
+    };
+    let mut ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "asset_acl.revoke",
+        json!({
+            "targetUserId": db_audit::audit_safe_id(&target_user_id),
+            "permission": permission,
+        }),
+    );
+    ev.asset_id = Some(&asset_id);
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -649,5 +714,153 @@ mod tests {
         // A failed acquire denies too.
         pool.close().await;
         assert!(!user_can(&pool, "a1", &auth("own", "author"), "write").await);
+    }
+
+    // ── Audit rows (#151) ──────────────────────────────────────────────────
+
+    async fn grant(
+        pool: &PgPool,
+        by: &AuthUser,
+        asset: &str,
+        target: &str,
+        permission: &str,
+    ) -> Result<StatusCode, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        create_handler(
+            State(state),
+            Extension(by.clone()),
+            Extension(ctx()),
+            Path(asset.into()),
+            Json(GrantRequest {
+                user_id: target.into(),
+                permission: permission.into(),
+            }),
+        )
+        .await
+        .map(|(c, _)| c)
+    }
+
+    async fn revoke(
+        pool: &PgPool,
+        by: &AuthUser,
+        asset: &str,
+        target: &str,
+    ) -> Result<StatusCode, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        delete_handler(
+            State(state),
+            Extension(by.clone()),
+            Extension(ctx()),
+            Path((asset.into(), target.into())),
+        )
+        .await
+    }
+
+    async fn acl_base(pool: &PgPool) {
+        for u in ["own", "tgt"] {
+            seed_user(pool, u).await;
+        }
+        seed_asset(pool, "a1", "own", false).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn asset_acl_grant_and_revoke_are_recorded_with_before_values(pool: PgPool) {
+        acl_base(&pool).await;
+        let owner = auth("own", "author");
+        assert_eq!(
+            grant(&pool, &owner, "a1", "tgt", "read").await,
+            Ok(StatusCode::CREATED)
+        );
+        assert_eq!(
+            grant(&pool, &owner, "a1", "tgt", "write").await,
+            Ok(StatusCode::CREATED)
+        );
+        let rows = audit_rows(&pool, "asset_acl.grant").await;
+        assert_eq!(rows.len(), 2);
+        let first = &rows[0];
+        assert_eq!(first.outcome, "ok");
+        assert_eq!(first.user_id.as_deref(), Some("own"));
+        assert_eq!(first.asset_id.as_deref(), Some("a1"));
+        assert_eq!(
+            first.detail_keys(),
+            ["permission", "previousPermission", "targetUserId"]
+        );
+        assert_eq!(first.detail["targetUserId"], "tgt");
+        assert_eq!(first.detail["permission"], "read");
+        assert!(first.detail["previousPermission"].is_null());
+        assert_eq!(first.request_id.as_deref(), Some("test-request"));
+        assert_eq!(first.source_ip.as_deref(), Some("198.51.100.4"));
+        assert_eq!(rows[1].detail["previousPermission"], "read");
+        assert_eq!(rows[1].detail["permission"], "write");
+
+        assert_eq!(
+            revoke(&pool, &owner, "a1", "tgt").await,
+            Ok(StatusCode::NO_CONTENT)
+        );
+        let rows = audit_rows(&pool, "asset_acl.revoke").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].asset_id.as_deref(), Some("a1"));
+        assert_eq!(rows[0].detail_keys(), ["permission", "targetUserId"]);
+        assert_eq!(rows[0].detail["permission"], "write");
+        // A revoke of nothing is a 404 and records nothing.
+        assert_eq!(
+            revoke(&pool, &owner, "a1", "tgt").await,
+            Err(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(audit_rows(&pool, "asset_acl.revoke").await.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn asset_acl_grant_and_revoke_fail_closed_when_the_audit_row_cannot_be_written(
+        pool: PgPool,
+    ) {
+        acl_base(&pool).await;
+        let owner = auth("own", "author");
+        fail_audit_inserts(&pool, &["asset_acl.grant", "asset_acl.revoke"]).await;
+        assert_eq!(
+            grant(&pool, &owner, "a1", "tgt", "read").await,
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_acl")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        seed_acl(&pool, "a1", "tgt", "read").await;
+        assert_eq!(
+            revoke(&pool, &owner, "a1", "tgt").await,
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asset_acl")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_acl_requests_write_no_audit_row(pool: PgPool) {
+        acl_base(&pool).await;
+        seed_user(&pool, "nosy").await;
+        let owner = auth("own", "author");
+        let nosy = auth("nosy", "author");
+        assert_eq!(
+            grant(&pool, &nosy, "a1", "tgt", "read").await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            grant(&pool, &owner, "a1", "tgt", "root").await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            revoke(&pool, &nosy, "a1", "tgt").await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        for a in ["asset_acl.grant", "asset_acl.revoke"] {
+            assert!(audit_rows(&pool, a).await.is_empty(), "{a}");
+        }
     }
 }

@@ -24,7 +24,8 @@ pub struct AttachmentCountRow {
     pub count: i64,
 }
 
-pub async fn insert(pool: &PgPool, row: &AttachmentRow) -> Result<()> {
+/// Insert on the caller's connection, so the row can commit with its audit event.
+pub async fn insert_on(conn: &mut sqlx::PgConnection, row: &AttachmentRow) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO attachments
@@ -41,7 +42,7 @@ pub async fn insert(pool: &PgPool, row: &AttachmentRow) -> Result<()> {
     .bind(row.size_bytes)
     .bind(&row.sha256)
     .bind(&row.uploaded_by)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -103,10 +104,11 @@ pub async fn get_by_id(pool: &PgPool, id: &str) -> Result<Option<AttachmentRow>>
     Ok(row)
 }
 
-pub async fn delete(pool: &PgPool, id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM attachments WHERE id = $1")
+/// Delete on the caller's connection; whether a row was removed.
+pub async fn delete_on(conn: &mut sqlx::PgConnection, id: &str) -> Result<bool> {
+    let r = sqlx::query("DELETE FROM attachments WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }

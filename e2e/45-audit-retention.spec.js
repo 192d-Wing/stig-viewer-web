@@ -162,9 +162,10 @@ test.describe("Audit retention", () => {
 
     // retain_days = 0 puts the cutoff at "now": everything written so far is expired.
     const swept = await runRetention(request, 0, false);
-    // The checklist.create row plus the two audit.read rows left by the two
-    // events() calls above (each read is itself audited); all are expired now.
-    expect(swept.prunedEvents).toBe(1 + 2);
+    // The asset.create row of the seeding POST /api/assets, the checklist.create
+    // row, and the two audit.read rows left by the two events() calls above
+    // (each read is itself audited); all are expired now.
+    expect(swept.prunedEvents).toBe(2 + 2);
     expect((await events()).totalCount).toBe(0);
   });
 });

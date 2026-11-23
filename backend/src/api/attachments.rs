@@ -9,9 +9,12 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::api::asset_acl;
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_assets;
 use crate::db_attachments::{self, AttachmentRow};
+use crate::db_audit;
 use crate::db_checklists;
 use crate::AppState;
 
@@ -53,6 +56,7 @@ async fn load_checklist_and_asset(
 pub async fn upload_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path((checklist_id, rule_id)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<AttachmentRow>), StatusCode> {
@@ -153,13 +157,48 @@ pub async fn upload_handler(
         uploaded_at: chrono::Utc::now(),
     };
 
-    if let Err(e) = db_attachments::insert(state.pool.as_ref(), &row).await {
-        tracing::error!("Failed to insert attachment row: {e:#}");
+    // The row and its `attachment.upload` event commit together; any failure
+    // removes the blob. The filename and MIME type are client text and are
+    // not recorded.
+    let rule_label = db_audit::audit_safe_id(&rule_id);
+    let mut ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "attachment.upload",
+        serde_json::json!({
+            "attachmentId": row.id,
+            "ruleId": rule_label,
+            "sizeBytes": row.size_bytes,
+            "sha256": row.sha256,
+        }),
+    );
+    ev.asset_id = Some(&asset.id);
+    ev.checklist_id = Some(&checklist_id);
+    if let Err(code) = insert_audited(state.pool.as_ref(), &row, &ev).await {
         let _ = tokio::fs::remove_file(&dest).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(code);
     }
 
     Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// Insert the attachment row and its audit event in one transaction.
+async fn insert_audited(
+    pool: &sqlx::PgPool,
+    row: &AttachmentRow,
+    ev: &db_audit::NewAuditEvent<'_>,
+) -> Result<(), StatusCode> {
+    let mut tx = crate::db::begin_bounded(pool)
+        .await
+        .map_err(audit_tx::failed)?;
+    db_attachments::insert_on(&mut tx, row).await.map_err(|e| {
+        tracing::error!("Failed to insert attachment row: {e:#}");
+        audit_tx::failed(e)
+    })?;
+    audit_tx::record(&mut tx, ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))
 }
 
 /// GET /api/checklists/:id/rules/:rule_id/attachments — list rows for a rule.
@@ -230,6 +269,7 @@ pub async fn download_handler(
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let row = db_attachments::get_by_id(state.pool.as_ref(), &id)
@@ -242,9 +282,35 @@ pub async fn delete_handler(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    db_attachments::delete(state.pool.as_ref(), &id)
+    // The row removal and its `attachment.delete` event commit together; the
+    // blob is removed after the commit.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
         .await
-        .map_err(map_db)?;
+        .map_err(audit_tx::failed)?;
+    if !db_attachments::delete_on(&mut tx, &id)
+        .await
+        .map_err(audit_tx::failed)?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let mut ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "attachment.delete",
+        serde_json::json!({
+            "attachmentId": row.id,
+            "ruleId": db_audit::audit_safe_id(&row.rule_id),
+            "sizeBytes": row.size_bytes,
+            "sha256": row.sha256,
+            "uploadedBy": db_audit::audit_safe_id(&row.uploaded_by),
+        }),
+    );
+    ev.asset_id = Some(&asset.id);
+    ev.checklist_id = Some(&row.checklist_id);
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
     let _ = tokio::fs::remove_file(blob_path(&state, &id)).await;
 
@@ -261,4 +327,185 @@ fn sanitize_filename(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::test_fixtures::{
+        app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_asset, seed_checklist,
+        seed_user, STIG_ID,
+    };
+    use axum::extract::FromRequest;
+    use sqlx::PgPool;
+
+    const RULE: &str = "SV-1r1_rule";
+
+    async fn base(pool: &PgPool) -> (AppState, crate::test_fixtures::StigDir) {
+        seed_user(pool, "owner").await;
+        seed_asset(pool, "a1", "owner", false).await;
+        seed_checklist(pool, "c1", "a1", STIG_ID).await;
+        app_state(pool.clone())
+    }
+
+    async fn multipart(filename: &str, body: &[u8]) -> Multipart {
+        let mut payload = format!(
+            "--XB\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: text/plain\r\n\r\n"
+        )
+        .into_bytes();
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(b"\r\n--XB--\r\n");
+        let req = axum::http::Request::builder()
+            .header(header::CONTENT_TYPE, "multipart/form-data; boundary=XB")
+            .body(Body::from(payload))
+            .unwrap();
+        Multipart::from_request(req, &()).await.unwrap()
+    }
+
+    async fn upload(
+        state: &AppState,
+        filename: &str,
+    ) -> Result<(StatusCode, Json<AttachmentRow>), StatusCode> {
+        upload_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path(("c1".into(), RULE.into())),
+            multipart(filename, b"evidence bytes").await,
+        )
+        .await
+    }
+
+    fn blobs(state: &AppState) -> usize {
+        std::fs::read_dir(attachments_dir(state))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    async fn rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM attachments")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_upload_and_delete_are_recorded(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let filename = "private-evidence-name.txt";
+        let (_, Json(row)) = upload(&state, filename).await.unwrap();
+        let up = audit_rows(&pool, "attachment.upload").await;
+        assert_eq!(up.len(), 1);
+        let u = &up[0];
+        assert_eq!(u.outcome, "ok");
+        assert_eq!(u.user_id.as_deref(), Some("owner"));
+        assert_eq!(u.asset_id.as_deref(), Some("a1"));
+        assert_eq!(u.checklist_id.as_deref(), Some("c1"));
+        assert_eq!(
+            u.detail_keys(),
+            ["attachmentId", "ruleId", "sha256", "sizeBytes"]
+        );
+        assert_eq!(u.detail["attachmentId"], row.id.as_str());
+        assert_eq!(u.detail["ruleId"], RULE);
+        assert_eq!(u.detail["sha256"], row.sha256.as_str());
+        assert_eq!(u.detail["sizeBytes"], 14);
+        assert_eq!(u.request_id.as_deref(), Some("test-request"));
+        assert_eq!(u.source_ip.as_deref(), Some("198.51.100.4"));
+        let text = u.detail.to_string();
+        assert!(!text.contains(filename) && !text.contains("text/plain"));
+
+        let res = delete_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path(row.id.clone()),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::NO_CONTENT));
+        let del = audit_rows(&pool, "attachment.delete").await;
+        assert_eq!(del.len(), 1);
+        let d = &del[0];
+        assert_eq!(d.asset_id.as_deref(), Some("a1"));
+        assert_eq!(d.checklist_id.as_deref(), Some("c1"));
+        assert_eq!(
+            d.detail_keys(),
+            [
+                "attachmentId",
+                "ruleId",
+                "sha256",
+                "sizeBytes",
+                "uploadedBy"
+            ]
+        );
+        assert_eq!(d.detail["sha256"], row.sha256.as_str());
+        assert_eq!(d.detail["uploadedBy"], "owner");
+        assert_eq!(rows(&pool).await, 0);
+        assert_eq!(blobs(&state), 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_upload_fails_closed_and_leaves_no_row_or_blob(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        fail_audit_inserts(&pool, &["attachment.upload"]).await;
+        let res = upload(&state, "e.txt").await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(rows(&pool).await, 0);
+        assert_eq!(blobs(&state), 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn attachment_delete_fails_closed_and_keeps_row_and_blob(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let (_, Json(row)) = upload(&state, "e.txt").await.unwrap();
+        fail_audit_inserts(&pool, &["attachment.delete"]).await;
+        let res = delete_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path(row.id.clone()),
+        )
+        .await;
+        assert_eq!(res, Err(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(rows(&pool).await, 1);
+        assert_eq!(blobs(&state), 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_attachment_requests_write_no_audit_row(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        seed_user(&pool, "nosy").await;
+        let (_, Json(row)) = upload(&state, "e.txt").await.unwrap();
+        let denied = upload_handler(
+            State(state.clone()),
+            Extension(auth("nosy", "author")),
+            Extension(ctx()),
+            Path(("c1".into(), RULE.into())),
+            multipart("e.txt", b"x").await,
+        )
+        .await;
+        assert_eq!(denied.err(), Some(StatusCode::FORBIDDEN));
+        let denied = delete_handler(
+            State(state.clone()),
+            Extension(auth("nosy", "author")),
+            Extension(ctx()),
+            Path(row.id.clone()),
+        )
+        .await;
+        assert_eq!(denied, Err(StatusCode::FORBIDDEN));
+        let missing = delete_handler(
+            State(state.clone()),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Path("missing".into()),
+        )
+        .await;
+        assert_eq!(missing, Err(StatusCode::NOT_FOUND));
+        assert_eq!(audit_rows(&pool, "attachment.upload").await.len(), 1);
+        assert!(audit_rows(&pool, "attachment.delete").await.is_empty());
+    }
 }

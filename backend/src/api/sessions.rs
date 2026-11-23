@@ -17,8 +17,12 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::json;
 
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
+use crate::db_audit;
 use crate::AppState;
 
 fn ensure_admin(user: &AuthUser) -> Result<(), StatusCode> {
@@ -85,21 +89,135 @@ pub async fn list_handler(
 pub async fn revoke_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     ensure_admin(&user)?;
-    let result = sqlx::query(
-        "UPDATE sessions \
-         SET revoked_at = COALESCE(revoked_at, NOW()) \
-         WHERE id = $1",
+    // The revoke and its `session.revoke` row commit together. The session id
+    // is the cookie value: it is never put in the event or in a log line.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
+    let row: Option<(String, bool)> = sqlx::query_as(
+        "WITH old AS (SELECT user_id, revoked_at FROM sessions WHERE id = $1 FOR UPDATE) \
+         UPDATE sessions s SET revoked_at = COALESCE(s.revoked_at, NOW()) \
+           FROM old WHERE s.id = $1 \
+         RETURNING old.user_id, (old.revoked_at IS NOT NULL)",
     )
     .bind(&id)
-    .execute(state.pool.as_ref())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_sqlx)?;
-
-    if result.rows_affected() == 0 {
+    let Some((target_user_id, already_revoked)) = row else {
         return Err(StatusCode::NOT_FOUND);
-    }
+    };
+    let ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "session.revoke",
+        json!({
+            "targetUserId": db_audit::audit_safe_id(&target_user_id),
+            "alreadyRevoked": already_revoked,
+        }),
+    );
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_user};
+    use sqlx::PgPool;
+
+    async fn base(pool: &PgPool) -> String {
+        seed_user(pool, "root").await;
+        seed_user(pool, "u1").await;
+        let sid = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, 'u1', NOW() + INTERVAL '1 day')",
+        )
+        .bind(&sid)
+        .execute(pool)
+        .await
+        .unwrap();
+        sid
+    }
+
+    async fn revoke(pool: &PgPool, sid: &str) -> Result<StatusCode, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        revoke_handler(
+            State(state),
+            Extension(auth("root", "admin")),
+            Extension(ctx()),
+            Path(sid.into()),
+        )
+        .await
+    }
+
+    async fn revoked(pool: &PgPool, sid: &str) -> bool {
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn session_revoke_is_recorded_without_the_session_id(pool: PgPool) {
+        let sid = base(&pool).await;
+        assert_eq!(revoke(&pool, &sid).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(revoke(&pool, &sid).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(revoke(&pool, "missing").await, Err(StatusCode::NOT_FOUND));
+        let rows = audit_rows(&pool, "session.revoke").await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].user_id.as_deref(), Some("root"));
+        assert_eq!(rows[0].detail_keys(), ["alreadyRevoked", "targetUserId"]);
+        assert_eq!(rows[0].detail["targetUserId"], "u1");
+        assert_eq!(rows[0].detail["alreadyRevoked"], false);
+        assert_eq!(rows[1].detail["alreadyRevoked"], true);
+        assert_eq!(rows[0].request_id.as_deref(), Some("test-request"));
+        let text: String = sqlx::query_scalar(
+            "SELECT string_agg(detail::text || COALESCE(request_id, ''), ' ') FROM audit_events WHERE action = 'session.revoke'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!text.contains(&sid), "{text}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn session_revoke_fails_closed_when_the_audit_row_cannot_be_written(pool: PgPool) {
+        let sid = base(&pool).await;
+        fail_audit_inserts(&pool, &["session.revoke"]).await;
+        assert_eq!(
+            revoke(&pool, &sid).await,
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(!revoked(&pool, &sid).await);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_session_revokes_write_no_audit_row(pool: PgPool) {
+        let sid = base(&pool).await;
+        let (state, _dir) = app_state(pool.clone());
+        let denied = revoke_handler(
+            State(state),
+            Extension(auth("u1", "author")),
+            Extension(ctx()),
+            Path(sid.clone()),
+        )
+        .await;
+        assert_eq!(denied, Err(StatusCode::FORBIDDEN));
+        assert_eq!(revoke(&pool, "missing").await, Err(StatusCode::NOT_FOUND));
+        assert!(!revoked(&pool, &sid).await);
+        assert!(audit_rows(&pool, "session.revoke").await.is_empty());
+    }
 }

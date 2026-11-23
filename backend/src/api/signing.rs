@@ -15,9 +15,13 @@
 //! these bytes, at this time, under this authenticated user's session.
 //! Replay is prevented by the `signedAt` field in the signing document.
 //!
-//! Audit trail: each successful sign emits a `tracing::info!` line with
-//! the user id, sha256, key id, and byte count. Hook this into whatever
-//! log aggregator you use for forensic review.
+//! Audit trail: each successful sign writes a durable `signing.sign` row to
+//! `audit_events` (sha256, key id, byte count, version, algorithms; `resource`
+//! is client free text, so only whether it was present is stored, plus the
+//! `stig_id` column when it has a STIG id's shape) and emits a
+//! `tracing::info!` line. The row is committed before the signature leaves the
+//! server: if it cannot be written the request fails (5xx) and no bundle is
+//! returned (fail closed, AU-10).
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use base64::{
@@ -29,7 +33,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::checklists::is_valid_stig_id;
+use crate::api::request_ctx::RequestCtx;
 use crate::AppState;
 
 /// Loaded signing material. Stored on `AppState` as `Option<SigningState>`;
@@ -485,6 +492,7 @@ fn sign_request(
 pub async fn sign_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Json(body): Json<SignRequest>,
 ) -> Result<Json<SignedBundle>, (StatusCode, String)> {
     let sk = require_signing(&state.signing).map_err(|(c, m)| (c, m.to_string()))?;
@@ -497,6 +505,30 @@ pub async fn sign_handler(
         .map(|s| s.algorithm)
         .collect::<Vec<_>>()
         .join(",");
+    // No mutation exists, so the row is its own one-statement transaction,
+    // committed before the signature is returned.
+    let resource = bundle.document.resource.as_deref();
+    let mut ev = audit_tx::ok_event(
+        &user,
+        &ctx,
+        "signing.sign",
+        serde_json::json!({
+            "sha256": bundle.document.sha256,
+            "keyId": sk.key_id,
+            "bytes": bytes,
+            "version": bundle.version,
+            "algorithms": algorithms,
+            "resourcePresent": resource.is_some(),
+        }),
+    );
+    ev.stig_id = resource.filter(|r| is_valid_stig_id(r));
+    let unavailable = |e: anyhow::Error| (audit_tx::failed(e), "signing unavailable".to_string());
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(unavailable)?;
+    audit_tx::record(&mut tx, &ev).await.map_err(unavailable)?;
+    tx.commit().await.map_err(|e| unavailable(e.into()))?;
+
     tracing::info!(
         user = %user.id,
         sha256 = %bundle.document.sha256,
@@ -1051,5 +1083,130 @@ mod tests {
         assert_eq!(a.key_id, b.key_id);
         // 8 bytes → 16 hex chars.
         assert_eq!(a.key_id.len(), 16);
+    }
+
+    // ── Audit rows (#151) ──────────────────────────────────────────────────
+
+    async fn sign(
+        pool: &sqlx::PgPool,
+        resource: Option<&str>,
+    ) -> Result<Json<SignedBundle>, (StatusCode, String)> {
+        let (mut state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        state.signing = Some(test_state());
+        sign_handler(
+            State(state),
+            Extension(crate::test_fixtures::auth("u1", "author")),
+            Extension(crate::test_fixtures::ctx()),
+            Json(request(&BASE64.encode(b"hello"), resource)),
+        )
+        .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn signing_sign_is_recorded_with_hash_and_key_but_not_the_resource_text(
+        pool: sqlx::PgPool,
+    ) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        let free_text = "customer secret label";
+        let Json(bundle) = sign(&pool, Some(free_text)).await.unwrap();
+        let rows = crate::test_fixtures::audit_rows(&pool, "signing.sign").await;
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.outcome, "ok");
+        assert_eq!(r.user_id.as_deref(), Some("u1"));
+        assert_eq!(r.stig_id, None, "free text is not a STIG id");
+        assert_eq!(
+            r.detail_keys(),
+            [
+                "algorithms",
+                "bytes",
+                "keyId",
+                "resourcePresent",
+                "sha256",
+                "version"
+            ]
+        );
+        assert_eq!(r.detail["sha256"], bundle.document.sha256.as_str());
+        assert_eq!(r.detail["keyId"], test_state().key_id.as_str());
+        assert_eq!(r.detail["bytes"], 5);
+        assert_eq!(r.detail["resourcePresent"], true);
+        assert_eq!(r.request_id.as_deref(), Some("test-request"));
+        assert_eq!(r.source_ip.as_deref(), Some("198.51.100.4"));
+        let text: String = sqlx::query_scalar(
+            "SELECT detail::text FROM audit_events WHERE action = 'signing.sign'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!text.contains(free_text), "{text}");
+
+        // A STIG-shaped resource lands in the stig_id column.
+        let _ = sign(&pool, Some("TEST-STIG")).await.unwrap();
+        let rows = crate::test_fixtures::audit_rows(&pool, "signing.sign").await;
+        assert_eq!(rows[1].stig_id.as_deref(), Some("TEST-STIG"));
+        // No resource: resourcePresent is false.
+        let _ = sign(&pool, None).await.unwrap();
+        let rows = crate::test_fixtures::audit_rows(&pool, "signing.sign").await;
+        assert_eq!(rows[2].detail["resourcePresent"], false);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn signing_sign_fails_closed_and_returns_no_bundle_when_the_row_cannot_be_written(
+        pool: sqlx::PgPool,
+    ) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        crate::test_fixtures::fail_audit_inserts(&pool, &["signing.sign"]).await;
+        let res = sign(&pool, None).await;
+        let Err((code, msg)) = res else {
+            panic!("a signature must not be released without its record");
+        };
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(msg, "signing unavailable");
+        assert!(crate::test_fixtures::audit_rows(&pool, "signing.sign")
+            .await
+            .is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_sign_requests_write_no_audit_row(pool: sqlx::PgPool) {
+        crate::test_fixtures::seed_user(&pool, "u1").await;
+        let bad = sign_with(&pool, "***").await;
+        assert_eq!(bad.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST));
+        let empty = sign_with(&pool, "").await;
+        assert_eq!(empty.err().map(|e| e.0), Some(StatusCode::BAD_REQUEST));
+        // No key configured.
+        let (state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        let off = sign_handler(
+            State(state),
+            Extension(crate::test_fixtures::auth("u1", "author")),
+            Extension(crate::test_fixtures::ctx()),
+            Json(request(&BASE64.encode(b"hello"), None)),
+        )
+        .await;
+        assert_eq!(
+            off.err().map(|e| e.0),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(crate::test_fixtures::audit_rows(&pool, "signing.sign")
+            .await
+            .is_empty());
+    }
+
+    async fn sign_with(
+        pool: &sqlx::PgPool,
+        content: &str,
+    ) -> Result<Json<SignedBundle>, (StatusCode, String)> {
+        let (mut state, _dir) = crate::test_fixtures::app_state(pool.clone());
+        state.signing = Some(test_state());
+        sign_handler(
+            State(state),
+            Extension(crate::test_fixtures::auth("u1", "author")),
+            Extension(crate::test_fixtures::ctx()),
+            Json(request(content, None)),
+        )
+        .await
     }
 }
