@@ -197,7 +197,9 @@ test.describe("Outbound webhooks", () => {
   }) => {
     const hook = await seedSignedHook(request, "Keep me signed");
     await openEdit(page, "Keep me signed");
-    await page.getByLabel("Name", { exact: true }).fill("Renamed hook");
+    // The admin page also has a policy form with a "Name" field, so target
+    // the webhook form's Name input by its placeholder.
+    await page.getByPlaceholder("Slack #security").fill("Renamed hook");
     const patched = page.waitForRequest(isPatch);
     await page.getByRole("button", { name: "Save" }).click();
     expect(Object.keys((await patched).postDataJSON())).not.toContain("secret");
