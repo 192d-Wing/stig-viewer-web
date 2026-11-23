@@ -66,6 +66,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # The default build must stay free of aws-lc; only `--features fips` pulls it in (#70).
+      - name: Check the default build has no aws-lc
+        run: "! cargo tree --locked -e normal | grep -q aws-lc"
       # sqlx::test creates a throwaway database per test, so the user must be
       # allowed to CREATE DATABASE (the image's POSTGRES_USER is a superuser).
       # The server lives only for this job, listens on loopback only, and gets
@@ -126,6 +129,36 @@ jobs:
           workspaces: backend
 
       - run: cargo "+$MSRV" check --locked --all-targets
+
+  # Builds, lints and tests the backend with the `fips` feature (#70). The
+  # AWS-LC FIPS module needs CMake, Go, Perl and a C compiler; the runner image has them.
+  backend-fips:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable with clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Check the FIPS build toolchain
+        run: cmake --version && go version && perl -v | head -2 && cc --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+
+      - run: cargo clippy --locked --features fips --all-targets -- -D warnings
+
+      - run: cargo test --locked --features fips
 
   # Decides whether a pull request touches anything e2e exercises. Pushes to
   # main always run e2e, whatever changed.

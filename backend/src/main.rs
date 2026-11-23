@@ -12,6 +12,7 @@ mod db_notice;
 mod db_roles;
 mod detached;
 mod failure_counters;
+mod fips;
 mod integrity;
 mod parser;
 mod pdf;
@@ -750,6 +751,11 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // Refuse to start when the FIPS build cannot confirm the validated module
+    // is in FIPS mode. Must stay before the migrate dispatch, DB access and
+    // bind (fail-closed, #64).
+    let _fips_policy = fips::startup_guard()?;
 
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
