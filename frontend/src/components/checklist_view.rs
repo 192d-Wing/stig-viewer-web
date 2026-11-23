@@ -409,6 +409,8 @@ struct ViewState {
     attachments_loading: UseStateHandle<bool>,
     uploading: UseStateHandle<bool>,
     upload_error: UseStateHandle<Option<String>>,
+    /// The caller lacks `read` on the asset, so evidence is withheld (403).
+    evidence_hidden: UseStateHandle<bool>,
     /// ruleId -> attachment count
     attachment_counts: UseStateHandle<Rc<HashMap<String, u32>>>,
 
@@ -469,6 +471,10 @@ impl ViewState {
     }
 
     async fn refresh_counts(&self) {
+        // A 403 on one rule's evidence means counts would 403 too.
+        if *self.evidence_hidden {
+            return;
+        }
         let path = format!("/api/checklists/{}/attachments", self.checklist_id);
         // Non-fatal on error — just leave counts as they are.
         if let Ok(rows) = api_get::<Vec<AttachmentCount>>(&path).await {
@@ -482,8 +488,22 @@ impl ViewState {
             return;
         }
         self.attachments_loading.set(true);
-        match api_get::<Vec<Attachment>>(&self.rule_path(rule_id, "/attachments")).await {
-            Ok(rows) => self.attachments.set(rows),
+        match api_fetch("GET", &self.rule_path(rule_id, "/attachments")).await {
+            Ok(res) if res.status() == 403 => {
+                self.attachments.set(Vec::new());
+                self.evidence_hidden.set(true);
+            }
+            Ok(res) if res.ok() => match res.json::<Vec<Attachment>>().await {
+                Ok(rows) => self.attachments.set(rows),
+                Err(e) => {
+                    self.attachments.set(Vec::new());
+                    self.upload_error.set(Some(e.to_string()));
+                }
+            },
+            Ok(res) => {
+                self.attachments.set(Vec::new());
+                self.upload_error.set(Some(res.status().to_string()));
+            }
             Err(e) => {
                 self.attachments.set(Vec::new());
                 self.upload_error.set(Some(e));
@@ -517,6 +537,7 @@ impl ViewState {
         }));
         self.save_error.set(None);
         self.upload_error.set(None);
+        self.evidence_hidden.set(false);
         self.attachments.set(Vec::new());
         self.comments.set(Vec::new());
         self.comment_draft.set(String::new());
@@ -807,6 +828,7 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
         attachments_loading: use_state(|| false),
         uploading: use_state(|| false),
         upload_error: use_state(|| None),
+        evidence_hidden: use_state(|| false),
         attachment_counts: use_state(Rc::default),
         comments: use_state(Vec::new),
         comments_loading: use_state(|| false),
@@ -1138,6 +1160,8 @@ pub fn ChecklistView(props: &ChecklistViewProps) -> Html {
                     <SpaceBetween direction="vertical" size="s">
                         if *s.attachments_loading {
                             <StatusIndicator kind="loading">{"Loading attachments"}</StatusIndicator>
+                        } else if *s.evidence_hidden {
+                            {secondary_note("You do not have access to this system's evidence.")}
                         } else if s.attachments.is_empty() {
                             {secondary_note("No attachments yet.")}
                         } else {

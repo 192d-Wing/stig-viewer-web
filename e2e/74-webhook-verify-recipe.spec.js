@@ -32,7 +32,7 @@ test.describe("Webhook receiver verifier docs", () => {
     const hook = await createWebhook(request, "alice", {
       name: "guarded",
       url: "https://example.invalid/hook",
-      secret: "shhh",
+      secret: crypto.randomBytes(12).toString("hex"),
     });
 
     const res = await request.get(
@@ -48,7 +48,7 @@ test.describe("Webhook receiver verifier docs", () => {
     await ensureUser(request, "alice");
     await setUserRole("alice", "admin");
 
-    const secret = "verifier-secret-!@#-with-mixed-chars";
+    const secret = crypto.randomBytes(16).toString("hex");
     const url = "https://example.invalid/incoming/abc123";
     const hook = await createWebhook(request, "alice", {
       name: "signed-hook",
@@ -94,6 +94,14 @@ test.describe("Webhook receiver verifier docs", () => {
     const match = body.snippets.curl.match(/sha256=([0-9a-f]{64})/);
     expect(match).not.toBeNull();
     expect(match[1]).toBe(expected);
+
+    // The secret is write-only: the receiver snippets read it from the
+    // environment and nothing in the response embeds it.
+    expect(body.snippets.python).toContain("WEBHOOK_SECRET");
+    expect(body.snippets.node).toContain("WEBHOOK_SECRET");
+    expect(body.snippets.python).not.toContain(secret);
+    expect(body.snippets.node).not.toContain(secret);
+    expect(JSON.stringify(body)).not.toContain(secret);
   });
 
   test("API: admin GET on an unsigned webhook explains it is unsigned", async ({
@@ -145,7 +153,7 @@ test.describe("Webhook receiver verifier docs", () => {
     const hook = await createWebhook(request, "alice", {
       name: "ui-hook",
       url: "https://example.invalid/ui-hook",
-      secret: "ui-secret",
+      secret: crypto.randomBytes(12).toString("hex"),
     });
 
     await loginAs(page, "alice");

@@ -55,6 +55,10 @@ use crate::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Signature scheme label: the digest name and the header-value prefix
+/// (`<name>=<hex>`). The signer and the verify recipes both derive from it.
+const SIG_ALGO: &str = "sha256";
+
 /// Compute the `sha256=<hex>` signature for `body` keyed by `secret`.
 /// Returns `None` when `secret` is empty so callers can branch on
 /// "unsigned webhook" without inspecting the string twice.
@@ -68,7 +72,7 @@ fn sign_body(secret: &str, body: &[u8]) -> Option<String> {
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(body);
     Some(format!(
-        "sha256={}",
+        "{SIG_ALGO}={}",
         hex::encode(mac.finalize().into_bytes())
     ))
 }
@@ -122,8 +126,9 @@ fn validate_flavor(flavor: &str) -> Result<(), StatusCode> {
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
+/// Internal row, including the stored secret. Never serialized: API
+/// responses use `WebhookView`, which omits the secret.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WebhookRow {
     pub id: String,
     pub name: String,
@@ -134,6 +139,38 @@ pub struct WebhookRow {
     pub flavor: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// API representation of a webhook. The secret is write-only: it is never
+/// echoed back, only whether one is set (`signed`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookView {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub signed: bool,
+    pub kinds: Vec<String>,
+    pub enabled: bool,
+    pub flavor: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<WebhookRow> for WebhookView {
+    fn from(r: WebhookRow) -> Self {
+        Self {
+            signed: !r.secret.is_empty(),
+            id: r.id,
+            name: r.name,
+            url: r.url,
+            kinds: r.kinds,
+            enabled: r.enabled,
+            flavor: r.flavor,
+            created_by: r.created_by,
+            created_at: r.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -204,7 +241,7 @@ fn valid_url(url: &str) -> bool {
 pub async fn list_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
-) -> Result<Json<Vec<WebhookRow>>, StatusCode> {
+) -> Result<Json<Vec<WebhookView>>, StatusCode> {
     ensure_admin(&user)?;
     let rows = sqlx::query_as::<_, WebhookRow>(
         r#"
@@ -216,7 +253,7 @@ pub async fn list_handler(
     .fetch_all(state.pool.as_ref())
     .await
     .map_err(map_sqlx)?;
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(WebhookView::from).collect()))
 }
 
 /// POST /api/webhooks — admin-only create. 400 on empty name/url or a
@@ -226,7 +263,7 @@ pub async fn create_handler(
     Extension(user): Extension<AuthUser>,
     Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreateRequest>,
-) -> Result<(StatusCode, Json<WebhookRow>), StatusCode> {
+) -> Result<(StatusCode, Json<WebhookView>), StatusCode> {
     ensure_admin(&user)?;
 
     let name = req.name.trim().to_string();
@@ -288,7 +325,7 @@ pub async fn create_handler(
         .map_err(audit_tx::failed)?;
     tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
-    Ok((StatusCode::CREATED, Json(row)))
+    Ok((StatusCode::CREATED, Json(row.into())))
 }
 
 /// PATCH /api/webhooks/:id — admin-only partial update. Any field left
@@ -299,7 +336,7 @@ pub async fn update_handler(
     Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<UpdateRequest>,
-) -> Result<Json<WebhookRow>, StatusCode> {
+) -> Result<Json<WebhookView>, StatusCode> {
     ensure_admin(&user)?;
 
     // The update and its `webhook.update` row commit together; the existing
@@ -384,7 +421,7 @@ pub async fn update_handler(
         .map_err(audit_tx::failed)?;
     tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
 
-    Ok(Json(row))
+    Ok(Json(row.into()))
 }
 
 /// Names (never values) of the fields an update replaced. The URL, name and
@@ -543,9 +580,10 @@ pub async fn test_handler(
 ///
 /// Renders the same HMAC verification logic documented at the top of
 /// this module as ready-to-paste curl / Python / Node snippets, with the
-/// webhook's actual URL + secret + a canned sample payload pre-filled so
-/// an operator can validate a receiver end-to-end without having to copy
-/// individual values around. When the webhook's secret is empty we emit
+/// webhook's actual URL + a canned sample payload pre-filled so an operator
+/// can validate a receiver end-to-end. The secret itself is never included:
+/// the Python/Node snippets read it from `WEBHOOK_SECRET`; only the curl
+/// snippet carries a signature precomputed over the sample payload. When the webhook's secret is empty we emit
 /// "unsigned" snippets instead of fabricating a meaningless signature.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -572,8 +610,9 @@ pub struct VerifyRecipeSnippets {
     pub node: String,
 }
 
-/// Build the curl/Python/Node snippets for one webhook. Pulled out so
-/// it's unit-testable in isolation from the HTTP layer.
+/// Build the curl, Python and Node snippets for one webhook. Kept apart from
+/// the HTTP layer so it can be unit-tested; the secret never appears in the
+/// output (only the curl signature over the fixed sample payload does).
 fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
     // Canonical sample event — kept compact on purpose so the snippets
     // fit in a Slack/Discord message without scrolling.
@@ -602,8 +641,8 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
             .expect("non-empty secret always signs");
         VerifyRecipeSnippets {
             curl: signed_curl_snippet(&webhook.url, &sample_payload, &sig, header_name),
-            python: signed_python_snippet(&webhook.secret, header_name),
-            node: signed_node_snippet(&webhook.secret, header_name),
+            python: signed_python_snippet(header_name),
+            node: signed_node_snippet(header_name),
         }
     };
 
@@ -632,14 +671,13 @@ fn unsigned_curl_snippet(url: &str, body: &str) -> String {
     )
 }
 
-fn signed_python_snippet(secret: &str, header: &str) -> String {
-    // Receiver-side verification recipe. The secret is embedded so the
-    // operator can paste-and-run; in production they'd load it from a
-    // secrets manager.
+fn signed_python_snippet(header: &str) -> String {
+    // Receiver-side verification recipe. The secret is write-only, so the
+    // snippet reads it from the environment instead of embedding it.
     format!(
-        "# Python receiver — verify the X-Webhook-Signature header.\nimport hmac, hashlib\n\nSECRET = {secret_lit}.encode()\nHEADER = {header_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = 'sha256=' + hmac.new(SECRET, raw_body, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify(request.get_data(), request.headers[HEADER])\n",
-        secret_lit = python_string_literal(secret),
+        "# Python receiver — verify the X-Webhook-Signature header.\nimport hmac, hashlib, os\n\n# Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nSECRET = os.environ['WEBHOOK_SECRET'].encode()\nHEADER = {header_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo}=' + hmac.new(SECRET, raw_body, hashlib.{algo}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify(request.get_data(), request.headers[HEADER])\n",
         header_lit = python_string_literal(header),
+        algo = SIG_ALGO,
     )
 }
 
@@ -650,11 +688,11 @@ fn unsigned_python_snippet() -> String {
     "# This webhook is configured as unsigned (no secret set).\n# Receivers cannot verify the body's authenticity — there is no signature header.\n# Set a secret on the webhook in the Admin Console to enable HMAC verification.\n".to_string()
 }
 
-fn signed_node_snippet(secret: &str, header: &str) -> String {
+fn signed_node_snippet(header: &str) -> String {
     format!(
-        "// Node.js receiver — verify the X-Webhook-Signature header.\nconst crypto = require('crypto');\n\nconst SECRET = {secret_lit};\nconst HEADER = {header_lit};\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = 'sha256=' + crypto.createHmac('sha256', SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verify(req.body, req.get(HEADER))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
-        secret_lit = js_string_literal(secret),
+        "// Node.js receiver — verify the X-Webhook-Signature header.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = '{algo}=' + crypto.createHmac('{algo}', SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verify(req.body, req.get(HEADER))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
         header_lit = js_string_literal(header),
+        algo = SIG_ALGO,
     )
 }
 
@@ -680,7 +718,7 @@ fn js_string_literal(s: &str) -> String {
 
 /// GET /api/webhooks/:id/verify-recipe — admin-only. Returns the curl /
 /// Python / Node receiver-verification snippets for one webhook, with
-/// the actual URL/secret/sample-body pre-filled. 404 if the webhook is
+/// the actual URL and sample body pre-filled (never the secret). 404 if the webhook is
 /// gone (so a typo'd id in the Admin UI surfaces as an error toast
 /// rather than a blank modal).
 pub async fn verify_recipe_handler(
@@ -1327,7 +1365,7 @@ mod audit_tests {
         )
     }
 
-    async fn make(state: &AppState, url: &str, secret: &str) -> Result<WebhookRow, StatusCode> {
+    async fn make(state: &AppState, url: &str, secret: &str) -> Result<WebhookView, StatusCode> {
         create_handler(
             State(state.clone()),
             admin(),
@@ -1348,7 +1386,7 @@ mod audit_tests {
         state: &AppState,
         id: &str,
         req: UpdateRequest,
-    ) -> Result<WebhookRow, StatusCode> {
+    ) -> Result<WebhookView, StatusCode> {
         update_handler(
             State(state.clone()),
             admin(),
@@ -1632,5 +1670,105 @@ mod audit_tests {
         ] {
             assert!(audit_rows(&pool, a).await.is_empty(), "{a}");
         }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn webhook_responses_never_carry_the_secret(pool: sqlx::PgPool) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let (url, secret) = creds();
+        let hook = make(&state, &url, &secret).await.unwrap();
+        assert!(hook.signed);
+        let Json(list) = list_handler(State(state.clone()), admin()).await.unwrap();
+        let listed = serde_json::to_string(&list).unwrap();
+        let created = serde_json::to_string(&hook).unwrap();
+        let kept = patch(
+            &state,
+            &hook.id,
+            UpdateRequest {
+                enabled: Some(false),
+                ..no_change()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(kept.signed);
+        let rotated = patch(
+            &state,
+            &hook.id,
+            UpdateRequest {
+                secret: Some(uuid::Uuid::new_v4().to_string()),
+                ..no_change()
+            },
+        )
+        .await
+        .unwrap();
+        let cleared = patch(
+            &state,
+            &hook.id,
+            UpdateRequest {
+                secret: Some(String::new()),
+                ..no_change()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!cleared.signed);
+        for body in [
+            listed,
+            created,
+            serde_json::to_string(&kept).unwrap(),
+            serde_json::to_string(&rotated).unwrap(),
+        ] {
+            assert!(!body.contains(&secret), "secret leaked: {body}");
+            assert!(!body.contains("\"secret\""), "secret key present: {body}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::*;
+
+    fn row(secret: &str) -> WebhookRow {
+        WebhookRow {
+            id: "w1".into(),
+            name: "n".into(),
+            url: "https://hooks.example.test/x".into(),
+            secret: secret.into(),
+            kinds: vec!["assigned".into()],
+            enabled: true,
+            flavor: "slack".into(),
+            created_by: "root".into(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn signed_recipe_omits_the_secret_but_keeps_the_curl_signature() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let r = build_verify_recipe(&row(&secret));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains(&secret));
+        assert!(r.snippets.python.contains("WEBHOOK_SECRET"));
+        assert!(r.snippets.node.contains("WEBHOOK_SECRET"));
+        let sig = sign_body(&secret, r.sample_payload.as_bytes()).unwrap();
+        assert!(r.snippets.curl.contains(&sig));
+    }
+
+    #[test]
+    fn empty_secret_gives_unsigned_snippets() {
+        let r = build_verify_recipe(&row(""));
+        assert!(r.snippets.python.contains("unsigned"));
+        assert!(r.snippets.node.contains("unsigned"));
+        assert!(!r.snippets.curl.contains("X-Webhook-Signature"));
+    }
+
+    #[test]
+    fn view_reports_signed_without_a_secret_field() {
+        let v = serde_json::to_value(WebhookView::from(row("s"))).unwrap();
+        assert_eq!(v["signed"], true);
+        assert!(v.get("secret").is_none());
     }
 }

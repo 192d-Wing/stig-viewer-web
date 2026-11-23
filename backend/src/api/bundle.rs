@@ -2,14 +2,19 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
+    Extension,
 };
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
+use crate::api::asset_acl;
+use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_assets;
 use crate::db_attachments;
+use crate::db_audit;
 use crate::db_checklists;
 use crate::AppState;
 
@@ -25,10 +30,12 @@ struct AssetCtx {
 
 /// GET /api/assets/:id/bundle.zip — streams a ZIP bundle of a single
 /// asset's CKL files (one per applied STIG) plus all evidence
-/// attachments. Auth posture matches `report.rs`: any authenticated
-/// user can fetch.
+/// attachments. Requires `read` on the asset (403 otherwise, 404 when the
+/// asset does not exist), since the bundle includes evidence files.
 pub async fn bundle_handler(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(asset_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let pool = state.pool.as_ref();
@@ -37,6 +44,9 @@ pub async fn bundle_handler(
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
+    if !asset_acl::user_can(pool, &asset.id, &user, "read").await {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let checklists = db_checklists::list_checklists_for_asset(pool, &asset_id)
         .await
@@ -109,6 +119,7 @@ pub async fn bundle_handler(
         owner_display,
     };
 
+    let attachment_count = attachment_entries.len();
     let zip_bytes = tokio::task::spawn_blocking(move || {
         build_zip(host, asset_ctx, sections, attachment_entries)
     })
@@ -121,6 +132,26 @@ pub async fn bundle_handler(
         tracing::error!("bundle build failed: {e:#}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Evidence leaves the system here, so the export is recorded (AU-2,
+    // fail-open). Counts only: no filenames or asset name.
+    db_audit::record_or_log(
+        pool,
+        db_audit::NewAuditEvent {
+            user_id: &user.id,
+            action: "asset.bundle_export",
+            outcome: "ok",
+            asset_id: Some(&asset.id),
+            checklist_id: None,
+            stig_id: None,
+            detail: serde_json::json!({
+                "checklistCount": checklists.len(),
+                "attachmentCount": attachment_count,
+            }),
+            ctx: Some(&ctx),
+        },
+    )
+    .await;
 
     let filename = sanitize_filename(&format!("{}-bundle.zip", asset.name));
     let mut headers = HeaderMap::new();
@@ -638,5 +669,52 @@ mod id_tests {
         for id in bad_ids() {
             assert!(load_stig_json(&state, &id).await.is_none(), "{id:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use crate::test_fixtures::{
+        app_state, audit_rows, auth, ctx, seed_acl, seed_asset, seed_checklist, seed_user, STIG_ID,
+    };
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn bundle_requires_asset_read_acl(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        seed_user(&pool, "nosy").await;
+        seed_user(&pool, "root").await;
+        seed_asset(&pool, "a1", "owner", false).await;
+        seed_checklist(&pool, "c1", "a1", STIG_ID).await;
+        let (state, _dir) = app_state(pool.clone());
+        let call = |who: &str, id: &str| {
+            bundle_handler(
+                State(state.clone()),
+                Extension(auth(who, "viewer")),
+                Extension(ctx()),
+                Path(id.to_string()),
+            )
+        };
+        assert_eq!(call("nosy", "a1").await.err(), Some(StatusCode::FORBIDDEN));
+        assert_eq!(call("nosy", "zz").await.err(), Some(StatusCode::NOT_FOUND));
+        seed_acl(&pool, "a1", "nosy", "read").await;
+        assert!(call("nosy", "a1").await.is_ok());
+        assert!(call("owner", "a1").await.is_ok());
+        let admin = bundle_handler(
+            State(state.clone()),
+            Extension(auth("root", "admin")),
+            Extension(ctx()),
+            Path("a1".to_string()),
+        )
+        .await;
+        assert!(admin.is_ok());
+
+        let rows = audit_rows(&pool, "asset.bundle_export").await;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].asset_id.as_deref(), Some("a1"));
+        assert_eq!(rows[0].detail_keys(), ["attachmentCount", "checklistCount"]);
+        assert_eq!(rows[0].detail["checklistCount"], 1);
     }
 }

@@ -232,7 +232,8 @@ struct Webhook {
     id: String,
     name: String,
     url: String,
-    secret: Option<String>,
+    /// Whether a signing secret is set. The secret itself is never returned.
+    signed: bool,
     kinds: Option<Vec<String>>,
     enabled: bool,
     flavor: Option<String>,
@@ -1962,7 +1963,12 @@ struct HookForm {
     id: Option<String>,
     name: String,
     url: String,
+    /// New secret to set. Empty on edit means keep the stored one.
     secret: String,
+    /// Whether the webhook being edited currently has a secret.
+    signed: bool,
+    /// Edit only: remove the stored secret (send unsigned).
+    clear_secret: bool,
     kinds: Vec<String>,
     flavor: String,
     enabled: bool,
@@ -1975,6 +1981,8 @@ impl Default for HookForm {
             name: String::new(),
             url: String::new(),
             secret: String::new(),
+            signed: false,
+            clear_secret: false,
             kinds: vec!["assigned".into()],
             flavor: "slack".into(),
             enabled: true,
@@ -1988,7 +1996,9 @@ impl HookForm {
             id: Some(w.id.clone()),
             name: w.name.clone(),
             url: w.url.clone(),
-            secret: w.secret.clone().unwrap_or_default(),
+            secret: String::new(),
+            signed: w.signed,
+            clear_secret: false,
             kinds: w.kinds.clone().unwrap_or_else(|| vec!["assigned".into()]),
             flavor: w.flavor.clone().unwrap_or_else(|| "slack".into()),
             enabled: w.enabled,
@@ -2010,6 +2020,48 @@ struct DeliveriesPanel {
 enum VerifyState {
     Loading { webhook_name: String },
     Ready(VerifyRecipe),
+}
+
+impl DeliveriesPanel {
+    /// Panel state once the deliveries fetch finishes: the latest ten rows,
+    /// or the error.
+    fn loaded(webhook_name: String, result: Result<Vec<Delivery>, String>) -> Self {
+        match result {
+            Ok(rows) => Self {
+                webhook_name,
+                rows: rows.into_iter().take(10).collect(),
+                ..Default::default()
+            },
+            Err(e) => Self {
+                webhook_name,
+                error: Some(e),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// Path, method and JSON body for saving the webhook form: POST on create,
+/// PATCH on edit. The stored secret is write-only, so on edit the `secret`
+/// key is omitted to keep it, set to a new value to rotate, or "" to clear.
+fn hook_request(form: &HookForm) -> (String, &'static str, Value) {
+    let mut body = json!({
+        "name": form.name,
+        "url": form.url,
+        "kinds": form.kinds,
+        "flavor": form.flavor,
+    });
+    let Some(id) = &form.id else {
+        body["secret"] = json!(form.secret);
+        return ("/api/webhooks".to_string(), "POST", body);
+    };
+    body["enabled"] = json!(form.enabled);
+    if form.clear_secret {
+        body["secret"] = json!("");
+    } else if !form.secret.is_empty() {
+        body["secret"] = json!(form.secret);
+    }
+    (format!("/api/webhooks/{id}"), "PATCH", body)
 }
 
 #[function_component]
@@ -2051,22 +2103,8 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             spawn_local(async move {
                 submitting.set(true);
                 error.set(None);
-                let mut body = json!({
-                    "name": form.name,
-                    "url": form.url,
-                    "secret": form.secret,
-                    "kinds": form.kinds,
-                    "flavor": form.flavor,
-                });
-                let result = match &form.id {
-                    None => api_json::<Value, _>("/api/webhooks", "POST", Some(&body)).await,
-                    Some(id) => {
-                        body["enabled"] = json!(form.enabled);
-                        api_json::<Value, _>(&format!("/api/webhooks/{id}"), "PATCH", Some(&body))
-                            .await
-                    }
-                };
-                match result {
+                let (path, method, body) = hook_request(&form);
+                match api_json::<Value, _>(&path, method, Some(&body)).await {
                     Ok(_) => {
                         modal.set(None);
                         console.refresh().await;
@@ -2136,24 +2174,10 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                 ..Default::default()
             }));
             spawn_local(async move {
-                let next = match api_get::<Vec<Delivery>>(&format!(
-                    "/api/webhooks/{}/deliveries",
-                    hook.id
-                ))
-                .await
-                {
-                    Ok(rows) => DeliveriesPanel {
-                        webhook_name,
-                        rows: rows.into_iter().take(10).collect(),
-                        ..Default::default()
-                    },
-                    Err(e) => DeliveriesPanel {
-                        webhook_name,
-                        error: Some(e),
-                        ..Default::default()
-                    },
-                };
-                panel.set(Some(next));
+                let result =
+                    api_get::<Vec<Delivery>>(&format!("/api/webhooks/{}/deliveries", hook.id))
+                        .await;
+                panel.set(Some(DeliveriesPanel::loaded(webhook_name, result)));
             });
         })
     };
@@ -2161,9 +2185,9 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         let panel = deliveries.clone();
         Callback::from(move |_: ()| panel.set(None))
     };
-    // Fetch and open the verify-recipe modal. The backend pre-fills the
-    // secret + sample HMAC so an operator can paste a snippet and have it
-    // validate end-to-end without further substitution.
+    // Fetch and open the verify-recipe modal. The backend pre-fills the URL
+    // and a sample HMAC; the Python/Node snippets read the secret from the
+    // WEBHOOK_SECRET environment variable (it is never returned).
     let open_verify = {
         let (verify, verify_error) = (verify.clone(), verify_error.clone());
         Callback::from(move |hook: Webhook| {
@@ -2229,6 +2253,13 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                 <Badge color={flavor_badge(&flavor)} testid={format!("webhook-flavor-{}", w.id)}>{flavor}</Badge>
             }
         }),
+        Column::new("signed", "Signing", |w: &Webhook| {
+            html! {
+                <Badge color={if w.signed { "green" } else { "grey" }} testid={format!("webhook-signed-{}", w.id)}>
+                    {if w.signed { "Signed" } else { "Unsigned" }}
+                </Badge>
+            }
+        }),
         Column::new("enabled", "Enabled", move |w: &Webhook| {
             let id = w.id.clone();
             let on_change = toggle_enabled.reform(move |next: bool| (id.clone(), next));
@@ -2260,6 +2291,26 @@ fn WebhooksSection(props: &SectionProps) -> Html {
         "Edit webhook"
     } else {
         "Add webhook"
+    };
+    let editing = form.as_ref().is_some_and(|f| f.id.is_some());
+    let editing_signed = editing && form.as_ref().is_some_and(|f| f.signed);
+    let clear_secret = form.as_ref().is_some_and(|f| f.clear_secret);
+    let secret_description = match (editing, editing_signed) {
+        (true, true) => "A secret is set. Leave blank to keep it; enter a new value to rotate. It is never shown.",
+        (true, false) => "No secret set (deliveries are unsigned). Enter a value to sign deliveries.",
+        _ => "Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned.",
+    };
+    let on_clear_secret = {
+        let modal = hook_modal.clone();
+        Callback::from(move |v: bool| {
+            if let Some(mut form) = (*modal).clone() {
+                form.clear_secret = v;
+                if v {
+                    form.secret.clear();
+                }
+                modal.set(Some(form));
+            }
+        })
     };
     let flavor = form
         .as_ref()
@@ -2299,7 +2350,7 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             html! {
                 <SpaceBetween direction="vertical" size="m">
                     <UiBox variant="p">
-                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The secret is pre-filled, so you can paste and run without further substitution."}
+                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The Python and Node snippets read the signing secret from the WEBHOOK_SECRET environment variable; it is never shown here."}
                     </UiBox>
                     <Tabs tabs={vec![
                         tab("curl", "curl", &recipe.snippets.curl),
@@ -2354,9 +2405,14 @@ fn WebhooksSection(props: &SectionProps) -> Html {
                                placeholder="https://hooks.slack.com/services/…" />
                     </FormField>
                     <FormField label="Secret"
-                               description="Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned.">
-                        <Input value={field(|f| &f.secret)} kind="password" on_change={edit(|f, v| f.secret = v)} />
+                               description={secret_description}>
+                        <Input value={field(|f| &f.secret)} kind="password" disabled={clear_secret} on_change={edit(|f, v| f.secret = v)} />
                     </FormField>
+                    if editing_signed {
+                        <Toggle testid="webhook-clear-secret" checked={clear_secret} on_change={on_clear_secret}>
+                            {"Remove secret (send unsigned)"}
+                        </Toggle>
+                    }
                     <FormField label="Events">
                         <Multiselect selected={selected_kinds} on_change={set_kinds}
                                      options={select_options(KIND_OPTIONS)} placeholder="Select event kinds" />
@@ -2977,5 +3033,56 @@ mod audit_event_tests {
     #[test]
     fn summary_of_an_empty_detail_is_a_dash() {
         assert_eq!(event_summary(&event(json!({}))), "—");
+    }
+}
+
+#[cfg(test)]
+mod hook_request_tests {
+    use super::*;
+
+    /// Generated stand-in so no secret literal appears in source (S2068).
+    fn sample_value(tag: char) -> String {
+        tag.to_string().repeat(12)
+    }
+
+    fn edit_form() -> HookForm {
+        HookForm {
+            id: Some("w1".into()),
+            signed: true,
+            ..HookForm::default()
+        }
+    }
+
+    #[test]
+    fn create_posts_the_secret() {
+        let form = HookForm {
+            secret: sample_value('s'),
+            ..HookForm::default()
+        };
+        let (path, method, body) = hook_request(&form);
+        assert_eq!((path.as_str(), method), ("/api/webhooks", "POST"));
+        assert_eq!(body["secret"], json!(sample_value('s')));
+    }
+
+    #[test]
+    fn edit_with_blank_secret_omits_the_key() {
+        let (path, method, body) = hook_request(&edit_form());
+        assert_eq!((path.as_str(), method), ("/api/webhooks/w1", "PATCH"));
+        assert!(body.get("secret").is_none());
+    }
+
+    #[test]
+    fn edit_rotates_or_clears_the_secret() {
+        let rotate = HookForm {
+            secret: sample_value('n'),
+            ..edit_form()
+        };
+        assert_eq!(hook_request(&rotate).2["secret"], json!(sample_value('n')));
+        let clear = HookForm {
+            clear_secret: true,
+            secret: sample_value('i'),
+            ..edit_form()
+        };
+        assert_eq!(hook_request(&clear).2["secret"], json!(""));
     }
 }
