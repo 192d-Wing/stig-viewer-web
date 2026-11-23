@@ -14,7 +14,7 @@ services:
       KC_HTTP_ENABLED: "true"
     command: start-dev --import-realm
     ports:
-      - "8081:8081"
+      - "${DEV_BIND_ADDR:-0.0.0.0}:${KEYCLOAK_HOST_PORT:-8081}:8081"
     volumes:
       - ./dev/keycloak:/opt/keycloak/data/import:ro
     healthcheck:
@@ -31,7 +31,7 @@ services:
       POSTGRES_PASSWORD: stig_local
       POSTGRES_DB: stig_viewer
     ports:
-      - "5433:5432"
+      - "${DEV_BIND_ADDR:-0.0.0.0}:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
@@ -139,7 +139,7 @@ services:
       STIG_ENABLE_TEST_ROUTES: ${STIG_ENABLE_TEST_ROUTES:-true}
       CARGO_TARGET_DIR: /target
     ports:
-      - "8080:8080"
+      - "${DEV_BIND_ADDR:-0.0.0.0}:${BACKEND_HOST_PORT:-8080}:8080"
     volumes:
       - ./backend:/app
       - backend_target:/target
@@ -152,30 +152,14 @@ services:
         condition: service_completed_successfully
       keycloak:
         condition: service_healthy
-    # podman-compose does not wait for db-roles to finish, so retry the owner
-    # step (`migrate`: migrations + grants) while it exits 75 (retryable:
-    # database unreachable or stig_app not created yet). Any other exit code is
-    # permanent (checksum mismatch, planted object, bad credentials, compile
-    # error) and stops the container at once instead of retrying 30 times.
-    # `migrate` already ran the owner step, so the FIRST serve blanks
-    # DATABASE_MIGRATION_URL and only verifies; later cargo-watch restarts keep
-    # the URL, so a newly added migration is still applied on reload.
-    command:
-      - sh
-      - -c
-      - |
-        n=0
-        while true; do
-          cargo run -- migrate
-          rc=$$?
-          if [ "$$rc" -eq 0 ]; then break; fi
-          if [ "$$rc" -ne 75 ]; then echo "migrate failed permanently (exit $$rc)" >&2; exit "$$rc"; fi
-          n=$$((n + 1))
-          if [ "$$n" -ge 30 ]; then echo "migrate failed 30 times; giving up" >&2; exit 1; fi
-          echo "waiting for db-roles / postgres (attempt $$n)"; sleep 2
-        done
-        touch /tmp/owner-step-done
-        exec cargo watch -w src -w migrations -w Cargo.toml -w Cargo.lock -w stig-sources.toml -s 'if [ -e /tmp/owner-step-done ]; then rm -f /tmp/owner-step-done; exec env DATABASE_MIGRATION_URL= cargo run; else exec cargo run; fi'
+    # Migrate loop, VerifyOnly first serve and SIGTERM handling live in the
+    # script (tested by scripts/dev-entrypoint.test.js). cargo-watch does not
+    # wait for its child on SIGTERM, so the script signals the backend and
+    # waits for its 8 s drain; `init` forwards the signal and reaps.
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 15s
+    command: ["sh", "/app/scripts/dev-entrypoint.sh"]
 
   frontend:
     build:
@@ -190,7 +174,7 @@ services:
       # Bind mounts don't deliver inotify events on every host; poll instead.
       TRUNK_WATCH_POLL: "true"
     ports:
-      - "5173:5173"
+      - "${DEV_BIND_ADDR:-0.0.0.0}:${FRONTEND_HOST_PORT:-5173}:5173"
     volumes:
       # Source is read-only: the image runs unprivileged and writes its build
       # output to the /target, /dist and /cargo paths it owns.

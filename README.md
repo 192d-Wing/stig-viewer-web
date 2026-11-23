@@ -491,6 +491,7 @@ cd frontend && cargo test          # parsers, exporters, markdown, diff
 npm ci && npm run test:e2e         # Playwright suite (requires the stack running)
 cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
+npm run test:scripts   # dev entrypoint (migrate loop, SIGTERM)
 cd backend && cargo test --features fips   # FIPS build (see below)
 ```
 
@@ -649,7 +650,10 @@ same way and startup continues.
   Refusals are counted on `/api/admin/failure-counters` (`admission`) and
   logged (a global or backlog refusal also names the users at their own cap) at most once a minute per reason, not written to the audit table. On SIGTERM or Ctrl-C the
   backend waits up to 8 s for open requests and pending writes; keep the
-  container stop grace period above that.
+  container stop grace period above that. Production should allow at least 15 s
+  of stop grace (compose `stop_grace_period: 15s`, Kubernetes
+  `terminationGracePeriodSeconds`) and must deliver SIGTERM to the backend
+  process itself; the dev compose file does both.
 - `source_ip` is the same client IP the login notice uses: the socket peer
   address, or, with `STIG_TRUST_PROXY_HEADERS=true`, the
   `STIG_TRUSTED_PROXY_HOPS`-th hop from the right of `X-Forwarded-For`. It is

@@ -141,6 +141,16 @@ tasks:
       - cd frontend && cargo test
       - cd backend && cargo test --locked
 
+  test:scripts:
+    desc: Tests for the dev entrypoint script (migrate loop, SIGTERM handling)
+    cmds:
+      - npm run test:scripts
+
+  verify:split-role:
+    desc: Verify the split-role stack on a fresh and an upgraded volume (throwaway compose project and ports, never the dev stack)
+    cmds:
+      - scripts/verify-split-role-upgrade.sh
+
   test:db:
     desc: Backend tests including the database-backed ones, against a throwaway Postgres on 127.0.0.1:55432
     deps: [engine]
