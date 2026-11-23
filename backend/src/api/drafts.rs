@@ -4,14 +4,13 @@ use axum::{
     Extension,
 };
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::api::auth::AuthUser;
 use crate::db_drafts::*;
 use crate::AppState;
 
 fn new_id() -> String {
-    Uuid::new_v4().to_string()
+    crate::crypto::rand::uuid_v4().to_string()
 }
 
 fn err_500(e: impl std::fmt::Display) -> (StatusCode, String) {

@@ -25,19 +25,11 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rsa::{
-    pkcs1v15::{Signature, VerifyingKey},
-    pkcs8::DecodePublicKey,
-    sha2::Sha256,
-    signature::Verifier,
-    traits::PublicKeyParts,
-    RsaPublicKey,
-};
-use sha2::{Digest, Sha256 as Sha256Hasher};
 use std::collections::HashSet;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::api::saml_xml::{reject, tag, SamlDoc, NS_DSIG};
+use crate::crypto::{self, rsa::RsaVerifyKey};
 
 const ALG_EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const ALG_ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
@@ -58,14 +50,13 @@ impl SigAlg {
         (u == ALG_RSA_SHA256).then_some(SigAlg::RsaSha256)
     }
 
-    fn verify(self, key: &RsaPublicKey, msg: &[u8], sig: &[u8]) -> Result<()> {
-        if sig.len() != key.size() {
+    fn verify(self, key: &RsaVerifyKey, msg: &[u8], sig: &[u8]) -> Result<()> {
+        if sig.len() != key.modulus_len() {
             bail!("SignatureValue length does not match the key modulus");
         }
-        let signature = Signature::try_from(sig).context("SignatureValue malformed")?;
         match self {
-            SigAlg::RsaSha256 => VerifyingKey::<Sha256>::new(key.clone())
-                .verify(msg, &signature)
+            SigAlg::RsaSha256 => key
+                .verify_pkcs1_sha256(msg, sig)
                 .context("RSA signature does not verify against SignedInfo"),
         }
     }
@@ -84,7 +75,7 @@ impl DigestAlg {
 
     fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
-            DigestAlg::Sha256 => Sha256Hasher::digest(data).to_vec(),
+            DigestAlg::Sha256 => crypto::digest::sha256(data).to_vec(),
         }
     }
 }
@@ -164,19 +155,19 @@ pub fn validate_idp_cert(pem: &str) -> Result<()> {
         .map_err(|e| tag("cert", e))
 }
 
-fn pinned_key(configured_b64: &str) -> Result<RsaPublicKey> {
+fn pinned_key(configured_b64: &str) -> Result<RsaVerifyKey> {
     let der = B64
         .decode(configured_b64.as_bytes())
         .context("SAML_IDP_CERT_PEM not base64")?;
     let (_, cert) = X509Certificate::from_der(&der).context("SAML_IDP_CERT_PEM parse failed")?;
-    let rsa_pub = RsaPublicKey::from_public_key_der(cert.public_key().raw)
+    let rsa_pub = RsaVerifyKey::from_spki_der(cert.public_key().raw)
         .context("certificate is not an RSA public key")?;
     check_key_size(&rsa_pub)?;
     Ok(rsa_pub)
 }
 
-fn check_key_size(key: &RsaPublicKey) -> Result<()> {
-    if key.n().bits() < MIN_RSA_BITS {
+fn check_key_size(key: &RsaVerifyKey) -> Result<()> {
+    if key.modulus_bits() < MIN_RSA_BITS {
         return Err(reject(
             "cert",
             format!("IdP RSA key is smaller than {MIN_RSA_BITS} bits"),
@@ -189,7 +180,7 @@ fn verify_one(
     doc: &SamlDoc,
     sig: usize,
     parent: usize,
-    key: &RsaPublicKey,
+    key: &RsaVerifyKey,
     configured_b64: &str,
 ) -> Result<()> {
     let parent_id = doc
@@ -284,6 +275,7 @@ pub(crate) mod fixtures {
     use rsa::{
         pkcs1v15::SigningKey,
         pkcs8::EncodePrivateKey,
+        sha2::{Digest, Sha256},
         signature::{SignatureEncoding, Signer},
         RsaPrivateKey,
     };
@@ -419,7 +411,7 @@ pub(crate) mod fixtures {
 
     /// Enveloped Signature over `unsigned` (the parent with no Signature).
     pub fn signature(id: &str, unsigned: &str, cert_pem: &str, rsa: &RsaPrivateKey) -> String {
-        let digest = B64.encode(Sha256Hasher::digest(unsigned.as_bytes()));
+        let digest = B64.encode(Sha256::digest(unsigned.as_bytes()));
         let si = format!(
             r##"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#{id}"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{digest}</DigestValue></Reference></SignedInfo>"##
         );
@@ -685,9 +677,14 @@ mod tests {
     fn weak_rsa_key_is_rejected() {
         // rcgen cannot issue a certificate for a 1024-bit key, so test the size gate directly.
         let weak = gen_rsa(1024);
-        let e = format!("{:#}", check_key_size(&weak.to_public_key()).unwrap_err());
+        use rsa::pkcs8::EncodePublicKey;
+        let spki = |k: &rsa::RsaPrivateKey| {
+            RsaVerifyKey::from_spki_der(k.to_public_key().to_public_key_der().unwrap().as_bytes())
+                .unwrap()
+        };
+        let e = format!("{:#}", check_key_size(&spki(&weak)).unwrap_err());
         assert!(e.contains("smaller than 2048"), "{e}");
-        assert!(check_key_size(&key().1.to_public_key()).is_ok());
+        assert!(check_key_size(&spki(&key().1)).is_ok());
         assert!(validate_idp_cert(&key().0).is_ok());
     }
 }

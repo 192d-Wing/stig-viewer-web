@@ -160,7 +160,7 @@ pub async fn create_handler(
     }
     let description = req.description.unwrap_or_default();
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
 
     sqlx::query(
         r#"

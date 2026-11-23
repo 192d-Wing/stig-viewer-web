@@ -371,7 +371,7 @@ fn move_aside(dir: &Path, file: &str, label: &'static str) -> Option<SetAside> {
         }
         to = dir.join(format!(
             "{file}.{label}-{ts}-{}",
-            uuid::Uuid::new_v4().simple()
+            crate::crypto::rand::uuid_v4().simple()
         ));
         result = std::fs::hard_link(&from, &to);
     }
@@ -697,7 +697,7 @@ const MAX_NAME_ATTEMPTS: u32 = 1000;
 /// error (the caller aborts before any row is deleted); the just-published
 /// name is removed again so no unsynced file stays visible.
 fn publish_new(dir: &Path, name: &str, bytes: &[u8], io: &mut ArchiveIo) -> Result<Publish> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let tmp = dir.join(format!(".{name}.{}.tmp", crate::crypto::rand::uuid_v4()));
     let result = (|| -> Result<Publish> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -1541,7 +1541,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         assert_eq!(run_prune(&pool, &dir, 5, true, None).await.unwrap(), 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit")
             .fetch_all(&pool)
@@ -1567,7 +1567,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         assert_eq!(run_prune(&app.pool, &dir, 5, true, None).await.unwrap(), 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT rule_id FROM rule_audit")
             .fetch_all(&pool)
@@ -1589,7 +1589,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let err = run_prune(&pool, &dir, 5, true, None).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("below the database retention floor"),
@@ -1623,7 +1623,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let n = run_prune_events(&pool, &dir, 5, true, None).await.unwrap();
         assert_eq!(n, 1);
         let left: Vec<String> = sqlx::query_scalar("SELECT detail->>'reason' FROM audit_events")
@@ -1660,7 +1660,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let n = run_prune_events(&pool, &dir, 365, true, None)
             .await
             .unwrap();
@@ -1682,7 +1682,7 @@ mod tests {
         assert_eq!(line["outcome"], "ok");
         assert_eq!(line["detail"]["k"], 1);
         // Without the archive switch nothing is written.
-        let dir2 = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir2 = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         assert_eq!(
             run_prune_events(&pool, &dir2, 5, false, None)
                 .await
@@ -1705,7 +1705,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let n = run_prune_events(&pool, &dir, 365, true, None)
             .await
             .unwrap();
@@ -1744,7 +1744,7 @@ mod tests {
             seed_expired_event(&pool, 400).await;
         }
         seed_expired_event(&pool, 1).await;
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let n = run_prune_events_batched(&pool, &dir, 365, true, 2, None)
             .await
             .unwrap();
@@ -1771,7 +1771,7 @@ mod tests {
         crate::test_fixtures::set_audit_retention_floor(&pool, 0).await;
         seed_user(&pool, "u1").await;
         seed_expired_event(&pool, 400).await;
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let msg = run_scheduled(&pool, &dir, 365, false, None).await.unwrap();
         assert!(msg.contains("1 events"), "{msg}");
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
@@ -1791,7 +1791,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
         let err = run_scheduled(&pool, &dir, 365, false, None)
             .await
             .unwrap_err();
@@ -1808,7 +1808,7 @@ mod tests {
     }
 
     fn temp_dir() -> std::path::PathBuf {
-        std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+        std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string())
     }
 
     fn line(id: i64, date: &str) -> ArchiveLine {

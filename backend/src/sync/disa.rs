@@ -1,6 +1,6 @@
+use crate::crypto;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
 use tracing::{error, info, warn};
@@ -215,7 +215,7 @@ fn check_source_origin(
 
 /// Lower-case hex SHA-256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    crypto::digest::sha256_hex(bytes)
 }
 
 /// Redirects followed before giving up: a 5-hop chain succeeds, a 6th fails.
@@ -608,11 +608,11 @@ async fn archive_previous_catalog(
 /// release are readable but lossy (`1.2` and `1-2` agree), so a hash of the
 /// raw pair keeps distinct versions from overwriting each other.
 pub(crate) fn archive_file_name(stig_id: &str, version: &str, release_info: &str) -> String {
-    let mut h = Sha256::new();
+    let mut h = crypto::digest::Sha256Stream::new();
     h.update(version.as_bytes());
-    h.update([0u8]);
+    h.update(&[0u8]);
     h.update(release_info.as_bytes());
-    let digest = h.finalize();
+    let digest = h.finish();
     let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!(
         "{stig_id}-v{}-r{}-{short}.json",

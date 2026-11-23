@@ -315,7 +315,7 @@ pub async fn create_handler(
     let classification_match = nullify_empty(req.classification_match);
     let tag_match = nullify_empty(req.tag_match);
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::crypto::rand::uuid_v4().to_string();
     // The policy and its `abac_policy.create` row commit together.
     let mut tx = crate::db::begin_bounded(state.pool.as_ref())
         .await

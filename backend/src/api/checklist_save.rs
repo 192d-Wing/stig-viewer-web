@@ -405,7 +405,7 @@ async fn find_or_create(
         db_checklists::catalog_version(&mut *conn, stig_id).await?;
     let now = chrono::Utc::now();
     let row = db_checklists::ChecklistRow {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: crate::crypto::rand::uuid_v4().to_string(),
         asset_id: asset_id.to_string(),
         stig_id: stig_id.to_string(),
         status: "in_progress".into(),

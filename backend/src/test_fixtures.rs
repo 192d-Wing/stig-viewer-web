@@ -425,7 +425,7 @@ pub fn rule_ids(n: usize) -> Vec<String> {
 
 /// Like [`app_state`] but the fixture STIG holds exactly `rule_ids`.
 pub fn app_state_with_rules(pool: PgPool, rule_ids: &[String]) -> (AppState, StigDir) {
-    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
     let stigs = dir.join("stigs");
     std::fs::create_dir_all(&stigs).expect("create stig dir");
     let rules: Vec<_> = rule_ids
@@ -487,7 +487,7 @@ pub fn bad_ids() -> Vec<String> {
 /// An `AppState` whose pool never connects, for handlers that must refuse
 /// before touching the database. The data dir is an unused unique path.
 pub fn lazy_state() -> (AppState, StigDir) {
-    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    let dir = std::env::temp_dir().join(crate::crypto::rand::uuid_v4().to_string());
     std::fs::create_dir_all(dir.join("stigs")).expect("create stig dir");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")

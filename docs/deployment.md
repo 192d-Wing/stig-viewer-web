@@ -15,7 +15,13 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
   `OIDC_PUBLIC_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`,
   `OIDC_REDIRECT_URI` and `FRONTEND_URL` explicitly. Their defaults are
   local-dev values and must not be relied on.
-- FIPS: see the FIPS notes in the README.
+- FIPS: build with `--no-default-features --features fips` and set
+  `STIG_REQUIRE_FIPS=1`. That runs the application's own Ed25519, HMAC,
+  SHA-2, SAML RSA verification and session RNG inside the AWS-LC FIPS module
+  (pending CMVP; no certificate). TLS, OIDC ID-token verification and
+  state/nonce, and Postgres SCRAM stay outside it. The in-module algorithms
+  are classical; under CNSA 2.0 the IdP signing key should be RSA of at least
+  3072 bits. See the README FIPS notes.
 
 ## 2. Database roles and migrations
 

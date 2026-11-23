@@ -44,8 +44,11 @@ pub struct RequestCtx {
 
 impl RequestCtx {
     pub fn new(headers: &axum::http::HeaderMap, peer: Option<SocketAddr>, role: &str) -> Self {
+        // uuid_v4 panics only if the module DRBG fails. The router's
+        // CatchPanicLayer turns that into a 500; there is deliberately no
+        // weaker fallback source.
         RequestCtx {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: crate::crypto::rand::uuid_v4().to_string(),
             source_ip: Some(notice_ip(headers, peer)).filter(|ip| !ip.is_empty()),
             role: role.to_string(),
             audited: Arc::new(AtomicBool::new(false)),

@@ -10,13 +10,12 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::api::auth::AuthUser;
 use crate::AppState;
 
 fn new_id() -> String {
-    Uuid::new_v4().to_string()
+    crate::crypto::rand::uuid_v4().to_string()
 }
 
 /// Scan a comment body for `@handle` tokens and return the unique handles

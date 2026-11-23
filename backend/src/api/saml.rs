@@ -210,7 +210,7 @@ pub async fn login_handler(
             "SAML IdP is not configured (set SAML_IDP_SSO_URL)".into(),
         ));
     }
-    let req_id = format!("_{}", uuid::Uuid::new_v4().simple());
+    let req_id = format!("_{}", crate::crypto::rand::uuid_v4().simple());
     let ip = crate::api::notice::notice_ip(&headers, peer.map(|p| p.0));
     if crate::api::notice::login_start_limited(&jar, &ip) {
         return Ok(crate::api::notice::rate_limited_redirect(
@@ -763,7 +763,7 @@ fn pick_identity(a: &ParsedAssertion) -> (String, String) {
         .name_id
         .clone()
         .or_else(|| a.email.clone())
-        .unwrap_or_else(|| format!("saml-{}", uuid::Uuid::new_v4()));
+        .unwrap_or_else(|| format!("saml-{}", crate::crypto::rand::uuid_v4()));
     let display = a
         .display_name
         .clone()
@@ -1551,7 +1551,7 @@ mod tests {
         };
         let (cap, _g) = crate::api::audit_capture::capture();
         let mut h = HeaderMap::new();
-        let id = uuid::Uuid::new_v4();
+        let id = crate::crypto::rand::uuid_v4();
         h.insert(
             "cookie",
             axum::http::HeaderValue::from_str(&format!("{SAML_REQ_COOKIE}={id}")).unwrap(),

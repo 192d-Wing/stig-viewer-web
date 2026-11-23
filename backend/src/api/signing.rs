@@ -28,22 +28,21 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use ed25519_dalek::{Signer, SigningKey as Ed25519SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
 use crate::api::checklists::is_valid_stig_id;
 use crate::api::request_ctx::RequestCtx;
+use crate::crypto;
 use crate::AppState;
 
 /// Loaded signing material. Stored on `AppState` as `Option<SigningState>`;
 /// `None` makes every endpoint in this module return 503.
 #[derive(Clone, Debug)]
 pub struct SigningState {
-    pub signing_key: Arc<Ed25519SigningKey>,
+    pub signing_key: Arc<crypto::ed25519::SigningKey>,
     /// Short public-key fingerprint — first 8 bytes of SHA-256 over the raw
     /// verifying-key bytes, hex-encoded. Clients embed this in signed
     /// bundles so a verifier can detect key rotation.
@@ -73,8 +72,8 @@ impl SigningState {
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&bytes);
-        let signing_key = Ed25519SigningKey::from_bytes(&seed);
-        let key_id = compute_key_id(&signing_key.verifying_key());
+        let signing_key = crypto::ed25519::SigningKey::from_seed(&seed)?;
+        let key_id = compute_key_id(&signing_key.public_key());
         Ok(Some(Self {
             signing_key: Arc::new(signing_key),
             key_id,
@@ -82,8 +81,8 @@ impl SigningState {
     }
 }
 
-fn compute_key_id(vk: &VerifyingKey) -> String {
-    let digest = Sha256::digest(vk.as_bytes());
+fn compute_key_id(vk: &[u8; 32]) -> String {
+    let digest = crypto::digest::sha256(vk);
     hex::encode(&digest[..8])
 }
 
@@ -118,7 +117,7 @@ pub struct PubkeyEntry {
 }
 
 fn pubkey_response(sk: &SigningState) -> PubkeyResponse {
-    let public_key = BASE64.encode(sk.signing_key.verifying_key().as_bytes());
+    let public_key = BASE64.encode(sk.signing_key.public_key());
     PubkeyResponse {
         algorithm: ALGORITHM,
         key_id: sk.key_id.clone(),
@@ -241,7 +240,7 @@ fn build_bundle(
     document: SigningDocument,
 ) -> Result<SignedBundle, serde_json::Error> {
     let payload = document_bytes(&document)?;
-    let signature = BASE64.encode(sk.signing_key.sign(&signing_input(&payload)).to_bytes());
+    let signature = BASE64.encode(sk.signing_key.sign(&signing_input(&payload)));
     Ok(SignedBundle {
         document,
         payload: URL_SAFE_NO_PAD.encode(&payload),
@@ -344,7 +343,7 @@ const MAX_SIGNERS: usize = 8;
 #[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
 pub fn verify_bundle(
     bundle_json: &[u8],
-    pinned: &VerifyingKey,
+    pinned: &[u8; 32],
     artifact_sha256: &str,
 ) -> Result<VerifiedDocument, VerifyError> {
     verify_inner(bundle_json, pinned, Some(artifact_sha256))
@@ -356,14 +355,14 @@ pub fn verify_bundle(
 #[allow(dead_code)] // reference verifier: exercised by tests, no in-tree caller
 pub fn verify_bundle_document_only(
     bundle_json: &[u8],
-    pinned: &VerifyingKey,
+    pinned: &[u8; 32],
 ) -> Result<VerifiedDocument, VerifyError> {
     verify_inner(bundle_json, pinned, None)
 }
 
 fn verify_inner(
     bundle_json: &[u8],
-    pinned: &VerifyingKey,
+    pinned: &[u8; 32],
     artifact_sha256: Option<&str>,
 ) -> Result<VerifiedDocument, VerifyError> {
     let env: EnvelopeIn =
@@ -421,11 +420,10 @@ fn verify_inner(
         let raw = BASE64
             .decode(sig.signature.as_bytes())
             .map_err(|_| VerifyError::BadSignatureEncoding)?;
-        let parsed = ed25519_dalek::Signature::from_slice(&raw)
-            .map_err(|_| VerifyError::BadSignatureEncoding)?;
-        pinned
-            .verify_strict(&input, &parsed)
-            .map_err(|_| VerifyError::SignatureInvalid)?;
+        crypto::ed25519::verify(pinned, &input, &raw).map_err(|e| match e {
+            crypto::ed25519::VerifyError::BadLength => VerifyError::BadSignatureEncoding,
+            crypto::ed25519::VerifyError::Invalid => VerifyError::SignatureInvalid,
+        })?;
     }
 
     if let Some(expected) = artifact_sha256 {
@@ -463,7 +461,7 @@ fn sign_request(
         ));
     }
 
-    let sha = Sha256::digest(&content);
+    let sha = crypto::digest::sha256(&content);
     let document = SigningDocument {
         version: ENVELOPE_VERSION,
         algorithm: ALGORITHM,
@@ -550,22 +548,33 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    const TEST_SEED_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    /// One runtime-generated seed per test process; no key material in source.
+    fn test_seed() -> [u8; 32] {
+        static SEED: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        *SEED.get_or_init(|| {
+            let mut s = [0u8; 32];
+            crypto::rand::fill(&mut s).unwrap();
+            s
+        })
+    }
 
     fn test_state() -> SigningState {
-        let bytes = hex::decode(TEST_SEED_HEX).unwrap();
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&bytes);
-        let signing_key = Ed25519SigningKey::from_bytes(&seed);
-        let key_id = compute_key_id(&signing_key.verifying_key());
+        let seed = test_seed();
+        let signing_key = crypto::ed25519::SigningKey::from_seed(&seed).unwrap();
+        let key_id = compute_key_id(&signing_key.public_key());
         SigningState {
             signing_key: Arc::new(signing_key),
             key_id,
         }
     }
 
-    fn other_key() -> VerifyingKey {
-        Ed25519SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+    fn other_key() -> [u8; 32] {
+        let mut other = [0u8; 32];
+        crypto::rand::fill(&mut other).unwrap();
+        other[0] ^= test_seed()[0] | 1; // never equal to the test key's seed
+        crypto::ed25519::SigningKey::from_seed(&other)
+            .unwrap()
+            .public_key()
     }
 
     fn sample_doc(st: &SigningState, sha256: String) -> SigningDocument {
@@ -599,7 +608,7 @@ mod tests {
         hash: Option<&str>,
     ) -> Result<VerifiedDocument, VerifyError> {
         let bytes = serde_json::to_vec(v).unwrap();
-        let vk = st.signing_key.verifying_key();
+        let vk = st.signing_key.public_key();
         match hash {
             Some(h) => verify_bundle(&bytes, &vk, h),
             None => verify_bundle_document_only(&bytes, &vk),
@@ -609,7 +618,7 @@ mod tests {
     /// Re-signs an arbitrary payload value with the test key, returning a wire envelope.
     fn resign(st: &SigningState, payload: &Value) -> Value {
         let bytes = serde_json::to_vec(payload).unwrap();
-        let sig = BASE64.encode(st.signing_key.sign(&signing_input(&bytes)).to_bytes());
+        let sig = BASE64.encode(st.signing_key.sign(&signing_input(&bytes)));
         json!({
             "payload": URL_SAFE_NO_PAD.encode(&bytes),
             "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": sig}]
@@ -770,7 +779,7 @@ mod tests {
         let bytes = URL_SAFE_NO_PAD
             .decode(v["payload"].as_str().unwrap())
             .unwrap();
-        let bare = BASE64.encode(st.signing_key.sign(&bytes).to_bytes());
+        let bare = BASE64.encode(st.signing_key.sign(&bytes));
         v["signatures"][0]["signature"] = bare.into();
         assert_eq!(verify(&v, &st, None), Err(VerifyError::SignatureInvalid));
     }
@@ -792,7 +801,7 @@ mod tests {
     }
 
     fn resign_raw(st: &SigningState, bytes: &[u8]) -> Value {
-        let sig = BASE64.encode(st.signing_key.sign(&signing_input(bytes)).to_bytes());
+        let sig = BASE64.encode(st.signing_key.sign(&signing_input(bytes)));
         json!({
             "payload": URL_SAFE_NO_PAD.encode(bytes),
             "signatures": [{"algorithm": "ed25519", "keyId": st.key_id, "signature": sig}]
@@ -949,7 +958,7 @@ mod tests {
     fn artifact_hash_is_mandatory_in_verify_bundle() {
         let st = test_state();
         let bytes = serde_json::to_vec(&wire(&st)).unwrap();
-        let vk = st.signing_key.verifying_key();
+        let vk = st.signing_key.public_key();
         assert!(verify_bundle(&bytes, &vk, &"AB".repeat(32)).is_ok());
         assert_eq!(
             verify_bundle(&bytes, &vk, ""),
@@ -998,7 +1007,7 @@ mod tests {
     fn pubkey_json_shape_snapshot() {
         let st = test_state();
         let v = serde_json::to_value(pubkey_response(&st)).unwrap();
-        let pk = BASE64.encode(st.signing_key.verifying_key().as_bytes());
+        let pk = BASE64.encode(st.signing_key.public_key());
         assert_eq!(
             v,
             json!({
@@ -1040,8 +1049,8 @@ mod tests {
         let wire = serde_json::to_vec(&b).unwrap();
         let doc = verify_bundle(
             &wire,
-            &st.signing_key.verifying_key(),
-            &hex::encode(Sha256::digest(b"hello")),
+            &st.signing_key.public_key(),
+            &crypto::digest::sha256_hex(b"hello"),
         )
         .unwrap();
         assert_eq!(doc.signed_by, "u1");

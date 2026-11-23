@@ -128,7 +128,7 @@ for local work. The ones you may want to change:
   `VITE_API_URL` is still read as a fallback.
 - `STIG_FIPS_PENDING_ALGS` — comma-separated allow-list of post-quantum
   algorithms that are not yet FIPS-validated and may still be used in a
-  `--features fips` build: `ML-DSA-87`, `ML-KEM-768`, `ML-KEM-1024`,
+  `--no-default-features --features fips` build: `ML-DSA-87`, `ML-KEM-768`, `ML-KEM-1024`,
   `X25519MLKEM768` (case-insensitive). `X25519MLKEM768` is the hybrid group for
   the transition period; CNSA 2.0 deployments need `ML-KEM-1024`. Default
   empty. In a build without the `fips` feature the list does not change which
@@ -492,32 +492,49 @@ npm ci && npm run test:e2e         # Playwright suite (requires the stack runnin
 cd backend && cargo test
 cd backend && cargo clippy -- -D warnings
 npm run test:scripts   # dev entrypoint (migrate loop, SIGTERM)
-cd backend && cargo test --features fips   # FIPS build (see below)
+cd backend && cargo test --no-default-features --features fips   # FIPS build (see below)
 ```
 
-The `fips` feature links the AWS-LC FIPS module (`aws-lc-rs`) and the backend
-refuses to start unless it reports FIPS mode. Building it needs CMake, Go, Perl
-and a C compiler. On macOS the module is a dylib (cargo run/test find it) and
-macOS is not a validated environment.
+All application crypto goes through `backend/src/crypto` on aws-lc-rs. The
+default build (`non-fips` feature) links the non-FIPS `aws-lc-sys`, needs only
+a C compiler and makes no FIPS claim. The `fips` feature links the AWS-LC FIPS
+module instead and the backend refuses to start unless it reports FIPS mode.
+Build it with `--no-default-features --features fips` (with the default
+`non-fips` also on, the build fails by design); it needs CMake, Go, Perl and a
+C compiler. On macOS the module is a dylib (cargo run/test find it) and macOS
+is not a validated environment.
 
-What this does and does not establish: the `fips` binary shows the AWS-LC FIPS
-module is linked and in FIPS mode. AWS-LC-FIPS 4.x is in process with CMVP and
-no certificate is confirmed, so the whole module is pending validation, not
-only the post-quantum algorithms. No application crypto uses it yet
-(`ed25519-dalek`, `sha2`, `hmac` and `rsa` remain; tracked in #65) and TLS
-still runs on ring. It is not a FIPS-compliance claim for the application.
+What this does and does not establish: in a `fips` build, the Ed25519 signing
+and verification, HMAC-SHA-256, SHA-256/SHA-512, SAML RSA signature
+verification and session/identifier random generation that this application
+calls run inside the module. Still outside it: TLS (rustls on ring), OIDC
+ID-token verification and state/nonce/PKCE generation (RustCrypto, via
+`openidconnect`; the audit token `oidc-state-nonce` covers OIDC state, nonce
+and PKCE verifier generation) and Postgres SCRAM (`sqlx`). The in-module
+primitives are still classical (Ed25519, RSA, HMAC/SHA-256): FIPS mode is not
+a CNSA 2.0 or post-quantum claim. AWS-LC-FIPS 4.x is in process
+with CMVP and no certificate is confirmed, so the whole module is pending
+validation, not only the post-quantum algorithms. It is not a FIPS-compliance
+claim for the application.
 
 `STIG_REQUIRE_FIPS=1` (or `true`) makes a build without the `fips` feature
 refuse to start; `0`, `false` or unset leaves it off, and any other value stops
 startup. It also applies to `migrate`. Set it in production only on images
-built with `--features fips`.
+built with `--no-default-features --features fips`.
 
 At server startup (not for `migrate`) one `system.fips_policy` audit event is
 written with the detail keys `fipsCompiled`, `fipsModeActive`, `requireFips`,
-`appCryptoInModule` (always `false` until #65) and `pendingAlgs` (the validated
+`appCryptoInModule` (`true` only in a `fips` build whose module check passed:
+the primitives this application calls directly run in the module),
+`cryptoOutsideModule` (what still does not: `tls`, `oidc-id-token-verify`,
+`oidc-state-nonce`, `postgres-scram`) and `pendingAlgs` (the validated
 `STIG_FIPS_PENDING_ALGS` list). A refused start has no audit row, only a
 `target: "audit"` log line; if the audit write itself fails, it is logged the
 same way and startup continues.
+
+Webhook HMAC secrets shorter than 14 bytes (112 bits) are not an approved use
+of HMAC under NIST SP 800-131A; the key length is not enforced (documentation
+only).
 
 ## Operations: audit
 

@@ -441,7 +441,7 @@ async fn request_chunk(
             results.push(ApprovalOutcome::AlreadyPending);
             continue;
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::crypto::rand::uuid_v4().to_string();
         results.push(ApprovalOutcome::Queued { id: id.clone() });
         ids.push(id);
         rules.push(item.rule_id);
