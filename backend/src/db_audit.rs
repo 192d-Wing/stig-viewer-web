@@ -1354,7 +1354,7 @@ async fn write_user_event(pool: &PgPool, owned: &OwnedEvent, ids: &BoundedIds) -
 
 /// Insert a system event on the pool now, returning a failure. Same columns
 /// and bounding as [`record_system_counted`], without the queue.
-async fn record_system_now(pool: &PgPool, ev: NewSystemEvent<'_>) -> Result<()> {
+pub(crate) async fn record_system_now(pool: &PgPool, ev: NewSystemEvent<'_>) -> Result<()> {
     debug_assert!(ev.action.len() <= 64 && ev.outcome.len() <= 64);
     let shell = NewAuditEvent {
         user_id: "",

@@ -226,8 +226,7 @@ async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> 
         db_roles::migrate_as_owner(
             owner_url,
             &config.database_url,
-            hooks.enable_test_routes,
-            hooks.production,
+            &owner_step(hooks, "server_startup"),
         )
         .await?;
     }
@@ -235,19 +234,33 @@ async fn connect_database(config: &Config, hooks: &TestHooks) -> Result<PgPool> 
     let can_migrate = !has_owner_url && db_roles::can_migrate(&pool).await?;
     match db_roles::startup_path(has_owner_url, || can_migrate) {
         db_roles::StartupPath::OwnerMigrates => {
-            db_roles::verify_migrations(&pool).await?;
+            db_roles::verify_or_record_refusal(&pool, hooks.production).await?;
             info!("Database connected; migrations applied by the owner role");
         }
         db_roles::StartupPath::SelfMigrate => {
+            let step = owner_step(hooks, "server_self_migrate");
+            let before = db_roles::applied_versions(&mut *pool.acquire().await?).await?;
             run_migrations(&pool).await?;
+            db_roles::finish_self_migrate(&pool, &step, &before).await?;
             info!("Database connected and migrations applied");
         }
         db_roles::StartupPath::VerifyOnly => {
-            db_roles::verify_migrations(&pool).await?;
+            db_roles::verify_or_record_refusal(&pool, hooks.production).await?;
             info!("Database connected; migrations verified (applied externally)");
         }
     }
     Ok(pool)
+}
+
+/// The owner step's inputs from the environment: the retention floor is
+/// `AUDIT_RETENTION_DAYS` as seen by this process.
+fn owner_step(hooks: &TestHooks, source: &'static str) -> db_roles::OwnerStep {
+    db_roles::OwnerStep {
+        test_routes: hooks.enable_test_routes,
+        production: hooks.production,
+        retention_floor_days: audit_retention::retain_days_from_env(),
+        source,
+    }
 }
 
 /// Log a loud warning for each test-only hook that is switched on.
@@ -277,9 +290,30 @@ async fn open_database(config: &Config, test_hooks: &TestHooks) -> Result<sqlx::
         tracing::warn!("{w}");
     }
     let pool = connect_database(config, test_hooks).await?;
-    db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await?;
-    let violations = db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await?;
-    db_roles::boundary_policy(test_hooks.production, &violations)?;
+    if test_hooks.production && config.database_migration_url.is_some() {
+        db_roles::record_owner_url_on_server(&pool, test_hooks.enable_test_routes).await;
+    }
+    if let Err(e) =
+        db_audit::apply_test_maintenance_policy(&pool, test_hooks.enable_test_routes).await
+    {
+        db_roles::record_boundary_refusal(&pool, "test_mode_policy", test_hooks.production).await;
+        return Err(e);
+    }
+    let violations = match db_roles::boundary_violations(&pool, test_hooks.enable_test_routes).await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            db_roles::record_boundary_refusal(&pool, "check_failed", test_hooks.production).await;
+            return Err(e);
+        }
+    };
+    db_roles::enforce_boundary(
+        &pool,
+        test_hooks.production,
+        test_hooks.enable_test_routes,
+        &violations,
+    )
+    .await?;
     Ok(pool)
 }
 
@@ -289,12 +323,25 @@ async fn run_migrate_command() -> Result<()> {
     let hooks = TestHooks::from_env();
     let config = Config::from_env()?;
     let owner_url =
-        db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref())?;
+        match db_roles::migrate_preconditions(&hooks, config.database_migration_url.as_deref()) {
+            Ok(u) => u,
+            Err(e) => {
+                // No connection exists yet, so the log line is the record.
+                tracing::error!(
+                    target: "audit",
+                    action = "db.migrate",
+                    outcome = "failure",
+                    source = "migrate_command",
+                    stage = "preconditions",
+                    "migrate preconditions failed (no audit row written)"
+                );
+                return Err(e);
+            }
+        };
     db_roles::migrate_as_owner(
         owner_url,
         &config.database_url,
-        hooks.enable_test_routes,
-        hooks.production,
+        &owner_step(&hooks, "migrate_command"),
     )
     .await?;
     info!("Migrations applied and application role grants updated");
@@ -907,10 +954,7 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(24);
-        let retain_days: i64 = std::env::var("AUDIT_RETENTION_DAYS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(365);
+        let retain_days: i64 = audit_retention::retain_days_from_env();
         let archive_enabled: bool = std::env::var("AUDIT_ARCHIVE_ENABLED")
             .ok()
             .and_then(|s| s.parse().ok())

@@ -363,12 +363,18 @@ audit guard (see "Database guard on the audit tables"):
   schema, and runs migrations. Its URL is `DATABASE_MIGRATION_URL`.
 - the **application** role (`DATABASE_URL`) gets only DML: `SELECT`, `INSERT`,
   `UPDATE`, `DELETE`, `TRUNCATE` on tables and `USAGE, SELECT, UPDATE` on
-  sequences, `SELECT`/`INSERT`/`DELETE`/`TRUNCATE` plus
-  `UPDATE (repeat_count, last_occurred_at)` on the two audit tables, and
-  `SELECT` only on `_sqlx_migrations`. It has no `TRIGGER`, `REFERENCES` or
+  sequences, except on the two audit tables and their sequences. On
+  `rule_audit` and `audit_events` it has `SELECT`, column-level `INSERT` (never
+  `id`, `occurred_at`, `repeat_count` or `last_occurred_at`),
+  `UPDATE (repeat_count, last_occurred_at)` on `audit_events`, and
+  `USAGE, SELECT` on their sequences: no `DELETE`, `TRUNCATE` or sequence
+  `UPDATE`. It has `SELECT` only on `_sqlx_migrations`, `audit_policy` and
+  `audit_restore_log`, and `EXECUTE` on the four audit functions of migration 050
+  (`audit_prune_rule_audit`, `audit_prune_events`, `audit_restore_truncate`,
+  `audit_restore_load`). It has no `TRIGGER`, `REFERENCES` or
   `CREATE`, so it cannot drop or disable the triggers, replace
-  `audit_tables_guard()`, drop or alter the audit tables, or set
-  `stig.audit_allow_test_mode`. It must not be a superuser, hold `CREATEROLE`,
+  `audit_tables_guard()` or the audit functions, drop or alter the audit
+  tables, or set `stig.audit_allow_test_mode`. It must not be a superuser, hold `CREATEROLE`,
   be a member of the owner role, or (PostgreSQL 15+) own the database.
 
 With `DATABASE_MIGRATION_URL` set, the server migrates as the owner, re-applies
@@ -395,7 +401,12 @@ only, and production refuses it), and otherwise only verifies that all
 migrations are applied with matching checksums, refusing to start on pending or
 modified ones. At startup the server checks that its role cannot reach the
 guard (superuser, `CREATEROLE`, membership of an owner role, `TRIGGER` on an
-audit table, table-level `UPDATE` on an audit table outside test mode). With
+audit table, table-level `UPDATE` on an audit table outside test mode, `DELETE`,
+`TRUNCATE` (outside test mode) or table-level `INSERT` on an audit table,
+`UPDATE` on an audit sequence, any write on `audit_policy` or
+`audit_restore_log`, and an audit function that is missing, not
+`SECURITY DEFINER`, without its pinned `search_path`, owned by another role or
+executable by `PUBLIC`). With
 `STIG_ENV=production` it refuses to start if any of these hold; otherwise it
 logs a warning. Neither URL is ever logged; if the URLs omit passwords,
 `PGPASSWORD` applies to both.
@@ -434,7 +445,9 @@ as `stig`. With `STIG_ENABLE_TEST_ROUTES` the owner role sets the audit test
 flag, so it must be a superuser or hold the parameter grant. The backend
 container runs the owner step once per start: after `migrate` succeeds, the
 first server run is started without `DATABASE_MIGRATION_URL` (verify only);
-later `cargo watch` restarts keep it so new migrations apply.
+later `cargo watch` restarts keep it so new migrations apply. With test routes
+the owner step also sets the audit retention floor to 0, opens the audit restore
+window for good and grants the test-only `UPDATE`/`TRUNCATE` on the audit tables.
 
 ### Frontend-only development
 
@@ -478,6 +491,20 @@ cd backend && cargo clippy -- -D warnings
   is written under `catalog.import_library_publish` (single uploads use
   `catalog.upload_publish`), outcome `error`, reason code `publish_failed`;
   the next upload's sweep rolls the file forward.
+- The owner step and the startup boundary check write system events (no user,
+  `user_role = 'system'`): `db.migrate` (`ok` for every completed owner step,
+  including no-ops, with `source`, `appliedVersions`, `schemaVersion`,
+  `testRoutes`, `retentionFloorDays` and `retentionFloorPrevious` when the floor
+  changed; `failure` with `source`, `stage`, `errorClass` and `sqlstate`, never
+  the error text), `db.boundary_degraded` (`partial`: a non-production start
+  with boundary violations, or a production start with
+  `DATABASE_MIGRATION_URL` on the server) and `db.boundary_refused`
+  (`rejected`: startup refused, with `reason` `violations`, `check_failed`,
+  `test_mode_policy` or `migrations_unverified`). They are written
+  synchronously. When no row can be written (no database connection yet, or
+  `audit_events` missing) the same fields are logged on the `audit` target
+  (`action=db.migrate`, `db.boundary_degraded`, `db.boundary_refused`) instead;
+  the original error and exit code are never replaced.
 - Durable request events live in `audit_events` (see `/api/audit/events`).
   Each row carries the user's role at the time, a server-generated request id
   (also returned in the `X-Request-Id` response header; an inbound
@@ -619,9 +646,21 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
 - `retention`: DELETE (the audit retention sweep), allowed only when the same
   transaction also sets `stig.audit_retention_protocol` to `2` (migration 047);
   older server versions never set it, so their sweeps fail with `42501` and
-  delete nothing;
-- `restore`: TRUNCATE only (a forced backup restore);
+  delete nothing. Since migration 050 only the owner-owned function
+  `audit_prune_rule_audit` / `audit_prune_events` declares it (the application
+  role has no `DELETE`);
+- `restore`: TRUNCATE only (a forced backup restore). Since migration 050 only
+  `audit_restore_truncate` declares it;
 - `migration`: UPDATE only (a data migration that backfills audit rows);
+
+Since migration 050 (guard revision 4) `retention`, `restore` and `migration`
+are honoured only when the statement runs as the owner of the audit table (or a
+member of it, or a superuser): inside the `audit_prune_*` / `audit_restore_*`
+functions and in owner-run migrations. The application role can still set the
+settings, but they do nothing for it (42501, "honoured only for the owner").
+`test` stays gated by the database flag, for any role. The startup check reports
+a guard that is not revision 4.
+
 - `test`: UPDATE and TRUNCATE (the `/api/test/*` reset and backdate routes,
   which exist only under `STIG_ENABLE_TEST_ROUTES`). Migration
   `043_audit_test_mode_flag.sql` honours it only in a database a superuser has
@@ -649,8 +688,50 @@ SQLSTATE `42501` unless the transaction declared a maintenance mode with
 The one update always allowed is the collapse of a repeated denial: on a
 `denied` or `rejected` `audit_events` row only `repeat_count` (exactly +1) and
 `last_occurred_at` (not before the row's last occurrence, not more than a
-minute in the future) may change. The triggers are `ENABLE ALWAYS`, so
+minute in the future) may change. Needing no mode, this is the only change the
+application role can make to an audit row; since it can only add one to
+`repeat_count` and move `last_occurred_at` forward, it cannot age a collapsed
+row to get it pruned under the retention floor. The triggers are `ENABLE ALWAYS`, so
 `session_replication_role = replica` does not skip them.
+
+Retention floor (migration 050): `audit_policy.min_retain_days` (default 365,
+0 to 36500) is set by the owner step from `AUDIT_RETENTION_DAYS` as the `migrate`
+job sees it (0 with test routes); lowering it is recorded in the `db.migrate`
+event (`retentionFloorPrevious`). The prune functions refuse the whole call
+(`42501`) when any listed row is younger than the floor, and a sweep whose
+`AUDIT_RETENTION_DAYS` is below the floor fails before archiving anything.
+
+Restore window: `audit_restore_truncate` and `audit_restore_load` refuse
+(`SV001`, HTTP 409 from the restore endpoint) unless the owner has opened the
+window. A finite window is capped at 24 hours: a trigger on `audit_policy` rejects
+a `restore_allowed_until` more than 24 hours ahead when it is set (22023;
+`infinity` stays allowed for test routes), and the restore functions treat a
+later one as closed at use time. Before a forced restore (or one that
+carries audit rows), as the owner:
+
+```sql
+UPDATE audit_policy SET restore_allowed_until = now() + interval '30 minutes';
+-- afterwards (optional, it expires by itself):
+UPDATE audit_policy SET restore_allowed_until = NULL;
+```
+
+Audit rows load only into an empty table, the audit id sequences never move
+backwards, and ids outside 1 to 10^12 above the current sequence value are
+refused. A successful `audit_events` load closes a finite window again (an
+`infinity` window, set by test routes, stays open); a forced restore always
+loads both audit tables so the window closes. A truncate also refuses any table
+the calling login could not truncate itself, and any call whose `CASCADE` (or inheritance/partition children) would
+reach a table outside the list (the restore endpoint therefore lists every table
+that references a restored one). Every truncate and load is recorded
+in `audit_restore_log` (`caller` = database login, `actor` = the restoring
+application user; owner write only, readable by the application role) and in
+the PostgreSQL server log. The functions raise `SV001` (window closed) and
+`SV002` (audit table not empty), which the restore endpoint maps to HTTP 409 and
+records as a `backup.restore` event with outcome `rejected` and
+`detail.reasonCode` `restore_window_closed` / `audit_tables_not_empty`; any other
+error is a 500 with a fixed message. The startup check also reports an
+`infinity` window, a finite window more than 24 hours ahead, or a zero retention
+floor while test routes are off.
 
 A forced restore records `backup.restore` inside the restore transaction,
 re-inserting the acting admin's user row first if the backup lacks it. If the
@@ -661,22 +742,10 @@ log line is also written before the restore starts and after it commits
 Migration authors: a migration that UPDATEs, backfills or DELETEs audit rows
 fails with 42501. A data migration must first run
 `SELECT set_config('stig.audit_maintenance', 'migration', true)` in its own
-transaction (UPDATE only). Never use `test` mode in production code.
+transaction (UPDATE only), and it works only as the owner role (the role
+`migrate` runs as). Never use `test` mode in production code.
 
-Limit: with the owner/application role split (see "Two database roles") the
-application role cannot drop, disable or replace the guard, drop or alter the
-audit tables, or set the `test` flag; the owner step also makes the
-`migration` mode unusable by the application. What remains: the application can
-still declare the `retention` (and set its protocol marker, a version gate
-rather than a security boundary) and `restore` modes (DELETE and TRUNCATE of
-audit rows), because the retention sweep and forced restore run in the server with
-that role. Code that can run SQL as the application role can therefore delete
-or truncate audit rows, insert new ones in their place (rewriting the trail)
-and `setval` the audit sequences. A superuser or the owner role can always bypass
-the guard, and with a superuser application role (a single-role setup, or
-`cargo run` against the dev superuser) there is no boundary at all; production
-refuses to start in that state. Ship audit rows to an external append-only store
-for stronger guarantees.
+Limit: with the owner/application role split the application role cannot drop, disable or replace the guard, delete or truncate audit rows, choose the id or timestamp of a row it inserts, or `setval` the audit sequences, and it cannot change `repeat_count` or `last_occurred_at` except by the +1 collapse, so it cannot age a collapsed row to get it pruned under the floor. Retention and restore run through owner-owned `SECURITY DEFINER` functions (migration 050). What remains: code that can run SQL as the application role can insert new rows, can call the prune functions for rows older than the owner-set retention floor without archiving them, and can restore while the owner has opened a restore window; every truncate and load is recorded in `audit_restore_log`, which that role cannot change. A superuser or the owner role can always bypass the guard, and a single-role setup has no boundary; production refuses to start in that state. Ship audit rows to an external append-only store for stronger guarantees.
 
 The database-backed tests (`task test:db`) need a superuser test role (or the
 parameter grant) because they flag each test database with `ALTER DATABASE`
@@ -733,6 +802,16 @@ expected and visible in the scheduler log. Mixed-version sweeping is
 unsupported: stop pre-#82 replicas before the first new sweep, because they can
 still overwrite archive files (the gate blocks their deletes, not their file
 writes). Rolling a binary back after 047 leaves retention failing closed.
+
+Upgrading to migration 050: run `migrate` before starting new servers (production
+refuses to start while the application role still holds the old audit grants);
+sweeps of old replicas fail closed (they can no longer `DELETE`). A deployment
+with `AUDIT_RETENTION_DAYS` below 365 must pass the same value to the `migrate`
+job, or sweeps fail closed (visible in the scheduler log). Forced restores now
+need the owner-opened restore window. An older binary refuses a database with
+migration 050; roll back by restoring a pre-migrate snapshot or with a forward
+migration that drops the four functions and two tables, and re-runs migration
+047's guard body to revert the guard to revision 3.
 
 Archiving is idempotent by row id, without trusting the directory. A row is
 skipped only when a segment that verifies holds the IDENTICAL serialized line

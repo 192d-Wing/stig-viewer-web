@@ -9,6 +9,14 @@
 //! The grants are applied by [`apply_app_grants`] after every migration run;
 //! it is the single authority (no `ALTER DEFAULT PRIVILEGES`), so the state
 //! converges even after new tables appear. Neither URL is ever logged.
+//!
+//! On the two audit tables the application role can read, insert (column-level,
+//! never `id` or `occurred_at`) and collapse repeats, but not delete, truncate
+//! or move the id sequences (#109). Pruning and restoring audit rows run
+//! through the owner-owned `SECURITY DEFINER` functions of migration 050
+//! ([`AUDIT_FUNCTIONS`]), which enforce the retention floor and the
+//! owner-opened restore window kept in `audit_policy`. The owner step and the
+//! startup boundary check also write system audit events (#110).
 
 use std::str::FromStr;
 
@@ -19,6 +27,27 @@ use sqlx::{Connection, PgConnection, PgPool};
 
 /// Append-only tables guarded by the triggers from migration 040.
 pub const AUDIT_TABLES: [&str; 2] = ["rule_audit", "audit_events"];
+
+/// The owner-owned `SECURITY DEFINER` functions of migration 050 that prune
+/// and restore audit rows. The application role holds only `EXECUTE` on them.
+pub const AUDIT_FUNCTIONS: [&str; 4] = [
+    "audit_prune_rule_audit(bigint[])",
+    "audit_prune_events(bigint[])",
+    "audit_restore_truncate(text[], text)",
+    "audit_restore_load(text, jsonb, text)",
+];
+
+/// Tables the application role may read but never write.
+const OWNER_ONLY_TABLES: [&str; 3] = ["_sqlx_migrations", "audit_policy", "audit_restore_log"];
+
+/// Columns the application role may set on INSERT, per audit table. `id` and
+/// `occurred_at` come from the defaults, so a row cannot be placed in the past
+/// or collide with a pruned id. A future migration that adds an app-written
+/// column extends these lists.
+const RULE_AUDIT_INSERT_COLUMNS: &str =
+    "user_id, checklist_id, rule_id, field, from_value, to_value";
+const AUDIT_EVENTS_INSERT_COLUMNS: &str = "user_id, action, outcome, asset_id, checklist_id, \
+     stig_id, detail, source_ip, request_id, user_role";
 
 /// The role name a connection URL logs in as.
 pub fn app_role_from_url(database_url: &str) -> Result<String> {
@@ -141,24 +170,56 @@ pub fn startup_path(has_owner_url: bool, can_migrate: impl FnOnce() -> bool) -> 
     }
 }
 
-/// Run pending migrations as the owner role, then (re)apply the application
-/// role's grants. With `test_routes` on, also flags the database for audit
-/// `test` maintenance mode (the owner must be a superuser or hold
-/// `GRANT SET ON PARAMETER stig.audit_allow_test_mode`). Test-only privileges
-/// are never granted, nor the flag set, when `production` is true.
+/// Inputs of one owner step.
+#[derive(Debug, Clone)]
+pub struct OwnerStep {
+    /// Grant the test-only privileges, flag the database for `test` mode and
+    /// open the restore window.
+    pub test_routes: bool,
+    /// Production refuses test routes.
+    pub production: bool,
+    /// `AUDIT_RETENTION_DAYS` as seen by this step; becomes the database's
+    /// retention floor (0 with test routes).
+    pub retention_floor_days: i64,
+    /// `migrate_command`, `server_startup` or `server_self_migrate`.
+    pub source: &'static str,
+}
+
+/// Run pending migrations as the owner role, then set the audit policy and
+/// (re)apply the application role's grants. With `test_routes` on, also flags
+/// the database for audit `test` maintenance mode (the owner must be a
+/// superuser or hold `GRANT SET ON PARAMETER stig.audit_allow_test_mode`).
+/// Test-only privileges are never granted, nor the flag set, when
+/// `production` is true. A completed step writes a `db.migrate` system audit
+/// event; a failure after the connection exists writes a failure event (#110).
 pub async fn migrate_as_owner(
     owner_url: &str,
     app_database_url: &str,
-    test_routes: bool,
-    production: bool,
+    step: &OwnerStep,
 ) -> Result<()> {
-    if production && test_routes {
+    if step.production && step.test_routes {
         bail!("refusing to grant test-only audit privileges in production");
     }
     let app_role = app_role_from_url(app_database_url)?;
     let owner_opts = PgConnectOptions::from_str(owner_url)
         .map_err(|_| anyhow::anyhow!("DATABASE_MIGRATION_URL is not a valid PostgreSQL URL"))?;
-    migrate_with(owner_opts, &app_role, test_routes).await
+    migrate_with(owner_opts, &app_role, step).await
+}
+
+/// Versions of the successfully applied migrations, empty before the first one.
+pub async fn applied_versions(conn: &mut PgConnection) -> Result<Vec<i64>> {
+    let present: bool =
+        sqlx::query_scalar("SELECT pg_catalog.to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !present {
+        return Ok(Vec::new());
+    }
+    Ok(
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+            .fetch_all(&mut *conn)
+            .await?,
+    )
 }
 
 /// [`migrate_as_owner`] with parsed options (the tests pass their own). The
@@ -166,10 +227,11 @@ pub async fn migrate_as_owner(
 async fn migrate_with(
     owner_opts: PgConnectOptions,
     app_role: &str,
-    test_routes: bool,
+    step: &OwnerStep,
 ) -> Result<()> {
     check_distinct_roles(owner_opts.get_username(), app_role)?;
-    let owner_pool = PgPoolOptions::new()
+    let stage = Stage::new("connect");
+    let owner_pool = match PgPoolOptions::new()
         .max_connections(2)
         // One connection holds the session-level advisory lock for the whole
         // step, so never recycle it; `close()` at the end releases it.
@@ -189,7 +251,15 @@ async fn migrate_with(
         })
         .connect_with(owner_opts)
         .await
-        .context("connecting with DATABASE_MIGRATION_URL")?;
+        .context("connecting with DATABASE_MIGRATION_URL")
+    {
+        Ok(pool) => pool,
+        Err(e) => {
+            // No connection: there is nowhere to write an audit event.
+            log_migrate_failure_fallback(stage.get(), &e, step.source);
+            return Err(e);
+        }
+    };
     let mut lock_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
     let result = async {
         // Serialise the whole owner step across replicas: the grants, the
@@ -198,30 +268,406 @@ async fn migrate_with(
         // session-level lock lives on a connection held out of the pool for
         // the whole step (the pool has a second one for the work), so it can
         // never be swapped for another session.
+        stage.set("lock");
         lock_conn = Some(owner_pool.acquire().await?);
         if let Some(c) = lock_conn.as_mut() {
             lock_owner_step(c, OWNER_LOCK_WAIT).await?;
         }
         // Close the schema to the application role and refuse pre-planted
         // objects before anything unqualified runs as the owner.
+        stage.set("prepare_schema");
         let mut conn = owner_pool.acquire().await?;
         prepare_owner_schema(&mut conn, app_role).await?;
+        let before = applied_versions(&mut conn).await?;
         drop(conn);
+        stage.set("migrations");
         sqlx::migrate!("./migrations").run(&owner_pool).await?;
+        // The policy goes in before the grants so EXECUTE on the audit
+        // functions is never granted while the floor is unset.
+        stage.set("audit_policy");
         let mut conn = owner_pool.acquire().await?;
-        apply_app_grants(&mut conn, app_role, test_routes).await?;
+        let floor_previous =
+            apply_audit_policy(&mut conn, step.retention_floor_days, step.test_routes).await?;
         drop(conn);
-        if test_routes {
+        stage.set("grants");
+        let mut conn = owner_pool.acquire().await?;
+        apply_app_grants(&mut conn, app_role, step.test_routes).await?;
+        drop(conn);
+        if step.test_routes {
+            stage.set("test_flag");
             crate::db_audit::allow_test_maintenance(&owner_pool).await?;
         }
+        stage.set("audit_record");
+        let mut conn = owner_pool.acquire().await?;
+        let after = applied_versions(&mut conn).await?;
+        drop(conn);
+        let applied: Vec<i64> = after
+            .iter()
+            .copied()
+            .filter(|v| !before.contains(v))
+            .collect();
+        record_migrate_event(
+            &owner_pool,
+            "ok",
+            migrate_detail(
+                step.source,
+                &applied,
+                after.last().copied(),
+                step.test_routes,
+                effective_floor(step.retention_floor_days, step.test_routes),
+                floor_previous,
+            ),
+        )
+        .await
+        .context("migrations applied but the db.migrate audit record could not be written")?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
+    if let Err(e) = &result {
+        // Before the lock is released; best effort, never replaces `e`.
+        record_migrate_failure(&owner_pool, stage.get(), e, step.source).await;
+    }
     // Return the lock connection first so `close()` ends the session, which
     // releases the lock.
     drop(lock_conn);
     owner_pool.close().await;
     result
+}
+
+/// The owner step's current stage, shared with the failure record. A mutex
+/// (not a `Cell`) so the step's future stays `Send`.
+struct Stage(std::sync::Mutex<&'static str>);
+
+impl Stage {
+    fn new(initial: &'static str) -> Self {
+        Self(std::sync::Mutex::new(initial))
+    }
+
+    fn set(&self, stage: &'static str) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = stage;
+        }
+    }
+
+    fn get(&self) -> &'static str {
+        self.0.lock().map_or("unknown", |g| *g)
+    }
+}
+
+/// The floor the owner step stores: 0 with test routes, else the configured
+/// number of days clamped to the column's range.
+fn effective_floor(retention_floor_days: i64, test_routes: bool) -> i64 {
+    if test_routes {
+        0
+    } else {
+        retention_floor_days.clamp(0, 36500)
+    }
+}
+
+/// Store the audit policy for this owner step: the retention floor
+/// ([`effective_floor`]) and the restore window (open forever with test routes,
+/// otherwise an `infinity` window left by a test-routes run is closed again;
+/// an operator's finite window is left alone). Returns the previous floor when
+/// it changed. Runs as the owner, the only role that can write `audit_policy`.
+pub async fn apply_audit_policy(
+    conn: &mut PgConnection,
+    retention_floor_days: i64,
+    test_routes: bool,
+) -> Result<Option<i64>> {
+    let floor = effective_floor(retention_floor_days, test_routes);
+    let previous: i32 = sqlx::query_scalar("SELECT min_retain_days FROM public.audit_policy")
+        .fetch_one(&mut *conn)
+        .await
+        .context("reading audit_policy")?;
+    let changed = i64::from(previous) != floor;
+    if changed {
+        sqlx::query(
+            "UPDATE public.audit_policy SET min_retain_days = $1, updated_at = pg_catalog.now()",
+        )
+        .bind(floor as i32)
+        .execute(&mut *conn)
+        .await?;
+    }
+    if test_routes {
+        sqlx::query(
+            "UPDATE public.audit_policy SET restore_allowed_until = 'infinity', \
+                    updated_at = pg_catalog.now() \
+             WHERE restore_allowed_until IS DISTINCT FROM 'infinity'",
+        )
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE public.audit_policy SET restore_allowed_until = NULL, \
+                    updated_at = pg_catalog.now() \
+             WHERE restore_allowed_until = 'infinity'",
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(changed.then_some(i64::from(previous)))
+}
+
+/// Most violations listed in an event; each is cut to [`MAX_VIOLATION_CHARS`].
+const MAX_VIOLATIONS_LISTED: usize = 20;
+const MAX_VIOLATION_CHARS: usize = 200;
+/// Longest wait for the `db.migrate` write and for a boundary event write.
+const MIGRATE_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const BOUNDARY_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Detail of a completed `db.migrate` event. Identifiers and counts only.
+pub(crate) fn migrate_detail(
+    source: &str,
+    applied: &[i64],
+    schema_version: Option<i64>,
+    test_routes: bool,
+    floor_days: i64,
+    floor_previous: Option<i64>,
+) -> serde_json::Value {
+    let mut d = serde_json::json!({
+        "source": source,
+        "appliedVersions": applied,
+        "schemaVersion": schema_version,
+        "testRoutes": test_routes,
+        "retentionFloorDays": floor_days,
+    });
+    if let (Some(prev), Some(obj)) = (floor_previous, d.as_object_mut()) {
+        obj.insert("retentionFloorPrevious".into(), prev.into());
+    }
+    d
+}
+
+/// The SQLSTATE of the first database error in the chain, if any.
+fn sqlstate_of(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|c| {
+        c.downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|d| d.code())
+            .map(|c| c.to_string())
+    })
+}
+
+/// Detail of a failed `db.migrate` event. Never carries the error text, which
+/// can quote object names or connection details.
+pub(crate) fn migrate_failure_detail(
+    source: &str,
+    stage: &str,
+    transient: bool,
+    sqlstate: Option<&str>,
+) -> serde_json::Value {
+    let mut d = serde_json::json!({
+        "source": source,
+        "stage": stage,
+        "errorClass": if transient { "transient" } else { "permanent" },
+    });
+    if let (Some(code), Some(obj)) = (sqlstate, d.as_object_mut()) {
+        obj.insert("sqlstate".into(), code.into());
+    }
+    d
+}
+
+/// Detail of a boundary event: the capped violation list plus one flag
+/// (`testRoutes` for a degraded start, `production` for a refusal).
+pub(crate) fn boundary_detail(
+    reason: &str,
+    violations: &[String],
+    flag: (&str, bool),
+) -> serde_json::Value {
+    let listed: Vec<String> = violations
+        .iter()
+        .take(MAX_VIOLATIONS_LISTED)
+        .map(|v| v.chars().take(MAX_VIOLATION_CHARS).collect())
+        .collect();
+    serde_json::json!({
+        "reason": reason,
+        "violations": listed,
+        "count": violations.len(),
+        flag.0: flag.1,
+    })
+}
+
+/// Write a system event synchronously with a timeout. The caller decides what
+/// a failure means.
+async fn record_event(
+    pool: &PgPool,
+    action: &'static str,
+    outcome: &'static str,
+    detail: serde_json::Value,
+    wait: std::time::Duration,
+) -> Result<()> {
+    let write = crate::db_audit::record_system_now(
+        pool,
+        crate::db_audit::NewSystemEvent {
+            action,
+            outcome,
+            stig_id: None,
+            detail,
+        },
+    );
+    match tokio::time::timeout(wait, write).await {
+        Ok(r) => r,
+        Err(_) => bail!("timed out writing the {action} audit event"),
+    }
+}
+
+/// Write a `db.migrate` event now, returning a failure.
+pub async fn record_migrate_event(
+    pool: &PgPool,
+    outcome: &'static str,
+    detail: serde_json::Value,
+) -> Result<()> {
+    record_event(pool, "db.migrate", outcome, detail, MIGRATE_EVENT_TIMEOUT).await
+}
+
+/// Structured log line used when no audit row can be written.
+fn log_migrate_failure_fallback(stage: &str, err: &anyhow::Error, source: &str) {
+    tracing::error!(
+        target: "audit",
+        action = "db.migrate",
+        outcome = "failure",
+        source,
+        stage,
+        error_class = if is_transient(err) { "transient" } else { "permanent" },
+        sqlstate = sqlstate_of(err).as_deref().unwrap_or(""),
+        "owner step failed (no audit row written)"
+    );
+}
+
+/// Record a failed owner step. Best effort: never returns an error and never
+/// replaces the original one. Without a writable `audit_events` (missing, or
+/// older than migration 045) the structured log line is the record.
+pub async fn record_migrate_failure(
+    pool: &PgPool,
+    stage: &str,
+    err: &anyhow::Error,
+    source: &'static str,
+) {
+    let detail = migrate_failure_detail(
+        source,
+        stage,
+        is_transient(err),
+        sqlstate_of(err).as_deref(),
+    );
+    if record_migrate_event(pool, "failure", detail).await.is_err() {
+        log_migrate_failure_fallback(stage, err, source);
+    }
+}
+
+/// Startup policy for [`boundary_violations`] that first records a degraded
+/// start. Production with violations is refused (and recorded) by the caller's
+/// `refuse` path: the refusal event is written here too.
+pub async fn enforce_boundary(
+    pool: &PgPool,
+    production: bool,
+    test_routes: bool,
+    violations: &[String],
+) -> Result<()> {
+    if !violations.is_empty() {
+        if production {
+            record_boundary_refusal_with(pool, "violations", production, violations).await;
+        } else if let Err(e) = record_event(
+            pool,
+            "db.boundary_degraded",
+            "partial",
+            boundary_detail("violations", violations, ("testRoutes", test_routes)),
+            BOUNDARY_EVENT_TIMEOUT,
+        )
+        .await
+        {
+            tracing::error!(
+                target: "audit",
+                action = "db.boundary_degraded",
+                outcome = "partial",
+                count = violations.len(),
+                "audit write failed: {e:#}"
+            );
+        }
+    }
+    boundary_policy(production, violations)
+}
+
+/// Record that startup is refused for `reason`. Best effort; the refusal
+/// stands whether or not the write succeeds.
+pub async fn record_boundary_refusal(pool: &PgPool, reason: &'static str, production: bool) {
+    record_boundary_refusal_with(pool, reason, production, &[]).await;
+}
+
+async fn record_boundary_refusal_with(
+    pool: &PgPool,
+    reason: &'static str,
+    production: bool,
+    violations: &[String],
+) {
+    if let Err(e) = record_event(
+        pool,
+        "db.boundary_refused",
+        "rejected",
+        boundary_detail(reason, violations, ("production", production)),
+        BOUNDARY_EVENT_TIMEOUT,
+    )
+    .await
+    {
+        tracing::error!(
+            target: "audit",
+            action = "db.boundary_refused",
+            outcome = "rejected",
+            reason,
+            count = violations.len(),
+            "audit write failed: {e:#}"
+        );
+    }
+}
+
+/// Record a degraded start: a production start that still carries the owner
+/// URL. Best effort.
+pub async fn record_owner_url_on_server(pool: &PgPool, test_routes: bool) {
+    if let Err(e) = record_event(
+        pool,
+        "db.boundary_degraded",
+        "partial",
+        boundary_detail("owner_url_on_server", &[], ("testRoutes", test_routes)),
+        BOUNDARY_EVENT_TIMEOUT,
+    )
+    .await
+    {
+        tracing::error!(
+            target: "audit",
+            action = "db.boundary_degraded",
+            outcome = "partial",
+            reason = "owner_url_on_server",
+            "audit write failed: {e:#}"
+        );
+    }
+}
+
+/// Finish a single-role self-migrate (development only): store the audit
+/// policy and write the `db.migrate` event. `before` is [`applied_versions`]
+/// taken ahead of the migrations.
+pub async fn finish_self_migrate(pool: &PgPool, step: &OwnerStep, before: &[i64]) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    let floor_previous =
+        apply_audit_policy(&mut conn, step.retention_floor_days, step.test_routes).await?;
+    let after = applied_versions(&mut conn).await?;
+    drop(conn);
+    let applied: Vec<i64> = after
+        .iter()
+        .copied()
+        .filter(|v| !before.contains(v))
+        .collect();
+    record_migrate_event(
+        pool,
+        "ok",
+        migrate_detail(
+            step.source,
+            &applied,
+            after.last().copied(),
+            step.test_routes,
+            effective_floor(step.retention_floor_days, step.test_routes),
+            floor_previous,
+        ),
+    )
+    .await
+    .context("migrations applied but the db.migrate audit record could not be written")
 }
 
 /// How long an owner step waits for another one before giving up (retryable).
@@ -458,10 +904,13 @@ async fn prepare_owner_schema(conn: &mut PgConnection, app_role: &str) -> Result
 
 /// Grant `app_role` the DML it needs and nothing more, in one transaction.
 /// Never `GRANT ALL`, never `TRIGGER` or `REFERENCES`. Idempotent: the audit
-/// tables and `_sqlx_migrations` are revoked first, so the state converges.
-/// `test_routes` adds table-level `UPDATE` on the audit tables (the E2E
-/// backdate hook updates `rule_audit.occurred_at`); with it off, it is revoked.
-/// The schema the grants act on is the one that holds `rule_audit`.
+/// tables and the owner-only tables are revoked first, so the state converges.
+/// On the audit tables the role gets `SELECT`, column-level `INSERT` and
+/// `UPDATE (repeat_count, last_occurred_at)`, `USAGE, SELECT` on their
+/// sequences and `EXECUTE` on [`AUDIT_FUNCTIONS`]; no `DELETE`, `TRUNCATE` or
+/// sequence `UPDATE`. `test_routes` adds table-level `UPDATE` and `TRUNCATE` on
+/// the audit tables (the E2E backdate and reset hooks); with it off, both are
+/// revoked. The schema the grants act on is the one that holds `rule_audit`.
 pub async fn apply_app_grants(
     conn: &mut PgConnection,
     app_role: &str,
@@ -493,7 +942,6 @@ pub async fn apply_app_grants(
         .fetch_one(&mut *conn)
         .await?;
     let audit = AUDIT_TABLES.map(|t| format!("{schema}.{t}")).join(", ");
-    let migrations = format!("{schema}._sqlx_migrations");
 
     let mut stmts = vec![
         format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
@@ -501,17 +949,38 @@ pub async fn apply_app_grants(
             "GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA {schema} TO {role}"
         ),
         format!("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA {schema} TO {role}"),
+        // A table-level REVOKE also drops column-level privileges.
         format!("REVOKE ALL ON {audit} FROM {role}"),
-        format!("GRANT SELECT, INSERT, DELETE, TRUNCATE ON {audit} TO {role}"),
+        format!("GRANT SELECT ON {audit} TO {role}"),
+        format!("GRANT INSERT ({RULE_AUDIT_INSERT_COLUMNS}) ON {schema}.rule_audit TO {role}"),
+        format!("GRANT INSERT ({AUDIT_EVENTS_INSERT_COLUMNS}) ON {schema}.audit_events TO {role}"),
         format!(
             "GRANT UPDATE (repeat_count, last_occurred_at) ON {schema}.audit_events TO {role}"
         ),
     ];
     if test_routes {
-        stmts.push(format!("GRANT UPDATE ON {audit} TO {role}"));
+        stmts.push(format!("GRANT UPDATE, TRUNCATE ON {audit} TO {role}"));
     }
-    stmts.push(format!("REVOKE ALL ON {migrations} FROM {role}"));
-    stmts.push(format!("GRANT SELECT ON {migrations} TO {role}"));
+    stmts.push(format!(
+        "REVOKE ALL ON SEQUENCE {schema}.rule_audit_id_seq, {schema}.audit_events_id_seq, \
+         {schema}.audit_restore_log_id_seq FROM {role}"
+    ));
+    stmts.push(format!(
+        "GRANT USAGE, SELECT ON SEQUENCE {schema}.rule_audit_id_seq, \
+         {schema}.audit_events_id_seq TO {role}"
+    ));
+    for table in OWNER_ONLY_TABLES {
+        stmts.push(format!("REVOKE ALL ON {schema}.{table} FROM {role}"));
+        stmts.push(format!("GRANT SELECT ON {schema}.{table} TO {role}"));
+    }
+    for function in AUDIT_FUNCTIONS {
+        stmts.push(format!(
+            "REVOKE ALL ON FUNCTION {schema}.{function} FROM PUBLIC"
+        ));
+        stmts.push(format!(
+            "GRANT EXECUTE ON FUNCTION {schema}.{function} TO {role}"
+        ));
+    }
 
     let mut tx = conn.begin().await?;
     for stmt in &stmts {
@@ -604,7 +1073,16 @@ const GUARD_TRIGGERS: [(&str, &str, i16); 4] = [
 pub async fn boundary_violations(pool: &PgPool, test_routes: bool) -> Result<Vec<String>> {
     let mut rows: Vec<String> = sqlx::query_scalar(
         "WITH s AS (SELECT c.relnamespace AS ns FROM pg_catalog.pg_class c \
-                    WHERE c.oid = pg_catalog.to_regclass('rule_audit')) \
+                    WHERE c.oid = pg_catalog.to_regclass('rule_audit')), \
+              fn AS (SELECT pg_catalog.to_regprocedure( \
+                         pg_catalog.quote_ident((SELECT nspname FROM pg_catalog.pg_namespace \
+                                                 WHERE oid = (SELECT ns FROM s))) || '.' || f.sig)::pg_catalog.oid \
+                         AS oid \
+                     FROM unnest($2::pg_catalog.text[]) AS f(sig) \
+                     WHERE pg_catalog.to_regprocedure( \
+                         pg_catalog.quote_ident((SELECT nspname FROM pg_catalog.pg_namespace \
+                                                 WHERE oid = (SELECT ns FROM s))) || '.' || f.sig) \
+                           IS NOT NULL) \
          SELECT 'role is a superuser' FROM pg_catalog.pg_roles \
            WHERE rolname = current_user AND rolsuper \
          UNION ALL \
@@ -664,12 +1142,81 @@ pub async fn boundary_violations(pool: &PgPool, test_routes: bool) -> Result<Vec
          FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
          WHERE NOT $1 AND pg_catalog.has_table_privilege(current_user, t, 'UPDATE') \
          UNION ALL \
+         SELECT 'role holds DELETE on ' || t \
+         FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
+         WHERE pg_catalog.has_table_privilege(current_user, t, 'DELETE') \
+         UNION ALL \
+         SELECT 'role holds TRUNCATE on ' || t || ' with test routes off' \
+         FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
+         WHERE NOT $1 AND pg_catalog.has_table_privilege(current_user, t, 'TRUNCATE') \
+         UNION ALL \
+         SELECT 'role holds table-level INSERT on ' || t \
+         FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
+         WHERE pg_catalog.has_table_privilege(current_user, t, 'INSERT') \
+         UNION ALL \
+         SELECT 'role holds UPDATE on sequence ' || pg_catalog.pg_get_serial_sequence(t, 'id') \
+         FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t \
+         WHERE pg_catalog.has_sequence_privilege(current_user, \
+                   pg_catalog.pg_get_serial_sequence(t, 'id'), 'UPDATE') \
+         UNION ALL \
+         SELECT 'role can write ' || t \
+         FROM unnest(ARRAY['audit_policy', 'audit_restore_log']) AS t \
+         WHERE pg_catalog.has_table_privilege(current_user, t, 'INSERT') \
+            OR pg_catalog.has_table_privilege(current_user, t, 'UPDATE') \
+            OR pg_catalog.has_table_privilege(current_user, t, 'DELETE') \
+            OR pg_catalog.has_table_privilege(current_user, t, 'TRUNCATE') \
+         UNION ALL \
+         SELECT 'audit function ' || f.sig || ' is missing' \
+         FROM unnest($2::pg_catalog.text[]) AS f(sig) \
+         WHERE pg_catalog.to_regprocedure( \
+                   pg_catalog.quote_ident((SELECT nspname FROM pg_catalog.pg_namespace \
+                                           WHERE oid = (SELECT ns FROM s))) || '.' || f.sig) IS NULL \
+         UNION ALL \
+         SELECT 'audit function ' || p.proname || ' is not SECURITY DEFINER' \
+         FROM pg_catalog.pg_proc p WHERE p.oid = ANY (SELECT oid FROM fn) AND NOT p.prosecdef \
+         UNION ALL \
+         SELECT 'audit function ' || p.proname || ' does not pin search_path to pg_catalog, pg_temp' \
+         FROM pg_catalog.pg_proc p WHERE p.oid = ANY (SELECT oid FROM fn) \
+           AND NOT ('search_path=pg_catalog, pg_temp' = ANY (COALESCE(p.proconfig, '{}'))) \
+         UNION ALL \
+         SELECT 'audit function ' || p.proname || ' is not owned by the owner of rule_audit' \
+         FROM pg_catalog.pg_proc p WHERE p.oid = ANY (SELECT oid FROM fn) \
+           AND p.proowner <> (SELECT c.relowner FROM pg_catalog.pg_class c \
+                              WHERE c.oid = pg_catalog.to_regclass('rule_audit')) \
+         UNION ALL \
+         SELECT 'audit function ' || p.proname || ' is executable by PUBLIC' \
+         FROM pg_catalog.pg_proc p WHERE p.oid = ANY (SELECT oid FROM fn) \
+           AND pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE') \
+         UNION ALL \
+         SELECT 'role can INSERT the ' || col || ' column of ' || t \
+         FROM unnest(ARRAY['rule_audit', 'audit_events']) AS t, \
+              unnest(ARRAY['id', 'occurred_at']) AS col \
+         WHERE pg_catalog.has_column_privilege(current_user, t, col, 'INSERT') \
+         UNION ALL \
+         SELECT 'audit restore window is held open (infinity) with test routes off' \
+         FROM audit_policy WHERE NOT $1 AND restore_allowed_until = 'infinity' \
+         UNION ALL \
+         SELECT 'audit restore window is open for more than 24 hours' \
+         FROM audit_policy WHERE NOT $1 AND restore_allowed_until <> 'infinity' \
+           AND restore_allowed_until > pg_catalog.now() + interval '24 hours' \
+         UNION ALL \
+         SELECT 'audit retention floor is 0 with test routes off' \
+         FROM audit_policy WHERE NOT $1 AND min_retain_days = 0 \
+         UNION ALL \
+         SELECT 'audit_tables_guard() is not revision 4 (owner-gated maintenance modes)' \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.oid = 'audit_tables_guard()'::pg_catalog.regprocedure \
+           AND position('as_owner' IN p.prosrc) = 0 \
+         UNION ALL \
          SELECT 'audit_tables_guard() does not pin search_path to pg_catalog, pg_temp' \
          FROM pg_catalog.pg_proc p \
          WHERE p.oid = 'audit_tables_guard()'::pg_catalog.regprocedure \
            AND NOT ('search_path=pg_catalog, pg_temp' = ANY (COALESCE(p.proconfig, '{}')))",
     )
     .bind(test_routes)
+    .bind(
+        AUDIT_FUNCTIONS.to_vec(),
+    )
     .fetch_all(pool)
     .await
     .context("checking the audit guard boundary (is the schema migrated?)")?;
@@ -752,6 +1299,16 @@ pub fn boundary_policy(production: bool, violations: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// [`verify_migrations`], recording a `db.boundary_refused` event (reason
+/// `migrations_unverified`, best effort) before returning its error.
+pub async fn verify_or_record_refusal(pool: &PgPool, production: bool) -> Result<()> {
+    if let Err(e) = verify_migrations(pool).await {
+        record_boundary_refusal(pool, "migrations_unverified", production).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Warning for an owner credential present on the serving process in production.
 pub fn owner_url_on_server_warning(production: bool, has_owner_url: bool) -> Option<&'static str> {
     (production && has_owner_url).then_some(
@@ -763,8 +1320,20 @@ pub fn owner_url_on_server_warning(production: bool, has_owner_url: bool) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{allow_audit_test_mode, app_role_pool, seed_user, temp_role};
+    use crate::test_fixtures::{
+        allow_audit_test_mode, app_role_pool, open_audit_restore_window, seed_user,
+        set_audit_retention_floor, temp_role,
+    };
     use sqlx::PgPool;
+
+    fn step(test_routes: bool) -> OwnerStep {
+        OwnerStep {
+            test_routes,
+            production: false,
+            retention_floor_days: 365,
+            source: "migrate_command",
+        }
+    }
 
     fn code(e: &sqlx::Error) -> Option<String> {
         e.as_database_error()
@@ -848,8 +1417,10 @@ mod tests {
         let err = migrate_as_owner(
             "postgres://o@127.0.0.1:1/d",
             "postgres://a@127.0.0.1:1/d",
-            true,
-            true,
+            &OwnerStep {
+                production: true,
+                ..step(true)
+            },
         )
         .await
         .unwrap_err()
@@ -979,17 +1550,345 @@ mod tests {
             let err = sqlx::query(stmt).execute(&app.pool).await.expect_err(stmt);
             assert_eq!(code(&err).as_deref(), Some("42501"), "{stmt}: {err}");
         }
-        // `migration` mode (UPDATE) is no longer usable by the app role.
+        // `migration` mode is honoured only for the owner: the app role cannot
+        // use it to rewrite a collapsed denial (null or lower its counters).
+        sqlx::query(
+            "INSERT INTO audit_events (user_id, action, outcome, repeat_count, last_occurred_at) \
+             VALUES ('u1', 'checklist.save', 'denied', 3, now())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for stmt in [
+            "UPDATE audit_events SET last_occurred_at = NULL, repeat_count = 1 WHERE outcome = 'denied'",
+            "UPDATE audit_events SET repeat_count = repeat_count + 5 WHERE outcome = 'denied'",
+            "UPDATE audit_events SET last_occurred_at = occurred_at WHERE outcome = 'denied'",
+            "UPDATE audit_events SET outcome = 'denied'",
+        ] {
+            let mut tx = app.pool.begin().await.unwrap();
+            crate::db_audit::set_maintenance(&mut tx, "migration")
+                .await
+                .unwrap();
+            let err = sqlx::query(stmt).execute(&mut *tx).await.expect_err(stmt);
+            assert_eq!(code(&err).as_deref(), Some("42501"), "{stmt}: {err}");
+        }
+        // With the mode still set, the legitimate collapse goes through.
         let mut tx = app.pool.begin().await.unwrap();
         crate::db_audit::set_maintenance(&mut tx, "migration")
             .await
             .unwrap();
-        let err = sqlx::query("UPDATE audit_events SET outcome = 'denied'")
+        let n = sqlx::query(
+            "UPDATE audit_events SET repeat_count = repeat_count + 1, last_occurred_at = now() \
+             WHERE outcome = 'denied'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(n, 1);
+        tx.commit().await.unwrap();
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_app_role_cannot_age_a_collapsed_row_to_prune_it(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        set_audit_retention_floor(&pool, 30).await;
+        sqlx::query(
+            "INSERT INTO audit_events (occurred_at, last_occurred_at, user_id, action, outcome, repeat_count) \
+             VALUES (now() - interval '40 days', now() - interval '1 day', 'u1', 'a', 'denied', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let app = app_role_pool(&pool, false).await;
+        let mut tx = app.pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "migration")
+            .await
+            .unwrap();
+        let err = sqlx::query("UPDATE audit_events SET last_occurred_at = NULL")
             .execute(&mut *tx)
             .await
-            .expect_err("migration-mode update");
+            .expect_err("aging update");
         assert_eq!(code(&err).as_deref(), Some("42501"), "{err}");
         drop(tx);
+        let r = sqlx::query_scalar::<_, i64>("SELECT audit_prune_events($1::bigint[])")
+            .bind(vec![id])
+            .fetch_one(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        let (repeat, young): (i32, bool) = sqlx::query_as(
+            "SELECT repeat_count, last_occurred_at > now() - interval '2 days' FROM audit_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((repeat, young), (3, true));
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn maintenance_modes_are_refused_for_a_non_owner_even_with_the_privilege(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&pool).await.unwrap();
+        let app = app_role_pool(&pool, false).await;
+        exec(
+            &pool,
+            &format!(
+                "GRANT DELETE, TRUNCATE, UPDATE ON rule_audit, audit_events TO \"{}\"",
+                app.name
+            ),
+        )
+        .await;
+        for (mode, stmt) in [
+            ("retention", "DELETE FROM rule_audit"),
+            ("restore", "TRUNCATE rule_audit, audit_events"),
+            ("migration", "UPDATE rule_audit SET field = 'x'"),
+        ] {
+            let mut tx = app.pool.begin().await.unwrap();
+            match mode {
+                "retention" => crate::audit_retention::declare_retention_delete(&mut tx)
+                    .await
+                    .unwrap(),
+                m => crate::db_audit::set_maintenance(&mut tx, m).await.unwrap(),
+            }
+            let err = sqlx::query(stmt).execute(&mut *tx).await.expect_err(stmt);
+            assert_eq!(code(&err).as_deref(), Some("42501"), "{stmt}: {err}");
+            assert!(
+                err.to_string().contains("honoured only for the owner"),
+                "{stmt}: {err}"
+            );
+        }
+        // In a flagged database `restore` still fails for the app role, while
+        // the DB-flag-gated `test` mode works for any role.
+        allow_audit_test_mode(&pool).await;
+        let mut tx = app.pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        let err = sqlx::query("TRUNCATE rule_audit, audit_events")
+            .execute(&mut *tx)
+            .await
+            .expect_err("restore truncate");
+        assert_eq!(code(&err).as_deref(), Some("42501"), "{err}");
+        drop(tx);
+        let mut tx = app.pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "test")
+            .await
+            .unwrap();
+        sqlx::query("TRUNCATE rule_audit, audit_events")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_load_rejects_out_of_range_ids_and_closes_a_finite_window(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let app = app_role_pool(&pool, false).await;
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'",
+        )
+        .await;
+        let row = |id: i64| {
+            serde_json::json!([{
+                "id": id, "occurred_at": "2025-01-01T00:00:00Z", "user_id": "u1",
+                "action": "a", "outcome": "ok", "asset_id": null, "checklist_id": null,
+                "stig_id": null, "detail": {}, "source_ip": null, "request_id": null,
+                "user_role": null, "repeat_count": 1, "last_occurred_at": null
+            }])
+        };
+        for bad in [0_i64, -5, i64::MAX - 10] {
+            let r = sqlx::query("SELECT audit_restore_load('audit_events', $1, 't')")
+                .bind(row(bad))
+                .execute(&app.pool)
+                .await;
+            assert_eq!(code_of(r).as_deref(), Some("22023"), "id {bad}");
+        }
+        // A rolled-back load leaves the window and the table untouched.
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let n: i64 = sqlx::query_scalar("SELECT audit_restore_load('audit_events', $1, 't')")
+            .bind(row(7))
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let open: bool =
+            sqlx::query_scalar("SELECT restore_allowed_until IS NOT NULL FROM audit_policy")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!open, "a finite window closes after the audit_events load");
+        // An infinity window (test routes) stays open.
+        let mut tx = pool.begin().await.unwrap();
+        crate::db_audit::set_maintenance(&mut tx, "restore")
+            .await
+            .unwrap();
+        exec_tx(&mut tx, "TRUNCATE audit_events").await;
+        tx.commit().await.unwrap();
+        open_audit_restore_window(&pool).await;
+        sqlx::query("SELECT audit_restore_load('audit_events', $1, 't')")
+            .bind(row(8))
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let open: bool =
+            sqlx::query_scalar("SELECT restore_allowed_until = 'infinity' FROM audit_policy")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(open);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_window_cap_applies_at_set_time_and_at_use_time(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let call = "SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 't')";
+        // Set time: the owner cannot set more than 24 hours ahead.
+        let r = sqlx::query(
+            "UPDATE audit_policy SET restore_allowed_until = now() + interval '30 days'",
+        )
+        .execute(&pool)
+        .await;
+        assert_eq!(code_of(r).as_deref(), Some("22023"));
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'",
+        )
+        .await;
+        // Use time: just under 24h opens, just over (set around the trigger) refuses.
+        set_window_unchecked(&pool, "23 hours").await;
+        sqlx::query(call).execute(&app.pool).await.unwrap();
+        set_window_unchecked(&pool, "25 hours").await;
+        let r = sqlx::query(call).execute(&app.pool).await;
+        assert_eq!(code_of(r).as_deref(), Some("SV001"));
+        // updated_at is stamped by the trigger.
+        let fresh: bool =
+            sqlx::query_scalar("SELECT updated_at > now() - interval '1 minute' FROM audit_policy")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(fresh);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_truncate_refuses_an_inheriting_child_outside_the_list(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        exec(
+            &pool,
+            "CREATE TABLE public.child_t () INHERITS (rule_audit)",
+        )
+        .await;
+        open_audit_restore_window(&pool).await;
+        let app = app_role_pool(&pool, false).await;
+        let r =
+            sqlx::query("SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 't')")
+                .execute(&app.pool)
+                .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "nothing was truncated");
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_truncate_refuses_a_cascade_into_an_unlisted_table(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        exec(
+            &pool,
+            "CREATE TABLE public.refs_audit (r bigint REFERENCES rule_audit(id))",
+        )
+        .await;
+        open_audit_restore_window(&pool).await;
+        let app = app_role_pool(&pool, false).await;
+        let r =
+            sqlx::query("SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 't')")
+                .execute(&app.pool)
+                .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "nothing was truncated");
+        // Listing the referencing table makes the call acceptable.
+        sqlx::query(
+            "SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events', 'refs_audit'], 't')",
+        )
+        .execute(&app.pool)
+        .await
+        .unwrap();
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_truncate_never_truncates_what_the_caller_could_not(pool: PgPool) {
+        open_audit_restore_window(&pool).await;
+        let app = app_role_pool(&pool, false).await;
+        // Created after the grants, so the app role has no privilege on it.
+        exec(&pool, "CREATE TABLE public.owner_only_t (x int)").await;
+        exec(&pool, "INSERT INTO public.owner_only_t VALUES (1)").await;
+        // A real login: SET SESSION AUTHORIZATION makes session_user the app role.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(&format!("SET SESSION AUTHORIZATION \"{}\"", app.name))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let r = sqlx::query(
+            "SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events', 'owner_only_t'], 't')",
+        )
+        .execute(&mut *conn)
+        .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        // With the privilege the same call works.
+        exec(
+            &pool,
+            &format!("GRANT TRUNCATE ON public.owner_only_t TO \"{}\"", app.name),
+        )
+        .await;
+        sqlx::query(
+            "SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events', 'owner_only_t'], 't')",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query("RESET SESSION AUTHORIZATION")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
         app.cleanup(&pool).await;
     }
 
@@ -997,6 +1896,7 @@ mod tests {
     #[ignore = "needs Postgres (DATABASE_URL)"]
     async fn app_role_can_do_its_normal_audit_work(pool: PgPool) {
         seed_user(&pool, "u1").await;
+        set_audit_retention_floor(&pool, 0).await;
         let app = app_role_pool(&pool, false).await;
         sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
             .execute(&app.pool).await.unwrap();
@@ -1011,27 +1911,336 @@ mod tests {
         .unwrap()
         .rows_affected();
         assert_eq!(n, 1);
-        // Retention DELETE.
-        let mut tx = app.pool.begin().await.unwrap();
-        crate::audit_retention::declare_retention_delete(&mut tx)
+        // Retention through the owner function: a row past the floor goes.
+        sqlx::query(
+            "INSERT INTO rule_audit (occurred_at, user_id, checklist_id, rule_id, field) \
+             VALUES (now() - interval '10 days', 'u1', 'c', 'old', 'status')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let old: i64 = sqlx::query_scalar("SELECT id FROM rule_audit WHERE rule_id = 'old'")
+            .fetch_one(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM rule_audit")
-            .execute(&mut *tx)
+        let pruned: i64 = sqlx::query_scalar("SELECT audit_prune_rule_audit($1::bigint[])")
+            .bind(vec![old])
+            .fetch_one(&app.pool)
             .await
             .unwrap();
-        tx.commit().await.unwrap();
-        // Restore TRUNCATE.
-        let mut tx = app.pool.begin().await.unwrap();
-        crate::db_audit::set_maintenance(&mut tx, "restore")
+        assert_eq!(pruned, 1);
+        // Restore through the owner functions, inside an open window.
+        open_audit_restore_window(&pool).await;
+        sqlx::query("SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 'tester')")
+            .execute(&app.pool)
             .await
             .unwrap();
-        sqlx::query("TRUNCATE audit_events, rule_audit")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
         app.cleanup(&pool).await;
+    }
+
+    /// Run `stmts` (each in its own transaction, in the given maintenance mode
+    /// where one is named) as the app role and expect 42501 for every one.
+    async fn expect_denied(app: &PgPool, stmts: &[(&str, &str)]) {
+        for (mode, stmt) in stmts {
+            let mut tx = app.begin().await.unwrap();
+            match *mode {
+                "retention" => crate::audit_retention::declare_retention_delete(&mut tx)
+                    .await
+                    .unwrap(),
+                "" => {}
+                m => crate::db_audit::set_maintenance(&mut tx, m).await.unwrap(),
+            }
+            let err = sqlx::query(stmt).execute(&mut *tx).await.expect_err(stmt);
+            assert_eq!(code(&err).as_deref(), Some("42501"), "{stmt}: {err}");
+        }
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn app_role_cannot_delete_truncate_reinsert_or_setval(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        let app = app_role_pool(&pool, false).await;
+        expect_denied(
+            &app.pool,
+            &[
+                ("retention", "DELETE FROM rule_audit"),
+                ("retention", "DELETE FROM audit_events"),
+                ("restore", "TRUNCATE rule_audit, audit_events"),
+                ("restore", "TRUNCATE users CASCADE"),
+                (
+                    "",
+                    "INSERT INTO rule_audit (id, user_id, checklist_id, rule_id, field) \
+                     VALUES (1, 'u1', 'c', 'r', 'f')",
+                ),
+                (
+                    "",
+                    "INSERT INTO rule_audit (occurred_at, user_id, checklist_id, rule_id, field) \
+                     VALUES (now() - interval '1 year', 'u1', 'c', 'r', 'f')",
+                ),
+                (
+                    "",
+                    "INSERT INTO audit_events (id, user_id, action, outcome) \
+                     VALUES (1, 'u1', 'a', 'ok')",
+                ),
+                (
+                    "",
+                    "INSERT INTO audit_events (occurred_at, user_id, action, outcome) \
+                     VALUES (now() - interval '1 year', 'u1', 'a', 'ok')",
+                ),
+                ("", "SELECT setval('rule_audit_id_seq', 1)"),
+                ("", "SELECT setval('audit_events_id_seq', 1)"),
+                ("", "ALTER SEQUENCE rule_audit_id_seq RESTART"),
+                ("", "ALTER SEQUENCE audit_events_id_seq RESTART"),
+                ("", "UPDATE audit_policy SET min_retain_days = 0"),
+                (
+                    "",
+                    "UPDATE audit_policy SET restore_allowed_until = 'infinity'",
+                ),
+                (
+                    "",
+                    "INSERT INTO audit_restore_log (step, target_table, caller, row_count) \
+                     VALUES ('load', 'rule_audit', 'x', 0)",
+                ),
+                ("", "DELETE FROM audit_restore_log"),
+                (
+                    "",
+                    "CREATE OR REPLACE FUNCTION public.audit_prune_rule_audit(p_ids bigint[]) \
+                     RETURNS bigint LANGUAGE sql AS 'SELECT 0::bigint'",
+                ),
+                (
+                    "",
+                    "CREATE OR REPLACE FUNCTION public.audit_restore_truncate(p_tables text[]) \
+                     RETURNS void LANGUAGE sql AS 'SELECT'",
+                ),
+            ],
+        )
+        .await;
+        // Normal inserts still draw from the sequences.
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+            .execute(&app.pool).await.unwrap();
+        sqlx::query("INSERT INTO audit_events (user_id, action, outcome) VALUES ('u1','checklist.save','ok')")
+            .execute(&app.pool).await.unwrap();
+        app.cleanup(&pool).await;
+    }
+
+    fn code_of(r: Result<impl std::fmt::Debug, sqlx::Error>) -> Option<String> {
+        code(&r.expect_err("expected a database error"))
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn prune_function_refuses_rows_younger_than_the_floor(pool: PgPool) {
+        seed_user(&pool, "u1").await;
+        set_audit_retention_floor(&pool, 30).await;
+        let app = app_role_pool(&pool, false).await;
+        for (rule, days) in [("old", 40), ("young", 10)] {
+            sqlx::query(
+                "INSERT INTO rule_audit (occurred_at, user_id, checklist_id, rule_id, field) \
+                 VALUES (now() - ($1 || ' days')::interval, 'u1', 'c', $2, 'status')",
+            )
+            .bind(days.to_string())
+            .bind(rule)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM rule_audit ORDER BY occurred_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let (old, young) = (ids[0], ids[1]);
+        let r = sqlx::query_scalar::<_, i64>("SELECT audit_prune_rule_audit($1::bigint[])")
+            .bind(vec![old, young])
+            .fetch_one(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 2);
+        let n: i64 = sqlx::query_scalar("SELECT audit_prune_rule_audit($1::bigint[])")
+            .bind(vec![old])
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // audit_events: the age is the later of occurred_at and last_occurred_at.
+        sqlx::query(
+            "INSERT INTO audit_events (occurred_at, last_occurred_at, user_id, action, outcome) \
+             VALUES (now() - interval '40 days', now() - interval '5 days', 'u1', 'a', 'denied')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ev: i64 = sqlx::query_scalar("SELECT id FROM audit_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let r = sqlx::query_scalar::<_, i64>("SELECT audit_prune_events($1::bigint[])")
+            .bind(vec![ev])
+            .fetch_one(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn restore_functions_need_the_owner_window_and_an_empty_table(pool: PgPool) {
+        const TRUNCATE: &str = "SELECT audit_restore_truncate($1::text[], 'tester')";
+        seed_user(&pool, "u1").await;
+        let app = app_role_pool(&pool, false).await;
+        let both = vec!["rule_audit".to_string(), "audit_events".to_string()];
+        let truncate = |tables: Vec<String>| {
+            let pool = app.pool.clone();
+            async move { sqlx::query(TRUNCATE).bind(tables).execute(&pool).await }
+        };
+
+        // Closed (NULL) and expired windows refuse with SV001.
+        let r = truncate(both.clone()).await;
+        assert_eq!(code_of(r).as_deref(), Some("SV001"));
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = now() - interval '1 minute'",
+        )
+        .await;
+        let r = truncate(both.clone()).await;
+        assert_eq!(code_of(r).as_deref(), Some("SV001"));
+        let r = sqlx::query("SELECT audit_restore_load('rule_audit', '[]'::jsonb, 't')")
+            .execute(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("SV001"));
+
+        // A finite window beyond 24 hours counts as closed.
+        set_window_unchecked(&pool, "48 hours").await;
+        let r = truncate(both.clone()).await;
+        assert_eq!(code_of(r).as_deref(), Some("SV001"));
+
+        // Open window.
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'",
+        )
+        .await;
+        for _ in 0..3 {
+            sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r1','status')")
+                .execute(&pool).await.unwrap();
+        }
+        let rows: serde_json::Value =
+            sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM rule_audit a")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // A list with a table outside the allowed set is refused.
+        let mut bad = both.clone();
+        bad.push("_sqlx_migrations".to_string());
+        let r = truncate(bad).await;
+        assert_eq!(code_of(r).as_deref(), Some("42501"));
+        let r = truncate(vec!["rule_audit".to_string()]).await;
+        assert_eq!(code_of(r).as_deref(), Some("22023"));
+        exec(&pool, "SELECT setval('rule_audit_id_seq', 500)").await;
+        truncate(both.clone()).await.unwrap();
+        let ledger: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM audit_restore_log WHERE step = 'truncate'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger, 2);
+        let removed: i64 = sqlx::query_scalar(
+            "SELECT row_count FROM audit_restore_log \
+             WHERE step = 'truncate' AND target_table = 'rule_audit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(removed, 3);
+        let actors: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT DISTINCT actor FROM audit_restore_log")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(actors, [Some("tester".to_string())]);
+
+        let n: i64 = sqlx::query_scalar("SELECT audit_restore_load('rule_audit', $1, 'tester')")
+            .bind(&rows)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        // The sequence never moves backwards: ids were 1..3, it stood at 500.
+        sqlx::query("INSERT INTO rule_audit (user_id, checklist_id, rule_id, field) VALUES ('u1','c','r2','status')")
+            .execute(&app.pool).await.unwrap();
+        let next: i64 = sqlx::query_scalar("SELECT max(id) FROM rule_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(next, 501);
+        // Audit rows load only into an empty table.
+        let r = sqlx::query("SELECT audit_restore_load('rule_audit', $1, 'tester')")
+            .bind(&rows)
+            .execute(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("SV002"));
+        let r = sqlx::query("SELECT audit_restore_load('users', '[]'::jsonb, 't')")
+            .execute(&app.pool)
+            .await;
+        assert_eq!(code_of(r).as_deref(), Some("22023"));
+        let loads: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_restore_log WHERE step = 'load' AND sequence_after = 500",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(loads, 1);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn execute_on_audit_functions_is_not_public(pool: PgPool) {
+        // Another role, never granted by the owner step.
+        let other = temp_role(&pool, "np_").await;
+        for call in [
+            "SELECT audit_prune_rule_audit(ARRAY[]::bigint[])",
+            "SELECT audit_prune_events(ARRAY[]::bigint[])",
+            "SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 't')",
+            "SELECT audit_restore_load('rule_audit', '[]'::jsonb, 't')",
+        ] {
+            let mut tx = pool.begin().await.unwrap();
+            exec_tx(&mut tx, &format!("SET LOCAL ROLE \"{}\"", other.name)).await;
+            let err = sqlx::query(call).execute(&mut *tx).await.expect_err(call);
+            assert_eq!(code(&err).as_deref(), Some("42501"), "{call}: {err}");
+        }
+    }
+
+    /// Set the restore window to now() + `interval` bypassing the policy
+    /// trigger's 24-hour cap (disabled for this transaction only).
+    async fn set_window_unchecked(pool: &PgPool, interval: &str) {
+        let mut tx = pool.begin().await.unwrap();
+        exec_tx(
+            &mut tx,
+            "ALTER TABLE audit_policy DISABLE TRIGGER audit_policy_guard",
+        )
+        .await;
+        exec_tx(
+            &mut tx,
+            &format!(
+                "UPDATE audit_policy SET restore_allowed_until = now() + interval '{interval}'"
+            ),
+        )
+        .await;
+        exec_tx(
+            &mut tx,
+            "ALTER TABLE audit_policy ENABLE TRIGGER audit_policy_guard",
+        )
+        .await;
+        tx.commit().await.unwrap();
+    }
+
+    async fn exec_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, sql: &str) {
+        sqlx::query(sql).execute(&mut **tx).await.expect(sql);
     }
 
     #[sqlx::test]
@@ -1088,7 +2297,104 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!trig);
+        // TRUNCATE follows the flag too; column-level INSERT survives it.
+        let priv_of = |sql: &'static str| {
+            let pool = pool.clone();
+            let name = app.name.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(sql)
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(!priv_of("SELECT has_table_privilege($1, 'rule_audit', 'TRUNCATE')").await);
+        assert!(!priv_of("SELECT has_table_privilege($1, 'audit_events', 'DELETE')").await);
+        assert!(!priv_of("SELECT has_table_privilege($1, 'rule_audit', 'INSERT')").await);
+        assert!(
+            priv_of("SELECT has_column_privilege($1, 'rule_audit', 'rule_id', 'INSERT')").await
+        );
+        assert!(!priv_of("SELECT has_column_privilege($1, 'rule_audit', 'id', 'INSERT')").await);
+        assert!(
+            !priv_of("SELECT has_column_privilege($1, 'audit_events', 'occurred_at', 'INSERT')")
+                .await
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        apply_app_grants(&mut conn, &app.name, true).await.unwrap();
+        drop(conn);
+        assert!(priv_of("SELECT has_table_privilege($1, 'rule_audit', 'TRUNCATE')").await);
+        assert!(priv_of("SELECT has_table_privilege($1, 'audit_events', 'TRUNCATE')").await);
+        assert!(
+            priv_of("SELECT has_column_privilege($1, 'rule_audit', 'rule_id', 'INSERT')").await
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        apply_app_grants(&mut conn, &app.name, false).await.unwrap();
+        drop(conn);
+        assert!(!priv_of("SELECT has_table_privilege($1, 'rule_audit', 'TRUNCATE')").await);
+        assert!(
+            priv_of("SELECT has_column_privilege($1, 'rule_audit', 'rule_id', 'INSERT')").await
+        );
         app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_audit_policy_converges(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let read = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        const FLOOR: &str = "SELECT min_retain_days::text FROM audit_policy";
+        const WINDOW: &str =
+            "SELECT COALESCE(restore_allowed_until::text, 'closed') FROM audit_policy";
+        // Defaults: floor 365, window closed. Lowering reports the previous value.
+        assert_eq!(read(FLOOR).await, "365");
+        assert_eq!(
+            apply_audit_policy(&mut conn, 365, false).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            apply_audit_policy(&mut conn, 30, false).await.unwrap(),
+            Some(365)
+        );
+        assert_eq!(
+            apply_audit_policy(&mut conn, 30, false).await.unwrap(),
+            None
+        );
+        assert_eq!(read(FLOOR).await, "30");
+        assert_eq!(read(WINDOW).await, "closed");
+        // Out-of-range values are clamped.
+        apply_audit_policy(&mut conn, -5, false).await.unwrap();
+        assert_eq!(read(FLOOR).await, "0");
+        apply_audit_policy(&mut conn, 10_000_000, false)
+            .await
+            .unwrap();
+        assert_eq!(read(FLOOR).await, "36500");
+        // Test routes: floor 0 and an open window.
+        assert_eq!(
+            apply_audit_policy(&mut conn, 365, true).await.unwrap(),
+            Some(36500)
+        );
+        assert_eq!(read(FLOOR).await, "0");
+        assert_eq!(read(WINDOW).await, "infinity");
+        // Back to production: the infinity window closes again.
+        apply_audit_policy(&mut conn, 365, false).await.unwrap();
+        assert_eq!(read(FLOOR).await, "365");
+        assert_eq!(read(WINDOW).await, "closed");
+        // An operator's finite window is left alone.
+        sqlx::query("UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply_audit_policy(&mut conn, 365, false).await.unwrap();
+        assert_ne!(read(WINDOW).await, "closed");
     }
 
     #[sqlx::test]
@@ -1131,6 +2437,12 @@ mod tests {
             "role can CREATE in schema",
             "role holds TRIGGER on rule_audit",
             "table-level UPDATE on audit_events with test routes off",
+            "role holds DELETE on rule_audit",
+            "role holds TRUNCATE on audit_events with test routes off",
+            "role holds table-level INSERT on rule_audit",
+            "role holds UPDATE on sequence",
+            "role can write audit_policy",
+            "role can write audit_restore_log",
         ] {
             assert!(has(&v, needle), "{needle}: {v:?}");
         }
@@ -1204,6 +2516,120 @@ mod tests {
         assert_eq!(v, ["role is a member of pg_write_server_files"]);
         exec(&pool, &format!("REVOKE pg_write_server_files FROM {q}")).await;
 
+        // New privileges on the audit tables, sequences and functions.
+        for (grant, revoke, needle) in [
+            (
+                "GRANT DELETE ON rule_audit TO {q}",
+                "REVOKE DELETE ON rule_audit FROM {q}",
+                "role holds DELETE on rule_audit",
+            ),
+            (
+                "GRANT INSERT ON audit_events TO {q}",
+                "REVOKE INSERT ON audit_events FROM {q}",
+                "role holds table-level INSERT on audit_events",
+            ),
+            (
+                "GRANT UPDATE ON SEQUENCE audit_events_id_seq TO {q}",
+                "REVOKE UPDATE ON SEQUENCE audit_events_id_seq FROM {q}",
+                "role holds UPDATE on sequence public.audit_events_id_seq",
+            ),
+            (
+                "GRANT UPDATE ON audit_policy TO {q}",
+                "REVOKE UPDATE ON audit_policy FROM {q}",
+                "role can write audit_policy",
+            ),
+            (
+                "GRANT TRUNCATE ON audit_restore_log TO {q}",
+                "REVOKE TRUNCATE ON audit_restore_log FROM {q}",
+                "role can write audit_restore_log",
+            ),
+            (
+                "ALTER FUNCTION audit_prune_events(bigint[]) SECURITY INVOKER",
+                "ALTER FUNCTION audit_prune_events(bigint[]) SECURITY DEFINER",
+                "audit function audit_prune_events is not SECURITY DEFINER",
+            ),
+            (
+                "ALTER FUNCTION audit_restore_load(text, jsonb, text) RESET search_path",
+                "ALTER FUNCTION audit_restore_load(text, jsonb, text) SET search_path = pg_catalog, pg_temp",
+                "audit function audit_restore_load does not pin search_path",
+            ),
+            (
+                "GRANT EXECUTE ON FUNCTION audit_restore_truncate(text[], text) TO PUBLIC",
+                "REVOKE EXECUTE ON FUNCTION audit_restore_truncate(text[], text) FROM PUBLIC",
+                "audit function audit_restore_truncate is executable by PUBLIC",
+            ),
+        ] {
+            exec(&pool, &grant.replace("{q}", &q)).await;
+            let v = boundary_violations(&app.pool, false).await.unwrap();
+            assert!(has(&v, needle), "{needle}: {v:?}");
+            exec(&pool, &revoke.replace("{q}", &q)).await;
+            let v = boundary_violations(&app.pool, false).await.unwrap();
+            assert!(v.is_empty(), "after {revoke}: {v:?}");
+        }
+        // Column-level INSERT of id / occurred_at.
+        exec(&pool, &format!("GRANT INSERT (id) ON rule_audit TO {q}")).await;
+        exec(
+            &pool,
+            &format!("GRANT INSERT (occurred_at) ON audit_events TO {q}"),
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(
+            has(&v, "role can INSERT the id column of rule_audit"),
+            "{v:?}"
+        );
+        assert!(
+            has(&v, "role can INSERT the occurred_at column of audit_events"),
+            "{v:?}"
+        );
+        exec(&pool, &format!("REVOKE INSERT (id) ON rule_audit FROM {q}")).await;
+        exec(
+            &pool,
+            &format!("REVOKE INSERT (occurred_at) ON audit_events FROM {q}"),
+        )
+        .await;
+
+        // A held-open restore window and a zero floor with test routes off.
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = 'infinity', min_retain_days = 0",
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "restore window is held open"), "{v:?}");
+        assert!(has(&v, "retention floor is 0"), "{v:?}");
+        let v = boundary_violations(&app.pool, true).await.unwrap();
+        assert!(v.is_empty(), "test routes on: {v:?}");
+        set_window_unchecked(&pool, "48 hours").await;
+        exec(&pool, "UPDATE audit_policy SET min_retain_days = 365").await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "open for more than 24 hours"), "{v:?}");
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = now() + interval '1 hour'",
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(v.is_empty(), "a short finite window is fine: {v:?}");
+        exec(
+            &pool,
+            "UPDATE audit_policy SET restore_allowed_until = NULL",
+        )
+        .await;
+
+        // A guard that is not revision 4 (047's body) is named; revision 4 is put back.
+        let migration = include_str!("../migrations/050_audit_owner_functions.sql");
+        let rev4 = &migration[migration
+            .find("CREATE OR REPLACE FUNCTION public.audit_tables_guard()")
+            .unwrap()..];
+        let rev3 = include_str!("../migrations/047_audit_retention_protocol_gate.sql");
+        exec(&pool, rev3).await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(has(&v, "is not revision 4"), "{v:?}");
+        exec(&pool, rev4).await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(v.is_empty(), "{v:?}");
+
         // Table-level UPDATE on the audit tables with test routes off.
         let test_app = app_role_pool(&pool, true).await;
         assert!(boundary_violations(&test_app.pool, true)
@@ -1216,6 +2642,61 @@ mod tests {
             "{v:?}"
         );
         test_app.cleanup(&pool).await;
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_missing_or_foreign_owned_audit_function_is_a_violation(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let other = temp_role(&pool, "fo_").await;
+        exec(
+            &pool,
+            &format!(
+                "ALTER FUNCTION audit_prune_rule_audit(bigint[]) OWNER TO \"{}\"",
+                other.name
+            ),
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(
+            has(
+                &v,
+                "audit function audit_prune_rule_audit is not owned by the owner of rule_audit"
+            ),
+            "{v:?}"
+        );
+        exec(
+            &pool,
+            "ALTER FUNCTION audit_prune_rule_audit(bigint[]) OWNER TO CURRENT_USER",
+        )
+        .await;
+        exec(&pool, "DROP FUNCTION audit_prune_rule_audit(bigint[])").await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(
+            has(
+                &v,
+                "audit function audit_prune_rule_audit(bigint[]) is missing"
+            ),
+            "{v:?}"
+        );
+        // A same-name overload with other argument types is not the function.
+        exec(
+            &pool,
+            "CREATE FUNCTION public.audit_prune_rule_audit(p text) RETURNS bigint \
+             LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp \
+             AS 'SELECT 0::bigint'",
+        )
+        .await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(
+            has(
+                &v,
+                "audit function audit_prune_rule_audit(bigint[]) is missing"
+            ),
+            "{v:?}"
+        );
+        exec(&pool, "DROP FUNCTION public.audit_prune_rule_audit(text)").await;
         app.cleanup(&pool).await;
     }
 
@@ -1372,7 +2853,7 @@ mod tests {
         )
         .await;
 
-        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap_err()
             .to_string();
@@ -1396,7 +2877,7 @@ mod tests {
         exec(&pool, "DROP FUNCTION public.pg_advisory_lock(bigint)").await;
         exec(&pool, "DROP TABLE planted_log").await;
         // With the plants gone the owner step succeeds.
-        migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap();
         app.cleanup(&pool).await;
@@ -1461,7 +2942,7 @@ mod tests {
         )
         .await;
         let before = migration_rows(&pool).await;
-        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap_err()
             .to_string();
@@ -1520,7 +3001,7 @@ mod tests {
             "{err}"
         );
         drop(conn);
-        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap_err();
         assert!(!is_transient(&err));
@@ -1643,7 +3124,7 @@ mod tests {
             .to_string();
         drop(conn);
         assert!(err.contains("can still CREATE"), "{err}");
-        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap_err()
             .to_string();
@@ -1815,7 +3296,7 @@ mod tests {
         let err = migrate_with(
             (*pool.connect_options()).clone(),
             "stig_no_such_role_x",
-            false,
+            &step(false),
         )
         .await
         .unwrap_err();
@@ -1828,7 +3309,7 @@ mod tests {
             "CREATE FUNCTION public.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1'",
         )
         .await;
-        let err = migrate_with((*pool.connect_options()).clone(), &app.name, false)
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
             .await
             .unwrap_err();
         assert!(!is_transient(&err), "{err:#}");
@@ -1860,7 +3341,7 @@ mod tests {
         for _ in 0..8 {
             let opts = (*pool.connect_options()).clone();
             let name = app.name.clone();
-            set.spawn(async move { migrate_with(opts, &name, true).await });
+            set.spawn(async move { migrate_with(opts, &name, &step(true)).await });
         }
         while let Some(r) = set.join_next().await {
             r.unwrap().unwrap();
@@ -1869,5 +3350,317 @@ mod tests {
             .await
             .unwrap());
         app.cleanup(&pool).await;
+    }
+
+    // ── #110: audit of the owner step and the boundary check ──
+
+    #[test]
+    fn migrate_detail_has_identifiers_and_counts_only() {
+        let d = migrate_detail("migrate_command", &[50], Some(50), false, 365, None);
+        assert_eq!(d["source"], "migrate_command");
+        assert_eq!(d["appliedVersions"], serde_json::json!([50]));
+        assert_eq!(d["schemaVersion"], 50);
+        assert_eq!(d["testRoutes"], false);
+        assert_eq!(d["retentionFloorDays"], 365);
+        assert!(d.get("retentionFloorPrevious").is_none());
+        let d = migrate_detail("server_startup", &[], Some(50), true, 0, Some(365));
+        assert_eq!(d["retentionFloorPrevious"], 365);
+        assert_eq!(d["appliedVersions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn migrate_failure_detail_never_carries_error_text() {
+        let d = migrate_failure_detail("migrate_command", "grants", true, Some("08006"));
+        assert_eq!(d["stage"], "grants");
+        assert_eq!(d["errorClass"], "transient");
+        assert_eq!(d["sqlstate"], "08006");
+        let keys: Vec<&String> = d.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        let d = migrate_failure_detail("migrate_command", "connect", false, None);
+        assert_eq!(d["errorClass"], "permanent");
+        assert!(d.get("sqlstate").is_none());
+    }
+
+    #[test]
+    fn boundary_detail_caps_the_list_and_each_entry() {
+        let many: Vec<String> = (0..30).map(|i| format!("v{i}")).collect();
+        let d = boundary_detail("violations", &many, ("testRoutes", true));
+        assert_eq!(d["violations"].as_array().unwrap().len(), 20);
+        assert_eq!(d["count"], 30);
+        assert_eq!(d["testRoutes"], true);
+        let long = vec!["x".repeat(500)];
+        let d = boundary_detail("violations", &long, ("production", true));
+        assert_eq!(d["violations"][0].as_str().unwrap().len(), 200);
+        assert_eq!(d["production"], true);
+    }
+
+    /// `(outcome, detail)` of the system events with this action, oldest first.
+    async fn events(pool: &PgPool, action: &str) -> Vec<(String, serde_json::Value)> {
+        sqlx::query_as(
+            "SELECT outcome, detail FROM audit_events \
+             WHERE action = $1 AND user_role = 'system' AND user_id IS NULL ORDER BY id",
+        )
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_owner_step_records_db_migrate_ok(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
+            .await
+            .unwrap();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].0, "ok");
+        assert_eq!(ev[0].1["source"], "migrate_command");
+        // The harness had already applied every migration, so this run applied none.
+        assert_eq!(ev[0].1["appliedVersions"], serde_json::json!([]));
+        assert_eq!(ev[0].1["testRoutes"], false);
+        assert_eq!(ev[0].1["retentionFloorDays"], 365);
+        assert!(ev[0].1["schemaVersion"].as_i64().unwrap() >= 50);
+        // A rerun is idempotent and writes another record.
+        migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
+            .await
+            .unwrap();
+        assert_eq!(events(&pool, "db.migrate").await.len(), 2);
+        // Lowering the floor is recorded with the previous value.
+        let lower = OwnerStep {
+            retention_floor_days: 30,
+            ..step(false)
+        };
+        migrate_with((*pool.connect_options()).clone(), &app.name, &lower)
+            .await
+            .unwrap();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev[2].1["retentionFloorDays"], 30);
+        assert_eq!(ev[2].1["retentionFloorPrevious"], 365);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_owner_step_records_db_migrate_failure(pool: PgPool) {
+        // Missing application role: transient.
+        migrate_with(
+            (*pool.connect_options()).clone(),
+            "stig_no_such_role_x",
+            &step(false),
+        )
+        .await
+        .unwrap_err();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].0, "failure");
+        assert_eq!(ev[0].1["stage"], "prepare_schema");
+        assert_eq!(ev[0].1["errorClass"], "transient");
+
+        // A planted look-alike object: permanent.
+        let app = app_role_pool(&pool, false).await;
+        exec(&pool, "GRANT CREATE ON SCHEMA public TO PUBLIC").await;
+        exec(
+            &app.pool,
+            "CREATE FUNCTION public.quote_ident(text) RETURNS text LANGUAGE sql AS 'SELECT $1'",
+        )
+        .await;
+        migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
+            .await
+            .unwrap_err();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert_eq!(ev[1].1["stage"], "prepare_schema");
+        assert_eq!(ev[1].1["errorClass"], "permanent");
+        // No error text, no object names.
+        assert!(!ev[1].1.to_string().contains("quote_ident"));
+        exec(&pool, "DROP FUNCTION public.quote_ident(text)").await;
+        app.cleanup(&pool).await;
+    }
+
+    async fn closed_pool(pool: &PgPool) -> PgPool {
+        let p = PgPoolOptions::new()
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        p.close().await;
+        p
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_audit_write_does_not_mask_the_migrate_error(pool: PgPool) {
+        let closed = closed_pool(&pool).await;
+        // Best effort and infallible: returns (after logging) instead of failing.
+        record_migrate_failure(
+            &closed,
+            "grants",
+            &anyhow::anyhow!("boom"),
+            "migrate_command",
+        )
+        .await;
+        assert!(record_migrate_event(&closed, "ok", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(events(&pool, "db.migrate").await.is_empty());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn boundary_degraded_is_recorded_outside_production(pool: PgPool) {
+        let v = boundary_violations(&pool, false).await.unwrap();
+        assert!(has(&v, "role is a superuser"));
+        enforce_boundary(&pool, false, true, &v).await.unwrap();
+        let ev = events(&pool, "db.boundary_degraded").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].0, "partial");
+        assert_eq!(ev[0].1["reason"], "violations");
+        assert_eq!(ev[0].1["testRoutes"], true);
+        assert!(ev[0].1["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "role is a superuser"));
+        record_owner_url_on_server(&pool, false).await;
+        let ev = events(&pool, "db.boundary_degraded").await;
+        assert_eq!(ev[1].1["reason"], "owner_url_on_server");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn boundary_refused_is_recorded_in_production(pool: PgPool) {
+        let v = boundary_violations(&pool, false).await.unwrap();
+        let err = enforce_boundary(&pool, true, false, &v).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to start"), "{err:#}");
+        let ev = events(&pool, "db.boundary_refused").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].0, "rejected");
+        assert_eq!(ev[0].1["reason"], "violations");
+        assert_eq!(ev[0].1["production"], true);
+        record_boundary_refusal(&pool, "migrations_unverified", true).await;
+        let ev = events(&pool, "db.boundary_refused").await;
+        assert_eq!(ev[1].1["reason"], "migrations_unverified");
+        assert_eq!(ev[1].1["count"], 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_clean_boundary_writes_no_event(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let v = boundary_violations(&app.pool, false).await.unwrap();
+        assert!(v.is_empty(), "{v:?}");
+        enforce_boundary(&app.pool, true, false, &v).await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE action LIKE 'db.boundary_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_boundary_refusal_still_refuses_when_the_write_fails(pool: PgPool) {
+        let v = boundary_violations(&pool, false).await.unwrap();
+        let closed = closed_pool(&pool).await;
+        let err = enforce_boundary(&closed, true, false, &v)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to start"), "{err:#}");
+        // And a degraded start still starts.
+        enforce_boundary(&closed, false, false, &v).await.unwrap();
+    }
+
+    /// A trigger that blocks every `db.migrate` audit row, as a planted fault.
+    async fn block_migrate_events(pool: &PgPool) {
+        exec(
+            pool,
+            "CREATE FUNCTION public.t_block_migrate() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'blocked'; END $$",
+        )
+        .await;
+        exec(
+            pool,
+            "CREATE TRIGGER t_block_migrate BEFORE INSERT ON audit_events \
+             FOR EACH ROW WHEN (NEW.action = 'db.migrate') EXECUTE FUNCTION public.t_block_migrate()",
+        )
+        .await;
+    }
+
+    async fn unblock_migrate_events(pool: &PgPool) {
+        exec(pool, "DROP TRIGGER t_block_migrate ON audit_events").await;
+        exec(pool, "DROP FUNCTION public.t_block_migrate()").await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failing_db_migrate_ok_write_fails_the_step_and_a_rerun_succeeds(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        block_migrate_events(&pool).await;
+        let err = migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not be written"),
+            "{err:#}"
+        );
+        assert!(events(&pool, "db.migrate").await.is_empty());
+        unblock_migrate_events(&pool).await;
+        migrate_with((*pool.connect_options()).clone(), &app.name, &step(false))
+            .await
+            .unwrap();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].0, "ok");
+        assert_eq!(ev[0].1["appliedVersions"], serde_json::json!([]));
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_failed_failure_record_returns_the_original_step_error(pool: PgPool) {
+        // The step fails (no such role) and the failure record fails too.
+        block_migrate_events(&pool).await;
+        let err = migrate_with(
+            (*pool.connect_options()).clone(),
+            "stig_no_such_role_x",
+            &step(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.chain().any(|c| c.is::<AppRoleMissing>()), "{err:#}");
+        assert!(!format!("{err:#}").contains("blocked"), "{err:#}");
+        assert!(is_transient(&err));
+        unblock_migrate_events(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn unverified_migrations_record_a_refusal_and_still_refuse(pool: PgPool) {
+        exec(&pool, "DELETE FROM _sqlx_migrations WHERE version = 49").await;
+        let err = verify_or_record_refusal(&pool, true).await.unwrap_err();
+        assert!(format!("{err:#}").contains("pending migrations"), "{err:#}");
+        let ev = events(&pool, "db.boundary_refused").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].1["reason"], "migrations_unverified");
+        assert_eq!(ev[0].1["production"], true);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_self_migrate_records_db_migrate(pool: PgPool) {
+        let step = OwnerStep {
+            source: "server_self_migrate",
+            ..step(false)
+        };
+        finish_self_migrate(&pool, &step, &[]).await.unwrap();
+        let ev = events(&pool, "db.migrate").await;
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].1["source"], "server_self_migrate");
+        // `before` was empty, so every applied migration counts as new.
+        assert!(ev[0].1["appliedVersions"].as_array().unwrap().len() > 10);
     }
 }

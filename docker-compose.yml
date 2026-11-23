@@ -131,6 +131,10 @@ services:
       #                             The flag persists; with routes off the backend
       #                             refuses to start until ALTER DATABASE <db>
       #                             RESET stig.audit_allow_test_mode.
+      #                             The owner step also sets the audit retention
+      #                             floor to 0 and leaves the audit restore window
+      #                             open (audit_policy), so the e2e retention and
+      #                             restore specs keep working.
       ALLOW_TEST_AUTH_HEADER: ${ALLOW_TEST_AUTH_HEADER:-true}
       STIG_ENABLE_TEST_ROUTES: ${STIG_ENABLE_TEST_ROUTES:-true}
       CARGO_TARGET_DIR: /target

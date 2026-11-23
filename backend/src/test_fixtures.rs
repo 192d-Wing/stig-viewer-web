@@ -169,6 +169,24 @@ pub async fn app_role_pool(admin: &PgPool, test_routes: bool) -> AppRole {
     AppRole { pool, name, role }
 }
 
+/// Set the database retention floor (`audit_policy.min_retain_days`). Plain
+/// UPDATE: call it on the superuser/owner pool, the application role cannot.
+pub async fn set_audit_retention_floor(pool: &PgPool, days: i32) {
+    sqlx::query("UPDATE audit_policy SET min_retain_days = $1")
+        .bind(days)
+        .execute(pool)
+        .await
+        .expect("set audit retention floor");
+}
+
+/// Open the restore window for good, as the owner step does with test routes.
+pub async fn open_audit_restore_window(pool: &PgPool) {
+    sqlx::query("UPDATE audit_policy SET restore_allowed_until = 'infinity'")
+        .execute(pool)
+        .await
+        .expect("open audit restore window");
+}
+
 pub async fn seed_user(pool: &PgPool, id: &str) {
     sqlx::query("INSERT INTO users (id, display_name, email, role, sub, provider) VALUES ($1, $1, '', 'author', $1, 'test')")
         .bind(id)
