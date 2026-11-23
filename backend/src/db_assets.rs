@@ -158,25 +158,30 @@ pub async fn get_asset_on(conn: &mut sqlx::PgConnection, id: &str) -> Result<Opt
     Ok(Some(row))
 }
 
-/// Replace the asset's tag set. Inserts/deletes in a single transaction.
-pub async fn replace_tags(pool: &PgPool, asset_id: &str, tags: &[String]) -> Result<()> {
-    let mut tx = pool.begin().await?;
+// The mutators below run on the caller's connection (a bounded transaction
+// opened by the handler), so the change commits with its audit event.
+
+/// Replace the asset's tag set on the caller's transaction.
+pub async fn replace_tags_on(
+    conn: &mut sqlx::PgConnection,
+    asset_id: &str,
+    tags: &[String],
+) -> Result<()> {
     sqlx::query("DELETE FROM asset_tags WHERE asset_id = $1")
         .bind(asset_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     for tag in tags {
         sqlx::query("INSERT INTO asset_tags (asset_id, tag) VALUES ($1, $2)")
             .bind(asset_id)
             .bind(tag)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
-pub async fn insert_asset(pool: &PgPool, asset: &AssetRow) -> Result<()> {
+pub async fn insert_asset_on(conn: &mut sqlx::PgConnection, asset: &AssetRow) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO assets
@@ -190,13 +195,13 @@ pub async fn insert_asset(pool: &PgPool, asset: &AssetRow) -> Result<()> {
     .bind(&asset.description)
     .bind(&asset.classification)
     .bind(&asset.owner_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
-pub async fn update_asset(
-    pool: &PgPool,
+pub async fn update_asset_on(
+    conn: &mut sqlx::PgConnection,
     id: &str,
     name: &str,
     hostname: &str,
@@ -216,7 +221,7 @@ pub async fn update_asset(
     .bind(description)
     .bind(classification)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -225,7 +230,7 @@ pub async fn update_asset(
 /// read path in `get_asset` / `list_assets` defensively truncates to
 /// `MAX_RUNBOOK_BYTES`, so an oversize write simply gets clipped on
 /// the next read. Stamps `updated_at` so the list view re-sorts.
-pub async fn set_runbook(pool: &PgPool, id: &str, runbook: &str) -> Result<()> {
+pub async fn set_runbook_on(conn: &mut sqlx::PgConnection, id: &str, runbook: &str) -> Result<()> {
     sqlx::query(
         "UPDATE assets \
          SET runbook = $1, updated_at = NOW() \
@@ -233,7 +238,7 @@ pub async fn set_runbook(pool: &PgPool, id: &str, runbook: &str) -> Result<()> {
     )
     .bind(runbook)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -255,7 +260,11 @@ pub async fn set_requires_approval(pool: &PgPool, id: &str, requires_approval: b
 /// Update the per-asset scheduled email cadence. Caller is responsible
 /// for validating the value against the allowlist (see
 /// `api::assets::VALID_EMAIL_CADENCES`).
-pub async fn set_email_cadence(pool: &PgPool, id: &str, cadence: &str) -> Result<()> {
+pub async fn set_email_cadence_on(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    cadence: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE assets \
          SET email_cadence = $1, updated_at = NOW() \
@@ -263,7 +272,7 @@ pub async fn set_email_cadence(pool: &PgPool, id: &str, cadence: &str) -> Result
     )
     .bind(cadence)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -280,10 +289,10 @@ pub async fn stamp_email_last_sent_at(pool: &PgPool, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn delete_asset(pool: &PgPool, id: &str) -> Result<()> {
+pub async fn delete_asset_on(conn: &mut sqlx::PgConnection, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM assets WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }

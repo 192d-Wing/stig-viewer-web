@@ -10,6 +10,7 @@ pub mod attachments;
 pub mod audit;
 #[cfg(test)]
 pub(crate) mod audit_capture;
+pub(crate) mod audit_tx;
 pub mod auth;
 pub mod authz_audit;
 pub mod backup;

@@ -23,9 +23,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::db_assets::AssetRow;
+use crate::db_audit;
 use crate::AppState;
 
 const VALID_EFFECTS: &[&str] = &["allow", "deny"];
@@ -244,11 +248,54 @@ fn nullify_empty(opt: Option<String>) -> Option<String> {
     })
 }
 
+/// Audit detail for a policy: ids, enums and the match predicates (through
+/// `audit_safe_id`); never the policy name.
+fn policy_detail(p: &PolicyRow) -> Value {
+    let safe = |v: &Option<String>| v.as_deref().map(db_audit::audit_safe_id);
+    json!({
+        "policyId": p.id,
+        "effect": p.effect,
+        "level": p.level,
+        "enabled": p.enabled,
+        "roleMatch": safe(&p.role_match),
+        "classificationMatch": safe(&p.classification_match),
+        "tagMatch": safe(&p.tag_match),
+    })
+}
+
+/// Names (never values) of the fields an update replaced.
+fn changed_fields(before: &PolicyRow, after: &PolicyRow) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if before.name != after.name {
+        changed.push("name");
+    }
+    if before.effect != after.effect {
+        changed.push("effect");
+    }
+    if before.level != after.level {
+        changed.push("level");
+    }
+    if before.role_match != after.role_match {
+        changed.push("roleMatch");
+    }
+    if before.classification_match != after.classification_match {
+        changed.push("classificationMatch");
+    }
+    if before.tag_match != after.tag_match {
+        changed.push("tagMatch");
+    }
+    if before.enabled != after.enabled {
+        changed.push("enabled");
+    }
+    changed
+}
+
 /// POST /api/admin/policies — create a new policy. Admin only.
 /// 400 on invalid effect/level. 409 on duplicate name.
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<PolicyRow>), StatusCode> {
     ensure_admin(&user)?;
@@ -269,6 +316,10 @@ pub async fn create_handler(
     let tag_match = nullify_empty(req.tag_match);
 
     let id = uuid::Uuid::new_v4().to_string();
+    // The policy and its `abac_policy.create` row commit together.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
     let row = sqlx::query_as::<_, PolicyRow>(
         r#"
         INSERT INTO abac_policies
@@ -289,7 +340,7 @@ pub async fn create_handler(
     .bind(&tag_match)
     .bind(req.enabled)
     .bind(&user.id)
-    .fetch_one(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await;
 
     let row = match row {
@@ -299,6 +350,11 @@ pub async fn create_handler(
         }
         Err(e) => return Err(map_sqlx(e)),
     };
+    let ev = audit_tx::ok_event(&user, &ctx, "abac_policy.create", policy_detail(&row));
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -308,24 +364,31 @@ pub async fn create_handler(
 pub async fn update_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
     Json(req): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyRow>, StatusCode> {
     ensure_admin(&user)?;
 
+    // The update and its `abac_policy.update` row commit together; the
+    // existing row is read under a lock so `changed` names what was replaced.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
+        .await
+        .map_err(audit_tx::failed)?;
     let existing = sqlx::query_as::<_, PolicyRow>(
         r#"
         SELECT id, name, effect, level,
                role_match, classification_match, tag_match,
                enabled, created_by, created_at
-          FROM abac_policies WHERE id = $1
+          FROM abac_policies WHERE id = $1 FOR NO KEY UPDATE
         "#,
     )
     .bind(&id)
-    .fetch_optional(state.pool.as_ref())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_sqlx)?
     .ok_or(StatusCode::NOT_FOUND)?;
+    let before = existing.clone();
 
     let name = match req.name {
         Some(n) => {
@@ -389,7 +452,7 @@ pub async fn update_handler(
     .bind(&tag_match)
     .bind(enabled)
     .bind(&id)
-    .fetch_one(state.pool.as_ref())
+    .fetch_one(&mut *tx)
     .await;
     let row = match row {
         Ok(r) => r,
@@ -398,6 +461,15 @@ pub async fn update_handler(
         }
         Err(e) => return Err(map_sqlx(e)),
     };
+    let mut detail = policy_detail(&row);
+    if let Some(obj) = detail.as_object_mut() {
+        obj.insert("changed".into(), json!(changed_fields(&before, &row)));
+    }
+    let ev = audit_tx::ok_event(&user, &ctx, "abac_policy.update", detail);
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok(Json(row))
 }
 
@@ -405,16 +477,237 @@ pub async fn update_handler(
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     ensure_admin(&user)?;
-    let res = sqlx::query("DELETE FROM abac_policies WHERE id = $1")
-        .bind(&id)
-        .execute(state.pool.as_ref())
+    // The delete and its `abac_policy.delete` row commit together.
+    let mut tx = crate::db::begin_bounded(state.pool.as_ref())
         .await
-        .map_err(map_sqlx)?;
-    if res.rows_affected() == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
+        .map_err(audit_tx::failed)?;
+    let row = sqlx::query_as::<_, PolicyRow>(
+        r#"
+        DELETE FROM abac_policies WHERE id = $1
+        RETURNING id, name, effect, level,
+                  role_match, classification_match, tag_match,
+                  enabled, created_by, created_at
+        "#,
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let ev = audit_tx::ok_event(&user, &ctx, "abac_policy.delete", policy_detail(&row));
+    audit_tx::record(&mut tx, &ev)
+        .await
+        .map_err(audit_tx::failed)?;
+    tx.commit().await.map_err(|e| audit_tx::failed(e.into()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_user};
+    use sqlx::PgPool;
+
+    const NAME: &str = "deny-contractors-secret";
+
+    fn admin() -> Extension<AuthUser> {
+        Extension(auth("root", "admin"))
+    }
+
+    async fn create(pool: &PgPool) -> Result<PolicyRow, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        create_handler(
+            State(state),
+            admin(),
+            Extension(ctx()),
+            Json(CreatePolicyRequest {
+                name: NAME.into(),
+                effect: "deny".into(),
+                level: "write".into(),
+                role_match: Some("viewer".into()),
+                classification_match: Some("secret".into()),
+                tag_match: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .map(|(_, Json(p))| p)
+    }
+
+    async fn update(pool: &PgPool, id: &str, enabled: bool) -> Result<PolicyRow, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        update_handler(
+            State(state),
+            admin(),
+            Extension(ctx()),
+            Path(id.into()),
+            Json(UpdatePolicyRequest {
+                name: None,
+                effect: None,
+                level: None,
+                role_match: None,
+                classification_match: None,
+                tag_match: None,
+                enabled: Some(enabled),
+            }),
+        )
+        .await
+        .map(|Json(p)| p)
+    }
+
+    async fn delete(pool: &PgPool, id: &str) -> Result<StatusCode, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        delete_handler(State(state), admin(), Extension(ctx()), Path(id.into())).await
+    }
+
+    async fn policies(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM abac_policies")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn abac_policy_changes_are_recorded_without_the_policy_name(pool: PgPool) {
+        seed_user(&pool, "root").await;
+        let p = create(&pool).await.unwrap();
+        update(&pool, &p.id, false).await.unwrap();
+        assert_eq!(delete(&pool, &p.id).await, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(delete(&pool, &p.id).await, Err(StatusCode::NOT_FOUND));
+
+        let keys = [
+            "classificationMatch",
+            "effect",
+            "enabled",
+            "level",
+            "policyId",
+            "roleMatch",
+            "tagMatch",
+        ];
+        let created = audit_rows(&pool, "abac_policy.create").await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].outcome, "ok");
+        assert_eq!(created[0].user_id.as_deref(), Some("root"));
+        assert_eq!(created[0].detail_keys(), keys);
+        assert_eq!(created[0].detail["policyId"], p.id.as_str());
+        assert_eq!(created[0].detail["effect"], "deny");
+        assert_eq!(created[0].detail["roleMatch"], "viewer");
+        assert!(created[0].detail["tagMatch"].is_null());
+        assert_eq!(created[0].request_id.as_deref(), Some("test-request"));
+
+        let updated = audit_rows(&pool, "abac_policy.update").await;
+        assert_eq!(updated.len(), 1);
+        let mut with_changed = keys.to_vec();
+        with_changed.insert(0, "changed");
+        assert_eq!(updated[0].detail_keys(), with_changed);
+        assert_eq!(updated[0].detail["changed"], serde_json::json!(["enabled"]));
+        assert_eq!(updated[0].detail["enabled"], false);
+
+        let deleted = audit_rows(&pool, "abac_policy.delete").await;
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].detail_keys(), keys);
+
+        let text: String = sqlx::query_scalar(
+            "SELECT string_agg(detail::text, ' ') FROM audit_events WHERE action LIKE 'abac_policy.%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!text.contains(NAME), "{text}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn abac_policy_changes_fail_closed_when_the_audit_row_cannot_be_written(pool: PgPool) {
+        seed_user(&pool, "root").await;
+        fail_audit_inserts(
+            &pool,
+            &[
+                "abac_policy.create",
+                "abac_policy.update",
+                "abac_policy.delete",
+            ],
+        )
+        .await;
+        assert_eq!(
+            create(&pool).await.err(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(policies(&pool).await, 0);
+
+        crate::test_fixtures::seed_policy(
+            &pool, "p1", "deny", "write", None, None, None, true, "root",
+        )
+        .await;
+        assert_eq!(
+            update(&pool, "p1", false).await.err(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM abac_policies WHERE id = 'p1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(enabled);
+        assert_eq!(
+            delete(&pool, "p1").await,
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(policies(&pool).await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn refused_policy_requests_write_no_audit_row(pool: PgPool) {
+        seed_user(&pool, "root").await;
+        let (state, _dir) = app_state(pool.clone());
+        let denied = create_handler(
+            State(state.clone()),
+            Extension(auth("u1", "author")),
+            Extension(ctx()),
+            Json(CreatePolicyRequest {
+                name: "n".into(),
+                effect: "deny".into(),
+                level: "write".into(),
+                role_match: None,
+                classification_match: None,
+                tag_match: None,
+                enabled: true,
+            }),
+        )
+        .await;
+        assert_eq!(denied.err(), Some(StatusCode::FORBIDDEN));
+        let invalid = create_handler(
+            State(state),
+            admin(),
+            Extension(ctx()),
+            Json(CreatePolicyRequest {
+                name: "n".into(),
+                effect: "maybe".into(),
+                level: "write".into(),
+                role_match: None,
+                classification_match: None,
+                tag_match: None,
+                enabled: true,
+            }),
+        )
+        .await;
+        assert_eq!(invalid.err(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            update(&pool, "nope", true).await.err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(delete(&pool, "nope").await, Err(StatusCode::NOT_FOUND));
+        for a in [
+            "abac_policy.create",
+            "abac_policy.update",
+            "abac_policy.delete",
+        ] {
+            assert!(audit_rows(&pool, a).await.is_empty(), "{a}");
+        }
+    }
 }

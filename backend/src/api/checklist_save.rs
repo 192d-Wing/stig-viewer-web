@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::api::asset_acl;
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
 use crate::api::checklists::{is_valid_stig_id, load_stig_json, take_rules};
 use crate::api::request_ctx::RequestCtx;
@@ -175,6 +176,12 @@ pub(crate) enum SaveOrigin<'a> {
 }
 
 impl SaveOrigin<'_> {
+    /// Whether the `checklist.create` row commits with the checklist (a set
+    /// save) rather than after it, fail open (the direct endpoint).
+    fn audit_in_tx(self) -> bool {
+        matches!(self, SaveOrigin::Set { .. })
+    }
+
     /// Adds the origin tags to an event detail object.
     fn tag(self, mut detail: serde_json::Value) -> serde_json::Value {
         if let (SaveOrigin::Set { set_id }, Some(obj)) = (self, detail.as_object_mut()) {
@@ -272,24 +279,28 @@ pub(crate) async fn save_to_asset(
     let (checklist, created) = find_or_create(&mut tx, &asset.id, &req.stig_id, &user.id)
         .await
         .map_err(map_db)?;
+    // Separate event so every checklist creation is searchable by action,
+    // whichever endpoint made it (also noted as `created` in the save event).
+    let create_event = NewAuditEvent {
+        user_id: &user.id,
+        ctx: Some(ctx),
+        action: "checklist.create",
+        outcome: "ok",
+        asset_id: Some(&asset.id),
+        checklist_id: Some(&checklist.id),
+        stig_id: Some(&req.stig_id),
+        detail: origin.tag(json!({ "via": "save" })),
+    };
+    // A set save commits the create row with the checklist (a failed row rolls
+    // the checklist back); the direct endpoint stays fail open.
+    if created && origin.audit_in_tx() {
+        audit_tx::record(&mut tx, &create_event)
+            .await
+            .map_err(map_db)?;
+    }
     tx.commit().await.map_err(|e| map_db(e.into()))?;
-    if created {
-        // Separate event so every checklist creation is searchable by action,
-        // whichever endpoint made it (also noted as `created` in the save event).
-        db_audit::record_or_log(
-            pool,
-            NewAuditEvent {
-                user_id: &user.id,
-                ctx: Some(ctx),
-                action: "checklist.create",
-                outcome: "ok",
-                asset_id: Some(&asset.id),
-                checklist_id: Some(&checklist.id),
-                stig_id: Some(&req.stig_id),
-                detail: origin.tag(json!({ "via": "save" })),
-            },
-        )
-        .await;
+    if created && !origin.audit_in_tx() {
+        db_audit::record_or_log(pool, create_event).await;
     }
 
     let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
@@ -1404,6 +1415,41 @@ mod tests {
             call(&state, "other", "author", STIG_ID, vec![]).await.err(),
             Some(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_set_origin_save_fails_at_checklist_creation_when_the_create_row_cannot_be_written(
+        pool: PgPool,
+    ) {
+        base(&pool, false).await;
+        let (state, _dir) = app_state(pool.clone());
+        crate::test_fixtures::fail_audit_inserts(&pool, &["checklist.create"]).await;
+        let asset = db_assets::get_asset(&pool, "a1").await.unwrap().unwrap();
+        let req = SaveRequest {
+            stig_id: STIG_ID.into(),
+            rules: vec![rule(RULES[0], "open", "", "")],
+        };
+        let res = save_to_asset(
+            &state,
+            &auth("owner", "author"),
+            &crate::test_fixtures::ctx(),
+            &asset,
+            &req,
+            SaveOrigin::Set { set_id: "s1" },
+        )
+        .await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            0
+        );
+        // The direct endpoint stays fail open for the same event.
+        let Json(out) = call(&state, "owner", "author", STIG_ID, req.rules)
+            .await
+            .unwrap();
+        assert!(out.created);
     }
 
     #[sqlx::test]

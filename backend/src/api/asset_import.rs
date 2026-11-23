@@ -6,8 +6,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::api::assets::{normalize_tags, MAX_TAG_LEN};
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
+use crate::api::request_ctx::RequestCtx;
 use crate::AppState;
+
+/// Most created asset ids listed in the `asset.import` audit row.
+const MAX_AUDITED_IDS: usize = 200;
 
 /// Allowed asset classifications. Mirrors the frontend Select options.
 const VALID_CLASSIFICATIONS: &[&str] = &["unclassified", "cui", "secret", "top-secret"];
@@ -61,6 +66,7 @@ struct ParsedRow {
 pub async fn import_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
+    Extension(ctx): Extension<RequestCtx>,
     Query(query): Query<ImportQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<ImportResponse>, StatusCode> {
@@ -276,6 +282,7 @@ pub async fn import_handler(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         let now = chrono::Utc::now();
+        let mut created_ids: Vec<String> = Vec::with_capacity(to_insert.len());
         for row in &to_insert {
             let id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
@@ -313,7 +320,26 @@ pub async fn import_handler(
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
             }
+            created_ids.push(id);
         }
+        // One summary row in the import's transaction, so a bulk import is not
+        // an unaudited way to create assets; a failed row rolls the batch back.
+        // The import has no row cap (only the request body limit), so the id
+        // list is capped; `assetIdsTruncated` says when it was.
+        let listed = &created_ids[..created_ids.len().min(MAX_AUDITED_IDS)];
+        let ev = audit_tx::ok_event(
+            &user,
+            &ctx,
+            "asset.import",
+            serde_json::json!({
+                "created": to_insert.len(),
+                "assetIds": listed,
+                "assetIdsTruncated": created_ids.len() > listed.len(),
+            }),
+        );
+        audit_tx::record(&mut tx, &ev)
+            .await
+            .map_err(audit_tx::failed)?;
         tx.commit().await.map_err(|e| {
             tracing::error!("import: commit failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -327,4 +353,129 @@ pub async fn import_handler(
         created_count,
         skipped_count,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{app_state, audit_rows, auth, ctx, fail_audit_inserts, seed_user};
+    use axum::extract::FromRequest;
+    use sqlx::PgPool;
+
+    const CSV: &str = "name,hostname,classification,tags\nweb1,h1,unclassified,a;b\nweb2,h2,cui,\n";
+
+    async fn run(pool: &PgPool, dry_run: bool) -> Result<Json<ImportResponse>, StatusCode> {
+        run_csv(pool, dry_run, CSV).await
+    }
+
+    async fn run_csv(
+        pool: &PgPool,
+        dry_run: bool,
+        csv: &str,
+    ) -> Result<Json<ImportResponse>, StatusCode> {
+        let (state, _dir) = app_state(pool.clone());
+        let payload = format!(
+            "--XB\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.csv\"\r\n\
+             Content-Type: text/csv\r\n\r\n{csv}\r\n--XB--\r\n"
+        );
+        let req = axum::http::Request::builder()
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=XB",
+            )
+            .body(axum::body::Body::from(payload))
+            .unwrap();
+        let multipart = Multipart::from_request(req, &()).await.unwrap();
+        import_handler(
+            State(state),
+            Extension(auth("owner", "author")),
+            Extension(ctx()),
+            Query(ImportQuery { dry_run }),
+            multipart,
+        )
+        .await
+    }
+
+    async fn assets(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn asset_import_records_one_summary_row_and_none_on_a_dry_run(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        let Json(dry) = run(&pool, true).await.unwrap();
+        assert_eq!(dry.created_count, 0);
+        assert!(audit_rows(&pool, "asset.import").await.is_empty());
+
+        let Json(done) = run(&pool, false).await.unwrap();
+        assert_eq!(done.created_count, 2);
+        let rows = audit_rows(&pool, "asset.import").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].user_id.as_deref(), Some("owner"));
+        assert_eq!(
+            rows[0].detail_keys(),
+            ["assetIds", "assetIdsTruncated", "created"]
+        );
+        assert_eq!(rows[0].detail["created"], 2);
+        assert_eq!(rows[0].detail["assetIdsTruncated"], false);
+        let mut listed: Vec<String> = rows[0].detail["assetIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let mut stored: Vec<String> = sqlx::query_scalar("SELECT id FROM assets")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        listed.sort();
+        stored.sort();
+        assert_eq!(listed, stored);
+        assert_eq!(rows[0].request_id.as_deref(), Some("test-request"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn asset_import_fails_closed_when_the_audit_row_cannot_be_written(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        fail_audit_inserts(&pool, &["asset.import"]).await;
+        assert_eq!(
+            run(&pool, false).await.err(),
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(assets(&pool).await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_refused_or_empty_import_writes_no_audit_row(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        // Everything is a duplicate of an existing asset: nothing is created.
+        let _ = run(&pool, false).await.unwrap();
+        let Json(again) = run(&pool, false).await.unwrap();
+        assert_eq!(again.created_count, 0);
+        assert_eq!(audit_rows(&pool, "asset.import").await.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_large_import_lists_at_most_200_asset_ids(pool: PgPool) {
+        seed_user(&pool, "owner").await;
+        let mut csv = String::from("name\n");
+        for i in 0..201 {
+            csv.push_str(&format!("host{i}\n"));
+        }
+        let Json(done) = run_csv(&pool, false, &csv).await.unwrap();
+        assert_eq!(done.created_count, 201);
+        let rows = audit_rows(&pool, "asset.import").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail["created"], 201);
+        assert_eq!(rows[0].detail["assetIds"].as_array().unwrap().len(), 200);
+        assert_eq!(rows[0].detail["assetIdsTruncated"], true);
+    }
 }
