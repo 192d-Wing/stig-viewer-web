@@ -35,6 +35,62 @@ async function seedAsset(request, name = "set-host", owner = "alice") {
   return request.post(`${BACKEND}/api/assets`, { headers: JSON_HEADERS(owner), data: { name } }).then((r) => r.json());
 }
 
+/** Record every fetch made with `keepalive: true` (the unload-time save) in `window.__keepalives`. */
+async function recordKeepalives(page) {
+  await page.addInitScript(() => {
+    window.__keepalives = [];
+    const orig = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      if (init && init.keepalive === true) {
+        window.__keepalives.push({ url: String(input), method: init.method, body: String(init.body) });
+      }
+      return orig(input, init);
+    };
+  });
+}
+
+/**
+ * Pretend the page is hidden (or shown) and fire `visibilitychange`. Headless
+ * Chromium cannot really hide a page, so the property is emulated; the page's
+ * own listener and flush path are the real ones.
+ */
+async function hidePage(page, hidden) {
+  await page.evaluate((h) => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => h });
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (h ? "hidden" : "visible") });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, hidden);
+}
+
+/** Open the first Edge rule as Open and wait until the set is created and saved (revision 1). */
+async function savedSet(page, request) {
+  await loginAs(page, "alice");
+  const listbox = await openEdge(page);
+  await listbox.getByRole("option").nth(0).click();
+  await page.getByRole("button", { name: "Open", exact: true }).click();
+  await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+  const [set] = await request.get(SETS, { headers: { "X-User-Id": "alice" } }).then((r) => r.json());
+  return { listbox, set };
+}
+
+async function setState(request, id) {
+  const d = await getSet(request, "alice", id).then((r) => r.json());
+  return `${d.revision}:${d.stigs[0].rules.length}`;
+}
+
+/** Record PATCH /rules requests (time, body) and their responses (time, status) on a page. */
+function watchPatches(page) {
+  const w = { reqs: [], resps: [] };
+  const isPatch = (r) => r.method() === "PATCH" && /\/api\/checklist-sets\/[^/]+\/rules$/.test(r.url());
+  page.on("request", (r) => {
+    if (isPatch(r)) w.reqs.push({ t: Date.now(), body: r.postData() });
+  });
+  page.on("response", (r) => {
+    if (isPatch(r.request())) w.resps.push({ t: Date.now(), status: r.status() });
+  });
+  return w;
+}
+
 async function openEdge(page) {
   await openEdgeFromLibrary(page);
   const listbox = page.getByRole("listbox", { name: "Rules" });
@@ -559,16 +615,7 @@ test.describe("Checklist sets — UI", () => {
   test("a save in doubt after pagehide is resent unchanged and settles without a conflict", async ({ page, request }) => {
     test.setTimeout(60_000);
     // Record every fetch made with keepalive (the pagehide save).
-    await page.addInitScript(() => {
-      window.__keepalives = [];
-      const orig = window.fetch.bind(window);
-      window.fetch = (input, init) => {
-        if (init && init.keepalive === true) {
-          window.__keepalives.push({ url: String(input), method: init.method, body: String(init.body) });
-        }
-        return orig(input, init);
-      };
-    });
+    await recordKeepalives(page);
     const bodies = [];
     await page.route("**/api/checklist-sets/*/rules", async (route) => {
       if (route.request().method() === "PATCH") bodies.push(route.request().postData());
@@ -715,5 +762,252 @@ test.describe("Checklist sets — UI", () => {
     await page.getByRole("button", { name: "Open Local File" }).click();
     await page.getByRole("button", { name: "Load Demo STIG" }).click();
     await expect(page.getByTestId("local-file-note")).toContainText("Not saved to your account");
+  });
+
+  test("a hidden page flushes at once; a visible one does not", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    await recordKeepalives(page);
+    const w = watchPatches(page);
+    const { listbox, set } = await savedSet(page, request);
+    const before = w.reqs.length;
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await hidePage(page, false);
+    await page.waitForTimeout(1000);
+    expect(w.reqs.length).toBe(before);
+    await hidePage(page, true);
+    await expect.poll(() => w.reqs.length, { timeout: 2000 }).toBe(before + 1);
+    expect(await page.evaluate(() => window.__keepalives)).toEqual([]);
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+    expect(await setState(request, set.id)).toBe("2:2");
+  });
+
+  test("pagehide with nothing unsaved sends nothing", async ({ page, request }) => {
+    await recordKeepalives(page);
+    await savedSet(page, request);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    expect(await page.evaluate(() => window.__keepalives)).toEqual([]);
+  });
+
+  test("pagehide while a save is in flight sends no second body", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    await recordKeepalives(page);
+    const { listbox, set } = await savedSet(page, request);
+    let held = null;
+    let release;
+    const gate = new Promise((r) => (release = r));
+    await page.route("**/api/checklist-sets/*/rules", async (route) => {
+      if (route.request().method() === "PATCH" && !held) {
+        held = true;
+        await gate;
+      }
+      await route.continue();
+    });
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await expect.poll(() => held, { timeout: 15_000 }).toBe(true);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    expect(await page.evaluate(() => window.__keepalives)).toEqual([]);
+    release();
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 20_000 });
+    await expect(page.getByTestId("set-conflict")).toHaveCount(0);
+    expect(await setState(request, set.id)).toBe("2:2");
+  });
+
+  test("edits over the keepalive cap are not sent on pagehide; the leave prompt still protects them", async ({ browser, request }) => {
+    test.setTimeout(60_000);
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await recordKeepalives(page);
+    const { listbox } = await savedSet(page, request);
+    await listbox.getByRole("option").nth(1).click();
+    const details = page.getByPlaceholder(/Enter finding details/i);
+    await details.fill("x".repeat(62 * 1024));
+    // Stay in the field: a focus change would flush at once.
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    expect(await page.evaluate(() => window.__keepalives)).toEqual([]);
+    const prompt = page.waitForEvent("dialog");
+    await page.close({ runBeforeUnload: true });
+    expect((await prompt).type()).toBe("beforeunload");
+    await ctx.close().catch(() => {});
+  });
+
+  test("leaving the page inside the debounce window saves the edit", async ({ browser, request }) => {
+    test.setTimeout(60_000);
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    const { listbox, set } = await savedSet(page, request);
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    const dialogs = [];
+    page.on("dialog", (d) => {
+      dialogs.push(d.type());
+      d.accept();
+    });
+    // The page is destroyed here (no back/forward cache in this browser), so
+    // only the keepalive request can deliver the edit. Playwright does not
+    // report requests issued during unload, so the server state is the proof.
+    await page.goto(`${BACKEND}/api/health`);
+    expect(dialogs).toEqual(["beforeunload"]);
+    await expect.poll(() => setState(request, set.id), { timeout: 15_000 }).toBe("2:2");
+    await ctx.close();
+  });
+
+  test("My checklists with no sets shows the empty state", async ({ page }) => {
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await expect(page.getByText("No saved checklists yet")).toBeVisible();
+    await expect(page.getByTestId("set-open")).toHaveCount(0);
+    await expect(page.getByText(/Could not load your checklists/)).toHaveCount(0);
+    await expect(page.getByTestId("new-set-create")).toBeDisabled();
+  });
+
+  test("a rename the server refuses is reported and the name is kept", async ({ page, request }) => {
+    const created = await createSet(request, "alice");
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await page.getByTestId("set-rename").click();
+    const input = page.getByTestId("set-rename-input").locator("input");
+    const long = "n".repeat(121);
+    await input.fill(long);
+    await page.getByTestId("set-rename-save").click();
+    await expect(page.getByText(/Could not rename:/)).toBeVisible();
+    await expect(input).toHaveValue(long);
+    const after = await getSet(request, "alice", created.id).then((r) => r.json());
+    expect(after.name).toBe(created.name);
+
+    await input.fill("Renamed ok");
+    await page.getByTestId("set-rename-save").click();
+    await expect(page.getByText(/Could not rename:/)).toHaveCount(0);
+    await expect(page.getByTestId("set-rename-input")).toHaveCount(0);
+    await expect(page.getByText("Renamed ok")).toBeVisible();
+  });
+
+  test("cancelling the delete prompt deletes nothing", async ({ page, request }) => {
+    const created = await createSet(request, "alice");
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    let deletes = 0;
+    page.on("request", (r) => {
+      if (r.method() === "DELETE") deletes += 1;
+    });
+    const dialogs = [];
+    page.on("dialog", (d) => {
+      dialogs.push({ type: d.type(), message: d.message() });
+      d.dismiss();
+    });
+    await page.getByTestId("set-delete").click();
+    await expect.poll(() => dialogs.length).toBe(1);
+    expect(dialogs[0].type).toBe("confirm");
+    expect(dialogs[0].message).toContain(created.name);
+    await page.waitForTimeout(500);
+    expect(deletes).toBe(0);
+    await expect(page.getByTestId("set-open")).toHaveCount(1);
+    expect((await getSet(request, "alice", created.id)).status()).toBe(200);
+  });
+
+  test("a delete the server fails is reported and the row stays", async ({ page, request }) => {
+    await createSet(request, "alice");
+    await loginAs(page, "alice");
+    await page.goto("/");
+    await page.getByRole("button", { name: "My checklists" }).click();
+    await page.route(new RegExp("/api/checklist-sets/[^/]+$"), async (route) => {
+      if (route.request().method() !== "DELETE") return route.continue();
+      return route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        headers: {
+          "Access-Control-Allow-Origin": route.request().headers()["origin"] ?? "*",
+          "Access-Control-Allow-Credentials": "true",
+        },
+        body: "{}",
+      });
+    });
+    page.on("dialog", (d) => d.accept());
+    await page.getByTestId("set-delete").click();
+    await expect(page.getByText(/Delete failed \(500\)/)).toBeVisible();
+    await expect(page.getByTestId("set-open")).toHaveCount(1);
+  });
+
+  // The drained mutation budget must not leak into other tests, even on failure.
+  test.afterEach(async ({ request }, info) => {
+    if (info.title.startsWith("a real 429")) await request.post(`${BACKEND}/api/test/reset-ratelimit`);
+  });
+
+  test("a real 429 backs off, resends the same body and saves once", async ({ page, request }) => {
+    test.setTimeout(60_000);
+    const w = watchPatches(page);
+    const { listbox, set } = await savedSet(page, request);
+    w.reqs.length = 0;
+    w.resps.length = 0;
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+
+    // Keep alice's mutation budget empty until the page's own save is refused.
+    // A 400 from create still spends a token.
+    let retryAfter = null;
+    const deadline = Date.now() + 25_000;
+    while (!w.resps.some((r) => r.status === 429) && Date.now() < deadline) {
+      await request.post(SETS, { headers: JSON_HEADERS("alice"), data: { stigIds: [] } });
+    }
+    expect(w.resps.some((r) => r.status === 429)).toBe(true);
+    await expect(page.getByTestId("autosave-status")).toContainText("Save failed: Too many requests", { timeout: 10_000 });
+    // Still drained: a cross-origin fetch must be able to read Retry-After.
+    for (let i = 0; i < 40 && retryAfter === null; i++) {
+      const [status, ra] = await page.evaluate(
+        async ([url]) => {
+          const r = await fetch(url, {
+            method: "POST",
+            headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+            body: '{"stigIds":[]}',
+          });
+          return [r.status, r.headers.get("retry-after")];
+        },
+        [SETS],
+      );
+      if (status === 429) retryAfter = ra;
+    }
+    expect(retryAfter).not.toBeNull();
+
+    await expect(page.getByTestId("autosave-status")).toContainText(/Saved/, { timeout: 40_000 });
+    const first429 = w.resps.find((r) => r.status === 429);
+    const next = w.reqs.find((r) => r.t > first429.t);
+    expect(next.t - first429.t).toBeGreaterThanOrEqual(900);
+    expect(new Set(w.reqs.map((r) => r.body)).size).toBe(1);
+    expect(w.reqs.length).toBeLessThanOrEqual(5);
+    await expect(page.getByTestId("set-conflict")).toHaveCount(0);
+    expect(await setState(request, set.id)).toBe("2:2");
+  });
+
+  test("a 401 during autosave stops saving, keeps the edits and the leave prompt", async ({ browser, request }) => {
+    test.setTimeout(60_000);
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await recordKeepalives(page);
+    const w = watchPatches(page);
+    const { listbox, set } = await savedSet(page, request);
+    await page.evaluate(() => localStorage.removeItem("userId"));
+    w.reqs.length = 0;
+    w.resps.length = 0;
+    const refused = page.waitForResponse((r) => r.request().method() === "PATCH" && r.url().endsWith("/rules"), { timeout: 20_000 });
+    await listbox.getByRole("option").nth(1).click();
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    expect((await refused).status()).toBe(401);
+    await expect(page.getByTestId("autosave-status")).toContainText("Signed out - sign in again");
+    const sent = w.reqs.length;
+    await page.waitForTimeout(4000);
+    await hidePage(page, true);
+    await page.waitForTimeout(500);
+    expect(w.reqs.length).toBe(sent);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    expect(await page.evaluate(() => window.__keepalives)).toEqual([]);
+    const prompt = page.waitForEvent("dialog");
+    await page.close({ runBeforeUnload: true });
+    expect((await prompt).type()).toBe("beforeunload");
+    expect(await setState(request, set.id)).toBe("1:1");
+    await ctx.close().catch(() => {});
   });
 });
