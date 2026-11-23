@@ -406,6 +406,29 @@ fn can_track(enabled: bool, stopped: bool, catalog_id: Option<&str>) -> bool {
     enabled && !stopped && catalog_id.is_some()
 }
 
+/// Dirty tabs per existing set that a `pagehide` keepalive may send. Empty
+/// after a 401: the credentials now in play may belong to a different
+/// identity than the one that made these edits.
+fn keepalive_tabs(i: &Inner) -> HashMap<String, Vec<String>> {
+    let mut m: HashMap<String, Vec<String>> = HashMap::new();
+    if i.stopped {
+        return m;
+    }
+    for tab_id in i.tracker.dirty_tabs() {
+        let set = i
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.set_id.clone());
+        if let Some(s) = set {
+            if !i.paused.contains(&s) {
+                m.entry(s).or_default().push(tab_id);
+            }
+        }
+    }
+    m
+}
+
 impl Autosave {
     /// Tell the app shell. The callback is cloned out first: dispatching can
     /// re-render synchronously, and a render replaces the stored callback.
@@ -946,23 +969,7 @@ impl Autosave {
     /// Bodies for a best-effort keepalive save of every set that already
     /// exists. Sets over the browser's keepalive cap are skipped.
     fn keepalive_requests(&self) -> Vec<(String, String)> {
-        let tabs_by_set: HashMap<String, Vec<String>> = {
-            let i = self.inner.borrow();
-            let mut m: HashMap<String, Vec<String>> = HashMap::new();
-            for tab_id in i.tracker.dirty_tabs() {
-                let set = i
-                    .tabs
-                    .iter()
-                    .find(|t| t.id == tab_id)
-                    .and_then(|t| t.set_id.clone());
-                if let Some(s) = set {
-                    if !i.paused.contains(&s) {
-                        m.entry(s).or_default().push(tab_id);
-                    }
-                }
-            }
-            m
-        };
+        let tabs_by_set = keepalive_tabs(&self.inner.borrow());
         let mut out = Vec::new();
         for (set_id, tabs) in tabs_by_set {
             let url = format!(
@@ -1335,6 +1342,23 @@ mod tests {
         assert!(!stash_allowed(true, false, 3, 3));
         // take_server_state / forget_set ran while the request was in flight.
         assert!(!stash_allowed(true, true, 3, 4));
+    }
+
+    #[test]
+    fn keepalive_sends_nothing_after_a_sign_out() {
+        let mut i = Inner::default();
+        i.tabs.push(StigTab {
+            id: "t".into(),
+            stig: Default::default(),
+            asset_info: Default::default(),
+            selected_rule_id: None,
+            catalog_id: Some("edge".into()),
+            set_id: Some("s".into()),
+        });
+        i.tracker.mark("t", "r");
+        assert_eq!(keepalive_tabs(&i).get("s"), Some(&vec!["t".to_string()]));
+        i.stopped = true;
+        assert!(keepalive_tabs(&i).is_empty());
     }
 
     #[test]

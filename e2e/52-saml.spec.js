@@ -154,4 +154,25 @@ test.describe("SAML 2.0 SSO", () => {
     }
     await ctx.dispose();
   });
+
+  test("POST /auth/saml/acs refuses an over-limit body with 413 and an oversized field with 401; neither sets a session", async () => {
+    const ctx = await pwRequest.newContext();
+    // Over the route's 512 KiB body cap: refused by the body limit.
+    const tooBig = await ctx.post(`${BACKEND}/auth/saml/acs`, {
+      form: { SAMLResponse: "A".repeat(600_000) },
+      maxRedirects: 0,
+    });
+    expect(tooBig.status()).toBe(413);
+    expect(tooBig.headers()["set-cookie"] || "").toBe("");
+    // Under the body cap but over the field cap: the generic 401.
+    const oversized = await ctx.post(`${BACKEND}/auth/saml/acs`, {
+      // "-" is not base64 and is not expanded by form encoding, so this stays under the body cap.
+      form: { SAMLResponse: "-".repeat(400_000) },
+      maxRedirects: 0,
+    });
+    expect(oversized.status()).toBe(401);
+    expect(await oversized.text()).toBe("SAML authentication failed");
+    expect(oversized.headers()["set-cookie"] || "").not.toContain("stig_session");
+    await ctx.dispose();
+  });
 });

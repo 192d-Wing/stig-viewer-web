@@ -10,7 +10,7 @@
 //! `SAML_IDP_CERT_PEM` is required and the response must verify. Identity is
 //! read only from the verified scope (see `saml_verify`).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -303,6 +303,8 @@ pub async fn acs_handler(
     .await
 }
 
+/// Audit detail for an oversized `SAMLResponse` field; kept stable.
+const FIELD_TOO_LONG: &str = "SAMLResponse field too long";
 /// Longest base64 SAMLResponse accepted (checked before any decoding).
 const MAX_RESPONSE_B64: usize = (crate::api::saml_xml::MAX_DOC_BYTES / 3 + 1) * 4 + 1024;
 /// Request body cap for the ACS route.
@@ -361,9 +363,6 @@ async fn acs_core(
             "SAML authentication failed".to_string(),
         )
     };
-    if form.saml_response.len() > MAX_RESPONSE_B64 {
-        return Err(deny("decode", "SAMLResponse field too long"));
-    }
     let xml =
         decode_saml_response(&form.saml_response).map_err(|e| deny("decode", &format!("{e:#}")))?;
 
@@ -438,6 +437,9 @@ async fn acs_core(
 /// Base64-decode the form value (ASCII whitespace from line wrapping is
 /// ignored) into UTF-8.
 fn decode_saml_response(raw: &str) -> Result<String> {
+    if raw.len() > MAX_RESPONSE_B64 {
+        bail!(FIELD_TOO_LONG);
+    }
     let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     let bytes = B64
         .decode(compact.as_bytes())
@@ -1282,17 +1284,35 @@ mod tests {
     #[tokio::test]
     async fn acs_rejects_oversized_field_before_decoding() {
         let limiter = crate::api::rate_limit::PreAuthLimiter::from_vars(Some("100"), Some("100"));
-        let big = "A".repeat(MAX_RESPONSE_B64 + 1);
+        let big = "!".repeat(MAX_RESPONSE_B64 + 1);
+        let jar = CookieJar::new().add(axum_extra::extract::cookie::Cookie::new(
+            SAML_REQ_COOKIE,
+            "x",
+        ));
         let r = acs_with_limiter(
             &limiter,
             &acs_state(),
             &HeaderMap::new(),
             None,
-            CookieJar::new(),
+            jar,
             form(&big),
         )
         .await;
-        assert_eq!(r.err().map(|e| e.0), Some(StatusCode::UNAUTHORIZED));
+        let (code, jar, msg) = r.err().unwrap();
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(msg, "SAML authentication failed");
+        assert!(jar.get(SAML_REQ_COOKIE).is_none(), "request cookie cleared");
+    }
+
+    #[test]
+    fn oversized_field_is_refused_before_base64_is_attempted() {
+        let e = decode_saml_response(&"!".repeat(MAX_RESPONSE_B64 + 1)).unwrap_err();
+        assert_eq!(format!("{e:#}"), FIELD_TOO_LONG);
+        let e = decode_saml_response(&"!".repeat(MAX_RESPONSE_B64)).unwrap_err();
+        assert!(format!("{e:#}").contains("not base64"));
+        let n = (MAX_RESPONSE_B64 / 4 + 2) * 4;
+        let e = decode_saml_response(&"A".repeat(n)).unwrap_err();
+        assert_eq!(format!("{e:#}"), FIELD_TOO_LONG);
     }
 
     #[test]

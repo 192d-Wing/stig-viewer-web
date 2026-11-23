@@ -314,6 +314,29 @@ fn exit_migrate(result: Result<()>) -> ! {
     }
 }
 
+/// CORS — cookie-based auth requires a specific origin (not "*") plus
+/// `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
+/// `x-user-id` is only an allowed request header when the test-auth bypass is
+/// on. `Retry-After` is exposed so a cross-origin frontend can read it.
+fn cors_layer(origin: HeaderValue, test_hooks: &TestHooks) -> CorsLayer {
+    let mut cors_headers = vec![header::CONTENT_TYPE, header::COOKIE];
+    if test_hooks.allow_test_auth_header {
+        cors_headers.push(header::HeaderName::from_static("x-user-id"));
+    }
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers(cors_headers)
+        .expose_headers([header::RETRY_AFTER])
+        .allow_credentials(true)
+}
+
 /// Assemble the full application router: public routes, auth, SAML, the protected
 /// stack, then the test-only routes (only when `test_hooks.enable_test_routes`), the
 /// body limit and CORS. The layer order is load-bearing; see `router_tests`.
@@ -772,25 +795,7 @@ async fn main() -> Result<()> {
         tasks: tasks.clone(),
     };
 
-    // CORS — cookie-based auth requires a specific origin (not "*")
-    // plus `allow_credentials`. Allow the frontend origin from FRONTEND_URL.
-    // `x-user-id` is only an allowed request header when the test-auth
-    // bypass is on.
-    let mut cors_headers = vec![header::CONTENT_TYPE, header::COOKIE];
-    if test_hooks.allow_test_auth_header {
-        cors_headers.push(header::HeaderName::from_static("x-user-id"));
-    }
-    let cors = CorsLayer::new()
-        .allow_origin(frontend_origin.parse::<HeaderValue>()?)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-        ])
-        .allow_headers(cors_headers)
-        .allow_credentials(true);
+    let cors = cors_layer(frontend_origin.parse::<HeaderValue>()?, &test_hooks);
 
     let state = AppState {
         pool: pool.clone(),
@@ -1349,6 +1354,173 @@ mod router_tests {
             )
             .await,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    // ---- SAML ACS through the real router (no database) ----
+
+    use std::net::SocketAddr;
+
+    /// A body with no `Content-Length`: a run of equal-sized chunks.
+    struct Chunks {
+        left: usize,
+        chunk: usize,
+    }
+
+    impl http_body::Body for Chunks {
+        type Data = axum::body::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if self.left == 0 {
+                return std::task::Poll::Ready(None);
+            }
+            let n = self.left.min(self.chunk);
+            self.left -= n;
+            std::task::Poll::Ready(Some(Ok(http_body::Frame::data(axum::body::Bytes::from(
+                vec![b'A'; n],
+            )))))
+        }
+    }
+
+    async fn acs(app: &Router, body: Body, peer: Option<SocketAddr>) -> axum::response::Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/auth/saml/acs")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .unwrap();
+        if let Some(p) = peer {
+            req.extensions_mut().insert(axum::extract::ConnectInfo(p));
+        }
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn body_text(r: axum::response::Response) -> String {
+        let b = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    fn acs_app() -> (Router, test_fixtures::StigDir) {
+        app(&TestHooks {
+            production: false,
+            enable_test_routes: false,
+            allow_test_auth_header: false,
+        })
+    }
+
+    fn form_of_len(total: usize) -> String {
+        let prefix = "SAMLResponse=";
+        format!("{prefix}{}", "!".repeat(total - prefix.len()))
+    }
+
+    #[tokio::test]
+    async fn saml_acs_over_its_body_limit_is_413() {
+        let (app, _dir) = acs_app();
+        let prefix = "SAMLResponse=";
+        let big = format!("{prefix}{}", "A".repeat(api::saml::ACS_BODY_LIMIT));
+        let r = acs(&app, Body::from(big), None).await;
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(r.headers().get("set-cookie").is_none());
+        let text = body_text(r).await;
+        assert!(text.len() < 200, "{text}");
+        assert!(!text.contains("AAAA"));
+
+        // No Content-Length: the limit still applies while streaming.
+        let streamed = Body::new(Chunks {
+            left: api::saml::ACS_BODY_LIMIT + 1024,
+            chunk: 16 * 1024,
+        });
+        let r = acs(&app, streamed, None).await;
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(r.headers().get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn saml_acs_at_its_body_limit_reaches_the_handler() {
+        let (app, _dir) = acs_app();
+        let r = acs(
+            &app,
+            Body::from(form_of_len(api::saml::ACS_BODY_LIMIT)),
+            None,
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_text(r).await, "SAML authentication failed");
+    }
+
+    #[tokio::test]
+    async fn saml_acs_route_consults_the_global_pre_auth_limiter() {
+        use api::rate_limit::{global, limiter_key};
+        let (app, _dir) = acs_app();
+        let ip = "198.51.100.86";
+        let peer = SocketAddr::new(ip.parse().unwrap(), 4000);
+        let other = SocketAddr::new("198.51.100.87".parse().unwrap(), 4000);
+        let small = || Body::from("SAMLResponse=!");
+        // test_support::reset_handler can clear the global limiter concurrently.
+        let mut limited = None;
+        for _ in 0..3 {
+            let r = acs(&app, small(), Some(peer)).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+            let key = limiter_key(ip);
+            let mut drained = false;
+            for _ in 0..100_000 {
+                if !global().allow(&key) {
+                    drained = true;
+                    break;
+                }
+            }
+            assert!(drained, "limiter never drained");
+            let r = acs(&app, small(), Some(peer)).await;
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                limited = Some(r);
+                break;
+            }
+        }
+        let r = limited.expect("a 429 within 3 attempts");
+        assert!(r.headers().get("set-cookie").is_none());
+        assert_eq!(body_text(r).await, "too many requests");
+        let r = acs(&app, small(), Some(other)).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cors_exposes_retry_after_to_the_frontend_origin() {
+        let origin = "http://localhost:15173";
+        let cors = cors_layer(
+            origin.parse::<HeaderValue>().unwrap(),
+            &TestHooks {
+                production: false,
+                enable_test_routes: false,
+                allow_test_auth_header: false,
+            },
+        );
+        let (state, _dir) = test_fixtures::lazy_state();
+        let auth = test_fixtures::auth_state(&state);
+        let saml = test_fixtures::saml_state(&state);
+        let hooks = TestHooks {
+            production: false,
+            enable_test_routes: false,
+            allow_test_auth_header: false,
+        };
+        let app = build_app(state, auth, saml, cors, &hooks);
+        let req = Request::builder()
+            .uri("/api/health")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        let r = app.oneshot(req).await.unwrap();
+        let exposed = r
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            exposed.to_ascii_lowercase().contains("retry-after"),
+            "{exposed}"
         );
     }
 
