@@ -21,7 +21,7 @@ PG="${SVW_POSTGRES_PORT:-15433}"
 OLD_REV="${SVW_OLD_REV:-5cb96e6^}"
 PHASES="${SVW_PHASES:-fresh upgrade}"
 SPECS="${SVW_SPECS:-}"
-if [ -n "${ENGINE:-}" ]; then
+if [[ -n "${ENGINE:-}" ]]; then
   :
 elif command -v podman >/dev/null 2>&1; then
   ENGINE=podman
@@ -40,20 +40,21 @@ esac
 for port in "$BE" "$FE" "$KC" "$PG"; do
   case "$port" in
     ''|*[!0-9]*) die "bad port '$port'" ;;
+    *) ;;
   esac
   num=$((10#$port))
-  if [ "$num" -lt 1 ] || [ "$num" -gt 65535 ]; then die "port $port out of range"; fi
+  if [[ "$num" -lt 1 ]] || [[ "$num" -gt 65535 ]]; then die "port $port out of range"; fi
   case "$num" in
     8080|8081|5433|5173) die "refusing default dev port $port" ;;
+    *) ;;
   esac
   port="$num"
   if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then die "port $port is already listening"; fi
 done
-if [ "${SVW_REUSE:-}" != 1 ]; then
-  if [ -n "$($ENGINE ps -a --format '{{.Names}}' | grep "^${P}[_-]" || true)" ] ||
-     [ -n "$($ENGINE volume ls --format '{{.Name}}' | grep "^${P}[_-]" || true)" ]; then
-    die "containers or volumes for project '$P' exist; remove them or set SVW_REUSE=1"
-  fi
+if [[ "${SVW_REUSE:-}" != 1 ]] &&
+   { [[ -n "$($ENGINE ps -a --format '{{.Names}}' | grep "^${P}[_-]" || true)" ]] ||
+     [[ -n "$($ENGINE volume ls --format '{{.Name}}' | grep "^${P}[_-]" || true)" ]]; }; then
+  die "containers or volumes for project '$P' exist; remove them or set SVW_REUSE=1"
 fi
 
 # --- environment ------------------------------------------------------------
@@ -74,25 +75,25 @@ override=""
 compose() {
   (
     cd "$compose_dir"
-    if [ -n "$override" ]; then export COMPOSE_FILE="docker-compose.yml:$override"; fi
+    if [[ -n "$override" ]]; then export COMPOSE_FILE="docker-compose.yml:$override"; fi
     $ENGINE compose -p "$P" "$@"
   )
 }
 compose_in() { local d="$1"; shift; compose_dir="$d" compose "$@"; }
-psql_q() { compose exec -T postgres psql -U stig -d stig_viewer -tAc "$1" | tr -d '[:space:]'; }
+psql_q() { local sql="$1"; compose exec -T postgres psql -U stig -d stig_viewer -tAc "$sql" | tr -d '[:space:]'; }
 
 old=""
-if [ "${SVW_LOW_MEMORY:-}" = 1 ]; then
+if [[ "${SVW_LOW_MEMORY:-}" = 1 ]]; then
   override=$(mktemp "${TMPDIR:-/tmp}/svw-override.XXXXXX")
   printf 'services:\n  backend:\n    environment:\n      CARGO_BUILD_JOBS: "1"\n      CARGO_PROFILE_DEV_DEBUG: "0"\n  frontend:\n    environment:\n      CARGO_BUILD_JOBS: "1"\n      CARGO_PROFILE_DEV_DEBUG: "0"\n' > "$override"
 fi
 cleanup() {
   local rc=$?
   set +e
-  if [ "${SVW_KEEP:-}" != 1 ]; then
+  if [[ "${SVW_KEEP:-}" != 1 ]]; then
     compose down -v >/dev/null 2>&1
-    if [ -n "$override" ]; then rm -f "$override"; fi
-    if [ -n "$old" ]; then git -C "$repo" worktree remove --force "$old" >/dev/null 2>&1; fi
+    if [[ -n "$override" ]]; then rm -f "$override"; fi
+    if [[ -n "$old" ]]; then git -C "$repo" worktree remove --force "$old" >/dev/null 2>&1; fi
   else
     echo "SVW_KEEP=1: leaving project '$P' running${old:+ and worktree $old}"
   fi
@@ -101,32 +102,32 @@ cleanup() {
 trap cleanup EXIT
 
 summary=()
-note() { summary+=("$1"); echo "== $1"; }
+note() { local msg="$1"; summary+=("$msg"); echo "== $msg"; }
 failures=0
 
 wait_http() { # url limit-seconds
-  local i=0 cid state
-  until curl -sf --max-time 3 "$1" >/dev/null 2>&1; do
+  local url="$1" limit="$2" i=0 cid state
+  until curl -sf --max-time 3 "$url" >/dev/null 2>&1; do
     # Fail fast when the backend container has already died (e.g. a compile
     # error or an OOM-killed rustc) instead of waiting out the limit.
     cid=$($ENGINE ps -a -q --filter "name=^${P}[_-]backend[_-]1$" 2>/dev/null | head -n 1 || true)
-    if [ -n "$cid" ]; then
+    if [[ -n "$cid" ]]; then
       state=$($ENGINE inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo "")
-      if [ "$state" = exited ] || [ "$state" = stopped ]; then
+      if [[ "$state" = exited ]] || [[ "$state" = stopped ]]; then
         compose logs --tail 20 backend >&2 || true
-        die "backend container exited while waiting for $1"
+        die "backend container exited while waiting for $url"
       fi
     fi
-    i=$((i + 2)); [ "$i" -lt "$2" ] || die "timed out waiting for $1"; sleep 2
+    i=$((i + 2)); [[ "$i" -lt "$limit" ]] || die "timed out waiting for $url"; sleep 2
   done
 }
 
 latest_migration() { # dir
-  local f n max=0
-  for f in "$1"/backend/migrations/[0-9]*; do
+  local dir="$1" f n max=0
+  for f in "$dir"/backend/migrations/[0-9]*; do
     n=${f##*/}
     n=$((10#${n%%[!0-9]*}))
-    if [ "$n" -gt "$max" ]; then max=$n; fi
+    if [[ "$n" -gt "$max" ]]; then max=$n; fi
   done
   echo "$max"
 }
@@ -136,10 +137,10 @@ check() { # description, command...
   if "$@"; then note "PASS $d"; else note "FAIL $d"; failures=$((failures + 1)); fi
 }
 
-assert_eq() { [ "$1" = "$2" ]; }
+assert_eq() { local have="$1" want="$2"; [[ "$have" = "$want" ]]; }
 
 run_playwright() { # label
-  local out rc=0
+  local label="$1" out rc=0
   out=$(mktemp)
   # shellcheck disable=SC2086 # SPECS is intentionally word-split into file args
   (cd "$repo" && npx playwright test -c playwright.verify.config.js $SPECS) 2>&1 | tee "$out" || rc=$?
@@ -147,16 +148,16 @@ run_playwright() { # label
   passed=$(grep -Eo '^ +[0-9]+ passed' "$out" | grep -Eo '[0-9]+' | tail -n 1 || true)
   failed=$(grep -Eo '^ +[0-9]+ failed' "$out" | grep -Eo '[0-9]+' | tail -n 1 || true)
   rm -f "$out"
-  if [ "${rc:-0}" -eq 0 ]; then
-    note "PASS $1 playwright: ${passed:-0} passed, 0 failed"
+  if [[ "${rc:-0}" -eq 0 ]]; then
+    note "PASS $label playwright: ${passed:-0} passed, 0 failed"
   else
-    note "FAIL $1 playwright: ${passed:-0} passed, ${failed:-?} failed (exit $rc)"
+    note "FAIL $label playwright: ${passed:-0} passed, ${failed:-?} failed (exit $rc)"
     failures=$((failures + 1))
   fi
 }
 
 stop_check() { # label
-  local start elapsed cid code
+  local label="$1" start elapsed cid code
   cid=$($ENGINE ps -a -q --filter "name=^${P}[_-]backend[_-]1$" | head -n 1)
   start=$(date +%s)
   compose stop backend >/dev/null 2>&1 || true
@@ -164,38 +165,38 @@ stop_check() { # label
   code=$($ENGINE inspect -f '{{.State.ExitCode}}' "$cid" 2>/dev/null || echo "?")
   STOP_SECONDS="$elapsed"
   if compose logs backend 2>&1 | grep -q 'Shutting down'; then
-    note "PASS $1 stop: backend logged 'Shutting down'"
+    note "PASS $label stop: backend logged 'Shutting down'"
   else
-    note "FAIL $1 stop: no 'Shutting down' in backend logs"; failures=$((failures + 1))
+    note "FAIL $label stop: no 'Shutting down' in backend logs"; failures=$((failures + 1))
   fi
-  if [ "$code" != 137 ] && [ "$elapsed" -lt 15 ]; then
-    note "PASS $1 stop: exit code $code, ${elapsed}s (< 15s, not SIGKILL)"
+  if [[ "$code" != 137 ]] && [[ "$elapsed" -lt 15 ]]; then
+    note "PASS $label stop: exit code $code, ${elapsed}s (< 15s, not SIGKILL)"
   else
-    note "FAIL $1 stop: exit code $code, ${elapsed}s"; failures=$((failures + 1))
+    note "FAIL $label stop: exit code $code, ${elapsed}s"; failures=$((failures + 1))
   fi
 }
 
 post_checks() { # label dir-of-HEAD
-  local want have
-  want=$(latest_migration "$2")
-  check "$1 stig_app role exists" assert_eq "$(psql_q "SELECT 1 FROM pg_roles WHERE rolname='stig_app'")" 1
+  local label="$1" head_dir="$2" want have
+  want=$(latest_migration "$head_dir")
+  check "$label stig_app role exists" assert_eq "$(psql_q "SELECT 1 FROM pg_roles WHERE rolname='stig_app'")" 1
   have=$(psql_q "SELECT max(version) FROM _sqlx_migrations")
-  check "$1 migrations at HEAD ($have = $want)" assert_eq "$have" "$want"
-  check "$1 #205 owner-run audit functions (mig 050) owned by stig, EXECUTE for stig_app, not PUBLIC" \
+  check "$label migrations at HEAD ($have = $want)" assert_eq "$have" "$want"
+  check "$label #205 owner-run audit functions (mig 050) owned by stig, EXECUTE for stig_app, not PUBLIC" \
     assert_eq "$(psql_q "SELECT count(*) FROM pg_proc p JOIN pg_roles o ON o.oid=p.proowner WHERE p.proname IN ('audit_prune_rule_audit','audit_prune_events','audit_restore_truncate','audit_restore_load') AND o.rolname='stig' AND p.prosecdef AND has_function_privilege('stig_app',p.oid,'EXECUTE') AND NOT has_function_privilege('public',p.oid,'EXECUTE')")" 4
-  check "$1 #205 audit_policy and audit_restore_log owned by stig" \
+  check "$label #205 audit_policy and audit_restore_log owned by stig" \
     assert_eq "$(psql_q "SELECT count(*) FROM pg_tables WHERE tablename IN ('audit_policy','audit_restore_log') AND tableowner='stig'")" 2
-  check "$1 audit_events owned by stig" assert_eq "$(psql_q "SELECT tableowner FROM pg_tables WHERE tablename='audit_events'")" stig
+  check "$label audit_events owned by stig" assert_eq "$(psql_q "SELECT tableowner FROM pg_tables WHERE tablename='audit_events'")" stig
 }
 
 # --- phases -----------------------------------------------------------------
 # In low-memory mode compile the crates one at a time (no Keycloak, no sibling builds)
 # so rustc is not OOM-killed; the stack start then finds a warm target volume.
 prebuild() {
-  if [ "${SVW_LOW_MEMORY:-}" = 1 ]; then
+  if [[ "${SVW_LOW_MEMORY:-}" = 1 ]]; then
     compose build backend
     compose run --rm --no-deps backend cargo build
-    if [ -d "$compose_dir/frontend" ]; then
+    if [[ -d "$compose_dir/frontend" ]]; then
       compose build frontend
       compose run --rm --no-deps frontend cargo build --target=wasm32-unknown-unknown --manifest-path /app/frontend/Cargo.toml
     fi
@@ -273,5 +274,5 @@ echo "=== split-role verification summary ==="
 echo "HEAD $(git -C "$repo" rev-parse --short HEAD), old revision $OLD_REV, phases: $PHASES, specs: ${SPECS:-full suite}"
 printf '%s\n' "${summary[@]}"
 echo "stop timing (last phase): ${STOP_SECONDS:-n/a}s (grace 15s)"
-echo "result: $([ "$failures" -eq 0 ] && echo PASS || echo "FAIL ($failures failing checks)")"
-[ "$failures" -eq 0 ]
+echo "result: $([[ "$failures" -eq 0 ]] && echo PASS || echo "FAIL ($failures failing checks)")"
+[[ "$failures" -eq 0 ]]

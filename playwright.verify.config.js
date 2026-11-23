@@ -27,7 +27,7 @@ export default {
     ...base.use,
     baseURL,
     launchOptions: {
-      ...(base.use?.launchOptions ?? {}),
+      ...base.use?.launchOptions,
       ...(process.env.E2E_CHROMIUM_PATH ? { executablePath: process.env.E2E_CHROMIUM_PATH } : {}),
     },
   },
