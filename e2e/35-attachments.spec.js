@@ -176,6 +176,9 @@ test.describe("Evidence attachments — API", () => {
       )
       .then((r) => r.json());
     const as = (user) => ({ headers: { "X-User-Id": user } });
+    // The ACL grant below needs mallory to exist as a user; /api/users/me
+    // provisions the row (the attachment endpoints do not).
+    expect((await request.get(`${BACKEND}/api/users/me`, as("mallory"))).ok()).toBe(true);
     const urls = {
       list: `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/attachments`,
       counts: `${BACKEND}/api/checklists/${checklistId}/attachments`,
