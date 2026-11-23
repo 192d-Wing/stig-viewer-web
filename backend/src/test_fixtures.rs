@@ -329,6 +329,69 @@ pub async fn fail_writes_of(pool: &PgPool, table: &str, rule_ids: &[&str]) {
     .expect("create fail trigger");
 }
 
+/// Make any insert of an `audit_events` row whose action is in `actions`
+/// raise, so one action's row fails while every other stays writable. Drop
+/// the trigger (`DROP TRIGGER test_fail_audit ON audit_events`) to recover.
+pub async fn fail_audit_inserts(pool: &PgPool, actions: &[&str]) {
+    sqlx::query(
+        "CREATE FUNCTION test_fail_audit() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN IF NEW.action = ANY(TG_ARGV) THEN RAISE EXCEPTION 'injected audit failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create audit fail function");
+    let args = actions
+        .iter()
+        .map(|a| format!("'{a}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_fail_audit BEFORE INSERT ON audit_events \
+         FOR EACH ROW EXECUTE FUNCTION test_fail_audit({args})"
+    ))
+    .execute(pool)
+    .await
+    .expect("create audit fail trigger");
+}
+
+/// One `audit_events` row as the in-transaction audit tests assert it.
+#[derive(Debug, sqlx::FromRow)]
+pub struct AuditRow {
+    pub user_id: Option<String>,
+    pub outcome: String,
+    pub asset_id: Option<String>,
+    pub checklist_id: Option<String>,
+    pub stig_id: Option<String>,
+    pub detail: serde_json::Value,
+    pub request_id: Option<String>,
+    pub source_ip: Option<String>,
+}
+
+impl AuditRow {
+    /// Sorted top-level keys of `detail`.
+    pub fn detail_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .detail
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys
+    }
+}
+
+/// Every `audit_events` row for `action`, oldest first.
+pub async fn audit_rows(pool: &PgPool, action: &str) -> Vec<AuditRow> {
+    sqlx::query_as::<_, AuditRow>(
+        "SELECT user_id, outcome, asset_id, checklist_id, stig_id, detail, request_id, source_ip \
+         FROM audit_events WHERE action = $1 ORDER BY id",
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await
+    .expect("audit rows")
+}
+
 pub fn auth(id: &str, role: &str) -> AuthUser {
     AuthUser {
         id: id.into(),

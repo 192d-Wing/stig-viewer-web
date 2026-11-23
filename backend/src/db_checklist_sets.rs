@@ -2,10 +2,15 @@
 //!
 //! Every function takes `owner_id` and filters on it in SQL, so a set that
 //! belongs to someone else is indistinguishable from a missing one.
+//!
+//! The mutators run on the caller's connection and never begin or commit a
+//! transaction: the handler opens a bounded one (`crate::db::begin_bounded`),
+//! records the audit row on it (`api::audit_tx::record`) and commits, so a
+//! failed audit insert rolls the change back. An early `Ok` return (not found,
+//! conflict, limit) leaves the transaction for the caller to drop.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
 
 /// Minimum gap between two `checklist_set.edit` audit events for one set.
 const EDIT_EVENT_WINDOW: &str = "15 minutes";
@@ -179,12 +184,6 @@ pub enum AddStig {
 }
 
 pub use crate::db::is_timeout;
-use crate::db::{bound_ms, STATEMENT_TIMEOUT_MS};
-
-/// Transaction-local statement and lock timeouts; the first call in a writer.
-async fn bound(tx: &mut sqlx::PgConnection) -> Result<()> {
-    bound_ms(tx, STATEMENT_TIMEOUT_MS).await
-}
 
 pub async fn list_sets(
     db: impl sqlx::PgExecutor<'_>,
@@ -260,7 +259,7 @@ pub async fn list_rules(
 /// `create_key` matches one of the owner's sets, that set's id is returned if
 /// the stored digest is present and equal, else `KeyConflict`.
 pub async fn insert_set(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
     name: &str,
@@ -268,11 +267,9 @@ pub async fn insert_set(
     max_sets: i64,
     create_key: Option<Token<'_>>,
 ) -> Result<CreateOutcome> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(owner_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
     if let Some(key) = create_key {
         let existing: Option<(String, Option<String>)> = sqlx::query_as(
@@ -280,7 +277,7 @@ pub async fn insert_set(
         )
         .bind(owner_id)
         .bind(key.id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
         if let Some((existing_id, stored)) = existing {
             return Ok(match stored {
@@ -294,7 +291,7 @@ pub async fn insert_set(
     }
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM checklist_sets WHERE owner_id = $1")
         .bind(owner_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await?;
     if n >= max_sets {
         return Ok(CreateOutcome::Limit);
@@ -310,7 +307,7 @@ pub async fn insert_set(
     .bind(create_key.map(|t| t.id))
     .bind(create_key.map(|t| t.body_digest))
     .bind(create_key.and_then(|t| legacy_sha256(t.body_digest)))
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     for (i, (stig_id, version, release)) in stigs.iter().enumerate() {
         sqlx::query(
@@ -322,37 +319,36 @@ pub async fn insert_set(
         .bind(i as i32)
         .bind(version)
         .bind(release)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
     Ok(CreateOutcome::Created)
 }
 
-pub async fn rename_set(pool: &PgPool, owner_id: &str, id: &str, name: &str) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
+pub async fn rename_set(
+    conn: &mut sqlx::PgConnection,
+    owner_id: &str,
+    id: &str,
+    name: &str,
+) -> Result<bool> {
     let r = sqlx::query(
         "UPDATE checklist_sets SET name = $3, updated_at = NOW() WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
     .bind(owner_id)
     .bind(name)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
 /// Clears the system link. Returns the previous link: `None` when the set is
 /// not the owner's, `Some(None)` when it was not linked.
 pub async fn unlink_asset(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
 ) -> Result<Option<Option<String>>> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "WITH old AS (SELECT asset_id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE)
          UPDATE checklist_sets c SET asset_id = NULL, updated_at = NOW()
@@ -361,53 +357,41 @@ pub async fn unlink_asset(
     )
     .bind(id)
     .bind(owner_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(row.map(|r| r.0))
 }
 
 /// Record that the set was saved to `asset_id`.
-pub async fn link_asset(pool: &PgPool, owner_id: &str, id: &str, asset_id: &str) -> Result<bool> {
-    link_asset_within(pool, owner_id, id, asset_id, STATEMENT_TIMEOUT_MS).await
-}
-
-async fn link_asset_within(
-    pool: &PgPool,
+pub async fn link_asset(
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
     asset_id: &str,
-    timeout_ms: i64,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    bound_ms(&mut tx, timeout_ms).await?;
     let r = sqlx::query(
         "UPDATE checklist_sets SET asset_id = $3, last_attached_at = NOW() WHERE id = $1 AND owner_id = $2",
     )
     .bind(id)
     .bind(owner_id)
     .bind(asset_id)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
-pub async fn delete_set(pool: &PgPool, owner_id: &str, id: &str) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
+pub async fn delete_set(conn: &mut sqlx::PgConnection, owner_id: &str, id: &str) -> Result<bool> {
     let r = sqlx::query("DELETE FROM checklist_sets WHERE id = $1 AND owner_id = $2")
         .bind(id)
         .bind(owner_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
 /// Idempotent add of a STIG at the end of the set, up to `max_stigs`.
 pub async fn add_stig(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
     stig_id: &str,
@@ -415,13 +399,11 @@ pub async fn add_stig(
     release: &str,
     max_stigs: i64,
 ) -> Result<AddStig> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("SELECT id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE")
             .bind(id)
             .bind(owner_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     if locked.is_none() {
         return Ok(AddStig::NotFound);
@@ -430,14 +412,14 @@ pub async fn add_stig(
         "SELECT COUNT(*), COALESCE(MAX(position) + 1, 0) FROM checklist_set_stigs WHERE set_id = $1",
     )
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
     let exists: Option<(i32,)> = sqlx::query_as(
         "SELECT position FROM checklist_set_stigs WHERE set_id = $1 AND stig_id = $2",
     )
     .bind(id)
     .bind(stig_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     if exists.is_some() {
         return Ok(AddStig::Exists);
@@ -454,31 +436,28 @@ pub async fn add_stig(
     .bind(next)
     .bind(version)
     .bind(release)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
     sqlx::query("UPDATE checklist_sets SET updated_at = NOW() WHERE id = $1")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(AddStig::Added)
 }
 
 /// Remove a STIG (its rules cascade) and bump the revision. `None` when the
 /// set is not the owner's; otherwise whether the STIG was in the set.
 pub async fn remove_stig(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
     stig_id: &str,
 ) -> Result<Option<bool>> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
     let locked: Option<(String,)> =
         sqlx::query_as("SELECT id FROM checklist_sets WHERE id = $1 AND owner_id = $2 FOR UPDATE")
             .bind(id)
             .bind(owner_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     if locked.is_none() {
         return Ok(None);
@@ -486,7 +465,7 @@ pub async fn remove_stig(
     let r = sqlx::query("DELETE FROM checklist_set_stigs WHERE set_id = $1 AND stig_id = $2")
         .bind(id)
         .bind(stig_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     let removed = r.rows_affected() > 0;
     if removed {
@@ -496,10 +475,9 @@ pub async fn remove_stig(
                 updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
     Ok(Some(removed))
 }
 
@@ -537,7 +515,7 @@ async fn totals(
 /// Autosave: replace each sent rule's state exactly, in one transaction,
 /// guarded by `base_revision`. Callers dedupe `changes` by (stig, rule).
 pub async fn write_rules(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     owner_id: &str,
     id: &str,
     base_revision: i64,
@@ -545,8 +523,6 @@ pub async fn write_rules(
     budget: SetBudget,
     save: Option<Token<'_>>,
 ) -> Result<WriteOutcome> {
-    let mut tx = pool.begin().await?;
-    bound(&mut tx).await?;
     let bumped: Option<(i64, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
         "WITH old AS (
              SELECT last_edit_event_at FROM checklist_sets
@@ -572,10 +548,10 @@ pub async fn write_rules(
     .bind(save.map(|t| t.id))
     .bind(save.map(|t| t.body_digest))
     .bind(save.and_then(|t| legacy_sha256(t.body_digest)))
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((revision, updated_at, edit_event_due)) = bumped else {
-        return Ok(match get_set(&mut *tx, owner_id, id).await? {
+        return Ok(match get_set(&mut *conn, owner_id, id).await? {
             Some(s) if is_replay(&s, base_revision, save.as_ref()) => WriteOutcome::Replayed {
                 revision: s.revision,
                 updated_at: s.updated_at,
@@ -608,7 +584,7 @@ pub async fn write_rules(
     let sizes = if up.is_empty() {
         None
     } else {
-        Some(totals(&mut tx, id, changes).await?)
+        Some(totals(&mut *conn, id, changes).await?)
     };
     if !del.is_empty() {
         let stigs: Vec<&str> = del.iter().map(|c| c.stig_id.as_str()).collect();
@@ -620,7 +596,7 @@ pub async fn write_rules(
         .bind(id)
         .bind(&stigs)
         .bind(&rules)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
     if !up.is_empty() {
@@ -644,7 +620,7 @@ pub async fn write_rules(
         .bind(&statuses)
         .bind(&details)
         .bind(&comments)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await;
         match res {
             Ok(_) => {}
@@ -661,7 +637,7 @@ pub async fn write_rules(
         .bind(id)
         .bind(&touched)
         .bind(budget.max_rows_per_stig)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
         if over.is_some() {
             return Ok(WriteOutcome::TooManyRules);
@@ -682,7 +658,6 @@ pub async fn write_rules(
             return Ok(WriteOutcome::SetTooLarge);
         }
     }
-    tx.commit().await?;
     Ok(WriteOutcome::Written {
         revision,
         updated_at,
@@ -707,6 +682,40 @@ pub async fn catalog_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::bound_ms;
+    use sqlx::PgPool;
+
+    /// `write_rules` on its own bounded transaction, committed.
+    async fn write_rules_committed(
+        pool: &PgPool,
+        owner_id: &str,
+        id: &str,
+        base_revision: i64,
+        changes: &[RuleChange],
+        budget: SetBudget,
+        save: Option<Token<'_>>,
+    ) -> Result<WriteOutcome> {
+        let mut tx = crate::db::begin_bounded(pool).await?;
+        let out = write_rules(&mut tx, owner_id, id, base_revision, changes, budget, save).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// `insert_set` on its own bounded transaction, committed.
+    async fn insert_set_committed(
+        pool: &PgPool,
+        owner_id: &str,
+        id: &str,
+        name: &str,
+        stigs: &[(String, String, String)],
+        max_sets: i64,
+        create_key: Option<Token<'_>>,
+    ) -> Result<CreateOutcome> {
+        let mut tx = crate::db::begin_bounded(pool).await?;
+        let out = insert_set(&mut tx, owner_id, id, name, stigs, max_sets, create_key).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
 
     #[sqlx::test]
     #[ignore = "needs Postgres (DATABASE_URL)"]
@@ -759,10 +768,10 @@ mod tests {
             .execute(&mut *lock)
             .await
             .unwrap();
-        let err = link_asset_within(&pool, "u1", "s1", "a1", 100)
-            .await
-            .unwrap_err();
+        let mut tx = crate::db::begin_bounded_ms(&pool, 100).await.unwrap();
+        let err = link_asset(&mut tx, "u1", "s1", "a1").await.unwrap_err();
         assert!(is_timeout(&err));
+        drop(tx);
         lock.rollback().await.unwrap();
     }
 
@@ -844,12 +853,12 @@ mod tests {
         };
         let d1: &'static str = Box::leak(d1.into_boxed_str());
         let d2: &'static str = Box::leak(d2.into_boxed_str());
-        let first = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
+        let first = write_rules_committed(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
             .await
             .unwrap();
         assert!(matches!(first, WriteOutcome::Written { revision: 1, .. }));
         // Same token, other content, stale base: refused, and flagged as a reuse.
-        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d2)))
+        let out = write_rules_committed(&pool, "u1", "s1", 0, &[], budget, Some(tok(d2)))
             .await
             .unwrap();
         assert_eq!(
@@ -861,7 +870,7 @@ mod tests {
             }
         );
         // The identical retry is a replay; another token is a plain conflict.
-        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
+        let out = write_rules_committed(&pool, "u1", "s1", 0, &[], budget, Some(tok(d1)))
             .await
             .unwrap();
         assert!(matches!(out, WriteOutcome::Replayed { revision: 1, .. }));
@@ -869,7 +878,7 @@ mod tests {
             id: "22222222-2222-4222-8222-222222222222",
             body_digest: d1,
         };
-        let out = write_rules(&pool, "u1", "s1", 0, &[], budget, Some(other))
+        let out = write_rules_committed(&pool, "u1", "s1", 0, &[], budget, Some(other))
             .await
             .unwrap();
         assert!(matches!(
@@ -891,7 +900,7 @@ mod tests {
             id: "11111111-1111-4111-8111-111111111111",
             body_digest: &digest,
         };
-        let out = insert_set(&pool, "u1", "s1", "n", &[], 50, Some(key))
+        let out = insert_set_committed(&pool, "u1", "s1", "n", &[], 50, Some(key))
             .await
             .unwrap();
         assert_eq!(out, CreateOutcome::Created);
@@ -900,7 +909,7 @@ mod tests {
             max_rows: 10_000,
             max_bytes: 4 << 20,
         };
-        write_rules(&pool, "u1", "s1", 0, &[], budget, Some(key))
+        write_rules_committed(&pool, "u1", "s1", 0, &[], budget, Some(key))
             .await
             .unwrap();
         let q =
@@ -916,7 +925,7 @@ mod tests {
             id: "22222222-2222-4222-8222-222222222222",
             body_digest: &format!("blake3:{hex}"),
         };
-        insert_set(&pool, "u1", "s2", "n", &[], 50, Some(other))
+        insert_set_committed(&pool, "u1", "s2", "n", &[], 50, Some(other))
             .await
             .unwrap();
         let c: Option<String> =

@@ -7,6 +7,17 @@
 //! SQL. Autosave validates shape and caps sizes only; catalog rule
 //! membership, the finding-details gate and the approval workflow are
 //! enforced at save-to-system by [`save_to_asset`].
+//!
+//! Every mutation commits its `ok` / `partial` audit row in the same
+//! transaction as the change ([`crate::api::audit_tx`]): a failed audit insert
+//! rolls the change back and the request fails (500/503). Save-to-system spans
+//! many transactions by design (each STIG's rule chunks commit on their own,
+//! with their `rule_audit` rows), so it writes an intent row
+//! (`checklist_set.save_to_system_start`) before any asset write and its
+//! closing row in the same transaction as the set's link to the asset.
+//! `denied` / `rejected` events have nothing to bind to and stay on
+//! `db_audit::record_or_log`, which is never called while a transaction is
+//! open (the pool is small).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -22,9 +33,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, Transaction};
 
 use crate::api::asset_acl;
+use crate::api::audit_tx;
 use crate::api::auth::AuthUser;
 use crate::api::checklist_save::{
     save_to_asset, SaveOrigin, SaveRequest, SaveResponse, SaveRule, MAX_TEXT_BYTES,
@@ -372,6 +384,23 @@ fn event<'a>(
     }
 }
 
+/// Insert `ev` on `tx` (the caller's transaction).
+async fn record_tx(tx: &mut Transaction<'_, Postgres>, ev: &NewAuditEvent<'_>) -> ApiResult<()> {
+    audit_tx::record(tx, ev).await.map_err(map_db)
+}
+
+/// Record `ev` (when there is one) and commit, both on `tx`. A failure drops
+/// the transaction, so the change rolls back with its audit row.
+async fn commit_audited(
+    mut tx: Transaction<'_, Postgres>,
+    ev: Option<&NewAuditEvent<'_>>,
+) -> ApiResult<()> {
+    if let Some(ev) = ev {
+        record_tx(&mut tx, ev).await?;
+    }
+    tx.commit().await.map_err(|e| map_db(e.into()))
+}
+
 /// The asset's name, only when the caller can still read it. Runs on the
 /// caller's (bounded) connection.
 async fn visible_asset_name(
@@ -530,8 +559,9 @@ async fn list_within(
 
 /// POST /api/checklist-sets
 ///
-/// Runs in a spawned task so a client disconnect cannot land between the
-/// commit and its audit event (a replay writes no second event).
+/// The set and its `checklist_set.create` row commit together. Runs in a
+/// spawned task so a client disconnect does not abandon an in-flight commit
+/// (a replay writes no second event).
 pub async fn create_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -593,12 +623,32 @@ async fn create_work(
     };
     let id = uuid::Uuid::new_v4().to_string();
     let hold = shield.hold();
-    match db::insert_set(pool, &user.id, &id, &name, &stigs, MAX_SETS_PER_USER, token)
-        .await
-        .map_err(map_db)?
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    match db::insert_set(
+        &mut tx,
+        &user.id,
+        &id,
+        &name,
+        &stigs,
+        MAX_SETS_PER_USER,
+        token,
+    )
+    .await
+    .map_err(map_db)?
     {
-        CreateOutcome::Created => {}
+        CreateOutcome::Created => {
+            let ev = event(
+                &user,
+                &ctx,
+                "checklist_set.create",
+                "ok",
+                None,
+                json!({ "setId": id, "stigs": stigs.len() }),
+            );
+            commit_audited(tx, Some(&ev)).await?;
+        }
         CreateOutcome::Existing(existing) => {
+            drop(tx);
             drop(hold);
             tracing::info!(user = %user.id, set = %existing, token = %short(&create_key), "checklist set create replayed");
             return Ok((
@@ -610,6 +660,7 @@ async fn create_work(
             set_id,
             stored_digest,
         } => {
+            drop(tx);
             tracing::warn!(user = %user.id, token = %short(&create_key), "checklist set create token reused with different content");
             // Recorded while the shield is held, like the ok events. An exact
             // repeat within `db_audit::collapse`'s window is folded into the
@@ -635,23 +686,12 @@ async fn create_work(
             return Err(request_conflict());
         }
         CreateOutcome::Limit => {
+            drop(tx);
             return Err(ApiError(Box::new(
                 (StatusCode::CONFLICT, Json(json!({ "error": "set_limit" }))).into_response(),
             )));
         }
     }
-    db_audit::record_or_log(
-        pool,
-        event(
-            &user,
-            &ctx,
-            "checklist_set.create",
-            "ok",
-            None,
-            json!({ "setId": id, "stigs": stigs.len() }),
-        ),
-    )
-    .await;
     drop(hold);
     Ok((
         StatusCode::CREATED,
@@ -674,8 +714,9 @@ pub async fn get_handler(
 /// PATCH /api/checklist-sets/:id — rename, or unlink (`assetId: null`).
 /// Linking happens only through save-to-system.
 ///
-/// Runs in a spawned task so a client disconnect cannot land between a
-/// commit and its audit event.
+/// A rename and an unlink in one request commit together, each with its audit
+/// row. Runs in a spawned task so a client disconnect does not abandon an
+/// in-flight commit.
 pub async fn patch_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -712,38 +753,34 @@ async fn patch_work(
         Some(n) => Some(clean_name(n).ok_or(StatusCode::BAD_REQUEST)?),
         None => None,
     };
+    let hold = shield.hold();
     let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
-    let found = db::get_set(&mut *tx, &user.id, &id)
+    if db::get_set(&mut *tx, &user.id, &id)
         .await
         .map_err(map_db)?
-        .is_some();
-    tx.commit().await.map_err(|e| map_db(e.into()))?;
-    if !found {
+        .is_none()
+    {
         return Err(StatusCode::NOT_FOUND.into());
     }
-    let hold = shield.hold();
     if let Some(n) = &name {
-        if !db::rename_set(pool, &user.id, &id, n)
+        if !db::rename_set(&mut tx, &user.id, &id, n)
             .await
             .map_err(map_db)?
         {
             return Err(StatusCode::NOT_FOUND.into());
         }
-        db_audit::record_or_log(
-            pool,
-            event(
-                &user,
-                &ctx,
-                "checklist_set.rename",
-                "ok",
-                None,
-                json!({ "setId": id }),
-            ),
-        )
-        .await;
+        let ev = event(
+            &user,
+            &ctx,
+            "checklist_set.rename",
+            "ok",
+            None,
+            json!({ "setId": id }),
+        );
+        record_tx(&mut tx, &ev).await?;
     }
     if req.asset_id == Some(None) {
-        let prev = db::unlink_asset(pool, &user.id, &id)
+        let prev = db::unlink_asset(&mut tx, &user.id, &id)
             .await
             .map_err(map_db)?
             .ok_or(StatusCode::NOT_FOUND)?;
@@ -757,17 +794,18 @@ async fn patch_work(
                 json!({ "setId": id }),
             );
             ev.asset_id = Some(&prev);
-            db_audit::record_or_log(pool, ev).await;
+            record_tx(&mut tx, &ev).await?;
         }
     }
+    commit_audited(tx, None).await?;
     drop(hold);
     Ok(Json(detail_of(&state, &user, &id).await?))
 }
 
 /// DELETE /api/checklist-sets/:id
 ///
-/// Runs in a spawned task so a client disconnect cannot land between the
-/// commit and its audit event.
+/// Runs in a spawned task so a client disconnect does not abandon an
+/// in-flight commit; the delete and its audit row commit together.
 pub async fn delete_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -796,28 +834,29 @@ async fn delete_work(
 ) -> ApiResult<StatusCode> {
     let pool = state.pool.as_ref();
     let _hold = shield.hold();
-    if !db::delete_set(pool, &user.id, &id).await.map_err(map_db)? {
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    if !db::delete_set(&mut tx, &user.id, &id)
+        .await
+        .map_err(map_db)?
+    {
         return Err(StatusCode::NOT_FOUND.into());
     }
-    db_audit::record_or_log(
-        pool,
-        event(
-            &user,
-            &ctx,
-            "checklist_set.delete",
-            "ok",
-            None,
-            json!({ "setId": id }),
-        ),
-    )
-    .await;
+    let ev = event(
+        &user,
+        &ctx,
+        "checklist_set.delete",
+        "ok",
+        None,
+        json!({ "setId": id }),
+    );
+    commit_audited(tx, Some(&ev)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /api/checklist-sets/:id/stigs — idempotent.
 ///
-/// Runs in a spawned task so a client disconnect cannot land between the
-/// commit and its audit event.
+/// Runs in a spawned task so a client disconnect does not abandon an
+/// in-flight commit; the new STIG and its audit row commit together.
 pub async fn add_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -856,10 +895,9 @@ async fn add_stig_work(
         return Err(StatusCode::NOT_FOUND.into());
     }
     let (version, release) = catalog_stig(&mut tx, &req.stig_id).await?;
-    tx.commit().await.map_err(|e| map_db(e.into()))?;
     let hold = shield.hold();
     match db::add_stig(
-        pool,
+        &mut tx,
         &user.id,
         &id,
         &req.stig_id,
@@ -872,20 +910,17 @@ async fn add_stig_work(
     {
         AddStig::NotFound => return Err(StatusCode::NOT_FOUND.into()),
         AddStig::Limit => return Err(StatusCode::BAD_REQUEST.into()),
-        AddStig::Exists => {}
+        AddStig::Exists => drop(tx),
         AddStig::Added => {
-            db_audit::record_or_log(
-                pool,
-                event(
-                    &user,
-                    &ctx,
-                    "checklist_set.stig_add",
-                    "ok",
-                    Some(&req.stig_id),
-                    json!({ "setId": id }),
-                ),
-            )
-            .await;
+            let ev = event(
+                &user,
+                &ctx,
+                "checklist_set.stig_add",
+                "ok",
+                Some(&req.stig_id),
+                json!({ "setId": id }),
+            );
+            commit_audited(tx, Some(&ev)).await?;
         }
     }
     drop(hold);
@@ -894,8 +929,8 @@ async fn add_stig_work(
 
 /// DELETE /api/checklist-sets/:id/stigs/:stig_id
 ///
-/// Runs in a spawned task so a client disconnect cannot land between the
-/// commit and its audit event.
+/// Runs in a spawned task so a client disconnect does not abandon an
+/// in-flight commit; the removal and its audit row commit together.
 pub async fn remove_stig_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -925,24 +960,24 @@ async fn remove_stig_work(
 ) -> ApiResult<Json<ChecklistSetDetail>> {
     let pool = state.pool.as_ref();
     let hold = shield.hold();
-    let removed = db::remove_stig(pool, &user.id, &id, &stig_id)
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let removed = db::remove_stig(&mut tx, &user.id, &id, &stig_id)
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
     if removed {
         let sid = is_valid_stig_id(&stig_id).then_some(stig_id.as_str());
-        db_audit::record_or_log(
-            pool,
-            event(
-                &user,
-                &ctx,
-                "checklist_set.stig_remove",
-                "ok",
-                sid,
-                json!({ "setId": id }),
-            ),
-        )
-        .await;
+        let ev = event(
+            &user,
+            &ctx,
+            "checklist_set.stig_remove",
+            "ok",
+            sid,
+            json!({ "setId": id }),
+        );
+        commit_audited(tx, Some(&ev)).await?;
+    } else {
+        drop(tx);
     }
     drop(hold);
     Ok(Json(detail_of(&state, &user, &id).await?))
@@ -964,8 +999,9 @@ pub async fn autosave_handler(
     autosave_run(state, user, ctx, id, req, budget, SET_LIMITS).await
 }
 
-/// Spawned so a client disconnect cannot land between the commit and the
-/// audit event (a retry is acknowledged without a second event).
+/// Spawned so a client disconnect does not abandon an in-flight commit. The
+/// write and its audit event commit together (a retry is acknowledged without
+/// a second event).
 async fn autosave_run(
     state: AppState,
     user: AuthUser,
@@ -1130,29 +1166,37 @@ async fn autosave_with_budget(
         v
     };
     let hold = shield.hold();
-    let outcome = db::write_rules(pool, &user.id, &id, req.revision, &changes, budget, token)
-        .await
-        .map_err(map_db)?;
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
+    let outcome = db::write_rules(
+        &mut tx,
+        &user.id,
+        &id,
+        req.revision,
+        &changes,
+        budget,
+        token,
+    )
+    .await
+    .map_err(map_db)?;
     match outcome {
         WriteOutcome::Written {
             revision,
             updated_at,
             edit_event_due,
         } => {
-            if edit_event_due {
-                db_audit::record_or_log(
-                    pool,
-                    event(
-                        &user,
-                        &ctx,
-                        "checklist_set.edit",
-                        "ok",
-                        None,
-                        json!({ "setId": id, "changes": changes.len(), "stigIds": stig_ids }),
-                    ),
+            // The edit event is coalesced per window; the window marker is
+            // bumped in this transaction, so a failed event rolls it back too.
+            let ev = edit_event_due.then(|| {
+                event(
+                    &user,
+                    &ctx,
+                    "checklist_set.edit",
+                    "ok",
+                    None,
+                    json!({ "setId": id, "changes": changes.len(), "stigIds": stig_ids }),
                 )
-                .await;
-            }
+            });
+            commit_audited(tx, ev.as_ref()).await?;
             drop(hold);
             Ok(Json(AutosaveResponse {
                 revision,
@@ -1175,6 +1219,7 @@ async fn autosave_with_budget(
             token_reused,
             stored_digest,
         } => {
+            drop(tx);
             if token_reused {
                 tracing::warn!(user = %user.id, set = %id, token = %short(&save_id), "checklist set autosave token reused with different content");
                 record_save_id_conflict(
@@ -1208,7 +1253,15 @@ async fn autosave_with_budget(
 /// POST /api/checklist-sets/:id/save-to-system
 ///
 /// Runs in a spawned task: each STIG's chunks commit on their own, so a
-/// client disconnect must not leave committed writes without audit events.
+/// client disconnect must not leave committed writes without the closing
+/// audit event. An intent row is committed before any asset write, and the
+/// closing row commits with the link to the asset.
+///
+/// Contract when the closing transaction (link plus summary row) fails: the
+/// response is 5xx (503 on a timeout) and the set is NOT linked. The asset
+/// writes stay committed, each with its `rule_audit` rows; the
+/// `checklist_set.save_to_system_start` row marks the save as unfinished; a
+/// retry is idempotent (every rule reports `unchanged`) and finishes the job.
 pub async fn save_to_system_handler(
     State(state): State<AppState>,
     Extension(user): Extension<AuthUser>,
@@ -1238,8 +1291,11 @@ async fn save_to_system_work(
     shield: Shield,
 ) -> ApiResult<Json<SetSaveResponse>> {
     let pool = state.pool.as_ref();
-    // Three short bounded transactions; every reject and audit record runs
-    // after the commit of the one before it, never inside one.
+    // Three short bounded transactions, then the saves (each STIG's chunks
+    // commit on their own), then a closing one. `denied` / `rejected` records
+    // run after the transaction before them ends or is dropped, never inside
+    // one; the intent and closing rows are written in-transaction and fail the
+    // request when they cannot be.
     let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
     let set = db::get_set(&mut *tx, &user.id, &id)
         .await
@@ -1323,11 +1379,23 @@ async fn save_to_system_work(
         .await
         .map_err(map_db)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    tx.commit().await.map_err(|e| map_db(e.into()))?;
     if after.revision != req.revision {
+        drop(tx);
         reject("revision_conflict").await;
         return Err(conflict(after.revision));
     }
+    // Intent row, fail closed: nothing has been written to the asset yet, so
+    // when this cannot be recorded the request fails with no effect.
+    let mut start = event(
+        &user,
+        &ctx,
+        "checklist_set.save_to_system_start",
+        "ok",
+        None,
+        json!({ "setId": id, "revision": req.revision, "stigs": stigs.len() }),
+    );
+    start.asset_id = Some(&asset.id);
+    commit_audited(tx, Some(&start)).await?;
     let mut by_stig: HashMap<String, Vec<SaveRule>> = HashMap::new();
     for r in rules {
         by_stig.entry(r.stig_id).or_default().push(SaveRule {
@@ -1367,15 +1435,26 @@ async fn save_to_system_work(
         .filter_map(|r| r.save.as_ref())
         .map(|s| s.error_count)
         .sum();
+    // Closing transaction: the link and the summary row commit together. When
+    // the row cannot be written the link is rolled back and the request fails;
+    // the asset writes above stay (each with its `rule_audit` rows), the start
+    // row shows an unfinished save and a retry is idempotent.
+    let mut tx = crate::db::begin_bounded(pool).await.map_err(map_db)?;
     if ok_count > 0 {
-        // The writes above are committed; a failed link (asset deleted in
-        // between) must not hide their results.
-        if let Err(e) = db::link_asset(pool, &user.id, &id, &asset.id).await {
-            tracing::error!("linking set {id} to asset {} failed: {e:#}", asset.id);
-        }
+        db::link_asset(&mut tx, &user.id, &id, &asset.id)
+            .await
+            .map_err(map_db)?;
     }
-    record(
-        if ok_count == results.len() && row_errors == 0 { "ok" } else { "partial" },
+    let mut closing = event(
+        &user,
+        &ctx,
+        "checklist_set.save_to_system",
+        if ok_count == results.len() && row_errors == 0 {
+            "ok"
+        } else {
+            "partial"
+        },
+        None,
         json!({
             "setId": id,
             "stigs": results.len(),
@@ -1386,8 +1465,9 @@ async fn save_to_system_work(
             "unchanged": results.iter().filter_map(|r| r.save.as_ref()).map(|s| s.unchanged_count).sum::<usize>(),
             "errors": row_errors,
         }),
-    )
-    .await;
+    );
+    closing.asset_id = Some(&asset.id);
+    commit_audited(tx, Some(&closing)).await?;
     Ok(Json(SetSaveResponse {
         asset_id: asset.id.clone(),
         asset_name: asset.name.clone(),
@@ -2873,7 +2953,6 @@ mod tests {
         // The handler is gone; the detached task still holds the permit.
         assert_eq!(state.admission.in_flight(), 1);
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         state.admission.idle().await;
         assert_eq!(state.admission.in_flight(), 0);
         assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
@@ -2896,7 +2975,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(audit_count(&pool, "checklist_set.edit").await, 1);
         assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
     }
@@ -2922,7 +3000,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(
             count(
                 &pool,
@@ -2965,7 +3042,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(
             count(
                 &pool,
@@ -3001,7 +3077,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 0);
         assert_eq!(audit_count(&pool, "checklist_set.delete").await, 1);
     }
@@ -3025,7 +3100,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
             2
@@ -3051,7 +3125,6 @@ mod tests {
         )
         .await;
         state.tasks.idle().await;
-        crate::db_audit::drain().await;
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
             1
@@ -3638,5 +3711,454 @@ mod tests {
             0
         );
         assert_eq!(audit_count(&pool, "checklist_set.edit").await, 0);
+    }
+
+    // ── Same-transaction audit rows (#150) ─────────────────────────────────
+
+    async fn fail_audit(pool: &PgPool, actions: &[&str]) {
+        crate::test_fixtures::fail_audit_inserts(pool, actions).await;
+    }
+
+    async fn stop_failing_audit(pool: &PgPool) {
+        sqlx::query("DROP TRIGGER test_fail_audit ON audit_events")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn rename(
+        state: &AppState,
+        id: &str,
+        name: Option<&str>,
+        unlink: bool,
+    ) -> Option<StatusCode> {
+        code(
+            patch_handler(
+                st(state),
+                Extension(auth("owner", "author")),
+                cx(),
+                Path(id.into()),
+                Json(PatchRequest {
+                    name: name.map(str::to_string),
+                    asset_id: unlink.then_some(None),
+                }),
+            )
+            .await,
+        )
+    }
+
+    /// A set holding both fixture STIGs with one stored rule, linked to `a1`.
+    async fn linked_set(state: &AppState) -> ChecklistSetDetail {
+        let set = make(state, "owner", &[STIG_ID, STIG2]).await;
+        autosave(
+            state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        push(state, "owner", &set.id, 1, Some("a1")).await.unwrap();
+        set
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn create_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        fail_audit(&pool, &["checklist_set.create"]).await;
+        let res = create_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Json(create_req(None, &[STIG_ID])),
+        )
+        .await;
+        assert_eq!(code(res), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
+            0
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn autosave_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        fail_audit(&pool, &["checklist_set.edit"]).await;
+        let res = autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            0
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE last_edit_event_at IS NOT NULL"
+            )
+            .await,
+            0,
+            "the coalescing window marker rolls back with the change"
+        );
+        // Once the table is writable again the same save writes its event.
+        stop_failing_audit(&pool).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        let rows = crate::test_fixtures::audit_rows(&pool, "checklist_set.edit").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail_keys(), ["changes", "setId", "stigIds"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn an_autosave_inside_the_coalescing_window_needs_no_audit_row(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        fail_audit(&pool, &["checklist_set.edit"]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            1,
+            vec![change(STIG_ID, RULES[1], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 2);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.edit").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn rename_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        fail_audit(&pool, &["checklist_set.rename"]).await;
+        assert_eq!(
+            rename(&state, &set.id, Some("renamed"), false).await,
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let name: String = sqlx::query_scalar("SELECT name FROM checklist_sets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name, set.name);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn unlink_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = linked_set(&state).await;
+        fail_audit(&pool, &["checklist_set.unlink"]).await;
+        assert_eq!(
+            rename(&state, &set.id, None, true).await,
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE asset_id = 'a1'"
+            )
+            .await,
+            1,
+            "the asset link is kept"
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_patch_with_rename_and_unlink_is_atomic(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = linked_set(&state).await;
+        fail_audit(&pool, &["checklist_set.unlink"]).await;
+        assert_eq!(
+            rename(&state, &set.id, Some("renamed"), true).await,
+            Some(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        let (name, asset): (String, Option<String>) =
+            sqlx::query_as("SELECT name, asset_id FROM checklist_sets")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((name, asset.as_deref()), (set.name, Some("a1")));
+        assert_eq!(audit_count(&pool, "checklist_set.rename").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn delete_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        fail_audit(&pool, &["checklist_set.delete"]).await;
+        let res = delete_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path(set.id.clone()),
+        )
+        .await;
+        assert_eq!(code(res), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklist_sets").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn stig_add_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        fail_audit(&pool, &["checklist_set.stig_add"]).await;
+        let res = add_stig_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path(set.id.clone()),
+            Json(AddStigRequest {
+                stig_id: STIG2.into(),
+            }),
+        )
+        .await;
+        assert_eq!(code(res), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
+            1
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn stig_remove_fails_closed_when_its_audit_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID, STIG2]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG2, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        fail_audit(&pool, &["checklist_set.stig_remove"]).await;
+        let res = remove_stig_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path((set.id.clone(), STIG2.to_string())),
+        )
+        .await;
+        assert_eq!(code(res), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_stigs").await,
+            2
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_set_rules").await,
+            1
+        );
+        assert_eq!(count(&pool, "SELECT revision FROM checklist_sets").await, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_to_system_writes_nothing_when_the_start_row_cannot_be_written(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        fail_audit(&pool, &["checklist_set.save_to_system_start"]).await;
+        let res = push(&state, "owner", &set.id, 1, Some("a1")).await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        for table in ["checklists", "checklist_rules", "rule_audit"] {
+            assert_eq!(
+                count(&pool, &format!("SELECT COUNT(*) FROM {table}")).await,
+                0,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE asset_id IS NOT NULL"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn save_to_system_reports_failure_and_does_not_link_when_the_final_row_cannot_be_written(
+        pool: PgPool,
+    ) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        fail_audit(&pool, &["checklist_set.save_to_system"]).await;
+        let res = push(&state, "owner", &set.id, 1, Some("a1")).await;
+        assert_eq!(res.err(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE asset_id IS NOT NULL"
+            )
+            .await,
+            0,
+            "the link rolls back with the closing row"
+        );
+        // The asset writes and their rule audit stay; the start row marks the
+        // unfinished save.
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM checklist_rules").await,
+            1
+        );
+        assert!(count(&pool, "SELECT COUNT(*) FROM rule_audit").await > 0);
+        assert_eq!(
+            audit_count_ok(&pool, "checklist_set.save_to_system_start").await,
+            1
+        );
+        // A retry is idempotent and finishes the job.
+        stop_failing_audit(&pool).await;
+        let again = push(&state, "owner", &set.id, 1, Some("a1")).await.unwrap();
+        assert!(again.results.iter().all(|x| x
+            .save
+            .as_ref()
+            .is_some_and(|s| s.applied_count == 0 && s.unchanged_count > 0)));
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM checklist_sets WHERE asset_id = 'a1'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            audit_count_ok(&pool, "checklist_set.save_to_system").await,
+            1
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_set_save_does_not_create_a_checklist_without_its_create_row(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        fail_audit(&pool, &["checklist.create"]).await;
+        let r = push(&state, "owner", &set.id, 1, Some("a1")).await.unwrap();
+        assert_eq!(r.results.len(), 1);
+        assert!(!r.results[0].ok);
+        assert_eq!(r.results[0].status, Some(500));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM checklists").await, 0);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn ok_events_are_visible_without_draining_the_audit_queue(pool: PgPool) {
+        let (state, _dir) = base(&pool).await;
+        let set = make(&state, "owner", &[STIG_ID]).await;
+        assert_eq!(audit_count_ok(&pool, "checklist_set.create").await, 1);
+        autosave(
+            &state,
+            "owner",
+            &set.id,
+            0,
+            vec![change(STIG_ID, RULES[0], "open", "", "")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(audit_count_ok(&pool, "checklist_set.edit").await, 1);
+        assert_eq!(rename(&state, &set.id, Some("n2"), false).await, None);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.rename").await, 1);
+        let add = add_stig_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path(set.id.clone()),
+            Json(AddStigRequest {
+                stig_id: STIG2.into(),
+            }),
+        )
+        .await;
+        assert_eq!(code(add), None);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.stig_add").await, 1);
+        let rm = remove_stig_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path((set.id.clone(), STIG2.to_string())),
+        )
+        .await;
+        assert_eq!(code(rm), None);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.stig_remove").await, 1);
+        let del = delete_handler(
+            st(&state),
+            Extension(auth("owner", "author")),
+            cx(),
+            Path(set.id.clone()),
+        )
+        .await;
+        assert_eq!(code(del), None);
+        assert_eq!(audit_count_ok(&pool, "checklist_set.delete").await, 1);
+        // The row carries the request context.
+        let (rid, ip): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT request_id, source_ip FROM audit_events WHERE action = 'checklist_set.delete'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rid.as_deref(), Some("test-request"));
+        assert_eq!(ip.as_deref(), Some("198.51.100.4"));
     }
 }

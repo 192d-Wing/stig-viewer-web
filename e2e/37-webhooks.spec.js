@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { randomBytes } from "node:crypto";
 import { resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 // Address that's guaranteed to fail to connect (port 1 reserved/unused
@@ -120,6 +121,50 @@ test.describe("Outbound webhooks", () => {
       })
       .then((r) => r.json());
     expect(after.length).toBe(0);
+  });
+
+  test("API: webhook create, update and delete leave audit rows without the URL or secret", async ({
+    request,
+  }) => {
+    await ensureUser(request, "alice");
+    await setUserRole("alice", "admin");
+    const url = `https://example.invalid/hook/${Date.now()}-path-credential`;
+    const secret = `s-${randomBytes(16).toString("hex")}`;
+    const created = await request
+      .post(`${BACKEND}/api/webhooks`, {
+        headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+        data: { name: "Audited hook", url, secret },
+      })
+      .then((r) => r.json());
+    await request.patch(`${BACKEND}/api/webhooks/${created.id}`, {
+      headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
+      data: { enabled: false },
+    });
+    await request.delete(`${BACKEND}/api/webhooks/${created.id}`, {
+      headers: { "X-User-Id": "alice" },
+    });
+
+    const rowsFor = async (action) =>
+      (
+        await request
+          .get(`${BACKEND}/api/audit/events?action=${action}`, {
+            headers: { "X-User-Id": "alice" },
+          })
+          .then((r) => r.json())
+      ).rows;
+    const all = [];
+    for (const action of ["webhook.create", "webhook.update", "webhook.delete"]) {
+      const rows = await rowsFor(action);
+      expect(rows.length).toBe(1);
+      expect(rows[0].outcome).toBe("ok");
+      expect(rows[0].detail.webhookId).toBe(created.id);
+      all.push(...rows);
+    }
+    expect(all[1].detail.changed).toEqual(["enabled"]);
+    const text = JSON.stringify(all);
+    expect(text).not.toContain(url);
+    expect(text).not.toContain(secret);
+    expect(text).not.toContain("Audited hook");
   });
 
   test("API: assigning a rule produces a delivery row", async ({ request }) => {
