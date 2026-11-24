@@ -57,19 +57,20 @@ const MAX_PREFIX_LIST: usize = 16;
 const MIN_RSA_BITS: usize = 2048;
 
 /// Supported SignatureMethod URIs: the single dispatch point for signing algorithms.
+/// Every variant is RSA PKCS#1 v1.5; the variant names the hash.
 #[derive(Clone, Copy)]
 enum SigAlg {
-    RsaSha256,
-    RsaSha384,
-    RsaSha512,
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 impl SigAlg {
     fn from_uri(u: &str) -> Option<Self> {
         match u {
-            ALG_RSA_SHA256 => Some(SigAlg::RsaSha256),
-            ALG_RSA_SHA384 => Some(SigAlg::RsaSha384),
-            ALG_RSA_SHA512 => Some(SigAlg::RsaSha512),
+            ALG_RSA_SHA256 => Some(SigAlg::Sha256),
+            ALG_RSA_SHA384 => Some(SigAlg::Sha384),
+            ALG_RSA_SHA512 => Some(SigAlg::Sha512),
             _ => None,
         }
     }
@@ -79,13 +80,13 @@ impl SigAlg {
             bail!("SignatureValue length does not match the key modulus");
         }
         match self {
-            SigAlg::RsaSha256 => key
+            SigAlg::Sha256 => key
                 .verify_pkcs1_sha256(msg, sig)
                 .context("RSA signature does not verify against SignedInfo"),
-            SigAlg::RsaSha384 => key
+            SigAlg::Sha384 => key
                 .verify_pkcs1_sha384(msg, sig)
                 .context("RSA signature does not verify against SignedInfo"),
-            SigAlg::RsaSha512 => key
+            SigAlg::Sha512 => key
                 .verify_pkcs1_sha512(msg, sig)
                 .context("RSA signature does not verify against SignedInfo"),
         }

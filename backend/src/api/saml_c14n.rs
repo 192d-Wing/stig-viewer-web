@@ -32,7 +32,10 @@ struct Ctx<'a> {
     out: Vec<u8>,
 }
 
-impl Ctx<'_> {
+/// An attribute as (namespace uri, local name, qname as written, value).
+type Attr<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+impl<'a> Ctx<'a> {
     fn put(&mut self, s: &str) -> Result<()> {
         self.out.extend_from_slice(s.as_bytes());
         if self.out.len() > MAX_C14N_BYTES {
@@ -41,22 +44,19 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn emit(&mut self, i: usize, rendered: &mut Vec<(String, String)>) -> Result<()> {
-        if Some(i) == self.omit {
-            return Ok(());
-        }
+    /// Candidate namespace prefixes for element `i` (true when visibly
+    /// utilised, false when only on the InclusiveNamespaces PrefixList), and
+    /// its attributes as (ns uri, local, qname, value).
+    fn candidates_and_attrs(&self, i: usize) -> Result<(BTreeMap<String, bool>, Vec<Attr<'a>>)> {
         let doc = self.doc;
         let n = doc.node(i);
-        let mark = rendered.len();
-
-        // Candidate prefixes: true when visibly utilised, false when only listed.
         let mut cand: BTreeMap<String, bool> = BTreeMap::new();
         for p in self.inclusive {
             let p = if p == "#default" { "" } else { p.as_str() };
             cand.entry(p.to_string()).or_insert(false);
         }
         cand.insert(n.prefix.clone(), true);
-        let mut attrs: Vec<(&str, &str, &str, &str)> = Vec::new();
+        let mut attrs = Vec::with_capacity(n.attrs.len());
         for (k, v) in &n.attrs {
             let (uri, local) = match k.split_once(':') {
                 Some((p, l)) => {
@@ -73,6 +73,17 @@ impl Ctx<'_> {
             attrs.push((uri, local, k.as_str(), v.as_str()));
         }
         cand.remove("xml");
+        Ok((cand, attrs))
+    }
+
+    fn emit(&mut self, i: usize, rendered: &mut Vec<(String, String)>) -> Result<()> {
+        if Some(i) == self.omit {
+            return Ok(());
+        }
+        let doc = self.doc;
+        let n = doc.node(i);
+        let mark = rendered.len();
+        let (cand, mut attrs) = self.candidates_and_attrs(i)?;
 
         // BTreeMap order puts the default namespace ("") first, then prefixes sorted.
         let mut decls: Vec<(String, Option<String>)> = Vec::new();

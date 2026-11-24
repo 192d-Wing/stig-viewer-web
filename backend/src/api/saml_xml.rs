@@ -232,6 +232,38 @@ fn make_node(
     })
 }
 
+/// Root-uniqueness and depth checks before opening an element.
+fn check_open(stack: &[usize], root_done: &mut bool) -> Result<()> {
+    if stack.is_empty() {
+        if *root_done {
+            bail!("more than one root element");
+        }
+        *root_done = true;
+    }
+    if stack.len() >= MAX_DEPTH {
+        bail!("element nesting too deep");
+    }
+    Ok(())
+}
+
+/// Append character data to the open element, or accept/reject it outside
+/// the root (only whitespace text is allowed there, and only when
+/// `whitespace_ok_outside`).
+fn place_text(
+    nodes: &mut [Node],
+    open: Option<usize>,
+    s: &str,
+    whitespace_ok_outside: bool,
+    what: &str,
+) -> Result<()> {
+    match open {
+        Some(i) => push_text(nodes, i, s),
+        None if whitespace_ok_outside && s.trim().is_empty() => {}
+        None => bail!("{what} outside root element"),
+    }
+    Ok(())
+}
+
 /// Append character data to element `idx`, keeping `text` and `content` in step.
 fn push_text(nodes: &mut [Node], idx: usize, s: &str) {
     if s.is_empty() {
@@ -315,15 +347,7 @@ impl SamlDoc {
             let after = r.buffer_position() as usize;
             match ev {
                 Event::Start(e) => {
-                    if stack.is_empty() {
-                        if root_done {
-                            bail!("more than one root element");
-                        }
-                        root_done = true;
-                    }
-                    if stack.len() >= MAX_DEPTH {
-                        bail!("element nesting too deep");
-                    }
+                    check_open(&stack, &mut root_done)?;
                     let n = make_node(ns, &e, stack.last().copied(), before, after)?;
                     let is_assertion = n.ns == NS_ASSERT && n.local == "Assertion";
                     let idx = add_node(&mut nodes, n, in_assertion > 0)?;
@@ -333,15 +357,7 @@ impl SamlDoc {
                     stack.push(idx);
                 }
                 Event::Empty(e) => {
-                    if stack.is_empty() {
-                        if root_done {
-                            bail!("more than one root element");
-                        }
-                        root_done = true;
-                    }
-                    if stack.len() >= MAX_DEPTH {
-                        bail!("element nesting too deep");
-                    }
+                    check_open(&stack, &mut root_done)?;
                     let n = make_node(ns, &e, stack.last().copied(), before, after)?;
                     add_node(&mut nodes, n, in_assertion > 0)?;
                 }
@@ -355,20 +371,13 @@ impl SamlDoc {
                 Event::Text(t) => {
                     let raw = std::str::from_utf8(&t).map_err(|_| anyhow!("text not utf-8"))?;
                     let s = unescape_checked(&normalize_eol(raw))?;
-                    match stack.last() {
-                        Some(&i) => push_text(&mut nodes, i, &s),
-                        None if s.trim().is_empty() => {}
-                        None => bail!("text outside root element"),
-                    }
+                    place_text(&mut nodes, stack.last().copied(), &s, true, "text")?;
                 }
                 Event::CData(c) => {
                     let raw = std::str::from_utf8(&c).map_err(|_| anyhow!("CDATA not utf-8"))?;
                     let s = normalize_eol(raw);
                     check_chars(&s)?;
-                    match stack.last() {
-                        Some(&i) => push_text(&mut nodes, i, &s),
-                        None => bail!("CDATA outside root element"),
-                    }
+                    place_text(&mut nodes, stack.last().copied(), &s, false, "CDATA")?;
                 }
                 Event::Decl(_) if nodes.is_empty() => {}
                 Event::Decl(_) => bail!("XML declaration after root"),
