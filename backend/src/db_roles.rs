@@ -1938,6 +1938,24 @@ mod tests {
         app.cleanup(&pool).await;
     }
 
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn app_role_can_use_the_saml_replay_cache(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let id = "a".repeat(64);
+        let ins = "INSERT INTO saml_seen_ids (id_sha256, kind, expires_at) \
+                   VALUES ($1, 'assertion', now() + interval '5 minutes') ON CONFLICT DO NOTHING";
+        let n = sqlx::query(ins).bind(&id).execute(&app.pool).await.unwrap();
+        assert_eq!(n.rows_affected(), 1);
+        let n = sqlx::query(ins).bind(&id).execute(&app.pool).await.unwrap();
+        assert_eq!(n.rows_affected(), 0);
+        sqlx::query("DELETE FROM saml_seen_ids WHERE expires_at < now()")
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        app.cleanup(&pool).await;
+    }
+
     /// Run `stmts` (each in its own transaction, in the given maintenance mode
     /// where one is named) as the app role and expect 42501 for every one.
     async fn expect_denied(app: &PgPool, stmts: &[(&str, &str)]) {

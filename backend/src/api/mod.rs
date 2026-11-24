@@ -42,6 +42,7 @@ pub mod rule_bulk_import;
 pub mod rule_bulk_status;
 pub mod rule_comments;
 pub mod saml;
+pub mod saml_c14n;
 pub mod saml_verify;
 pub mod saml_xml;
 pub mod saved_searches;

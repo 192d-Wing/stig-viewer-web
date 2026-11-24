@@ -1,10 +1,16 @@
 //! SHA-2 digests.
 
-use aws_lc_rs::digest::{self, Context, SHA256, SHA512};
+use aws_lc_rs::digest::{self, Context, SHA256, SHA384, SHA512};
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest::digest(&SHA256, data).as_ref());
+    out
+}
+
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out.copy_from_slice(digest::digest(&SHA384, data).as_ref());
     out
 }
 
@@ -50,7 +56,7 @@ impl Default for Sha256Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256, Sha512};
+    use sha2::{Digest, Sha256, Sha384, Sha512};
 
     // Published FIPS 180-4 vectors for "abc".
     #[test]
@@ -58,6 +64,11 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex::encode(sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
         );
         assert_eq!(
             sha512_hex(b"abc"),
@@ -71,6 +82,7 @@ mod tests {
         for len in [0usize, 1, 55, 56, 64, 111, 112, 128, 1000, 1 << 20] {
             let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
             assert_eq!(sha256(&data).as_slice(), Sha256::digest(&data).as_slice());
+            assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
             assert_eq!(sha512(&data).as_slice(), Sha512::digest(&data).as_slice());
         }
     }

@@ -369,6 +369,65 @@ async fn acs_core(
     let assertion = process_saml_response(&xml, &state.config, Utc::now())
         .map_err(|e| deny(code_of(&e), &format!("{e:#}")))?;
 
+    // IA-2(8): a verified Assertion (and a verified Response ID) is processed at
+    // most once cluster-wide, whoever presents it and whatever happens next. A
+    // database error fails closed.
+    let mut seen = vec![(
+        "assertion",
+        crate::db_saml_replay::id_digest("assertion", &assertion.assertion_id),
+    )];
+    if let Some(r) = &assertion.response_id {
+        seen.push(("response", crate::db_saml_replay::id_digest("response", r)));
+    }
+    let expires_at =
+        assertion.not_on_or_after + chrono::Duration::seconds(state.config.clock_skew_secs);
+    match crate::db_saml_replay::record_first_use(state.pool.as_ref(), &seen, expires_at).await {
+        Ok(true) => {}
+        Ok(false) => {
+            crate::db_audit::record_system_or_log(
+                state.pool.as_ref(),
+                crate::db_audit::NewSystemEvent {
+                    action: "auth.saml_replay",
+                    outcome: "rejected",
+                    stig_id: None,
+                    detail: serde_json::json!({
+                        "reasonCode": "replay",
+                        "assertionIdSha256": seen[0].1,
+                        "responseIdSha256": seen.get(1).map(|(_, d)| d.as_str()),
+                        "issuer": assertion.issuer,
+                        "nameIdSha256": assertion
+                            .name_id
+                            .as_deref()
+                            .map(crate::db_saml_replay::name_id_digest),
+                        "sourceIp": ip.to_string(),
+                    }),
+                },
+            )
+            .await;
+            return Err(deny("replay", "assertion or response ID already seen"));
+        }
+        Err(e) => {
+            tracing::error!("saml replay check failed: {e:#}");
+            // Best effort: the database that failed may be the one being written.
+            crate::db_audit::record_system_or_log(
+                state.pool.as_ref(),
+                crate::db_audit::NewSystemEvent {
+                    action: "auth.saml_replay",
+                    outcome: "error",
+                    stig_id: None,
+                    detail: serde_json::json!({
+                        "reasonCode": "replay_check_error",
+                        "assertionIdSha256": seen[0].1,
+                        "issuer": assertion.issuer,
+                        "sourceIp": ip.to_string(),
+                    }),
+                },
+            )
+            .await;
+            return Err(deny("replay_check_error", "replay cache query failed"));
+        }
+    }
+
     // AC-8: the verified InResponseTo plus this browser's request cookie must claim
     // the acknowledgement consumed at login start. IdP-initiated responses are refused.
     let Some(irt) = assertion.in_response_to.as_deref() else {
@@ -412,7 +471,7 @@ async fn acs_core(
     .await
     .map_err(|c| internal(&format!("login session failed: {c}")))?;
 
-    tracing::info!(target: "audit", action = "auth.saml_acs", outcome = "success", user_id = %user.id, assertion_id = assertion.assertion_id.as_deref().unwrap_or(""), ip = %ip);
+    tracing::info!(target: "audit", action = "auth.saml_acs", outcome = "success", user_id = %user.id, assertion_id = %assertion.assertion_id, ip = %ip);
 
     let jar = jar.remove(removal_cookie(
         SAML_REQ_COOKIE,
@@ -527,18 +586,21 @@ pub(crate) struct ParsedAssertion {
     /// verified scope (see [`extract`]); at most 128 chars.
     pub in_response_to: Option<String>,
     /// `ID` of the Assertion the identity was read from.
-    #[allow(dead_code)] // carried for the replay-cache follow-up
-    pub assertion_id: Option<String>,
+    pub assertion_id: String,
+    /// `ID` of the Response, set only when the Response itself was verified
+    /// (otherwise it is unauthenticated and must not key the replay cache).
+    pub response_id: Option<String>,
     /// Expiry of the accepted bearer SubjectConfirmation.
-    #[allow(dead_code)] // carried for the replay-cache follow-up
-    pub not_on_or_after: Option<DateTime<Utc>>,
-    #[allow(dead_code)] // informational; asserted in tests
-    pub scope: ScopeKind,
+    pub not_on_or_after: DateTime<Utc>,
+    /// The verified `Issuer` (for the audit record).
+    pub issuer: Option<String>,
 }
 
 const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
 const CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const MAX_IRT_CHARS: usize = 128;
+/// Longest bearer validity accepted (bounds how long the replay cache keeps an ID).
+const MAX_ASSERTION_VALIDITY: chrono::Duration = chrono::Duration::hours(24);
 
 /// Parse, verify, and validate a SAMLResponse; returns identity read only
 /// from the verified element. The single entry point used by the ACS.
@@ -639,6 +701,9 @@ fn extract(
         None => None,
     };
     let mut bearer = None;
+    // Latest NotOnOrAfter over every bearer confirmation for this ACS, valid
+    // now or not: the replay cache and the 24 h cap must cover the longest one.
+    let mut latest: Option<DateTime<Utc>> = None;
     for sc in doc.children(subject, a, "SubjectConfirmation") {
         if doc.attr(sc, "Method") != Some(CM_BEARER) {
             continue;
@@ -652,6 +717,12 @@ fn extract(
         let Some(na) = doc.attr(d, "NotOnOrAfter") else {
             continue;
         };
+        if let Ok(t) = parse_time(na) {
+            latest = latest.max(Some(t));
+        }
+        if bearer.is_some() {
+            continue;
+        }
         if check_window(
             now,
             skew,
@@ -664,14 +735,26 @@ fn extract(
             continue;
         }
         bearer = Some((d, parse_time(na)?));
-        break;
     }
-    let (conf_data, not_on_or_after) = bearer.ok_or_else(|| {
+    let (conf_data, first_valid) = bearer.ok_or_else(|| {
         reject(
             "recipient",
             "no valid bearer SubjectConfirmation for this ACS",
         )
     })?;
+
+    let not_on_or_after = latest.unwrap_or(first_valid).max(first_valid);
+    if not_on_or_after > now + MAX_ASSERTION_VALIDITY {
+        return Err(reject(
+            "validity_too_long",
+            "bearer NotOnOrAfter is more than 24 hours away",
+        ));
+    }
+
+    let issuer = doc
+        .child_opt(assertion, a, "Issuer")?
+        .and_then(|i| doc.leaf_text(i).ok())
+        .map(|t| t.chars().take(256).collect::<String>());
 
     // Conditions: validity window and audience.
     let cond = doc.child_one(assertion, a, "Conditions")?;
@@ -748,9 +831,12 @@ fn extract(
         email,
         display_name,
         in_response_to: in_response_to.map(String::from),
-        assertion_id: Some(assertion_id),
-        not_on_or_after: Some(not_on_or_after),
-        scope,
+        assertion_id,
+        response_id: (scope == ScopeKind::Response)
+            .then(|| doc.attr(root, "ID").map(String::from))
+            .flatten(),
+        not_on_or_after,
+        issuer,
     })
 }
 
@@ -1053,8 +1139,74 @@ mod tests {
             assert_eq!(p.email.as_deref(), Some("alice@example.com"));
             assert_eq!(p.display_name.as_deref(), Some("Alice Example"));
             assert_eq!(p.in_response_to.as_deref(), Some("_req1"));
-            assert_eq!(p.assertion_id.as_deref(), Some("AS1"));
+            assert_eq!(p.assertion_id, "AS1");
+            // The Response ID is trusted only when the Response itself is signed.
+            let want = (l != Layout::Assertion).then(|| "RS1".to_string());
+            assert_eq!(p.response_id, want);
+            assert_eq!(
+                p.not_on_or_after,
+                "2030-01-01T00:05:00Z".parse::<DateTime<Utc>>().unwrap()
+            );
         }
+    }
+
+    #[test]
+    fn replay_horizon_uses_the_latest_bearer_confirmation() {
+        // Two bearer confirmations for this ACS (+1 min and +10 h); both
+        // verified, so the 10 h one decides expiry and the 24 h cap.
+        let base = Fx::new(Layout::Unsigned).build();
+        let sc = |na: &str| {
+            format!(
+                r#"<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="{ACS}" NotOnOrAfter="{na}" InResponseTo="_req1"/></saml:SubjectConfirmation>"#
+            )
+        };
+        let with = |a: &str, b: &str| {
+            base.replacen(
+                "</saml:Subject>",
+                &format!("{}{}</saml:Subject>", sc(a), sc(b)),
+                1,
+            )
+        };
+        let p = process_saml_response(
+            &with("2030-01-01T00:01:00Z", "2030-01-01T10:00:00Z"),
+            &dev_cfg(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.not_on_or_after,
+            "2030-01-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        // Order does not matter.
+        let p = process_saml_response(
+            &with("2030-01-01T10:00:00Z", "2030-01-01T00:01:00Z"),
+            &dev_cfg(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.not_on_or_after,
+            "2030-01-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        // A long second confirmation trips the cap even though the first is short.
+        let e = process_saml_response(
+            &with("2030-01-01T00:01:00Z", "2030-01-03T00:00:00Z"),
+            &dev_cfg(),
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(code_of(&e), "validity_too_long");
+    }
+
+    #[test]
+    fn bearer_validity_over_24_hours_is_rejected() {
+        let mut fx = Fx::new(Layout::Assertion);
+        fx.bearer_nooa = "2030-01-02T00:00:00Z".into();
+        fx.cond_nooa = "2030-01-02T00:00:00Z".into();
+        assert!(process_saml_response(&fx.build(), &cfg(), now()).is_ok());
+        fx.bearer_nooa = "2030-01-02T00:00:01Z".into();
+        fx.cond_nooa = "2030-01-02T00:00:01Z".into();
+        assert_eq!(code(&fx.build()), "validity_too_long");
     }
 
     #[test]
@@ -1372,14 +1524,28 @@ mod tests {
 
     // ── ACS AC-8 binding ──
 
-    fn signed_b64(irt: Option<&str>) -> String {
-        let mut fx = Fx::new(Layout::Both);
-        fx.cond_nb = "2020-01-01T00:00:00Z".into();
-        fx.cond_nooa = "2099-01-01T00:00:00Z".into();
-        fx.bearer_nooa = "2099-01-01T00:00:00Z".into();
+    /// RFC 3339 `Utc::now() + mins`.
+    fn rel(mins: i64) -> String {
+        (Utc::now() + chrono::Duration::minutes(mins))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    /// A response valid right now, with fresh Assertion and Response IDs so
+    /// each call is a distinct assertion for the replay cache.
+    fn signed_fx(layout: Layout, irt: Option<&str>) -> Fx {
+        let mut fx = Fx::new(layout);
+        fx.assertion_id = format!("_a{}", crate::crypto::rand::uuid_v4());
+        fx.response_id = format!("_r{}", crate::crypto::rand::uuid_v4());
+        fx.cond_nb = rel(-1);
+        fx.cond_nooa = rel(5);
+        fx.bearer_nooa = rel(5);
         fx.resp_irt = irt.map(String::from);
         fx.sub_irt = irt.map(String::from);
-        B64.encode(fx.build())
+        fx
+    }
+
+    fn signed_b64(irt: Option<&str>) -> String {
+        B64.encode(signed_fx(Layout::Both, irt).build())
     }
 
     fn acs_ready(pool: PgPool) -> AppSamlState {
@@ -1516,9 +1682,8 @@ mod tests {
 
         // Matching cookie + InResponseTo: session, audit row, ack gone, cookie cleared.
         cap.clear();
-        let (jar, _) = acs(&state, cookie(id), &signed_b64(Some("_req1")))
-            .await
-            .unwrap();
+        let good = signed_b64(Some("_req1"));
+        let (jar, _) = acs(&state, cookie(id), &good).await.unwrap();
         assert!(jar.get(SESSION_COOKIE).is_some());
         assert_eq!(counts(&pool).await, (1, 1, 0));
         let last = cap.take_one();
@@ -1527,7 +1692,7 @@ mod tests {
             ("auth.saml_acs", "success")
         );
         assert!(!last["user_id"].is_empty());
-        // Replay.
+        // A fresh assertion for the spent acknowledgement is refused at the claim.
         cap.clear();
         let r = acs(&state, cookie(id), &signed_b64(Some("_req1")))
             .await
@@ -1536,10 +1701,128 @@ mod tests {
         assert_eq!(r.0, StatusCode::UNAUTHORIZED);
         assert_eq!(one(), denied("ack_not_claimed"));
         assert_eq!(counts(&pool).await, (1, 1, 0));
+        // Replaying the accepted response: refused as a replay, audited, no new session.
+        cap.clear();
+        let r = acs(&state, cookie(id), &good).await.err().unwrap();
+        assert_eq!(r.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(one(), denied("replay"));
+        crate::db_audit::drain().await;
+        assert_eq!(replay_rows(&pool).await, 1);
+        assert_eq!(counts(&pool).await, (1, 1, 0));
+    }
+
+    async fn replay_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action='auth.saml_replay' AND outcome='rejected'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn replay_is_refused_without_cookie_and_when_rewrapped(pool: PgPool) {
+        let state = acs_ready(pool.clone());
+        let id = "00000000-0000-4000-8000-0000000000f4";
+        started_login(&pool, id, "_req1").await;
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            axum::http::HeaderValue::from_str(&format!("{SAML_REQ_COOKIE}={id}")).unwrap(),
+        );
+        // Assertion-only signature: the Response ID is unauthenticated.
+        let fx = signed_fx(Layout::Assertion, Some("_req1"));
+        let accepted = acs(&state, CookieJar::from_headers(&h), &B64.encode(fx.build()))
+            .await
+            .unwrap();
+        assert!(accepted.0.get(SESSION_COOKIE).is_some());
+        // Same Assertion in a Response with a new ID and no request cookie.
+        let mut rewrapped = fx.clone();
+        rewrapped.response_id = "_other".into();
+        let r = acs(&state, CookieJar::new(), &B64.encode(rewrapped.build()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(r.0, StatusCode::UNAUTHORIZED);
+        crate::db_audit::drain().await;
+        assert_eq!(replay_rows(&pool).await, 1);
+        let (sessions, _, _) = counts(&pool).await;
+        assert_eq!(sessions, 1);
+        // Only the Assertion ID was recorded for an Assertion-only signature.
+        let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM saml_seen_ids ORDER BY kind")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kinds, vec!["assertion".to_string()]);
+        // The stored event carries digests only.
+        let detail: serde_json::Value =
+            sqlx::query_scalar("SELECT detail FROM audit_events WHERE action='auth.saml_replay'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let text = detail.to_string();
+        assert!(!text.contains(&fx.assertion_id) && !text.contains(&fx.name_id));
+        assert_eq!(detail["issuer"], fx.issuer.as_str());
+        assert_eq!(
+            detail["nameIdSha256"],
+            crate::db_saml_replay::name_id_digest(&fx.name_id)
+        );
+        assert_eq!(detail["reasonCode"], "replay");
+        assert_eq!(
+            detail["assertionIdSha256"],
+            crate::db_saml_replay::id_digest("assertion", &fx.assertion_id)
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn acs_claim_db_error_is_logged_as_claim_error(pool: PgPool) {
+        // The replay check passes; the claim query then fails.
+        sqlx::query("DROP TABLE login_notice_acks")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = acs_ready(pool.clone());
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            axum::http::HeaderValue::from_str(&format!(
+                "{SAML_REQ_COOKIE}=00000000-0000-4000-8000-0000000000f5"
+            ))
+            .unwrap(),
+        );
+        cap.clear();
+        let r = acs(
+            &state,
+            CookieJar::from_headers(&h),
+            &signed_b64(Some("_req1")),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(r.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(cap.take_one()["reason"], "claim_error");
     }
 
     #[tokio::test]
-    async fn acs_claim_db_error_is_logged_as_claim_error() {
+    async fn acs_overlong_validity_is_refused_before_any_db_use() {
+        let (cap, _g) = crate::api::audit_capture::capture();
+        let mut fx = signed_fx(Layout::Both, Some("_req1"));
+        fx.cond_nooa = rel(25 * 60);
+        fx.bearer_nooa = rel(25 * 60);
+        cap.clear();
+        let r = acs(&acs_state(), CookieJar::new(), &B64.encode(fx.build()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(r.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(cap.take_one()["reason"], "validity_too_long");
+    }
+
+    #[tokio::test]
+    async fn acs_replay_db_error_is_logged_as_replay_check_error() {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(std::time::Duration::from_millis(500))
             .connect_lazy("postgres://u:p@127.0.0.1:1/x")
@@ -1566,7 +1849,15 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(r.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(cap.take_one()["reason"], "claim_error");
+        // The refusal line, plus the best-effort stored event (its write fails
+        // too with the database down, which is itself logged).
+        let lines = cap.lines();
+        assert!(lines
+            .iter()
+            .any(|l| l["action"] == "auth.saml_acs" && l["reason"] == "replay_check_error"));
+        assert!(lines
+            .iter()
+            .any(|l| l["action"] == "auth.saml_replay" && l["outcome"] == "error"));
     }
 
     #[sqlx::test]
