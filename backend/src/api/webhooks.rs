@@ -723,7 +723,7 @@ fn unsigned_python_snippet() -> String {
 
 fn signed_node_snippet(header: &str, header_v2: &str) -> String {
     format!(
-        "// Node.js receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n// {header} (HMAC-SHA256) is sent alongside for existing receivers.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\nconst HEADER_V2 = {header_v2_lit};\n\nfunction check(algo, rawBody, receivedSig) {{\n  const expected = algo + '=' + crypto.createHmac(algo, SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\nconst verify = (rawBody, receivedSig) => check('{algo}', rawBody, receivedSig);\nconst verifyV2 = (rawBody, receivedSig) => check('{algo_v2}', rawBody, receivedSig);\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verifyV2(req.body, req.get(HEADER_V2))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
+        "// Node.js receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n// {header} (HMAC-SHA256) is sent alongside for existing receivers.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\nconst HEADER_V2 = {header_v2_lit};\n\nfunction safeEqual(expected, receivedSig) {{\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = '{algo}=' + crypto.createHmac('{algo}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\nfunction verifyV2(rawBody, receivedSig) {{\n  const expected = '{algo_v2}=' + crypto.createHmac('{algo_v2}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verifyV2(req.body, req.get(HEADER_V2))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
         header_lit = js_string_literal(header),
         header_v2_lit = js_string_literal(header_v2),
         algo = SIG_ALGO,
@@ -1817,6 +1817,12 @@ mod recipe_tests {
         assert_eq!(r.header_name_v2, "X-Webhook-Signature-V2");
         assert!(r.snippets.python.contains("verify_v2"));
         assert!(r.snippets.node.contains("verifyV2"));
+        // Existing receivers copy the v1 verifier; every snippet must keep
+        // the literal `sha256=` prefix (e2e 74 asserts the same).
+        for s in [&r.snippets.curl, &r.snippets.python, &r.snippets.node] {
+            assert!(s.contains("sha256="), "missing sha256= prefix: {s}");
+        }
+        assert!(r.snippets.node.contains("'sha384='"));
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["headerNameV2"], "X-Webhook-Signature-V2");
         assert_eq!(v["headerName"], "X-Webhook-Signature");
