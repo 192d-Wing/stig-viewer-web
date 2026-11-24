@@ -3,31 +3,23 @@
 // both Ed25519 and ML-DSA-87) to the checked-in test vector, so the Rust
 // verifier is tested against signatures it did not produce.
 //
-//   node scripts/make-foreign-vector.mjs testdata/signing/v2-hybrid-bundle.json
+//   node scripts/make-foreign-vector.mjs
+//
+// It always rewrites testdata/signing/v2-hybrid-bundle.json.
 //
 // Keys are generated at runtime and discarded; only public keys and signatures
 // are written. TEST VECTOR ONLY.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
-import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
 import { SIGN_DOMAIN, keyId, verifyBundle } from "./verify-bundle.mjs";
 
-const arg = process.argv[2];
-if (!arg) {
-  console.error("usage: make-foreign-vector.mjs <vector.json>");
-  process.exit(2);
-}
-// Only read and rewrite a .json file under the repository's testdata/signing/.
-const allowedDir = nodePath.resolve(
-  fileURLToPath(new URL("../testdata/signing/", import.meta.url)),
+// The vector path is fixed (no command-line input), so the script can only
+// read and rewrite the checked-in vector.
+const path = fileURLToPath(
+  new URL("../testdata/signing/v2-hybrid-bundle.json", import.meta.url),
 );
-const path = nodePath.resolve(arg);
-if (!path.startsWith(allowedDir + nodePath.sep) || nodePath.extname(path) !== ".json") {
-  console.error(`refusing: the vector must be a .json file under ${allowedDir}`);
-  process.exit(2);
-}
 const vector = JSON.parse(fs.readFileSync(path, "utf8"));
 if (typeof vector.label !== "string" || !vector.label.startsWith("TEST VECTOR ONLY")) {
   console.error("refusing: not a labelled test vector");
