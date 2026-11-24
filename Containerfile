@@ -119,7 +119,8 @@ RUN dnf -y install --nodocs --setopt=install_weak_deps=0 \
 # non-fips: default features. fips: AWS-LC-FIPS (see docs/deployment.md).
 ARG CRYPTO=non-fips
 # Optional cap on parallel rustc jobs for small build machines.
-ARG CARGO_BUILD_JOBS=
+# Not named CARGO_BUILD_JOBS: cargo reads that env var itself and rejects an empty value.
+ARG BUILD_JOBS=
 
 WORKDIR /src/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
@@ -141,7 +142,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         *) echo "CRYPTO must be non-fips or fips, got: $CRYPTO" >&2; exit 1 ;; \
     esac; \
     # shellcheck disable=SC2086
-    cargo build --release --locked ${CARGO_BUILD_JOBS:+--jobs "$CARGO_BUILD_JOBS"} $features; \
+    cargo build --release --locked ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} $features; \
     mkdir -p /out/data; \
     # Toolchain record, shipped as /app/BUILD-INFO (a LABEL cannot take RUN output).
     { echo "crypto=$CRYPTO"; \

@@ -246,7 +246,7 @@ so every request is relative).
   podman build --format docker --build-arg CRYPTO=fips -t <image>-fips -f Containerfile .
   ```
 
-  Add `--build-arg CARGO_BUILD_JOBS=2` on a small build machine.
+  Add `--build-arg BUILD_JOBS=2` on a small build machine.
 - Iron Bank or other hardened bases: `podman login registry1.dso.mil`, then
   `--build-arg BACKEND_BUILD_BASE=<ubi10 path>@sha256:...` and
   `--build-arg RUNTIME_BASE=<ubi10-micro path>@sha256:...`. The paths are for

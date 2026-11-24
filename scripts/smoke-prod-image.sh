@@ -8,7 +8,7 @@
 #
 #   ENGINE (podman)  CRYPTO (non-fips|fips)  SVW_SMOKE_PORT (28080)
 #   SVW_SMOKE_SKIP_BUILD=1 (use an existing svw-prod-smoke:<crypto> image)
-#   SVW_SMOKE_CARGO_JOBS (passed to the build as CARGO_BUILD_JOBS)
+#   SVW_SMOKE_CARGO_JOBS (passed to the build as BUILD_JOBS)
 #   SVW_KEEP=1 (leave containers, network and volume for debugging)
 #
 # All credentials are generated per run with openssl and passed to containers
@@ -107,7 +107,7 @@ KC_IMAGE=$(compose_image keycloak)
 if [[ "${SVW_SMOKE_SKIP_BUILD:-}" != 1 ]]; then
   build_args=(--build-arg "CRYPTO=$CRYPTO")
   if [[ -n "${SVW_SMOKE_CARGO_JOBS:-}" ]]; then
-    build_args+=(--build-arg "CARGO_BUILD_JOBS=$SVW_SMOKE_CARGO_JOBS")
+    build_args+=(--build-arg "BUILD_JOBS=$SVW_SMOKE_CARGO_JOBS")
   fi
   note "building $IMAGE"
   $ENGINE build --format docker "${build_args[@]}" -t "$IMAGE" -f "$repo/Containerfile" "$repo"
