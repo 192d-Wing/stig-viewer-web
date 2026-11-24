@@ -136,14 +136,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     echo "rustc ${have}, MSRV ${need}"; \
     [ -n "$need" ]; \
     [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)" = "$need" ]; \
-    set -- --release --locked; \
+    set --; \
     if [ -n "$BUILD_JOBS" ]; then set -- "$@" --jobs "$BUILD_JOBS"; fi; \
     case "$CRYPTO" in \
         non-fips) ;; \
         fips) set -- "$@" --no-default-features --features fips ;; \
         *) echo "CRYPTO must be non-fips or fips, got: $CRYPTO" >&2; exit 1 ;; \
     esac; \
-    cargo build "$@"; \
+    cargo build --release --locked "$@"; \
     mkdir -p /out/data; \
     # Toolchain record, shipped as /app/BUILD-INFO (a LABEL cannot take RUN output).
     { echo "crypto=$CRYPTO"; \
