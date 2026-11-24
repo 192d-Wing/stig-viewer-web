@@ -267,9 +267,12 @@ mod tests {
 
     #[test]
     fn install_self_check_accepts_the_build_provider() {
-        let policy = FipsPolicy::from_vars(fips::compiled(), None).unwrap();
-        // Already installed by another test is fine: same group list.
-        install(&policy).unwrap();
+        // Use the same env-derived policy as `ensure_installed`: the provider
+        // is process-wide, so installing a different group list here would
+        // race the negotiation tests (and fail when STIG_FIPS_PENDING_ALGS
+        // opts the ML-KEM groups in). Already installed with the same list
+        // by another test is fine.
+        install(&current_policy()).unwrap();
     }
 
     /// Runtime-generated self-signed cert for `localhost`.
