@@ -10,11 +10,22 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import nodePath from "node:path";
+import { fileURLToPath } from "node:url";
 import { SIGN_DOMAIN, keyId, verifyBundle } from "./verify-bundle.mjs";
 
-const path = process.argv[2];
-if (!path) {
+const arg = process.argv[2];
+if (!arg) {
   console.error("usage: make-foreign-vector.mjs <vector.json>");
+  process.exit(2);
+}
+// Only read and rewrite a .json file under the repository's testdata/signing/.
+const allowedDir = nodePath.resolve(
+  fileURLToPath(new URL("../testdata/signing/", import.meta.url)),
+);
+const path = nodePath.resolve(arg);
+if (!path.startsWith(allowedDir + nodePath.sep) || nodePath.extname(path) !== ".json") {
+  console.error(`refusing: the vector must be a .json file under ${allowedDir}`);
   process.exit(2);
 }
 const vector = JSON.parse(fs.readFileSync(path, "utf8"));
