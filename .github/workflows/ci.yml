@@ -42,6 +42,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
       - run: cargo test --locked
+      # The frontend never signs or verifies (#66-#69); no crypto library may
+      # reach the WebAssembly build.
+      - name: Check the wasm dependency tree has no aws-lc or ring
+        run: |
+          tree=$(cargo tree --locked --target wasm32-unknown-unknown -e normal)
+          ! grep -E '(^|[^A-Za-z0-9_-])(ring|aws-lc[A-Za-z-]*) v[0-9]' <<<"$tree"
       - run: trunk build --release --locked
 
   backend:
@@ -66,6 +72,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      # Cross-implementation check (#69): a bundle signed by this build with
+      # fresh runtime keys must verify under Node's OpenSSL, with every negative
+      # case rejected. Needs Node 24.7+ for ML-DSA.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Verify a fresh hybrid bundle with the independent Node verifier
+        env:
+          STIG_WRITE_TEST_VECTOR: ${{ runner.temp }}/hybrid-vector.json
+        run: |
+          cargo test --locked write_test_vector
+          node ../scripts/verify-bundle.mjs vector "$STIG_WRITE_TEST_VECTOR"
       # The default build links the non-FIPS aws-lc-sys and never the FIPS module (#65).
       - name: Check the default build links aws-lc-sys and not aws-lc-fips-sys
         run: |
@@ -176,6 +194,17 @@ jobs:
 
       - run: cargo test --locked --no-default-features --features fips
 
+      # Same cross-implementation check against the FIPS-module ML-DSA (#69).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Verify a fresh hybrid bundle with the independent Node verifier
+        env:
+          STIG_WRITE_TEST_VECTOR: ${{ runner.temp }}/hybrid-vector.json
+        run: |
+          cargo test --locked --no-default-features --features fips write_test_vector
+          node ../scripts/verify-bundle.mjs vector "$STIG_WRITE_TEST_VECTOR"
+
   # Decides whether a pull request touches anything e2e exercises. Pushes to
   # main always run e2e, whatever changed.
   changes:
@@ -213,7 +242,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Shellcheck dev scripts
         run: shellcheck backend/scripts/dev-entrypoint.sh scripts/verify-split-role-upgrade.sh

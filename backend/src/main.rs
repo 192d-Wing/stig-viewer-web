@@ -27,6 +27,7 @@ mod pdf;
 mod scheduler_log;
 mod seed;
 mod severity;
+mod signers;
 mod stig_id;
 mod sync;
 #[cfg(test)]
@@ -47,7 +48,9 @@ use std::{sync::Arc, time::Duration};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    fmt::writer::BoxMakeWriter, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 use api::{
     abac::{
@@ -355,6 +358,53 @@ async fn run_migrate_command() -> Result<()> {
     )
     .await?;
     info!("Migrations applied and application role grants updated");
+    Ok(())
+}
+
+/// The `gen-mldsa-key` subcommand: generate an ML-DSA-87 key and print it as
+/// base64 PKCS#8 on stdout (the value for `SIGNING_MLDSA87_KEY_B64`) and its
+/// key id on stderr. Nothing is logged or stored; capture stdout into a secret
+/// store. In a `fips` build the same `STIG_FIPS_PENDING_ALGS=ML-DSA-87` gate as
+/// the server applies. Refuses when stdout is a terminal, so the key does not
+/// land in scrollback or a log driver by accident.
+fn run_gen_mldsa_key(policy: &fips::FipsPolicy) -> Result<()> {
+    use std::io::IsTerminal as _;
+    check_gen_key_allowed(policy, std::io::stdout().is_terminal())?;
+    let key = crypto::mldsa::SigningKey::generate()?;
+    write_mldsa_key(
+        &key,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+/// Preconditions of `gen-mldsa-key`: the pending-algorithm gate, and stdout
+/// must not be a terminal.
+fn check_gen_key_allowed(policy: &fips::FipsPolicy, stdout_is_terminal: bool) -> Result<()> {
+    policy.require(fips::PendingAlg::MlDsa87)?;
+    if stdout_is_terminal {
+        anyhow::bail!(
+            "refusing to print a private key to a terminal; redirect stdout to a file or a secret store (gen-mldsa-key > key.b64)"
+        );
+    }
+    Ok(())
+}
+
+/// Key (one base64 PKCS#8 line) to `out`, key id only to `err`.
+fn write_mldsa_key(
+    key: &crypto::mldsa::SigningKey,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<()> {
+    use base64::Engine as _;
+    let der = key.to_pkcs8()?;
+    let key_id = signers::key_id(signers::Algorithm::MlDsa87, &key.public_key());
+    writeln!(
+        out,
+        "{}",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )?;
+    writeln!(err, "ml-dsa-87 keyId: {key_id}")?;
     Ok(())
 }
 
@@ -730,8 +780,9 @@ fn build_app(
             .route("/api/stigs/:id/diff", get(catalog_diff_handler))
             .route("/api/stigs/:id/archive", get(list_catalog_archive_handler))
             .route("/api/catalog/search", get(catalog_search_handler))
-            // Ed25519 detached signing for exported artifacts (.ckl bundles).
-            // Returns 503 when SIGNING_KEY_HEX isn't set.
+            // Detached signing for exported artifacts (.ckl bundles): Ed25519, or
+            // Ed25519 + ML-DSA-87 when SIGNING_MLDSA87_KEY_B64 is set. Returns 503
+            // when SIGNING_KEY_HEX isn't set.
             .route(
                 "/api/sign",
                 post(api::signing::sign_handler).layer(DefaultBodyLimit::max(SIGN_BODY_LIMIT)),
@@ -795,12 +846,19 @@ fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> axum::respons
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `gen-mldsa-key` prints the key on stdout, so its logs go to stderr.
+    let log_writer = if args.first().map(String::as_str) == Some("gen-mldsa-key") {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "stig_viewer_backend=info,tower_http=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(log_writer))
         .init();
 
     // Refuse to start when the FIPS build cannot confirm the FIPS module is
@@ -811,9 +869,10 @@ async fn main() -> Result<()> {
     let fips_startup = fips::startup_guard()?;
 
     // `migrate`: run migrations and grants as the owner role, then exit.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        exit_migrate(run_migrate_command().await);
+    match db_roles::parse_command(&args)? {
+        db_roles::Command::Migrate => exit_migrate(run_migrate_command().await),
+        db_roles::Command::GenMldsaKey => return run_gen_mldsa_key(&fips_startup.policy),
+        db_roles::Command::Serve => {}
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one
@@ -856,9 +915,22 @@ async fn main() -> Result<()> {
     seed::warn_orphaned_ids(&pool, &sources, config.seed_dir.as_deref()).await;
 
     // ── Signing (optional) ──────────────────────────────────────────────────
-    let signing = api::signing::SigningState::from_env()?;
+    let signing = api::signing::SigningState::from_env(&fips_startup.policy)?;
     match &signing {
-        Some(s) => info!("Signing enabled (key_id={})", s.key_id),
+        Some(s) => {
+            info!(
+                profile = s.profile().as_str(),
+                key_ids = %s.key_ids().join(","),
+                require_hybrid = s.require_hybrid,
+                "Signing enabled (key_id={})",
+                s.key_id
+            );
+            if s.mldsa.is_none() {
+                tracing::warn!(
+                    "Signing is classical (Ed25519 only): set SIGNING_MLDSA87_KEY_B64 for hybrid ML-DSA-87 signatures"
+                );
+            }
+        }
         None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
     }
 
@@ -1916,5 +1988,43 @@ mod router_tests {
             expected += 1;
             assert_eq!(reads().await, expected, "one audit.read row for {route}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gen_key_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn gen_mldsa_key_refuses_a_terminal_and_an_ungated_enforced_policy() {
+        let open = fips::FipsPolicy::from_vars(false, None).unwrap();
+        assert!(check_gen_key_allowed(&open, false).is_ok());
+        let e = check_gen_key_allowed(&open, true).unwrap_err().to_string();
+        assert!(e.contains("terminal"), "{e}");
+        let enforced = fips::FipsPolicy::from_vars(true, None).unwrap();
+        let e = check_gen_key_allowed(&enforced, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ML-DSA-87"), "{e}");
+        let listed = fips::FipsPolicy::from_vars(true, Some("ML-DSA-87")).unwrap();
+        assert!(check_gen_key_allowed(&listed, false).is_ok());
+    }
+
+    #[test]
+    fn gen_mldsa_key_prints_one_pkcs8_line_and_the_key_id_only_on_stderr() {
+        let key = crypto::mldsa::SigningKey::generate().unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        write_mldsa_key(&key, &mut out, &mut err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(out.matches('\n').count(), 1);
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(out.trim_end())
+            .unwrap();
+        let loaded = crypto::mldsa::SigningKey::from_pkcs8(&der).unwrap();
+        let id = signers::key_id(signers::Algorithm::MlDsa87, &loaded.public_key());
+        assert_eq!(err, format!("ml-dsa-87 keyId: {id}\n"));
+        assert!(!out.contains(&id) && !err.contains(out.trim_end()));
     }
 }

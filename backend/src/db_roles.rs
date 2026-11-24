@@ -125,15 +125,19 @@ fn check_distinct_roles(owner: &str, app: &str) -> Result<()> {
 pub enum Command {
     Serve,
     Migrate,
+    /// Print a new ML-DSA-87 signing key (base64 PKCS#8) to stdout.
+    GenMldsaKey,
 }
 
 /// Parse the arguments after the program name: none serves, `migrate` runs the
-/// owner step, anything else (including extra arguments) is an error.
+/// owner step, `gen-mldsa-key` generates a signing key, anything else
+/// (including extra arguments) is an error.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     match args {
         [] => Ok(Command::Serve),
         [cmd] if cmd == "migrate" => Ok(Command::Migrate),
-        _ => bail!("unknown argument; the only subcommand is `migrate`"),
+        [cmd] if cmd == "gen-mldsa-key" => Ok(Command::GenMldsaKey),
+        _ => bail!("unknown argument; the subcommands are `migrate` and `gen-mldsa-key`"),
     }
 }
 
@@ -1393,6 +1397,11 @@ mod tests {
             parse_command(&args(&["migrate"])).unwrap(),
             Command::Migrate
         );
+        assert_eq!(
+            parse_command(&args(&["gen-mldsa-key"])).unwrap(),
+            Command::GenMldsaKey
+        );
+        assert!(parse_command(&args(&["gen-mldsa-key", "extra"])).is_err());
         assert!(parse_command(&args(&["bogus"])).is_err());
         assert!(parse_command(&args(&["migrate", "extra"])).is_err());
         assert!(parse_command(&args(&["--migrate"])).is_err());

@@ -34,7 +34,7 @@ Not just a viewer — a full-stack compliance workflow platform.
 
 **Exports**
 - CKL, XCCDF, POAM, OSCAL, PDF compliance reports.
-- Signed export bundles (Ed25519).
+- Signed export bundles (Ed25519, or hybrid Ed25519 + ML-DSA-87 when an ML-DSA key is configured), with an independent Node verifier.
 
 **Admin & governance**
 - OIDC and SAML authentication.
@@ -134,6 +134,15 @@ for local work. The ones you may want to change:
   empty. In a build without the `fips` feature the list does not change which
   algorithms are used (a warning is logged if set), but it is still validated
   and an unknown token stops startup.
+- `SIGNING_KEY_HEX` — 64 hex characters, the Ed25519 seed; unset means signing
+  is off. `SIGNING_MLDSA87_KEY_B64` — base64 PKCS#8 ML-DSA-87 key (generate with
+  `stig-viewer-backend gen-mldsa-key`); with both set, `/api/sign` bundles,
+  audit archive manifests and backup manifests carry both signatures (hybrid).
+  ML-DSA alone, or a malformed key, stops startup. In a `fips` build the
+  ML-DSA key also needs `ML-DSA-87` in `STIG_FIPS_PENDING_ALGS`.
+  `SIGNING_REQUIRE_HYBRID=true` refuses to start without both keys and stops
+  verifiers accepting Ed25519-only artifacts (default false). See "Signing
+  envelope (v2)" and docs/deployment.md section 5.
 - `OIDC_INTERNAL_URL` / `OIDC_PUBLIC_URL` / `OIDC_CLIENT_ID` /
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
@@ -252,7 +261,7 @@ actualSha256}`.
 
 ### Signing envelope (v2)
 
-`POST /api/sign` returns:
+`POST /api/sign` returns, with only `SIGNING_KEY_HEX` set (classical profile):
 
 ```json
 {
@@ -261,50 +270,102 @@ actualSha256}`.
   "signature": "<base64 Ed25519, legacy = signatures[0].signature>",
   "keyId": "<legacy = signatures[0].keyId>",
   "version": 2,
-  "signatures": [{ "algorithm": "ed25519", "keyId": "...", "signature": "<base64>" }]
+  "signatures": [{ "algorithm": "ed25519", "keyId": "<16 hex>", "signature": "<base64, 64 bytes>" }]
+}
+```
+
+and, with `SIGNING_MLDSA87_KEY_B64` also set (hybrid profile; the legacy
+top-level `signature` and `keyId` are omitted):
+
+```json
+{
+  "document": { "...": "convenience copy, NOT authenticated" },
+  "payload": "<base64url, no padding, of the exact signed bytes>",
+  "version": 2,
+  "signatures": [
+    { "algorithm": "ed25519",   "keyId": "<16 hex>", "signature": "<base64, 64 bytes>" },
+    { "algorithm": "ml-dsa-87", "keyId": "<32 hex>", "signature": "<base64, 4627 bytes>" }
+  ]
 }
 ```
 
 `GET /api/signing/pubkey` returns `{algorithm, keyId, publicKey, keys:
-[{algorithm, keyId, publicKey}]}`; pin the key from it out of band.
+[{algorithm, keyId, publicKey}]}`; the top-level fields are the Ed25519 key
+and `keys` also lists the ML-DSA-87 key (raw FIPS 204 public key, 2592 bytes,
+base64) in hybrid mode. Pin the keys from it out of band.
 
 **Only `payload` is authenticated.** It is the compact UTF-8 JSON of the
 signing document: `version`, `algorithm`, `keyId`, `signers`
-(`[{algorithm, keyId}]`), `sha256`, `signedAt`, `signedBy`, `signedByName`,
-and `resource` only when present. `algorithm` and `keyId` equal `signers[0]`.
-The top-level `document`, `signature`, `keyId` and `version` are ignored by
-verifiers. Verifiers never rebuild JSON: they decode `payload` and parse those
-same bytes.
+(`[{algorithm, keyId}]`), `sha256`, `sha512`, `signedAt`, `signedBy`,
+`signedByName`, and `resource` only when present. `algorithm` and `keyId`
+equal `signers[0]`. `sha512` was added in the hybrid work; it is an additive
+signed field and `sha256` is unchanged. The top-level `document`, `signature`,
+`keyId` and `version` are ignored by verifiers. Verifiers never rebuild JSON:
+they decode `payload` and parse those same bytes.
 
-Domain separation: the signature input is
+**Profiles.** The signed `signers` list is the profile, and exactly two are
+accepted: `[ed25519]` (classical) and `[ed25519, ml-dsa-87]` (hybrid, in that
+order). Anything else is rejected. EVERY listed signer must have a valid
+signature (AND semantics), so removing the ML-DSA signature from a hybrid
+bundle is detected; removing it and the signer entry needs an Ed25519 forgery,
+because the signer list is inside the signed bytes. Key ids: Ed25519 is the
+first 8 bytes of SHA-256 of the raw public key (16 hex); ML-DSA-87 is the first
+16 bytes of SHA-384 over `"ml-dsa-87" || 0x00 || raw public key` (32 hex).
+ML-DSA-87 is FIPS 204 pure ML-DSA with an EMPTY context string; domain
+separation comes from the `SIGN_DOMAIN` prefix on the signed message below, not
+from the ML-DSA context.
+
+Hybrid signing alone gives no post-quantum protection for acceptance: a server
+with both keys still accepts classical artifacts until
+`SIGNING_REQUIRE_HYBRID=true` is set.
+
+Domain separation: every signature's input is
 `b"stig-viewer/sign/v2\0" || payload_bytes` (`SIGN_DOMAIN` in
 `backend/src/api/signing.rs`).
 
-Verification steps (implemented by `verify_bundle` in `signing.rs`):
+Verification steps (implemented by `verify_bundle` in `signing.rs` and, as an
+independent implementation, by `scripts/verify-bundle.mjs`):
 
-1. Base64url-decode `payload` and parse it as the signing document.
+1. Base64url-decode `payload` (strict, unpadded) and parse it as the signing
+   document (no duplicate keys, no trailing bytes).
 2. Require the signed `version` to be exactly 2.
-3. Require `signers` to be non-empty and free of duplicates, with
-   `signers[0]` equal to the signed `algorithm`/`keyId`.
+3. Require `signers` to be non-empty, with `signers[0]` equal to the signed
+   `algorithm`/`keyId`.
 4. If any signer uses an algorithm you do not support, reject (never skip).
-5. Require the envelope's `signatures[]` to match `signers` one to one (same
+5. Require every signer to be a key you pinned, by `(algorithm, keyId)`.
+6. Require the signer set to be exactly one of the two profiles above. Accept
+   the classical profile only if you have not required hybrid.
+7. Require the envelope's `signatures[]` to match `signers` one to one (same
    algorithm and keyId; no extras, none missing).
-6. Require every signer's `keyId` to be the fingerprint of the key you pinned
-   (first 8 bytes of SHA-256 of the raw public key, hex).
-7. Verify every signature over `SIGN_DOMAIN || payload`.
-8. Require the artifact's SHA-256 to equal `sha256` (hex, compared
-   case-insensitively). `verify_bundle` makes this mandatory;
+8. Verify every signature over `SIGN_DOMAIN || payload`.
+9. Require the artifact's SHA-256 (and SHA-512 when present) to equal the
+   signed values. `verify_bundle` makes this mandatory;
    `verify_bundle_document_only` skips it and binds no artifact.
 
-v1 is detected by the absence of `version` (and of `payload`); v1 verifiers,
-which checked a signature over a rebuilt document, break against v2 and must
-be updated. ML-DSA is not supported yet. Adding it means a new entry in both
-`signers` (inside the signed bytes) and `signatures`, and every signer must
-verify, so stripping a post-quantum signature is detected. Export bundles do
-not use this envelope.
+v1 is detected by the absence of `version` (and of `payload`); pre-v2 bundles
+are rejected and there is no legacy verification path. Export bundles do not
+use this envelope.
 
-Worked example (Python, `cryptography` package). It uses explicit `raise`
-rather than `assert` (which `python -O` strips) and strict base64:
+**Independent verifier (Node 24.7+, no dependencies).**
+
+```sh
+node scripts/verify-bundle.mjs bundle bundle.json pubkey.json artifact.ckl
+node scripts/verify-bundle.mjs vector testdata/signing/v2-hybrid-bundle.json
+```
+
+`pubkey.json` is the saved `GET /api/signing/pubkey` response. Pass
+`--allow-classical` to accept Ed25519-only bundles. `testdata/signing/v2-hybrid-bundle.json`
+is a cross-implementation test vector labelled TEST VECTOR ONLY: public keys,
+signatures, negative cases, and a bundle signed by Node/OpenSSL that the Rust
+verifier also accepts. The private keys were generated at runtime and
+discarded. CI writes a fresh vector with the backend (default and `fips`
+builds) and verifies it with this script.
+
+Worked example (Python, `cryptography` package), **classical profile only**.
+Python's `cryptography` can verify ML-DSA in recent releases, but this recipe
+has not been extended or tested for it: use the Node verifier for hybrid
+bundles, which a classical-only recipe like this one rejects. It uses explicit
+`raise` rather than `assert` (which `python -O` strips) and strict base64:
 
 ```python
 import base64, hashlib, json
@@ -351,18 +412,23 @@ def verify(bundle_path, pinned_pub: Ed25519PublicKey, artifact_sha256_hex: str):
     return doc
 ```
 
-The Rust verifier uses `verify_strict`, which rejects non-canonical
-signatures and small-order keys. OpenSSL's Ed25519 verify (used by
-`cryptography`) may be more permissive about non-canonical signatures; that is
-harmless for authenticity here but means the two verifiers can disagree on
-malformed input. Generalise the single-signer check above to a loop over
-`signers` once more algorithms exist.
+The Rust verifier checks Ed25519 with AWS-LC (aws-lc-rs), which rejects
+non-canonical signatures but is not dalek's `verify_strict`: it does not reject
+small-order or mixed-order public keys. That is acceptable because the keys it
+checks are the server's own pinned keys, never attacker-supplied ones.
+OpenSSL's Ed25519 verify (used by `cryptography` and Node) may be more
+permissive about non-canonical signatures; that is harmless for authenticity
+here but means verifiers can disagree on malformed input.
 
-Rollout note: verifiers must support ML-DSA before the server starts emitting
-it, because unknown algorithms are rejected rather than skipped. When ML-DSA is
-added, derive key ids over `algorithm || pubkey` (so equal key bytes under two
-algorithms cannot share an id) and have `verify_bundle` take pinned keys keyed
-by `(algorithm, keyId)`.
+Rollout note: external verifiers must support ML-DSA-87 and the hybrid profile
+before the server starts emitting hybrid output, because the signer list is
+checked strictly and unknown algorithms are rejected rather than skipped. Do not
+roll the backend back to a build without ML-DSA support after enabling hybrid:
+an older build cannot verify hybrid archive segments (it treats them as
+definite failures and renames them `.rejected-*`) or restore hybrid backups.
+ML-DSA-87 here runs in the AWS-LC module (in a `fips` build, the FIPS module)
+but is a pending algorithm: no FIPS 140-3 validation of ML-DSA is claimed, and
+hybrid signing is not CNSA 2.0 exclusive use.
 
 ### Database
 
@@ -504,15 +570,17 @@ Build it with `--no-default-features --features fips` (with the default
 C compiler. On macOS the module is a dylib (cargo run/test find it) and macOS
 is not a validated environment.
 
-What this does and does not establish: in a `fips` build, the Ed25519 signing
-and verification, HMAC-SHA-256, SHA-256/SHA-512, SAML RSA signature
+What this does and does not establish: in a `fips` build, the Ed25519 and
+ML-DSA-87 signing and verification (ML-DSA-87 only with `ML-DSA-87` in
+`STIG_FIPS_PENDING_ALGS`; it is a pending algorithm, no validation claimed),
+HMAC-SHA-256, SHA-256/SHA-384/SHA-512, SAML RSA signature
 verification and session/identifier random generation that this application
 calls run inside the module. Still outside it: TLS (rustls on ring), OIDC
 ID-token verification and state/nonce/PKCE generation (RustCrypto, via
 `openidconnect`; the audit token `oidc-state-nonce` covers OIDC state, nonce
 and PKCE verifier generation) and Postgres SCRAM (`sqlx`). The in-module
-primitives are still classical (Ed25519, RSA, HMAC/SHA-256): FIPS mode is not
-a CNSA 2.0 or post-quantum claim. AWS-LC-FIPS 4.x is in process
+primitives are classical except the optional ML-DSA-87 signature: FIPS mode is
+not a CNSA 2.0 claim. AWS-LC-FIPS 4.x is in process
 with CMVP and no certificate is confirmed, so the whole module is pending
 validation, not only the post-quantum algorithms. It is not a FIPS-compliance
 claim for the application.
@@ -882,7 +950,8 @@ Archiving is idempotent by row id, without trusting the directory. A row is
 skipped only when a segment that verifies holds the IDENTICAL serialized line
 for it. "Verifies" means the sidecar exists and checks out (SHA-512, row count,
 ids inside the range in the file name) and, when `SIGNING_KEY_HEX` is set, that
-the signature is valid for the configured key. With a key, a planted segment
+the signature is valid for the configured key (every signer: both keys in hybrid
+mode). With a key, a planted segment
 cannot pass at all. Without a key the digest is not a secret, so a planted
 segment can be self-consistent; it still cannot hide a real row, because its
 line would have to equal the row's actual line. A segment that fails
@@ -893,7 +962,9 @@ missing or unparseable sidecar) renames the segment and its sidecar to
 `<name>.rejected-<UTC timestamp>`, keeping them as evidence (recorded in the
 `audit_archive.file_set_aside` event); such files are never counted. An I/O
 error, or a segment that is `unsigned` or `unknown_key` while a key is
-configured, is logged and not counted but left untouched. A
+configured, or a verified classical segment under `SIGNING_REQUIRE_HYBRID`, is
+logged and not counted but left untouched (a classical segment is never a
+definite failure and is never renamed). A
 verified or left-in-place file is never replaced: new rows that would collide
 with an existing name go to `<stream>-<date>.<first>-<last>.r<n>.jsonl`. Each
 segment is read once, and the verified bytes are the bytes used. Without a key,
@@ -924,20 +995,29 @@ payload itself, and adds `type`, `entries` (`{entry name: sha512 hex}` for every
 other ZIP entry), `entriesDigest: "sha-512"` and `signers`. Every listed
 signer must have a signature, and none may be extra.
 
-**Keys and domains.** The Ed25519 key is `SIGNING_KEY_HEX`, the same key that
-signs `/api/sign` exports. The signature input is a domain prefix followed by
+**Keys and domains.** The Ed25519 key is `SIGNING_KEY_HEX` and the optional
+ML-DSA-87 key is `SIGNING_MLDSA87_KEY_B64`, the same keys that sign `/api/sign`
+exports. With both set, sidecars and backup signature files carry two signed
+signers and two signatures (hybrid, `[ed25519, ml-dsa-87]`); the outer
+`version` stays 1 and a backup manifest stays version 2. Only the two profiles
+described in "Signing envelope (v2)" are accepted, every listed signer must
+verify, and the restore audit detail and response gain `signatureProfile`
+(`classical` or `hybrid`; absent for unsigned). The signature input is a domain prefix followed by
 the payload, with a different prefix per purpose so one signature cannot be
 replayed as another: `stig-viewer/audit-archive/v1\0`,
 `stig-viewer/backup/v1\0` (and `stig-viewer/sign/v2\0` for exports). The signed
 payload also carries a `type`. Fetch the public key from
 `GET /api/signing/pubkey` and pin it offline; a key id alone proves nothing.
-Verification uses strict Ed25519 (`verify_strict`).
+Ed25519 is checked with AWS-LC, which rejects non-canonical signatures but is
+not dalek's `verify_strict`; the keys it checks are the server's own.
 
 **Without `SIGNING_KEY_HEX`**, manifests carry digests only. That detects
 corruption but not deliberate alteration: anyone who can edit a segment can
 recompute its digest.
 
-**Verify a segment.** Needs Python 3 with `cryptography`; the third argument is
+**Verify a segment.** (Classical profile only; the Ed25519-only recipes below
+reject a hybrid artifact because they require the signer list to be exactly the
+pinned Ed25519 key.) Needs Python 3 with `cryptography`; the third argument is
 the pinned base64 public key. The script trusts only `payload` and
 `signatures`, fails on an empty signer list, requires a valid signature for
 every signer (and no others), and recomputes the SHA-512 itself. Run it as
@@ -1049,7 +1129,8 @@ To check a digest by hand, use `sha512sum FILE` (Linux) or `shasum -a 512 FILE`
 (macOS) and compare it with the digest in the decoded payload, not with any
 other copy.
 
-**Restore policy.** Restore checks the entry digests and the signature before
+**Restore policy.** (The `SIGNING_REQUIRE_HYBRID` rule below is the only
+addition for hybrid.) Restore checks the entry digests and the signature before
 it changes the database. A signature that is present and wrong is always
 rejected, as is an entry that is altered, added, missing or duplicated, and a
 version 1 manifest carrying version 2 fields (a downgrade).
@@ -1058,6 +1139,9 @@ version 1 manifest carrying version 2 fields (a downgrade).
   default: unsigned, unknown-key and version 1 backups are rejected with a 400.
   Set `BACKUP_REQUIRE_SIGNATURE=false` to opt out explicitly, for example to
   migrate version 1 or unsigned backups.
+- With `SIGNING_REQUIRE_HYBRID=true`, a verified classical (Ed25519-only)
+  backup is also refused while a verified signature is required; the
+  break-glass is the same `BACKUP_REQUIRE_SIGNATURE=false`.
 - Without a key, unsigned backups are accepted (with a warning) as before.
   `BACKUP_REQUIRE_SIGNATURE=true` still requires a verified signature, which
   without a key no backup can have.
@@ -1096,10 +1180,14 @@ only.
   once `SIGNING_KEY_HEX` changes, so old backups need
   `BACKUP_REQUIRE_SIGNATURE=false` to restore. A list of trusted previous keys
   is a follow-up.
-- Ed25519 is not quantum-safe, which matters for evidence that must stay
-  trustworthy for decades. The migration target is a hybrid with ML-DSA-87
-  (FIPS 204); because manifests carry a signer list in the signed bytes, that
-  means adding a signer, and verifiers must then require every signer.
+- Ed25519 alone is not quantum-safe, which matters for evidence that must stay
+  trustworthy for decades. With `SIGNING_MLDSA87_KEY_B64` set, new artifacts
+  are hybrid (Ed25519 and ML-DSA-87, both required). Artifacts signed before
+  that stay classical and verify via the classical profile until
+  `SIGNING_REQUIRE_HYBRID=true`. During the transition, stripping the ML-DSA
+  half plus the signer entry needs an Ed25519 forgery, which
+  `SIGNING_REQUIRE_HYBRID` closes. Do not roll back to a build without ML-DSA
+  support after enabling hybrid.
 
 ## Repository layout
 

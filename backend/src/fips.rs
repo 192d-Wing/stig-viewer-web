@@ -5,7 +5,11 @@
 //! whole is pending CMVP validation (in process, no certificate claimed); the
 //! per-algorithm list below is an additional gate. The application's own
 //! Ed25519, HMAC-SHA-256, SHA-2, SAML RSA verification and session/identifier
-//! RNG run in the module (`crate::crypto`, #65). TLS (rustls on ring), OIDC
+//! RNG run in the module (`crate::crypto`, #65). ML-DSA-87 (hybrid signing,
+//! #66-#69) runs in the module too but stays a pending algorithm: a build with
+//! `SIGNING_MLDSA87_KEY_B64` set refuses to start unless `ML-DSA-87` is listed
+//! in `STIG_FIPS_PENDING_ALGS` (`FipsPolicy::require`); no validation of it
+//! is claimed. TLS (rustls on ring), OIDC
 //! ID-token verification and state/nonce (openidconnect, RustCrypto) and
 //! Postgres SCRAM do not; see [`OUTSIDE_MODULE`].
 //!
@@ -139,12 +143,10 @@ impl FipsPolicy {
         self.allowed_pending.iter().copied()
     }
 
-    #[allow(dead_code)] // first caller is the ML-DSA / v2 envelope work (#66-#69)
     pub fn permits(&self, alg: PendingAlg) -> bool {
         !self.enforced || self.allowed_pending.contains(&alg)
     }
 
-    #[allow(dead_code)] // first caller is the ML-DSA / v2 envelope work (#66-#69)
     pub fn require(&self, alg: PendingAlg) -> Result<()> {
         if self.permits(alg) {
             Ok(())

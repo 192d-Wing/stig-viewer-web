@@ -1,10 +1,16 @@
-//! SHA-2 digests.
+//! SHA-2 digests (SHA-256, SHA-384, SHA-512).
 
-use aws_lc_rs::digest::{self, Context, SHA256, SHA512};
+use aws_lc_rs::digest::{self, Context, SHA256, SHA384, SHA512};
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(digest::digest(&SHA256, data).as_ref());
+    out
+}
+
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out.copy_from_slice(digest::digest(&SHA384, data).as_ref());
     out
 }
 
@@ -50,7 +56,7 @@ impl Default for Sha256Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256, Sha512};
+    use sha2::{Digest, Sha256, Sha384, Sha512};
 
     // Published FIPS 180-4 vectors for "abc".
     #[test]
@@ -72,6 +78,7 @@ mod tests {
             let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
             assert_eq!(sha256(&data).as_slice(), Sha256::digest(&data).as_slice());
             assert_eq!(sha512(&data).as_slice(), Sha512::digest(&data).as_slice());
+            assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
         }
     }
 
