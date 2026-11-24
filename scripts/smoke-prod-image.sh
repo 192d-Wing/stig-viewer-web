@@ -94,8 +94,9 @@ check() { # description, command...
 
 # Image refs for Postgres and Keycloak come from docker-compose.yml so the
 # digests are not duplicated here.
-compose_image() { # service
-  awk -v svc="  $1:" '$0 == svc {f=1; next} f && /^  [a-z]/ {f=0} f && $1 == "image:" {print $2; exit}' \
+compose_image() {
+  local service="$1"
+  awk -v svc="  $service:" '$0 == svc {f=1; next} f && /^  [a-z]/ {f=0} f && $1 == "image:" {print $2; exit}' \
     "$repo/docker-compose.yml"
 }
 PG_IMAGE=$(compose_image postgres)

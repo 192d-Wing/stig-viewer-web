@@ -136,13 +136,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     echo "rustc ${have}, MSRV ${need}"; \
     [ -n "$need" ]; \
     [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -n1)" = "$need" ]; \
+    set -- --release --locked; \
+    if [ -n "$BUILD_JOBS" ]; then set -- "$@" --jobs "$BUILD_JOBS"; fi; \
     case "$CRYPTO" in \
-        non-fips) features="" ;; \
-        fips) features="--no-default-features --features fips" ;; \
+        non-fips) ;; \
+        fips) set -- "$@" --no-default-features --features fips ;; \
         *) echo "CRYPTO must be non-fips or fips, got: $CRYPTO" >&2; exit 1 ;; \
     esac; \
-    # shellcheck disable=SC2086
-    cargo build --release --locked ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} $features; \
+    cargo build "$@"; \
     mkdir -p /out/data; \
     # Toolchain record, shipped as /app/BUILD-INFO (a LABEL cannot take RUN output).
     { echo "crypto=$CRYPTO"; \
@@ -156,7 +157,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cp target/release/stig-viewer-backend /out/stig-viewer-backend; \
     # Only libc, libm, libgcc_s and the loader may be linked dynamically.
     ldd /out/stig-viewer-backend; \
-    extra="$(ldd /out/stig-viewer-backend | awk '{print $1}' | grep -Ev '^(linux-vdso|libc\.so|libm\.so|libgcc_s\.so)|/?ld-linux' || true)"; \
+    allowed='^(linux-vdso|libc\.so|libm\.so|libgcc_s\.so)|/?ld-linux'; \
+    extra="$(ldd /out/stig-viewer-backend | awk '{print $1}' \
+        | grep -Ev "$allowed" || true)"; \
     if [ -n "$extra" ]; then echo "unexpected shared libraries: $extra" >&2; exit 1; fi
 
 # ---- runtime --------------------------------------------------------------
