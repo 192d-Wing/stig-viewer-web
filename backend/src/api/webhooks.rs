@@ -1,35 +1,42 @@
 //! Outbound webhook delivery + admin CRUD.
 //!
-//! ## Payload signing (HMAC-SHA256)
+//! ## Payload signing (HMAC-SHA256 and HMAC-SHA384)
 //!
-//! Every delivery whose `webhooks.secret` is non-empty carries an
-//! `X-Webhook-Signature` header of the form `sha256=<hex>` where `<hex>`
-//! is the lower-case hexadecimal HMAC-SHA256 of the raw request body
-//! keyed by the configured secret. The scheme matches GitHub's webhook
-//! convention, so any receiver that already validates GitHub webhooks
-//! can reuse the same code path verbatim.
+//! Every delivery whose `webhooks.secret` is non-empty carries two headers
+//! over the same raw request body, keyed by the configured secret:
 //!
-//! Webhooks with an empty secret are sent **unsigned** — no header at
-//! all — preserving the original opt-in behaviour for users who do not
-//! care about replay protection (e.g. internal-only Slack incoming
+//! - `X-Webhook-Signature: sha256=<hex>`, the lower-case hexadecimal
+//!   HMAC-SHA256. It matches GitHub's webhook convention, so any receiver
+//!   that already validates GitHub webhooks can reuse the same code path.
+//! - `X-Webhook-Signature-V2: sha384=<hex>`, the HMAC-SHA384 (the CNSA 2.0
+//!   hash size). Receivers that must meet CNSA 2.0 should require this
+//!   header, ignore the SHA-256 one, and use a secret of at least 48 bytes.
+//!
+//! Webhooks with an empty secret are sent **unsigned**: no signature header
+//! at all, preserving the original opt-in behaviour for users who do not
+//! need to authenticate the sender (e.g. internal-only Slack incoming
 //! webhooks behind a VPN). The pre-HMAC `X-Webhook-Secret` literal-value
 //! header was removed; secrets are never transmitted on the wire.
 //!
-//! ### Verification recipe — Python
+//! The signature covers the body only. It carries no timestamp or nonce, so
+//! it authenticates the sender and the body but does not by itself stop a
+//! captured delivery from being replayed.
+//!
+//! ### Verification recipe: Python
 //! ```python
 //! import hmac, hashlib
-//! sig = "sha256=" + hmac.new(
-//!     secret.encode(), body_bytes, hashlib.sha256
+//! sig = "sha384=" + hmac.new(
+//!     secret.encode(), body_bytes, hashlib.sha384
 //! ).hexdigest()
-//! # constant-time compare against request.headers["X-Webhook-Signature"]
+//! # constant-time compare against request.headers["X-Webhook-Signature-V2"]
 //! hmac.compare_digest(sig, received_header)
 //! ```
 //!
-//! ### Verification recipe — Node.js
+//! ### Verification recipe: Node.js
 //! ```js
 //! const crypto = require("crypto");
-//! const sig = "sha256=" + crypto
-//!   .createHmac("sha256", secret)
+//! const sig = "sha384=" + crypto
+//!   .createHmac("sha384", secret)
 //!   .update(rawBody)
 //!   .digest("hex");
 //! crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(receivedHeader));
@@ -52,9 +59,14 @@ use crate::api::request_ctx::RequestCtx;
 use crate::crypto;
 use crate::AppState;
 
-/// Signature scheme label: the digest name and the header-value prefix
-/// (`<name>=<hex>`). The signer and the verify recipes both derive from it.
+/// Header carrying the HMAC-SHA256 signature (`sha256=<hex>`).
+const SIG_HEADER: &str = "X-Webhook-Signature";
+/// Header carrying the HMAC-SHA384 signature (`sha384=<hex>`).
+const SIG_HEADER_V2: &str = "X-Webhook-Signature-V2";
+/// Signature scheme labels: the digest name and the header-value prefix
+/// (`<name>=<hex>`). The signers and the verify recipes both derive from them.
 const SIG_ALGO: &str = "sha256";
+const SIG_ALGO_V2: &str = "sha384";
 
 /// Compute the `sha256=<hex>` signature for `body` keyed by `secret`.
 /// Returns `None` when `secret` is empty so callers can branch on
@@ -66,6 +78,18 @@ fn sign_body(secret: &str, body: &[u8]) -> Option<String> {
     Some(format!(
         "{SIG_ALGO}={}",
         hex::encode(crypto::hmac::hmac_sha256(secret.as_bytes(), body))
+    ))
+}
+
+/// Compute the `sha384=<hex>` signature for `body` keyed by `secret`
+/// (`X-Webhook-Signature-V2`). `None` for an empty secret.
+fn sign_body_v2(secret: &str, body: &[u8]) -> Option<String> {
+    if secret.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{SIG_ALGO_V2}={}",
+        hex::encode(crypto::hmac::hmac_sha384(secret.as_bytes(), body))
     ))
 }
 
@@ -588,6 +612,9 @@ pub struct VerifyRecipe {
     /// every existing copy/paste recipe out in the wild.
     #[serde(rename = "headerName")]
     pub header_name: String,
+    /// Header carrying the HMAC-SHA384 signature (CNSA 2.0 receivers).
+    #[serde(rename = "headerNameV2")]
+    pub header_name_v2: String,
     /// Pretty-printed canonical sample body — matches what the Slack
     /// formatter produces for the synthetic /test (`assigned`) event.
     #[serde(rename = "samplePayload")]
@@ -621,7 +648,8 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
     // is byte-accurate against the wire format.
     let sample_payload = serde_json::to_string(&sample).expect("sample payload serialises");
 
-    let header_name = "X-Webhook-Signature";
+    let header_name = SIG_HEADER;
+    let header_name_v2 = SIG_HEADER_V2;
     let snippets = if webhook.secret.is_empty() {
         VerifyRecipeSnippets {
             curl: unsigned_curl_snippet(&webhook.url, &sample_payload),
@@ -631,10 +659,16 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
     } else {
         let sig = sign_body(&webhook.secret, sample_payload.as_bytes())
             .expect("non-empty secret always signs");
+        let sig_v2 = sign_body_v2(&webhook.secret, sample_payload.as_bytes())
+            .expect("non-empty secret always signs");
         VerifyRecipeSnippets {
-            curl: signed_curl_snippet(&webhook.url, &sample_payload, &sig, header_name),
-            python: signed_python_snippet(header_name),
-            node: signed_node_snippet(header_name),
+            curl: signed_curl_snippet(
+                &webhook.url,
+                &sample_payload,
+                &[(header_name, &sig), (header_name_v2, &sig_v2)],
+            ),
+            python: signed_python_snippet(header_name, header_name_v2),
+            node: signed_node_snippet(header_name, header_name_v2),
         }
     };
 
@@ -643,17 +677,22 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
         name: webhook.name.clone(),
         url: webhook.url.clone(),
         header_name: header_name.to_string(),
+        header_name_v2: header_name_v2.to_string(),
         sample_payload,
         snippets,
     }
 }
 
-fn signed_curl_snippet(url: &str, body: &str, sig: &str, header: &str) -> String {
+fn signed_curl_snippet(url: &str, body: &str, sigs: &[(&str, &str)]) -> String {
     // Single-line curl that demonstrates exactly what the dispatcher
     // emits on the wire. The signature is pre-computed for the literal
     // sample body so a paste-and-run actually validates downstream.
+    let headers: String = sigs
+        .iter()
+        .map(|(h, v)| format!("  -H '{h}: {v}' \\\n"))
+        .collect();
     format!(
-        "curl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n  -H '{header}: {sig}' \\\n  -d '{body}'"
+        "curl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n{headers}  -d '{body}'"
     )
 }
 
@@ -663,13 +702,15 @@ fn unsigned_curl_snippet(url: &str, body: &str) -> String {
     )
 }
 
-fn signed_python_snippet(header: &str) -> String {
+fn signed_python_snippet(header: &str, header_v2: &str) -> String {
     // Receiver-side verification recipe. The secret is write-only, so the
     // snippet reads it from the environment instead of embedding it.
     format!(
-        "# Python receiver — verify the X-Webhook-Signature header.\nimport hmac, hashlib, os\n\n# Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nSECRET = os.environ['WEBHOOK_SECRET'].encode()\nHEADER = {header_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo}=' + hmac.new(SECRET, raw_body, hashlib.{algo}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify(request.get_data(), request.headers[HEADER])\n",
+        "# Python receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n# {header} (HMAC-SHA256) is sent alongside for existing receivers.\nimport hmac, hashlib, os\n\n# Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nSECRET = os.environ['WEBHOOK_SECRET'].encode()\nHEADER = {header_lit}\nHEADER_V2 = {header_v2_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo}=' + hmac.new(SECRET, raw_body, hashlib.{algo}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\ndef verify_v2(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo_v2}=' + hmac.new(SECRET, raw_body, hashlib.{algo_v2}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify_v2(request.get_data(), request.headers[HEADER_V2])\n",
         header_lit = python_string_literal(header),
+        header_v2_lit = python_string_literal(header_v2),
         algo = SIG_ALGO,
+        algo_v2 = SIG_ALGO_V2,
     )
 }
 
@@ -680,11 +721,13 @@ fn unsigned_python_snippet() -> String {
     "# This webhook is configured as unsigned (no secret set).\n# Receivers cannot verify the body's authenticity — there is no signature header.\n# Set a secret on the webhook in the Admin Console to enable HMAC verification.\n".to_string()
 }
 
-fn signed_node_snippet(header: &str) -> String {
+fn signed_node_snippet(header: &str, header_v2: &str) -> String {
     format!(
-        "// Node.js receiver — verify the X-Webhook-Signature header.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = '{algo}=' + crypto.createHmac('{algo}', SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verify(req.body, req.get(HEADER))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
+        "// Node.js receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n// {header} (HMAC-SHA256) is sent alongside for existing receivers.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\nconst HEADER_V2 = {header_v2_lit};\n\nfunction check(algo, rawBody, receivedSig) {{\n  const expected = algo + '=' + crypto.createHmac(algo, SECRET).update(rawBody).digest('hex');\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\nconst verify = (rawBody, receivedSig) => check('{algo}', rawBody, receivedSig);\nconst verifyV2 = (rawBody, receivedSig) => check('{algo_v2}', rawBody, receivedSig);\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verifyV2(req.body, req.get(HEADER_V2))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
         header_lit = js_string_literal(header),
+        header_v2_lit = js_string_literal(header_v2),
         algo = SIG_ALGO,
+        algo_v2 = SIG_ALGO_V2,
     )
 }
 
@@ -1090,6 +1133,29 @@ pub async fn dispatch_event(pool: &PgPool, event: WebhookEvent) {
 /// serialise the body bytes and sign them — so the HMAC always matches
 /// the exact wire payload the receiver sees, regardless of which schema
 /// the operator picked.
+/// The outgoing POST: JSON body plus the signature headers.
+/// HMAC-SHA256(body, secret) → `X-Webhook-Signature: sha256=<hex>` and
+/// HMAC-SHA384(body, secret) → `X-Webhook-Signature-V2: sha384=<hex>`.
+/// Webhooks with an empty secret remain unsigned (no headers) so the
+/// "no sender authentication needed" path keeps working.
+fn build_request(
+    client: &reqwest::Client,
+    webhook: &WebhookRow,
+    body: &str,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .post(&webhook.url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_owned());
+    if let Some(sig) = sign_body(&webhook.secret, body.as_bytes()) {
+        req = req.header(SIG_HEADER, sig);
+    }
+    if let Some(sig) = sign_body_v2(&webhook.secret, body.as_bytes()) {
+        req = req.header(SIG_HEADER_V2, sig);
+    }
+    req
+}
+
 async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) {
     let payload = format_for_flavor(event, &webhook.flavor);
     let kind = event.kind.as_str();
@@ -1101,7 +1167,9 @@ async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) 
         }
     };
 
-    let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build();
+    let client = crate::crypto::tls::http_client_builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build();
     let client = match client {
         Ok(c) => c,
         Err(e) => {
@@ -1121,16 +1189,7 @@ async fn deliver_one(pool: &PgPool, webhook: &WebhookRow, event: &WebhookEvent) 
         }
     };
 
-    let mut req = client
-        .post(&webhook.url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body.clone());
-    // HMAC-SHA256(body, secret) → `X-Webhook-Signature: sha256=<hex>`.
-    // Webhooks with an empty secret remain unsigned (no header) so the
-    // "I don't care about replay protection" path keeps working.
-    if let Some(sig) = sign_body(&webhook.secret, body.as_bytes()) {
-        req = req.header("X-Webhook-Signature", sig);
-    }
+    let req = build_request(&client, webhook, &body);
 
     match req.send().await {
         Ok(resp) => {
@@ -1750,6 +1809,105 @@ mod recipe_tests {
         assert!(r.snippets.node.contains("WEBHOOK_SECRET"));
         let sig = sign_body(&secret, r.sample_payload.as_bytes()).unwrap();
         assert!(r.snippets.curl.contains(&sig));
+        let sig_v2 = sign_body_v2(&secret, r.sample_payload.as_bytes()).unwrap();
+        assert!(r
+            .snippets
+            .curl
+            .contains(&format!("-H 'X-Webhook-Signature-V2: {sig_v2}'")));
+        assert_eq!(r.header_name_v2, "X-Webhook-Signature-V2");
+        assert!(r.snippets.python.contains("verify_v2"));
+        assert!(r.snippets.node.contains("verifyV2"));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["headerNameV2"], "X-Webhook-Signature-V2");
+        assert_eq!(v["headerName"], "X-Webhook-Signature");
+    }
+
+    #[test]
+    fn both_signatures_cover_the_same_body_and_v1_is_unchanged() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let body = br#"{"text":"x"}"#;
+        let v1 = sign_body(&secret, body).unwrap();
+        let v2 = sign_body_v2(&secret, body).unwrap();
+        assert_eq!(
+            v1,
+            format!(
+                "sha256={}",
+                hex::encode(crypto::hmac::hmac_sha256(secret.as_bytes(), body))
+            )
+        );
+        assert!(v1.starts_with("sha256=") && v1.len() == 7 + 64);
+        assert!(v2.starts_with("sha384=") && v2.len() == 7 + 96);
+        assert_eq!(
+            v2,
+            format!(
+                "sha384={}",
+                hex::encode(crypto::hmac::hmac_sha384(secret.as_bytes(), body))
+            )
+        );
+        assert_ne!(sign_body_v2(&secret, b"other"), Some(v2));
+    }
+
+    /// Send the request `build_request` makes to a local listener and return
+    /// the raw request head as seen on the wire.
+    async fn wire_head(secret: &str) -> (String, String) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut c, _) = l.accept().unwrap();
+            let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            // The headers are all that is asserted on; stop at the blank line.
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = c.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let _ =
+                c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let mut w = row(secret);
+        w.url = format!("http://{addr}/hook");
+        let body = r#"{"text":"hi"}"#;
+        let client = crate::crypto::tls::http_client_builder().build().unwrap();
+        let resp = build_request(&client, &w, body).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let head = tokio::task::spawn_blocking(move || h.join().unwrap())
+            .await
+            .unwrap();
+        (head.to_ascii_lowercase(), body.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_wire_request_carries_both_signatures_when_signed() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let (head, body) = wire_head(&secret).await;
+        let v1 = sign_body(&secret, body.as_bytes()).unwrap();
+        let v2 = sign_body_v2(&secret, body.as_bytes()).unwrap();
+        assert!(
+            head.contains(&format!("x-webhook-signature: {v1}")),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("x-webhook-signature-v2: {v2}")),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wire_request_carries_no_signature_when_unsigned() {
+        let (head, _) = wire_head("").await;
+        assert!(!head.contains("x-webhook-signature"), "{head}");
+    }
+
+    #[test]
+    fn empty_secret_sends_no_signature_of_either_kind() {
+        assert_eq!(sign_body("", b"x"), None);
+        assert_eq!(sign_body_v2("", b"x"), None);
     }
 
     #[test]

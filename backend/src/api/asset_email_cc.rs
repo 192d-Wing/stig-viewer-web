@@ -368,6 +368,7 @@ pub async fn send_asset_report(
         let message = builder
             .multipart(multipart)
             .map_err(|e| anyhow::anyhow!("build message: {e}"))?;
+        crate::crypto::tls::ensure_installed();
         let transport_builder = SmtpTransport::starttls_relay(&cfg.host)
             .map_err(|e| anyhow::anyhow!("build transport: {e}"))?;
         let transport_builder = transport_builder.port(cfg.port);

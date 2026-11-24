@@ -225,7 +225,7 @@ const MAX_REDIRECTS: usize = 5;
 
 /// The sync HTTP client: every redirect hop must stay inside `origin`.
 fn build_client(origin: AllowedOrigin) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::crypto::tls::http_client_builder()
         .user_agent("stig-viewer-backend/0.1")
         .timeout(std::time::Duration::from_secs(120))
         .https_only(origin.scheme == "https")
@@ -776,7 +776,13 @@ mod id_tests {
 
     async fn fetch(head: &str, body: Vec<u8>, limit: usize) -> Result<Vec<u8>> {
         let url = serve_once(head.to_string(), body).await;
-        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        let resp = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
         read_capped_body(resp, limit).await
     }
 
@@ -891,7 +897,7 @@ mod id_tests {
         .await;
         let e = sync_one_with(
             &source_for("big-src", url.clone()),
-            &reqwest::Client::new(),
+            &crate::crypto::tls::http_client_builder().build().unwrap(),
             &pool,
             &data_dir,
             10,
@@ -924,7 +930,7 @@ mod id_tests {
         .await;
         let e = sync_one_with(
             &source_for("stream-src", url.clone()),
-            &reqwest::Client::new(),
+            &crate::crypto::tls::http_client_builder().build().unwrap(),
             &pool,
             &data_dir,
             10,
@@ -954,7 +960,7 @@ mod id_tests {
         .await;
         let e = sync_one_with(
             &source_for("small-src", url.clone()),
-            &reqwest::Client::new(),
+            &crate::crypto::tls::http_client_builder().build().unwrap(),
             &pool,
             &data_dir,
             10,
@@ -1240,7 +1246,7 @@ mod id_tests {
         src.sha256 = Some(expected.clone());
         let e = sync_one_with(
             &src,
-            &reqwest::Client::new(),
+            &crate::crypto::tls::http_client_builder().build().unwrap(),
             &pool,
             &data_dir,
             1 << 20,
@@ -1275,7 +1281,7 @@ mod id_tests {
         src.sha256 = Some(pin);
         let out = sync_one_with(
             &src,
-            &reqwest::Client::new(),
+            &crate::crypto::tls::http_client_builder().build().unwrap(),
             &pool,
             &data_dir,
             1 << 20,

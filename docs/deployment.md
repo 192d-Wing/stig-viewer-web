@@ -18,8 +18,12 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 - FIPS: build with `--no-default-features --features fips` and set
   `STIG_REQUIRE_FIPS=1`. That runs the application's own Ed25519, HMAC,
   SHA-2, SAML RSA verification and session RNG inside the AWS-LC FIPS module
-  (pending CMVP; no certificate). TLS, OIDC ID-token verification and
-  state/nonce, and Postgres SCRAM stay outside it. The in-module algorithms
+  (pending CMVP; no certificate), and outbound TLS (webhooks, OIDC, DISA
+  sync, SMTP STARTTLS). OIDC ID-token verification and state/nonce, and
+  Postgres SCRAM stay outside it. A FIPS build offers only classical
+  (P-384, P-256) outbound TLS key exchange unless
+  `STIG_FIPS_PENDING_ALGS=X25519MLKEM768,ML-KEM-1024` is set; set it to get
+  the hybrid and `ML-KEM-1024` groups (pending validation). The in-module algorithms
   are classical; under CNSA 2.0 the IdP signing key should be RSA of at least
   3072 bits. See the README FIPS notes.
 

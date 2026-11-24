@@ -2298,7 +2298,7 @@ fn WebhooksSection(props: &SectionProps) -> Html {
     let secret_description = match (editing, editing_signed) {
         (true, true) => "A secret is set. Leave blank to keep it; enter a new value to rotate. It is never shown.",
         (true, false) => "No secret set (deliveries are unsigned). Enter a value to sign deliveries.",
-        _ => "Used as the HMAC-SHA256 key. Verify with: hex(hmac_sha256(secret, body)) and the X-Webhook-Signature header (format sha256=<hex>). Leave blank to send unsigned.",
+        _ => "Used as the HMAC key. Each delivery carries X-Webhook-Signature (sha256=<hex>, HMAC-SHA256) and X-Webhook-Signature-V2 (sha384=<hex>, HMAC-SHA384; CNSA 2.0 receivers should require it, and the V2 profile needs a secret of at least 48 random bytes). Leave blank to send unsigned.",
     };
     let on_clear_secret = {
         let modal = hook_modal.clone();

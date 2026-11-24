@@ -228,6 +228,10 @@ test.describe("Webhook payload flavor adapters", () => {
       const expected =
         "sha256=" +
         crypto.createHmac("sha256", secret).update(received.body).digest("hex");
+      expect(received.headers["x-webhook-signature-v2"]).toBe(
+        "sha384=" +
+          crypto.createHmac("sha384", secret).update(received.body).digest("hex"),
+      );
       expect(sigHeader).toBe(expected);
     } finally {
       await capture.close();

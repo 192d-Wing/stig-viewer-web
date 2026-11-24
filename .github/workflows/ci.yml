@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, so a new advisory against an unchanged lock file is noticed.
+  schedule:
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
@@ -72,6 +75,12 @@ jobs:
           tree=$(cargo tree --locked -e normal)
           grep -q aws-lc-sys <<<"$tree"
           ! grep -q aws-lc-fips-sys <<<"$tree"
+      # TLS (reqwest, lettre) runs on rustls + aws-lc-rs, so ring must not be
+      # in the normal graph; only the dev-only rcgen may use it (#215).
+      - name: Check ring is not in the normal dependency graph
+        run: |
+          tree=$(cargo tree --locked -e normal --prefix none)
+          ! grep -E '^ring v' <<<"$tree"
       # RustCrypto stays in the graph via openidconnect and sqlx, but this crate
       # must not call it directly: application crypto goes through src/crypto.
       - name: Check the backend has no direct RustCrypto dependency
@@ -166,15 +175,74 @@ jobs:
           workspaces: backend
 
       # `--no-default-features` drops `non-fips`, so only the FIPS module links.
-      - name: Check the FIPS build links aws-lc-fips-sys and not aws-lc-sys
+      # rustls' `fips` feature also pulls aws-lc-sys into the build graph, but
+      # it is compiled, not linked: the binary check below is the real test.
+      - name: Check the FIPS build links aws-lc-fips-sys and has no ring
         run: |
-          tree=$(cargo tree --locked --no-default-features --features fips -e normal)
-          grep -q aws-lc-fips-sys <<<"$tree"
-          ! grep -q 'aws-lc-sys' <<<"$tree"
+          tree=$(cargo tree --locked --no-default-features --features fips -e normal --prefix none)
+          grep -q '^aws-lc-fips-sys v' <<<"$tree"
+          ! grep -E '^ring v' <<<"$tree"
 
       - run: cargo clippy --locked --no-default-features --features fips --all-targets -- -D warnings
 
       - run: cargo test --locked --no-default-features --features fips
+
+      # The TLS tests also run with the post-quantum groups opted in.
+      - name: TLS tests with the pending ML-KEM groups opted in
+        env:
+          STIG_FIPS_PENDING_ALGS: "X25519MLKEM768,ML-KEM-1024"
+        run: cargo test --locked --no-default-features --features fips crypto::tls
+
+      # The binary must contain the FIPS module's symbols and none of the
+      # non-FIPS aws-lc-sys ones (which are built but not linked).
+      - name: Check the FIPS binary links only the FIPS module
+        run: |
+          cargo build --locked --no-default-features --features fips
+          bin=target/debug/stig-viewer-backend
+          fips_syms=$(nm "$bin" | grep -cE ' _?aws_lc_fips_[0-9]' || true)
+          plain_syms=$(nm "$bin" | grep -cE ' _?aws_lc_[0-9]' || true)
+          echo "aws_lc_fips_* symbols: $fips_syms, aws_lc_* symbols: $plain_syms"
+          [ "$fips_syms" -gt 0 ]
+          [ "$plain_syms" -eq 0 ]
+
+  # cargo-deny advisories, bans and sources (#215), config in deny.toml. The
+  # release tarball is pinned by version and SHA-256. Also runs weekly so a new
+  # advisory against an unchanged lock file is noticed.
+  supply-chain:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.22.0"
+      CARGO_DENY_SHA256: "98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install cargo-deny (pinned, checksum verified)
+        run: |
+          f="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$f" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/$f"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/cargo-deny"
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/cargo-deny" --strip-components=1
+          install "$RUNNER_TEMP/cargo-deny/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+
+      - name: Backend (default features)
+        run: cargo deny --manifest-path backend/Cargo.toml --locked check advisories bans sources
+
+      - name: Backend (fips feature)
+        run: cargo deny --manifest-path backend/Cargo.toml --locked --no-default-features --features fips check advisories bans sources
+
+      - name: Frontend (wasm32)
+        run: cargo deny --manifest-path frontend/Cargo.toml --locked --target wasm32-unknown-unknown check advisories bans sources
 
   # Decides whether a pull request touches anything e2e exercises. Pushes to
   # main always run e2e, whatever changed.

@@ -1691,7 +1691,9 @@ mod tests {
 
     async fn call(base: &str, method: &str, path: &str, user: &str) -> reqwest::Response {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
-        reqwest::Client::new()
+        crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .request(m, format!("{base}{path}"))
             .header("x-user", user)
             .send()
@@ -2721,7 +2723,9 @@ mod flood_tests {
             for _ in 0..per_user {
                 let (base, u, done_tx) = (base.clone(), u.clone(), done_tx.clone());
                 tokio::spawn(async move {
-                    let s = reqwest::Client::new()
+                    let s = crate::crypto::tls::http_client_builder()
+                        .build()
+                        .unwrap()
                         .post(format!("{base}/api/save"))
                         .header("x-user", &u)
                         .send()
@@ -2790,7 +2794,9 @@ mod flood_tests {
         ))
         .with_state(state);
         let base = serve_app(router).await;
-        let r = reqwest::Client::new()
+        let r = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .post(format!("{base}/api/save"))
             .header("x-user", "viewer-d")
             .send()
@@ -2816,7 +2822,9 @@ mod flood_tests {
     }
 
     async fn viewer_post(base: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .post(format!("{base}/api/save"))
             .header("x-user", "viewer-d")
             .send()

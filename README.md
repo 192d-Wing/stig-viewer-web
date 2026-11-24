@@ -507,7 +507,10 @@ is not a validated environment.
 What this does and does not establish: in a `fips` build, the Ed25519 signing
 and verification, HMAC-SHA-256, SHA-256/SHA-512, SAML RSA signature
 verification and session/identifier random generation that this application
-calls run inside the module. Still outside it: TLS (rustls on ring), OIDC
+calls run inside the module, as does outbound TLS (reqwest and the SMTP
+STARTTLS client, rustls on AWS-LC; no inbound TLS is terminated by the
+backend, and the build refuses to start unless its TLS client configuration
+reports FIPS). Still outside it: OIDC
 ID-token verification and state/nonce/PKCE generation (RustCrypto, via
 `openidconnect`; the audit token `oidc-state-nonce` covers OIDC state, nonce
 and PKCE verifier generation) and Postgres SCRAM (`sqlx`). The in-module
@@ -526,15 +529,34 @@ At server startup (not for `migrate`) one `system.fips_policy` audit event is
 written with the detail keys `fipsCompiled`, `fipsModeActive`, `requireFips`,
 `appCryptoInModule` (`true` only in a `fips` build whose module check passed:
 the primitives this application calls directly run in the module),
-`cryptoOutsideModule` (what still does not: `tls`, `oidc-id-token-verify`,
-`oidc-state-nonce`, `postgres-scram`) and `pendingAlgs` (the validated
+`cryptoOutsideModule` (what still does not: `oidc-id-token-verify`,
+`oidc-state-nonce`, `postgres-scram`), `tlsKxGroups` (the outbound TLS
+key-exchange groups offered, in order) and `pendingAlgs` (the validated
 `STIG_FIPS_PENDING_ALGS` list). A refused start has no audit row, only a
 `target: "audit"` log line; if the audit write itself fails, it is logged the
 same way and startup continues.
 
+Outbound TLS offers `X25519MLKEM768` and `ML-KEM-1024` key exchange first, then
+`X25519` (non-FIPS builds only), P-384 and P-256. In a `fips` build the two
+ML-KEM groups are pending validation and are offered only when listed in
+`STIG_FIPS_PENDING_ALGS` (`X25519MLKEM768`, `ML-KEM-1024`); otherwise it offers
+P-384 and P-256.
+
 Webhook HMAC secrets shorter than 14 bytes (112 bits) are not an approved use
 of HMAC under NIST SP 800-131A; the key length is not enforced (documentation
-only).
+only). Each signed webhook delivery carries `X-Webhook-Signature`
+(`sha256=<hex>`, HMAC-SHA-256) and `X-Webhook-Signature-V2` (`sha384=<hex>`,
+HMAC-SHA-384) over the same body. Receivers that must meet CNSA 2.0 should
+require V2 and use a secret of at least 48 bytes. The signature has no
+timestamp or nonce, so it does not by itself prevent replay.
+
+## Supply chain
+
+CI runs `cargo deny check advisories bans sources` (`deny.toml`) against the
+backend (default and `fips`) and frontend dependency graphs. Ignored advisories
+carry a reason in `deny.toml`. `ring` is banned from the backend's normal
+dependency graph (TLS and application crypto run on aws-lc-rs); the dev-only
+`rcgen` test dependency is the one exception.
 
 ## Operations: audit
 
