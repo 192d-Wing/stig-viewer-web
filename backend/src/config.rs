@@ -45,6 +45,9 @@ pub struct Config {
     /// Missing files are copied into `data_dir/stigs` at start; unset in
     /// production.
     pub seed_dir: Option<PathBuf>,
+    /// Directory of the release frontend (`STIG_STATIC_DIR`). When set the
+    /// backend serves it same-origin from memory; unset in dev and e2e.
+    pub static_dir: Option<PathBuf>,
 }
 
 /// Debug never prints the connection URLs (they can carry passwords).
@@ -62,6 +65,7 @@ impl std::fmt::Debug for Config {
             .field("backup_require_signature", &self.backup_require_signature)
             .field("sync_on_start", &self.sync_on_start)
             .field("seed_dir", &self.seed_dir)
+            .field("static_dir", &self.static_dir)
             .finish()
     }
 }
@@ -90,6 +94,7 @@ impl Config {
                 std::env::var("STIG_SYNC_ON_START").ok().as_deref(),
             ),
             seed_dir: parse_seed_dir(std::env::var("STIG_SEED_DIR").ok().as_deref()),
+            static_dir: parse_seed_dir(std::env::var("STIG_STATIC_DIR").ok().as_deref()),
         })
     }
 }
@@ -519,6 +524,7 @@ mod tests {
             backup_require_signature: None,
             sync_on_start: false,
             seed_dir: None,
+            static_dir: None,
         };
         let d = format!("{c:?}");
         assert!(!d.contains("secret1") && !d.contains("secret2"), "{d}");
@@ -543,6 +549,17 @@ mod tests {
         assert_eq!(
             parse_seed_dir(Some("/app/data")),
             Some(PathBuf::from("/app/data"))
+        );
+    }
+
+    #[test]
+    fn static_dir_blank_or_unset_is_none() {
+        // Parsed with the same helper as `STIG_SEED_DIR`.
+        assert_eq!(parse_seed_dir(None), None);
+        assert_eq!(parse_seed_dir(Some(" ")), None);
+        assert_eq!(
+            parse_seed_dir(Some("/app/static")),
+            Some(PathBuf::from("/app/static"))
         );
     }
 

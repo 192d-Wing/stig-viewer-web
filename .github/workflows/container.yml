@@ -1,0 +1,66 @@
+name: Container image
+
+# Builds the production image (Containerfile, #71) with podman and smoke-tests
+# it against a throwaway Postgres and Keycloak. Self-contained; ci.yml is not
+# involved. Not a required check: the path filter leaves it absent on PRs that
+# touch none of these files.
+on:
+  pull_request:
+    paths:
+      - Containerfile
+      - .dockerignore
+      - backend/**
+      - frontend/**
+      - scripts/smoke-prod-image.sh
+      - docker-compose.yml
+      - .github/workflows/container.yml
+  push:
+    branches: [main]
+    paths:
+      - Containerfile
+      - .dockerignore
+      - backend/**
+      - frontend/**
+      - scripts/smoke-prod-image.sh
+      - docker-compose.yml
+      - .github/workflows/container.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: image (${{ matrix.crypto }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        crypto: [non-fips, fips]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck the smoke script
+        run: shellcheck scripts/smoke-prod-image.sh
+
+      - name: Build and smoke-test the image
+        env:
+          ENGINE: podman
+          CRYPTO: ${{ matrix.crypto }}
+        run: scripts/smoke-prod-image.sh
+
+      - name: Dump container logs
+        if: failure()
+        run: |
+          for c in $(podman ps -a --format '{{.Names}}' | grep '^svw-prod-smoke-' || true); do
+            echo "::group::$c"
+            podman logs --tail 100 "$c" 2>&1 || true
+            echo "::endgroup::"
+          done

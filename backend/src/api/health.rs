@@ -475,8 +475,94 @@ async fn check_webhooks(pool: &sqlx::PgPool) -> (Status, Value) {
     )
 }
 
+/// Blocking probe for the container `HEALTHCHECK` (`<binary> healthcheck`):
+/// `GET /api/health` on `127.0.0.1:port` with 3 s timeouts, std only. Ok only
+/// when the status line is 200; `get_health` answers 503 on top-level `error`.
+pub fn probe(port: u16) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+
+    let timeout = Duration::from_secs(3);
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).context("connect")?;
+    stream.set_read_timeout(Some(timeout)).context("timeout")?;
+    stream.set_write_timeout(Some(timeout)).context("timeout")?;
+    stream
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .context("write request")?;
+    // The status line is in the first bytes; do not read the whole body.
+    let mut buf = [0u8; 64];
+    let mut len = 0;
+    while len < buf.len() && !buf[..len].contains(&b'\n') {
+        let n = stream.read(&mut buf[len..]).context("read response")?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+    }
+    let head = String::from_utf8_lossy(&buf[..len]);
+    let line = head.lines().next().unwrap_or("");
+    if status_line_ok(line) {
+        Ok(())
+    } else {
+        anyhow::bail!("unhealthy: {line}")
+    }
+}
+
+/// True for an HTTP/1.x status line with code 200.
+fn status_line_ok(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(v), Some("200")) if v.starts_with("HTTP/1.")
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    /// One-shot server on an ephemeral port that answers with `reply`.
+    fn serve_once(reply: &'static str) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn probe_ok_on_200_err_on_503_and_closed_port() {
+        let ok = serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert!(super::probe(ok).is_ok());
+        let bad = serve_once("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        assert!(super::probe(bad).is_err());
+        // A port that was just closed refuses the connection.
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(super::probe(port).is_err());
+    }
+
+    #[test]
+    fn status_line_parsing() {
+        assert!(super::status_line_ok("HTTP/1.1 200 OK"));
+        assert!(super::status_line_ok("HTTP/1.0 200"));
+        assert!(!super::status_line_ok("HTTP/1.1 503 Service Unavailable"));
+        assert!(!super::status_line_ok("HTTP/1.1 2000 X"));
+        assert!(!super::status_line_ok("garbage"));
+        assert!(!super::status_line_ok(""));
+        assert!(!super::status_line_ok("200 HTTP/1.1"));
+    }
+
     use super::*;
     use crate::failure_counters::FailureCounter;
     use chrono::Duration as D;
