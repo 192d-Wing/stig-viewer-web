@@ -176,9 +176,11 @@ test.describe("Evidence attachments — API", () => {
       )
       .then((r) => r.json());
     const as = (user) => ({ headers: { "X-User-Id": user } });
-    // The ACL grant below needs mallory to exist as a user; /api/users/me
-    // provisions the row (the attachment endpoints do not).
-    expect((await request.get(`${BACKEND}/api/users/me`, as("mallory"))).ok()).toBe(true);
+    // The ACL grant below targets mallory's users.id, which is generated and is
+    // not the X-User-Id value; /api/users/me provisions the row and returns it.
+    const me = await request.get(`${BACKEND}/api/users/me`, as("mallory"));
+    expect(me.ok()).toBe(true);
+    const malloryId = (await me.json()).id;
     const urls = {
       list: `${BACKEND}/api/checklists/${checklistId}/rules/${encodeURIComponent(ruleId)}/attachments`,
       counts: `${BACKEND}/api/checklists/${checklistId}/attachments`,
@@ -195,7 +197,7 @@ test.describe("Evidence attachments — API", () => {
 
     const grant = await request.post(`${BACKEND}/api/assets/${assetId}/acl`, {
       headers: { "X-User-Id": "alice", "Content-Type": "application/json" },
-      data: { userId: "mallory", permission: "read" },
+      data: { userId: malloryId, permission: "read" },
     });
     expect(grant.ok()).toBe(true);
     for (const [name, url] of Object.entries(urls)) {
