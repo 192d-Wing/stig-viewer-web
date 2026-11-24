@@ -245,9 +245,11 @@ $ENGINE rm -f "$APP" >/dev/null
 
 uid_args=()
 for a in "${server_args[@]}"; do uid_args+=("$a"); done
-note "starting server as uid 123456 gid 0 on the same volume"
-$ENGINE run -d --name "$APP-uid" --user 123456:0 "${uid_args[@]}" -p "127.0.0.1:$PORT:8080" "$IMAGE" >/dev/null
-check "arbitrary uid 123456:0 reaches healthy" wait_healthy "$APP-uid" 120
+# Must stay below 65536: rootless podman (CI runners) maps only that many uids.
+alt_uid=54321
+note "starting server as uid $alt_uid gid 0 on the same volume"
+$ENGINE run -d --name "$APP-uid" --user "$alt_uid:0" "${uid_args[@]}" -p "127.0.0.1:$PORT:8080" "$IMAGE" >/dev/null
+check "arbitrary uid $alt_uid:0 reaches healthy" wait_healthy "$APP-uid" 120
 $ENGINE stop -t 15 "$APP-uid" >/dev/null || true
 
 # --- require-FIPS refusal on a non-FIPS build --------------------------------
