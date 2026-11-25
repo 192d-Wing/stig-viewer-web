@@ -1168,23 +1168,52 @@ it), `SAML_SP_ENTITY_ID` (Audience, default `{frontend}/saml/sp`),
 The ACS accepts exactly one Assertion, a direct child of `samlp:Response`.
 Accepted signature layouts: Assertion signed, Response signed, or both; a
 `ds:Signature` must be a direct child of the Response or the Assertion, with one
-Reference to its parent's ID, RSA-SHA256 and SHA-256 only. Identity is read only
+Reference to its parent's ID. Identity is read only
 from the signed scope. Required: Status Success, a bearer SubjectConfirmation
 with matching Recipient and unexpired NotOnOrAfter, Conditions, and an
 AudienceRestriction naming the SP; Destination is checked when present. DOCTYPE,
 comments, processing instructions and EncryptedAssertion are rejected. Failed
 ACS attempts return a generic 401 and log an `auth.saml_acs` audit line.
 
-Only RSA-SHA256 with keys of at least 2048 bits is accepted (a weaker
-`SAML_IDP_CERT_PEM` stops startup). `SignedInfo` and the signed element must
-declare every namespace they use themselves (the `ds` namespace included), since
-bindings outside the signed bytes are not authenticated. `POST /auth/saml/acs`
+Accepted algorithms: exclusive canonicalisation (`xml-exc-c14n#`, and
+`#WithComments`, which is identical because comments are rejected), RSA PKCS#1
+v1.5 with SHA-256, SHA-384 or SHA-512 (`rsa-sha256`/`rsa-sha384`/`rsa-sha512`),
+and the SHA-256, SHA-384 or SHA-512 digest in any pairing. SHA-1, PSS and ECDSA
+are rejected. RSA keys must be at least 2048 bits (a weaker `SAML_IDP_CERT_PEM`
+stops startup). Each Reference must list exactly two Transforms, in this order:
+enveloped-signature, then exclusive canonicalisation; a Reference without the
+canonicalisation transform is rejected (XML-DSig would default to inclusive
+C14N 1.0, which is not implemented). An `InclusiveNamespaces` `PrefixList`
+(at most 16 prefixes) is honoured on the CanonicalizationMethod and the
+Transform. Digest and signature are computed over the exclusive canonical form
+of the parsed document, so IdP output need not be canonical on the wire
+(indentation, quote style, attribute order, `<x/>` versus `<x></x>`, CDATA and
+CRLF are all fine). Namespace bindings in scope are signed into the canonical
+bytes, so rebinding a prefix after signing breaks the digest. A prefix used
+only inside attribute values or text (such as `xsi:type="xs:string"`) is signed
+only if it is listed in the `PrefixList`; QName content is never interpreted.
+IdPs that emit comments or processing instructions, or that sign with inclusive
+C14N 1.0, fail closed. `POST /auth/saml/acs`
 shares the per-IP pre-auth rate limit (429 when exceeded) and answers every
 failure with a generic 401; reasons go to the audit log as fixed codes.
 
-Limitation: exclusive canonicalisation is not implemented yet. Signatures are
-verified over the bytes as sent, so IdPs that do not emit canonical XML will
-fail closed until c14n is added.
+Replay protection (IA-2(8)): after a response verifies, its Assertion `ID` (and
+its Response `ID` when the Response itself is signed) is recorded in the
+`saml_seen_ids` table as a domain-separated SHA-256, kept until the bearer
+`NotOnOrAfter` plus the clock skew has passed (and pruned a few minutes later).
+The insert is atomic and the table is shared, so across all instances exactly
+one presentation of a valid assertion is processed, and the cache survives
+restarts. A second presentation is refused as `replay` whether or not the first
+one completed, and with or without the request cookie; a database error refuses
+the login (`replay_check_error`). Because of this, someone who captures a
+response can burn it and the user simply signs in again. An assertion whose
+bearer `NotOnOrAfter` is more than 24 hours away is refused
+(`validity_too_long`) so the cache stays bounded. The table holds only hashes
+and is not part of the application backup. The assertion is recorded before the
+acknowledgement and request-cookie claim, so a response that then fails that
+claim cannot be retried; the user must restart the login. When an assertion
+carries several bearer confirmations for this ACS, the latest `NotOnOrAfter`
+sets both the cache expiry and the 24-hour cap.
 
 `SAML_INSECURE_SKIP_VERIFY=true` skips only the signature check (all other
 checks still run) and is for local development. The backend **refuses to start**
@@ -1209,7 +1238,8 @@ SAML sets a similar `stig_saml_req` cookie (path `/auth/saml`, `SameSite=None;
 Secure` over https, `Lax` over plain http). IdP-initiated SAML responses (no
 `InResponseTo`) are refused unconditionally. In plain-http dev, SAML therefore
 works only with an IdP that is same-site with the API, or behind https.
-Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored.
+Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored,
+except the SAML replay refusal described below.
 
 What is stored for an in-flight OIDC login, on its `login_notice_acks` row and
 for at most 10 minutes: the `state` as a SHA-256 hash (it is only compared, never
@@ -1225,15 +1255,22 @@ up to 10 minutes, which are of no use without an intercepted authorization code.
 Auth audit events:
 
 - Stored in `audit_events`: `auth.notice_ack`, outcome `ok` only, written when a
-  login completes.
+  login completes; and `auth.saml_replay`, outcome `rejected`, written when a
+  verified SAML assertion is presented a second time (detail: `reasonCode`,
+  `assertionIdSha256`, `responseIdSha256`, `issuer`, `nameIdSha256`, `sourceIp`;
+  digests only, never the raw IDs or the NameID), and the same action with
+  outcome `error` (best effort) when the replay check itself fails. Producing one needs an IdP-signed, in-window assertion
+  (or the non-production skip-verify mode), and the ACS per-IP limiter and the
+  audit queue's shedding of denied events bound the volume.
 - Log-only (`target: "audit"`, not stored): `auth.notice_ack` / `issued`;
   `auth.login_start` / `denied` (reasons `rate_limited`, `missing`, `malformed`,
   `invalid`, `error`); `auth.oidc_callback` / `success` or `denied` (reasons
   `rate_limited`, `no_state_cookie`, `malformed_state_cookie`, `ack_not_claimed`,
   `claim_error`, `token_exchange`, `id_token`); `auth.saml_acs` / `success` or
   `denied` (reasons `rate_limited`, `decode`, `unsolicited`,
-  `no_request_cookie`, `ack_not_claimed`, `claim_error`, plus the fixed
-  validation codes of the SAML response checks).
+  `no_request_cookie`, `ack_not_claimed`, `claim_error`, `replay`,
+  `replay_check_error`, `validity_too_long`, plus the fixed validation codes of
+  the SAML response checks).
 - Removed: `auth.notice_ack` with outcome `missing` was written by the first AC-8
   release (f0b65f9) and removed by PR #56 (e0a0c9d). A login without the
   acknowledgement is now refused and appears as an `auth.oidc_callback` or

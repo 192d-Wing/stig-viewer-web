@@ -47,7 +47,7 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 - Keep the owner URL out of the server environment. Production with the owner
   URL on the server records `db.boundary_degraded`.
 - Migrations are not selectable by range; `migrate` applies everything pending
-  through `050_audit_owner_functions.sql`. All run as the owner role. None needs
+  through `051_saml_replay_cache.sql`. All run as the owner role. None needs
   a superuser in production.
 
 | Migration | Operator note |
@@ -59,6 +59,7 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 | 046 | The table becomes `UNLOGGED`: in-flight logins re-acknowledge after a crash or failover. Pass `--no-unlogged-table-data` to a manual `pg_dump`. |
 | 047 | Run `migrate` first. Sweeps from older replicas fail closed with `42501`. Stop pre-#82 replicas before the first new sweep. |
 | 050 | Requires the owner/app split. Run `migrate` before starting new servers. Pass the same `AUDIT_RETENTION_DAYS` to the `migrate` job if it is below 365. Forced restores need the owner-opened window. An older binary refuses a database at 050. |
+| 051 | `saml_seen_ids` (SAML replay cache) is transient and excluded from the app backup. Schema only, no action. |
 
 - The retention floor `audit_policy.min_retain_days` is set by the owner step
   from `AUDIT_RETENTION_DAYS` as the `migrate` process sees it (default 365).

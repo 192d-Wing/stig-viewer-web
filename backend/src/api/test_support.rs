@@ -48,7 +48,7 @@ pub(crate) async fn reset_db(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     crate::db_audit::set_maintenance(&mut tx, "test").await?;
     sqlx::query(
         "TRUNCATE draft_comments, stig_drafts, users, catalog_archive, \
-                  email_deliveries, login_notice_acks CASCADE",
+                  email_deliveries, login_notice_acks, saml_seen_ids CASCADE",
     )
     .execute(&mut *tx)
     .await?;

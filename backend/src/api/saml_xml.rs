@@ -1,10 +1,15 @@
 //! Strict, single-pass XML front end for SAMLResponse documents.
 //!
 //! The document is parsed exactly once with `quick-xml` into an index of
-//! elements (namespace, local name, attributes, parent, byte span). Both
-//! signature verification (`saml_verify`) and identity extraction (`saml`)
-//! work from this one tree, so the element whose signature is verified is
-//! the same element the identity is read from.
+//! elements (namespace, local name, declarations, attributes, ordered
+//! content, parent, byte span). Signature verification (`saml_verify`,
+//! which canonicalises this tree via `saml_c14n`) and identity extraction
+//! (`saml`) work from this one tree, so the bytes that are digested are
+//! serialised from the same nodes the identity is read from.
+//!
+//! quick-xml 0.37 performs neither attribute-value normalisation nor
+//! end-of-line normalisation, so this module does both (XML 1.0 3.3.3 and
+//! 2.11) and checks every character against the XML 1.0 `Char` range.
 //!
 //! The parser fails closed: DOCTYPE, processing instructions (other than
 //! the XML declaration), comments, duplicate attributes, unknown namespace
@@ -70,17 +75,28 @@ pub fn code_of(e: &anyhow::Error) -> &'static str {
         .unwrap_or("invalid_response")
 }
 
+/// Namespace bound to the reserved `xml` prefix.
+pub const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// One piece of an element's content, in document order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Content {
+    /// Character data (text and CDATA merged), line endings normalised.
+    Text(String),
+    /// A child element, by node index.
+    Child(usize),
+}
+
 #[derive(Debug)]
 pub struct Node {
     pub ns: String,
     pub local: String,
     /// Element prefix as written ("" for unprefixed).
     pub prefix: String,
-    /// Namespace prefixes declared on this element ("" is the default namespace).
-    pub decls: Vec<String>,
-    /// Prefixes used by this element's attributes (excluding `xmlns`/`xml`).
-    pub attr_prefixes: Vec<String>,
-    /// Raw attributes by qualified key (only unprefixed keys are ever looked up).
+    /// Namespace declarations on this element as (prefix, uri); "" is the
+    /// default namespace.
+    pub decls: Vec<(String, String)>,
+    /// Non-`xmlns` attributes as (qualified name as written, normalised value).
     pub attrs: Vec<(String, String)>,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
@@ -89,12 +105,62 @@ pub struct Node {
     pub end: usize,
     /// Concatenated direct text and CDATA.
     pub text: String,
+    /// Direct text and children interleaved in document order.
+    pub content: Vec<Content>,
 }
 
 #[derive(Debug)]
 pub struct SamlDoc {
-    src: String,
     nodes: Vec<Node>,
+}
+
+/// XML 1.0 `Char` production.
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
+}
+
+fn check_chars(s: &str) -> Result<()> {
+    if s.chars().all(is_xml_char) {
+        Ok(())
+    } else {
+        bail!("character outside the XML 1.0 Char range")
+    }
+}
+
+/// XML 1.0 2.11 end-of-line handling: `\r\n` and lone `\r` become `\n`.
+fn normalize_eol(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// XML 1.0 3.3.3 attribute-value normalisation for CDATA attributes, applied
+/// to the literal text before entity expansion: each of `\r\n`, `\r`, `\n`
+/// and `\t` becomes one space.
+fn normalize_attr(s: &str) -> String {
+    s.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ")
+}
+
+fn unescape_checked(s: &str) -> Result<String> {
+    let v = quick_xml::escape::unescape(s)
+        .map_err(|e| anyhow!("bad entity: {e}"))?
+        .into_owned();
+    check_chars(&v)?;
+    Ok(v)
+}
+
+/// XML `NCName` (name without a colon).
+fn is_ncname(s: &str) -> bool {
+    let mut it = s.chars();
+    it.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+        && it.all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// `NCName` or `NCName:NCName`; returns (prefix, local).
+fn split_qname(name: &str) -> Result<(&str, &str)> {
+    let (p, l) = name.split_once(':').unwrap_or(("", name));
+    if (!p.is_empty() || name.contains(':')) && !is_ncname(p) || !is_ncname(l) {
+        bail!("name is not a namespace-well-formed QName");
+    }
+    Ok((p, l))
 }
 
 /// Build a node from a start/empty tag (without linking it into the tree).
@@ -111,48 +177,104 @@ fn make_node(
     let name = std::str::from_utf8(e.name().as_ref())
         .map_err(|_| anyhow!("element name not utf-8"))?
         .to_string();
-    let (prefix, local) = match name.split_once(':') {
-        Some((p, l)) => (p.to_string(), l.to_string()),
-        None => (String::new(), name),
+    let (prefix, local) = {
+        let (p, l) = split_qname(&name)?;
+        (p.to_string(), l.to_string())
     };
-    let (mut attrs, mut decls, mut attr_prefixes) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut attrs, mut decls) = (Vec::new(), Vec::new());
+    let mut seen = 0usize;
     for a in e.attributes() {
-        if attrs.len() >= MAX_ATTRS {
+        seen += 1;
+        if seen > MAX_ATTRS {
             bail!("too many attributes");
         }
         let a = a.map_err(|e| anyhow!("bad attribute: {e}"))?;
         let key = std::str::from_utf8(a.key.as_ref())
             .map_err(|_| anyhow!("attribute name not utf-8"))?
             .to_string();
-        let val = a
-            .unescape_value()
-            .map_err(|e| anyhow!("bad attribute value: {e}"))?
-            .to_string();
+        let raw =
+            std::str::from_utf8(&a.value).map_err(|_| anyhow!("attribute value not utf-8"))?;
+        if raw.contains('<') {
+            bail!("'<' in attribute value");
+        }
+        let val = unescape_checked(&normalize_attr(raw))?;
         if key == "xmlns" || key.starts_with("xmlns:") {
-            if a.value.contains(&b'&') || val != val.trim() {
+            // No entities, whitespace or control characters: the raw text then
+            // equals the normalised value, so `Node.ns` and `ns_of_prefix` agree.
+            if raw.contains('&') || raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 bail!("namespace declaration value not accepted");
             }
-            decls.push(key.strip_prefix("xmlns:").unwrap_or("").to_string());
-        } else if let Some((p, _)) = key.split_once(':') {
-            if p != "xml" {
-                attr_prefixes.push(p.to_string());
+            let p = key.strip_prefix("xmlns:").unwrap_or("");
+            if key != "xmlns" && !is_ncname(p) {
+                bail!("namespace declaration prefix not accepted");
             }
+            if p == "xml" || p == "xmlns" || (!key.eq("xmlns") && val.is_empty()) {
+                bail!("namespace declaration not accepted");
+            }
+            decls.push((p.to_string(), val));
+        } else {
+            split_qname(&key)?;
+            attrs.push((key, val));
         }
-        attrs.push((key, val));
     }
     Ok(Node {
         ns,
         local,
         prefix,
         decls,
-        attr_prefixes,
         attrs,
         parent,
         children: Vec::new(),
         start,
         end,
         text: String::new(),
+        content: Vec::new(),
     })
+}
+
+/// Root-uniqueness and depth checks before opening an element.
+fn check_open(stack: &[usize], root_done: &mut bool) -> Result<()> {
+    if stack.is_empty() {
+        if *root_done {
+            bail!("more than one root element");
+        }
+        *root_done = true;
+    }
+    if stack.len() >= MAX_DEPTH {
+        bail!("element nesting too deep");
+    }
+    Ok(())
+}
+
+/// Append character data to the open element, or accept/reject it outside
+/// the root (only whitespace text is allowed there, and only when
+/// `whitespace_ok_outside`).
+fn place_text(
+    nodes: &mut [Node],
+    open: Option<usize>,
+    s: &str,
+    whitespace_ok_outside: bool,
+    what: &str,
+) -> Result<()> {
+    match open {
+        Some(i) => push_text(nodes, i, s),
+        None if whitespace_ok_outside && s.trim().is_empty() => {}
+        None => bail!("{what} outside root element"),
+    }
+    Ok(())
+}
+
+/// Append character data to element `idx`, keeping `text` and `content` in step.
+fn push_text(nodes: &mut [Node], idx: usize, s: &str) {
+    if s.is_empty() {
+        return;
+    }
+    nodes[idx].text.push_str(s);
+    if let Some(Content::Text(t)) = nodes[idx].content.last_mut() {
+        t.push_str(s);
+    } else {
+        nodes[idx].content.push(Content::Text(s.to_string()));
+    }
 }
 
 /// Append `n`, link it to its parent, enforce the element cap and the
@@ -178,6 +300,7 @@ fn add_node(nodes: &mut Vec<Node>, n: Node, in_assertion: bool) -> Result<usize>
     let idx = nodes.len();
     if let Some(p) = n.parent {
         nodes[p].children.push(idx);
+        nodes[p].content.push(Content::Child(idx));
     }
     nodes.push(n);
     Ok(idx)
@@ -185,6 +308,21 @@ fn add_node(nodes: &mut Vec<Node>, n: Node, in_assertion: bool) -> Result<usize>
 
 impl SamlDoc {
     pub fn parse(xml: &str) -> Result<SamlDoc> {
+        let doc = Self::build(xml)?;
+        doc.validate()?;
+        Ok(doc)
+    }
+
+    /// Parse without the SAML-shape rules (attribute checks still apply), so
+    /// canonicalisation can be tested on arbitrary documents.
+    #[cfg(test)]
+    pub(crate) fn parse_tree(xml: &str) -> Result<SamlDoc> {
+        let doc = Self::build(xml)?;
+        doc.validate_attrs()?;
+        Ok(doc)
+    }
+
+    fn build(xml: &str) -> Result<SamlDoc> {
         if xml.len() > MAX_DOC_BYTES {
             bail!("SAMLResponse exceeds {MAX_DOC_BYTES} bytes");
         }
@@ -209,15 +347,7 @@ impl SamlDoc {
             let after = r.buffer_position() as usize;
             match ev {
                 Event::Start(e) => {
-                    if stack.is_empty() {
-                        if root_done {
-                            bail!("more than one root element");
-                        }
-                        root_done = true;
-                    }
-                    if stack.len() >= MAX_DEPTH {
-                        bail!("element nesting too deep");
-                    }
+                    check_open(&stack, &mut root_done)?;
                     let n = make_node(ns, &e, stack.last().copied(), before, after)?;
                     let is_assertion = n.ns == NS_ASSERT && n.local == "Assertion";
                     let idx = add_node(&mut nodes, n, in_assertion > 0)?;
@@ -227,15 +357,7 @@ impl SamlDoc {
                     stack.push(idx);
                 }
                 Event::Empty(e) => {
-                    if stack.is_empty() {
-                        if root_done {
-                            bail!("more than one root element");
-                        }
-                        root_done = true;
-                    }
-                    if stack.len() >= MAX_DEPTH {
-                        bail!("element nesting too deep");
-                    }
+                    check_open(&stack, &mut root_done)?;
                     let n = make_node(ns, &e, stack.last().copied(), before, after)?;
                     add_node(&mut nodes, n, in_assertion > 0)?;
                 }
@@ -247,19 +369,15 @@ impl SamlDoc {
                     }
                 }
                 Event::Text(t) => {
-                    let s = t.unescape().map_err(|e| anyhow!("bad text: {e}"))?;
-                    match stack.last() {
-                        Some(&i) => nodes[i].text.push_str(&s),
-                        None if s.trim().is_empty() => {}
-                        None => bail!("text outside root element"),
-                    }
+                    let raw = std::str::from_utf8(&t).map_err(|_| anyhow!("text not utf-8"))?;
+                    let s = unescape_checked(&normalize_eol(raw))?;
+                    place_text(&mut nodes, stack.last().copied(), &s, true, "text")?;
                 }
                 Event::CData(c) => {
-                    let s = std::str::from_utf8(&c).map_err(|_| anyhow!("CDATA not utf-8"))?;
-                    match stack.last() {
-                        Some(&i) => nodes[i].text.push_str(s),
-                        None => bail!("CDATA outside root element"),
-                    }
+                    let raw = std::str::from_utf8(&c).map_err(|_| anyhow!("CDATA not utf-8"))?;
+                    let s = normalize_eol(raw);
+                    check_chars(&s)?;
+                    place_text(&mut nodes, stack.last().copied(), &s, false, "CDATA")?;
                 }
                 Event::Decl(_) if nodes.is_empty() => {}
                 Event::Decl(_) => bail!("XML declaration after root"),
@@ -272,15 +390,33 @@ impl SamlDoc {
         if !stack.is_empty() || nodes.is_empty() {
             bail!("incomplete XML document");
         }
-        let doc = SamlDoc {
-            src: xml.to_string(),
-            nodes,
-        };
-        doc.validate()?;
-        Ok(doc)
+        Ok(SamlDoc { nodes })
+    }
+
+    /// Every attribute prefix must resolve, and no two attributes of an
+    /// element may share an expanded name.
+    fn validate_attrs(&self) -> Result<()> {
+        for (i, n) in self.nodes.iter().enumerate() {
+            let mut expanded = HashSet::new();
+            for (k, _) in &n.attrs {
+                let (uri, local) = match k.split_once(':') {
+                    Some((p, l)) => (
+                        self.ns_of_prefix(i, p)
+                            .ok_or_else(|| anyhow!("unknown attribute namespace prefix"))?,
+                        l,
+                    ),
+                    None => ("", k.as_str()),
+                };
+                if !expanded.insert((uri, local)) {
+                    bail!("duplicate attribute {{{uri}}}{local}");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_attrs()?;
         let root = &self.nodes[0];
         if root.ns != NS_PROTO || root.local != "Response" {
             bail!("root element is not samlp:Response");
@@ -322,6 +458,23 @@ impl SamlDoc {
 
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Namespace URI bound to `prefix` ("" is the default namespace) in the
+    /// scope of element `i`: the nearest declaration on `i` or an ancestor.
+    /// `None` when unbound (including a default namespace undeclared with `xmlns=""`).
+    pub fn ns_of_prefix(&self, i: usize, prefix: &str) -> Option<&str> {
+        if prefix == "xml" {
+            return Some(NS_XML);
+        }
+        let mut cur = Some(i);
+        while let Some(c) = cur {
+            if let Some((_, u)) = self.nodes[c].decls.iter().find(|(p, _)| p == prefix) {
+                return (!u.is_empty()).then_some(u.as_str());
+            }
+            cur = self.nodes[c].parent;
+        }
+        None
     }
 
     /// Unprefixed attribute value.
@@ -379,39 +532,6 @@ impl SamlDoc {
             .collect()
     }
 
-    /// Exact source text of element `i`, `<` through `>`.
-    pub fn span(&self, i: usize) -> &str {
-        &self.src[self.nodes[i].start..self.nodes[i].end]
-    }
-
-    /// Source text of element `i` with the span of its descendant `excise` removed.
-    pub fn span_without(&self, i: usize, excise: usize) -> String {
-        let (s, e) = (self.nodes[i].start, self.nodes[i].end);
-        let (xs, xe) = (self.nodes[excise].start, self.nodes[excise].end);
-        format!("{}{}", &self.src[s..xs], &self.src[xe..e])
-    }
-
-    /// True when every prefix (and the default namespace, for unprefixed
-    /// elements) used within element `i` is declared inside it, so the
-    /// element's bytes alone fix the namespace of everything they cover.
-    /// The subtree of `skip` (an excised enveloped Signature) is not checked.
-    pub fn namespaces_closed(&self, i: usize, skip: Option<usize>) -> bool {
-        fn walk(d: &SamlDoc, i: usize, skip: Option<usize>, scope: &mut Vec<String>) -> bool {
-            if Some(i) == skip {
-                return true;
-            }
-            let n = &d.nodes[i];
-            let mark = scope.len();
-            scope.extend(n.decls.iter().cloned());
-            let ok = scope.contains(&n.prefix)
-                && n.attr_prefixes.iter().all(|p| scope.contains(p))
-                && n.children.iter().all(|&c| walk(d, c, skip, scope));
-            scope.truncate(mark);
-            ok
-        }
-        walk(self, i, skip, &mut Vec::new())
-    }
-
     /// The single `Assertion` element (guaranteed by `parse`).
     pub fn assertion(&self) -> Result<usize> {
         self.child_one(0, NS_ASSERT, "Assertion")
@@ -435,17 +555,20 @@ mod tests {
         );
         let d = SamlDoc::parse(&xml).unwrap();
         for i in 0..d.len() {
-            let s = d.span(i);
+            let s = &xml[d.node(i).start..d.node(i).end];
             assert!(s.starts_with('<') && s.ends_with('>'), "{s}");
         }
         let a = d.assertion().unwrap();
         assert_eq!(
-            d.span(a),
+            &xml[d.node(a).start..d.node(a).end],
             r#"<saml:Assertion ID="a"><saml:Issuer>i &amp; j</saml:Issuer><saml:Empty x='1' /></saml:Assertion>"#
         );
         let issuer = d.child_one(a, NS_ASSERT, "Issuer").unwrap();
         assert_eq!(d.leaf_text(issuer).unwrap(), "i & j");
-        assert_eq!(d.span(issuer), "<saml:Issuer>i &amp; j</saml:Issuer>");
+        assert_eq!(
+            &xml[d.node(issuer).start..d.node(issuer).end],
+            "<saml:Issuer>i &amp; j</saml:Issuer>"
+        );
     }
 
     #[test]
@@ -492,16 +615,86 @@ mod tests {
         assert!(SamlDoc::parse(&resp(&format!("{a}<x:e xmlns:x=\"urn:x\"/>"))).is_ok());
     }
 
+    fn tree(inner: &str) -> SamlDoc {
+        SamlDoc::parse(&resp(&format!(r#"<saml:Assertion ID="a"/>{inner}"#))).unwrap()
+    }
+
     #[test]
-    fn namespaces_closed_requires_inner_declarations() {
-        let ok = resp(
-            r#"<saml:Assertion ID="a" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Issuer/></saml:Assertion>"#,
+    fn content_keeps_document_order() {
+        let d = tree(r#"<x:e xmlns:x="urn:x">a<x:c/>b<![CDATA[<c>]]><x:d/>e</x:e>"#);
+        let e = d.node(0).children[1];
+        let n = d.node(e);
+        assert_eq!(
+            n.content,
+            vec![
+                Content::Text("a".into()),
+                Content::Child(n.children[0]),
+                Content::Text("b<c>".into()),
+                Content::Child(n.children[1]),
+                Content::Text("e".into()),
+            ]
         );
-        let d = SamlDoc::parse(&ok).unwrap();
-        assert!(d.namespaces_closed(d.assertion().unwrap(), None));
-        // Assertion relies on the prefix declared on the Response.
-        let d = SamlDoc::parse(&resp(r#"<saml:Assertion ID="a"/>"#)).unwrap();
-        assert!(!d.namespaces_closed(d.assertion().unwrap(), None));
-        assert!(d.namespaces_closed(d.root(), None));
+        assert_eq!(n.text, "ab<c>e");
+    }
+
+    #[test]
+    fn eol_and_attribute_normalisation() {
+        let d = tree(
+            "<x:e xmlns:x=\"urn:x\" a=\"1\t2\r\n3\n4\" b=\"1&#9;2&#10;3\">l1\r\nl2\rl3&#13;</x:e>",
+        );
+        let n = d.node(d.node(0).children[1]);
+        assert_eq!(d.attr(d.node(0).children[1], "a"), Some("1 2 3 4"));
+        assert_eq!(d.attr(d.node(0).children[1], "b"), Some("1\t2\n3"));
+        assert_eq!(n.text, "l1\nl2\nl3\r");
+    }
+
+    #[test]
+    fn rejects_bad_declarations_attributes_and_chars() {
+        let bad = [
+            r#"<x:e xmlns:x="urn:x" xmlns:xml="urn:y"/>"#,
+            r#"<x:e xmlns:x="urn:x" xmlns:xmlns="urn:y"/>"#,
+            r#"<x:e xmlns:x="urn:x" xmlns:p=""/>"#,
+            r#"<x:e xmlns:x="urn:x" q:a="1"/>"#,
+            r#"<x:e xmlns:x="urn:x" xmlns:p="urn:p" xmlns:q="urn:p" p:a="1" q:a="2"/>"#,
+            r#"<x:e xmlns:x="urn:x">&#x1;</x:e>"#,
+            r#"<x:e xmlns:x="urn:x" a="&#x1;"/>"#,
+            r#"<x:e xmlns:x="urn:x" a="<"/>"#,
+            "<x:e xmlns:x=\"urn:x\" xmlns:p=\"urn:a\tb\"/>",
+            "<x:e xmlns:x=\"urn:x\" xmlns:p=\"urn:a b\"/>",
+            "<x:e xmlns:x=\"urn:x\" xmlns:p=\"urn:a\u{7f}\"/>",
+            r#"<x:e xmlns:x="urn:x" xmlns:="urn:y"/>"#,
+            r#"<x:e xmlns:x="urn:x" x:="1"/>"#,
+            r#"<x:e xmlns:x="urn:x" x:y:z="1"/>"#,
+            r#"<x:e:f xmlns:x="urn:x"/>"#,
+            r#"<x: xmlns:x="urn:x"/>"#,
+            r#"<x:e xmlns:x="urn:x" 1a="1"/>"#,
+        ];
+        for b in bad {
+            assert!(
+                SamlDoc::parse(&resp(&format!(r#"<saml:Assertion ID="a"/>{b}"#))).is_err(),
+                "accepted: {b}"
+            );
+        }
+        // Distinct prefixes for distinct namespaces are fine, and xml: needs no declaration.
+        let ok = r#"<x:e xmlns:x="urn:x" xmlns:p="urn:p" xmlns:q="urn:q" p:a="1" q:a="2" xml:lang="en"/>"#;
+        assert!(SamlDoc::parse(&resp(&format!(r#"<saml:Assertion ID="a"/>{ok}"#))).is_ok());
+    }
+
+    #[test]
+    fn ns_of_prefix_walks_ancestors() {
+        let d = tree(
+            r#"<x:e xmlns:x="urn:x" xmlns="urn:d"><x:y xmlns=""><z xmlns="urn:z"/></x:y></x:e>"#,
+        );
+        let e = d.node(0).children[1];
+        let y = d.node(e).children[0];
+        let z = d.node(y).children[0];
+        assert_eq!(d.ns_of_prefix(e, "x"), Some("urn:x"));
+        assert_eq!(d.ns_of_prefix(z, "x"), Some("urn:x"));
+        assert_eq!(d.ns_of_prefix(e, ""), Some("urn:d"));
+        assert_eq!(d.ns_of_prefix(y, ""), None);
+        assert_eq!(d.ns_of_prefix(z, ""), Some("urn:z"));
+        assert_eq!(d.ns_of_prefix(e, "xml"), Some(NS_XML));
+        assert_eq!(d.ns_of_prefix(e, "nope"), None);
+        assert_eq!(d.ns_of_prefix(0, "saml"), Some(NS_ASSERT));
     }
 }

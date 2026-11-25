@@ -18,6 +18,7 @@ mod db_checklists;
 mod db_drafts;
 mod db_notice;
 mod db_roles;
+mod db_saml_replay;
 mod detached;
 mod failure_counters;
 mod fips;
@@ -1106,7 +1107,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // AC-8: drop consumed login acknowledgements whose claim window has passed.
+    // AC-8: drop consumed login acknowledgements whose claim window has passed;
+    // the same tick prunes expired SAML replay-cache rows (#62).
     // Deliberately not registered with `scheduler_log` (not a status-page scheduler);
     // failures are counted: status on `/api/health` (`checks.loginAckPrune`),
     // numbers on the admin-only `/api/admin/failure-counters`.
@@ -1117,6 +1119,7 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 db_notice::prune_acks_tick(&db, &failure_counters::ACK_PRUNE).await;
+                db_saml_replay::prune_tick(&db).await;
             }
         });
     }
