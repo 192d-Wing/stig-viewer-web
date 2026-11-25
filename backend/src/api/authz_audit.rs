@@ -161,7 +161,9 @@ mod tests {
 
     async fn send(app: &Server, method: &str, uri: &str) -> StatusCode {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
-        let status = reqwest::Client::new()
+        let status = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .request(m, format!("{}{uri}", app.0))
             .send()
             .await

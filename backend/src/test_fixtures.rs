@@ -544,7 +544,7 @@ pub fn auth_state(state: &AppState) -> crate::api::auth::AppAuthState {
         pool: state.pool.clone(),
         oidc: crate::api::auth::OidcContext {
             client: Arc::new(client),
-            http: reqwest::Client::new(),
+            http: crate::crypto::tls::http_client_builder().build().unwrap(),
             public_auth_base: "https://idp.test".into(),
             internal_issuer: ISS.into(),
             public_issuer: ISS.into(),

@@ -1706,7 +1706,9 @@ mod restore_integrity_db_tests {
         .into_bytes();
         body.extend_from_slice(zip);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let r = reqwest::Client::new()
+        let r = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .post(format!("{base}/api/admin/restore?force={force}"))
             .header(
                 "content-type",

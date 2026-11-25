@@ -1073,7 +1073,9 @@ mod tests {
         );
         body.extend_from_slice(zip);
         body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
-        let r = reqwest::Client::new()
+        let r = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .post(format!("{base}{path}"))
             .header("content-type", format!("multipart/form-data; boundary={b}"))
             .body(body)

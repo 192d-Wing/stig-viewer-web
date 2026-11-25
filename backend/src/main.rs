@@ -809,6 +809,9 @@ async fn main() -> Result<()> {
     // guard applies to `migrate`; the audit event is written only on server
     // startup.
     let fips_startup = fips::startup_guard()?;
+    // Outbound TLS (reqwest, lettre) runs on AWS-LC; install the provider
+    // before any client is built (#215).
+    crypto::tls::install(&fips_startup.policy)?;
 
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();

@@ -69,6 +69,7 @@ test.describe("Webhook receiver verifier docs", () => {
     expect(body.name).toBe("signed-hook");
     expect(body.url).toBe(url);
     expect(body.headerName).toBe("X-Webhook-Signature");
+    expect(body.headerNameV2).toBe("X-Webhook-Signature-V2");
     expect(typeof body.samplePayload).toBe("string");
     expect(body.samplePayload.length).toBeGreaterThan(0);
 
@@ -94,6 +95,19 @@ test.describe("Webhook receiver verifier docs", () => {
     const match = body.snippets.curl.match(/sha256=([0-9a-f]{64})/);
     expect(match).not.toBeNull();
     expect(match[1]).toBe(expected);
+
+    // The V2 (HMAC-SHA384) signature is in the curl snippet too.
+    const expectedV2 = crypto
+      .createHmac("sha384", secret)
+      .update(body.samplePayload)
+      .digest("hex");
+    expect(body.snippets.curl).toContain(
+      `X-Webhook-Signature-V2: sha384=${expectedV2}`,
+    );
+    expect(body.snippets.python).toContain("def verify_v2");
+    expect(body.snippets.python).toContain("hashlib.sha384");
+    expect(body.snippets.node).toContain("verifyV2");
+    expect(body.snippets.node).toContain("'sha384'");
 
     // The secret is write-only: the receiver snippets read it from the
     // environment and nothing in the response embeds it.
