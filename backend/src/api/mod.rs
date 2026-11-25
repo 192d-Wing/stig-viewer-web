@@ -49,6 +49,7 @@ pub mod saved_searches;
 pub mod scheduler_status;
 pub mod sessions;
 pub mod signing;
+pub mod static_files;
 pub mod stig;
 pub mod stig_validator;
 pub mod test_support;

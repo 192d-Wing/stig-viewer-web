@@ -138,6 +138,10 @@ for local work. The ones you may want to change:
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
   how the browser does.
+- `STIG_STATIC_DIR` — directory of the release frontend. When set, the backend
+  loads it into memory at startup and serves it same-origin (any path that is
+  not a file and not under `/api/` or `/auth/` returns `index.html`). Set to
+  `/app/static` in the production image; unset in dev and e2e.
 - `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs.
 - `STIG_SYNC_ON_START` — run the first DISA sync at boot (default `true`).
   `false` delays the first run by one interval; CI sets it to `false` so the
@@ -482,6 +486,19 @@ API_URL=http://localhost:8080 trunk serve     # http://localhost:5173
 
 `trunk build --release` writes the static site to `frontend/dist/`, with the
 production Content-Security-Policy injected into `index.html`.
+
+### Production image
+
+`Containerfile` builds the backend and the release frontend into one non-root
+image (UBI 10 based; `--format docker` keeps the `HEALTHCHECK`):
+
+```bash
+podman build --format docker -t stig-viewer-web:dev -f Containerfile .
+podman build --format docker --build-arg CRYPTO=fips -t stig-viewer-web:dev-fips -f Containerfile .
+```
+
+See "Container image" in [docs/deployment.md](docs/deployment.md) for running
+it. `scripts/smoke-prod-image.sh` builds and smoke-tests it (`task image:smoke`).
 
 ### Lint and tests
 
@@ -1138,6 +1155,7 @@ only.
 │   ├── migrations/       sqlx migrations
 │   └── stig-sources.toml STIG ZIPs to sync from DISA
 ├── dev/keycloak/         Dev realm import
+├── Containerfile         Production image (UBI 10)
 ├── docs/                 Deployment notes, runbook alerts, SSP notes
 └── docker-compose.yml    Local dev stack
 ```

@@ -10,8 +10,10 @@ if [ "${TRUNK_PROFILE:-debug}" != "release" ]; then
   exit 0
 fi
 
-# Must match the origin compiled into the bundle (src/api.rs).
-api_url="${API_URL:-${VITE_API_URL:-http://localhost:8080}}"
+# Must match the origin compiled into the bundle (src/api.rs). Defaults apply
+# only when the variable is unset: an explicitly empty API_URL means same-origin
+# (the production image), so connect-src stays 'self' with no extra origin.
+api_url="${API_URL-${VITE_API_URL-http://localhost:8080}}"
 
 # No unsafe-inline for scripts, no external origins. 'wasm-unsafe-eval' is
 # required to compile the WebAssembly module. style-src keeps 'unsafe-inline'

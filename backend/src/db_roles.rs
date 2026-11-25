@@ -125,15 +125,19 @@ fn check_distinct_roles(owner: &str, app: &str) -> Result<()> {
 pub enum Command {
     Serve,
     Migrate,
+    /// Container health probe: `GET /api/health` on the local port, exit 0/1.
+    Healthcheck,
 }
 
 /// Parse the arguments after the program name: none serves, `migrate` runs the
-/// owner step, anything else (including extra arguments) is an error.
+/// owner step, `healthcheck` probes the local server, anything else (including
+/// extra arguments) is an error.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     match args {
         [] => Ok(Command::Serve),
         [cmd] if cmd == "migrate" => Ok(Command::Migrate),
-        _ => bail!("unknown argument; the only subcommand is `migrate`"),
+        [cmd] if cmd == "healthcheck" => Ok(Command::Healthcheck),
+        _ => bail!("unknown argument; the subcommands are `migrate` and `healthcheck`"),
     }
 }
 
@@ -1393,6 +1397,11 @@ mod tests {
             parse_command(&args(&["migrate"])).unwrap(),
             Command::Migrate
         );
+        assert_eq!(
+            parse_command(&args(&["healthcheck"])).unwrap(),
+            Command::Healthcheck
+        );
+        assert!(parse_command(&args(&["healthcheck", "extra"])).is_err());
         assert!(parse_command(&args(&["bogus"])).is_err());
         assert!(parse_command(&args(&["migrate", "extra"])).is_err());
         assert!(parse_command(&args(&["--migrate"])).is_err());

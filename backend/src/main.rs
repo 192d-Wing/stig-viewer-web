@@ -34,7 +34,7 @@ mod sync;
 mod test_fixtures;
 mod zip_safe;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use axum::http::{header, HeaderValue, Method};
 use axum::{
     extract::DefaultBodyLimit,
@@ -404,6 +404,7 @@ fn build_app(
     saml_state: AppSamlState,
     cors: CorsLayer,
     test_hooks: &TestHooks,
+    static_site: Option<Arc<api::static_files::StaticSite>>,
 ) -> Router {
     // Auth flow routes — public, do not require an existing session.
     let auth_routes: Router = Router::new()
@@ -771,6 +772,17 @@ fn build_app(
 
     let app = api::test_support::mount(app, test_hooks.enable_test_routes, state.clone());
 
+    // Release frontend, same origin. A fallback, so every explicit route above
+    // wins; it is attached before the layers below so it stays inside
+    // `CatchPanicLayer`. Unset (dev, e2e) leaves the router unchanged.
+    let app = match static_site {
+        Some(site) => app.fallback(move |req: axum::extract::Request| {
+            let site = site.clone();
+            async move { site.respond(req.method(), req.uri().path()) }
+        }),
+        None => app,
+    };
+
     // Inside CORS (so the 500 carries CORS headers) and outside every route and
     // middleware (so a panic anywhere below becomes a 500, not a dropped connection).
     app.layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
@@ -816,8 +828,23 @@ async fn main() -> Result<()> {
 
     // `migrate`: run migrations and grants as the owner role, then exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if db_roles::parse_command(&args)? == db_roles::Command::Migrate {
-        exit_migrate(run_migrate_command().await);
+    match db_roles::parse_command(&args)? {
+        db_roles::Command::Migrate => exit_migrate(run_migrate_command().await),
+        // Container HEALTHCHECK: probe the local server, no config or DB.
+        db_roles::Command::Healthcheck => {
+            let port = match std::env::var("PORT") {
+                Ok(p) => p
+                    .parse::<u16>()
+                    .context("PORT must be a valid port number")?,
+                Err(_) => 8080,
+            };
+            if let Err(e) = api::health::probe(port) {
+                eprintln!("healthcheck failed: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        db_roles::Command::Serve => {}
     }
 
     // Test-only hooks are opt-in, and a production deployment that has one
@@ -905,7 +932,24 @@ async fn main() -> Result<()> {
         config: saml_config.clone(),
         tasks: tasks.clone(),
     };
-    let app = build_app(state.clone(), auth_state, saml_state, cors, &test_hooks);
+    let static_site = match config.static_dir.as_deref() {
+        Some(dir) => Some(Arc::new(
+            api::static_files::StaticSite::load(
+                dir,
+                config::is_production(std::env::var("STIG_ENV").ok().as_deref()),
+            )
+            .with_context(|| format!("STIG_STATIC_DIR={}", dir.display()))?,
+        )),
+        None => None,
+    };
+    let app = build_app(
+        state.clone(),
+        auth_state,
+        saml_state,
+        cors,
+        &test_hooks,
+        static_site,
+    );
 
     {
         let cfg = config.clone();
@@ -1393,7 +1437,10 @@ mod router_tests {
         let (state, dir) = test_fixtures::lazy_state();
         let auth = test_fixtures::auth_state(&state);
         let saml = test_fixtures::saml_state(&state);
-        (build_app(state, auth, saml, CorsLayer::new(), hooks), dir)
+        (
+            build_app(state, auth, saml, CorsLayer::new(), hooks, None),
+            dir,
+        )
     }
 
     async fn status(app: &Router, method: &str, uri: &str, body: Option<&str>) -> StatusCode {
@@ -1612,7 +1659,7 @@ mod router_tests {
             enable_test_routes: false,
             allow_test_auth_header: false,
         };
-        let app = build_app(state, auth, saml, cors, &hooks);
+        let app = build_app(state, auth, saml, cors, &hooks, None);
         let req = Request::builder()
             .uri("/api/health")
             .header("origin", origin)
@@ -1628,6 +1675,83 @@ mod router_tests {
             exposed.to_ascii_lowercase().contains("retry-after"),
             "{exposed}"
         );
+    }
+
+    // ---- Static frontend fallback (no database needed) ----
+
+    fn static_app(with_site: bool) -> (Router, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("svw-router-static-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<html>shell</html>").unwrap();
+        std::fs::write(dir.join("app-0123456789abcdef.js"), "js").unwrap();
+        let site =
+            with_site.then(|| Arc::new(api::static_files::StaticSite::load(&dir, false).unwrap()));
+        let (state, _d) = test_fixtures::lazy_state();
+        let auth = test_fixtures::auth_state(&state);
+        let saml = test_fixtures::saml_state(&state);
+        let hooks = TestHooks {
+            production: false,
+            enable_test_routes: false,
+            allow_test_auth_header: false,
+        };
+        (
+            build_app(state, auth, saml, CorsLayer::new(), &hooks, site),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn static_fallback_serves_shell_and_keeps_api_misses_404() {
+        let (app, dir) = static_app(true);
+        for uri in ["/", "/assets/x", "/some/deep/link"] {
+            let res = send_plain(&app, "GET", uri).await;
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
+            assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{uri}");
+        }
+        let res = send_plain(&app, "GET", "/app-0123456789abcdef.js").await;
+        assert_eq!(
+            res.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        for uri in ["/api/nope", "/auth/nope", "/api", "/auth"] {
+            assert_eq!(
+                send_plain(&app, "GET", uri).await.status(),
+                StatusCode::NOT_FOUND,
+                "{uri}"
+            );
+        }
+        // A real route is not shadowed by the fallback: health is never the
+        // HTML shell (the lazy pool has no database, so it answers 503 JSON).
+        let res = send_plain(&app, "GET", "/api/health").await;
+        assert_ne!(res.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(
+            send_plain(&app, "POST", "/").await.status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn without_a_static_site_unknown_paths_stay_404() {
+        let (app, dir) = static_app(false);
+        assert_eq!(
+            send_plain(&app, "GET", "/").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send_plain(&app, "GET", "/some/deep/link").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn send_plain(app: &Router, method: &str, uri: &str) -> axum::response::Response {
+        let req = Request::builder().method(method).uri(uri);
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
     }
 
     // ---- Admission through the real router (needs Postgres) ----
@@ -1655,7 +1779,7 @@ mod router_tests {
             enable_test_routes,
             allow_test_auth_header: true,
         };
-        build_app(state, auth, saml, CorsLayer::new(), &hooks)
+        build_app(state, auth, saml, CorsLayer::new(), &hooks, None)
     }
 
     async fn send(

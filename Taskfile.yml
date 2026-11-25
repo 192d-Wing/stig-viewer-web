@@ -146,6 +146,20 @@ tasks:
     cmds:
       - npm run test:scripts
 
+  image:build:
+    desc: Build the production image (CRYPTO=non-fips|fips, default non-fips) with podman
+    vars:
+      CRYPTO: '{{.CRYPTO | default "non-fips"}}'
+    cmds:
+      - podman build --format docker --build-arg CRYPTO={{.CRYPTO}} -t stig-viewer-web:{{.CRYPTO}} -f Containerfile .
+
+  image:smoke:
+    desc: Build and smoke-test the production image (CRYPTO=non-fips|fips; throwaway containers and port 28080)
+    vars:
+      CRYPTO: '{{.CRYPTO | default "non-fips"}}'
+    cmds:
+      - CRYPTO={{.CRYPTO}} scripts/smoke-prod-image.sh
+
   verify:split-role:
     desc: Verify the split-role stack on a fresh and an upgraded volume (throwaway compose project and ports, never the dev stack)
     cmds:
