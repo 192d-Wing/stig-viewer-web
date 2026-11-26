@@ -141,6 +141,14 @@ test.describe("Webhook HMAC payload signing", () => {
         crypto.createHmac("sha256", secret).update(received.body).digest("hex");
       expect(sigHeader).toBe(expected);
 
+      // The HMAC-SHA384 V2 header is sent alongside, over the same body.
+      const sigV2 = received.headers["x-webhook-signature-v2"];
+      expect(sigV2).toMatch(/^sha384=[0-9a-f]{96}$/);
+      expect(sigV2).toBe(
+        "sha384=" +
+          crypto.createHmac("sha384", secret).update(received.body).digest("hex"),
+      );
+
       // The pre-HMAC literal-secret header must be gone — this is the
       // wire-level guarantee operators rely on to know the secret is
       // never exposed in transit.
@@ -188,6 +196,7 @@ test.describe("Webhook HMAC payload signing", () => {
       await waitForCaptures(capture.captures, 1);
       const [received] = capture.captures;
       expect(received.headers["x-webhook-signature"]).toBeUndefined();
+      expect(received.headers["x-webhook-signature-v2"]).toBeUndefined();
       expect(received.headers["x-webhook-secret"]).toBeUndefined();
 
       // Delivery row is still recorded, even though no header was sent.

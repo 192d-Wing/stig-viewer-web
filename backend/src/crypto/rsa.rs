@@ -1,7 +1,10 @@
-//! RSA PKCS#1 v1.5 / SHA-256 signature verification for SAML.
+//! RSA PKCS#1 v1.5 / SHA-256, SHA-384 and SHA-512 signature verification for SAML.
 
 use anyhow::{anyhow, Result};
-use aws_lc_rs::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+use aws_lc_rs::signature::{
+    UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384,
+    RSA_PKCS1_2048_8192_SHA512,
+};
 use x509_parser::prelude::{FromDer, SubjectPublicKeyInfo};
 use x509_parser::public_key::PublicKey;
 
@@ -65,6 +68,20 @@ impl RsaVerifyKey {
             .verify(msg, sig)
             .map_err(|_| anyhow!("RSA signature does not verify"))
     }
+
+    /// Verify an RSASSA-PKCS1-v1_5 SHA-384 signature (2048..=8192-bit keys).
+    pub fn verify_pkcs1_sha384(&self, msg: &[u8], sig: &[u8]) -> Result<()> {
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &self.pkcs1_der)
+            .verify(msg, sig)
+            .map_err(|_| anyhow!("RSA signature does not verify"))
+    }
+
+    /// Verify an RSASSA-PKCS1-v1_5 SHA-512 signature (2048..=8192-bit keys).
+    pub fn verify_pkcs1_sha512(&self, msg: &[u8], sig: &[u8]) -> Result<()> {
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &self.pkcs1_der)
+            .verify(msg, sig)
+            .map_err(|_| anyhow!("RSA signature does not verify"))
+    }
 }
 
 #[cfg(test)]
@@ -103,10 +120,29 @@ mod tests {
     }
 
     #[test]
+    fn sha384_and_sha512_round_trip() {
+        use rsa::sha2::{Sha384, Sha512};
+        let (sk, k) = pair(2048);
+        let s384 = SigningKey::<Sha384>::new(sk.clone()).sign(b"m").to_vec();
+        let s512 = SigningKey::<Sha512>::new(sk).sign(b"m").to_vec();
+        assert!(k.verify_pkcs1_sha384(b"m", &s384).is_ok());
+        assert!(k.verify_pkcs1_sha384(b"x", &s384).is_err());
+        assert!(k.verify_pkcs1_sha384(b"m", &s512).is_err());
+        assert!(k.verify_pkcs1_sha512(b"m", &s512).is_ok());
+        assert!(k.verify_pkcs1_sha512(b"x", &s512).is_err());
+        assert!(k.verify_pkcs1_sha512(b"m", &s384).is_err());
+    }
+
+    #[test]
     fn rejects_1024_bit_keys() {
         let (sk, k) = pair(1024);
         assert_eq!(k.modulus_bits(), 1024);
         assert!(k.verify_pkcs1_sha256(b"m", &sign(&sk, b"m")).is_err());
+        use rsa::sha2::{Sha384, Sha512};
+        let s384 = SigningKey::<Sha384>::new(sk.clone()).sign(b"m").to_vec();
+        let s512 = SigningKey::<Sha512>::new(sk).sign(b"m").to_vec();
+        assert!(k.verify_pkcs1_sha384(b"m", &s384).is_err());
+        assert!(k.verify_pkcs1_sha512(b"m", &s512).is_err());
     }
 
     #[test]

@@ -5,13 +5,14 @@
 //! whole is pending CMVP validation (in process, no certificate claimed); the
 //! per-algorithm list below is an additional gate. The application's own
 //! Ed25519, HMAC-SHA-256, SHA-2, SAML RSA verification and session/identifier
-//! RNG run in the module (`crate::crypto`, #65). ML-DSA-87 (hybrid signing,
-//! #66-#69) runs in the module too but stays a pending algorithm: a build with
+//! RNG run in the module (`crate::crypto`, #65), as does outbound TLS (rustls on
+//! AWS-LC, `crypto::tls`, #215). ML-DSA-87 (hybrid signing, #66-#69) runs in
+//! the module too but stays a pending algorithm: a build with
 //! `SIGNING_MLDSA87_KEY_B64` set refuses to start unless `ML-DSA-87` is listed
-//! in `STIG_FIPS_PENDING_ALGS` (`FipsPolicy::require`); no validation of it
-//! is claimed. TLS (rustls on ring), OIDC
-//! ID-token verification and state/nonce (openidconnect, RustCrypto) and
-//! Postgres SCRAM do not; see [`OUTSIDE_MODULE`].
+//! in `STIG_FIPS_PENDING_ALGS` (`FipsPolicy::require`); no validation of it is
+//! claimed. OIDC ID-token verification and state/nonce (openidconnect,
+//! RustCrypto) and Postgres SCRAM do not run in the module; see
+//! [`OUTSIDE_MODULE`].
 //!
 //! `STIG_REQUIRE_FIPS` makes a non-`fips` build refuse to start. One
 //! `system.fips_policy` audit event is written at server startup.
@@ -34,12 +35,8 @@ pub const REQUIRE_FIPS_ENV: &str = "STIG_REQUIRE_FIPS";
 pub const POLICY_ACTION: &str = "system.fips_policy";
 
 /// Crypto that still runs outside the FIPS module even in a `fips` build.
-pub const OUTSIDE_MODULE: [&str; 4] = [
-    "tls",
-    "oidc-id-token-verify",
-    "oidc-state-nonce",
-    "postgres-scram",
-];
+pub const OUTSIDE_MODULE: [&str; 3] =
+    ["oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"];
 
 /// Bound on the startup audit write, so a hung pool cannot stall startup.
 const POLICY_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,6 +212,8 @@ impl FipsStartup {
             // crypto, which `cryptoOutsideModule` lists.
             "appCryptoInModule": self.app_crypto_in_module,
             "cryptoOutsideModule": OUTSIDE_MODULE,
+            // Outbound TLS key-exchange groups, in preference order.
+            "tlsKxGroups": crypto::tls::offered_group_names(&self.policy),
             "pendingAlgs": algs,
         })
     }
@@ -287,7 +286,7 @@ pub fn startup_guard() -> Result<FipsStartup> {
         );
         tracing::warn!(
             outside_module = ?OUTSIDE_MODULE,
-            "TLS, OIDC ID-token verification and state/nonce, and Postgres SCRAM do not use the FIPS module; this is not a compliance claim"
+            "OIDC ID-token verification and state/nonce, and Postgres SCRAM do not use the FIPS module; this is not a compliance claim"
         );
     } else {
         tracing::info!(require_fips = false, "FIPS mode: not compiled in");
@@ -535,20 +534,38 @@ mod tests {
 
     #[test]
     fn audit_detail_shape() {
+        // Non-enforced policy offers everything; the enforced one here opts
+        // in to the hybrid only. X25519 is absent from FIPS builds.
+        let x = if cfg!(feature = "fips") {
+            vec![]
+        } else {
+            vec!["X25519"]
+        };
+        let tail = ["secp384r1", "secp256r1"];
+        let all_groups: Vec<&str> = ["X25519MLKEM768", "MLKEM1024"]
+            .into_iter()
+            .chain(x.iter().copied())
+            .chain(tail)
+            .collect();
+        let hybrid_only: Vec<&str> = ["X25519MLKEM768"]
+            .into_iter()
+            .chain(x.iter().copied())
+            .chain(tail)
+            .collect();
         let s = guard(false, None, None, || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": []})
+            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "tlsKxGroups": all_groups, "pendingAlgs": []})
         );
         let s = guard(false, None, Some("ML-DSA-87"), || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": ["ML-DSA-87"]})
+            json!({"fipsCompiled": false, "fipsModeActive": false, "requireFips": false, "appCryptoInModule": false, "cryptoOutsideModule": ["oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "tlsKxGroups": all_groups, "pendingAlgs": ["ML-DSA-87"]})
         );
         let s = guard(true, Some("1"), Some("X25519MLKEM768,ml-dsa-87"), || Ok(())).unwrap();
         assert_eq!(
             s.audit_detail(),
-            json!({"fipsCompiled": true, "fipsModeActive": true, "requireFips": true, "appCryptoInModule": cfg!(feature = "fips"), "cryptoOutsideModule": ["tls", "oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "pendingAlgs": ["ML-DSA-87", "X25519MLKEM768"]})
+            json!({"fipsCompiled": true, "fipsModeActive": true, "requireFips": true, "appCryptoInModule": cfg!(feature = "fips"), "cryptoOutsideModule": ["oidc-id-token-verify", "oidc-state-nonce", "postgres-scram"], "tlsKxGroups": hybrid_only, "pendingAlgs": ["ML-DSA-87", "X25519MLKEM768"]})
         );
     }
 
@@ -564,7 +581,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            4
+            3
         );
     }
 

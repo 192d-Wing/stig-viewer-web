@@ -13,11 +13,12 @@ pub mod hmac;
 pub mod mldsa;
 pub mod rand;
 pub mod rsa;
+pub mod tls;
 
 /// True when the primitives *this application calls directly* (Ed25519,
 /// ML-DSA-87, HMAC, SHA-2, SAML RSA verify, RNG) run inside the AWS-LC FIPS module, i.e. the
 /// binary was built with `--no-default-features --features fips`. It does not cover crypto done by
-/// dependencies: TLS (rustls on ring), OIDC ID-token verification and
+/// dependencies: OIDC ID-token verification and
 /// state/nonce generation (openidconnect, RustCrypto) and Postgres SCRAM
 /// (sqlx); see [`crate::fips::OUTSIDE_MODULE`].
 pub const fn app_primitives_in_module() -> bool {

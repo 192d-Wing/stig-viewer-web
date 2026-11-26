@@ -127,17 +127,22 @@ pub enum Command {
     Migrate,
     /// Print a new ML-DSA-87 signing key (base64 PKCS#8) to stdout.
     GenMldsaKey,
+    /// Container health probe: `GET /api/health` on the local port, exit 0/1.
+    Healthcheck,
 }
 
 /// Parse the arguments after the program name: none serves, `migrate` runs the
-/// owner step, `gen-mldsa-key` generates a signing key, anything else
-/// (including extra arguments) is an error.
+/// owner step, `gen-mldsa-key` generates a signing key, `healthcheck` probes
+/// the local server, anything else (including extra arguments) is an error.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     match args {
         [] => Ok(Command::Serve),
         [cmd] if cmd == "migrate" => Ok(Command::Migrate),
         [cmd] if cmd == "gen-mldsa-key" => Ok(Command::GenMldsaKey),
-        _ => bail!("unknown argument; the subcommands are `migrate` and `gen-mldsa-key`"),
+        [cmd] if cmd == "healthcheck" => Ok(Command::Healthcheck),
+        _ => bail!(
+            "unknown argument; the subcommands are `migrate`, `gen-mldsa-key` and `healthcheck`"
+        ),
     }
 }
 
@@ -1402,6 +1407,11 @@ mod tests {
             Command::GenMldsaKey
         );
         assert!(parse_command(&args(&["gen-mldsa-key", "extra"])).is_err());
+        assert_eq!(
+            parse_command(&args(&["healthcheck"])).unwrap(),
+            Command::Healthcheck
+        );
+        assert!(parse_command(&args(&["healthcheck", "extra"])).is_err());
         assert!(parse_command(&args(&["bogus"])).is_err());
         assert!(parse_command(&args(&["migrate", "extra"])).is_err());
         assert!(parse_command(&args(&["--migrate"])).is_err());
@@ -1941,6 +1951,24 @@ mod tests {
         // Restore through the owner functions, inside an open window.
         open_audit_restore_window(&pool).await;
         sqlx::query("SELECT audit_restore_truncate(ARRAY['rule_audit', 'audit_events'], 'tester')")
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        app.cleanup(&pool).await;
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn app_role_can_use_the_saml_replay_cache(pool: PgPool) {
+        let app = app_role_pool(&pool, false).await;
+        let id = "a".repeat(64);
+        let ins = "INSERT INTO saml_seen_ids (id_sha256, kind, expires_at) \
+                   VALUES ($1, 'assertion', now() + interval '5 minutes') ON CONFLICT DO NOTHING";
+        let n = sqlx::query(ins).bind(&id).execute(&app.pool).await.unwrap();
+        assert_eq!(n.rows_affected(), 1);
+        let n = sqlx::query(ins).bind(&id).execute(&app.pool).await.unwrap();
+        assert_eq!(n.rows_affected(), 0);
+        sqlx::query("DELETE FROM saml_seen_ids WHERE expires_at < now()")
             .execute(&app.pool)
             .await
             .unwrap();

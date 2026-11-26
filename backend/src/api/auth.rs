@@ -93,7 +93,7 @@ impl OidcEnv {
 }
 
 pub async fn build_oidc_context(env: &OidcEnv) -> Result<OidcContext> {
-    let http = reqwest::ClientBuilder::new()
+    let http = crate::crypto::tls::http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("Build reqwest client for OIDC")?;
@@ -1114,7 +1114,7 @@ mod callback_flow_tests {
         );
         OidcContext {
             client: Arc::new(client),
-            http: reqwest::ClientBuilder::new()
+            http: crate::crypto::tls::http_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),

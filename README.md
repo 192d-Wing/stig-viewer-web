@@ -147,6 +147,10 @@ for local work. The ones you may want to change:
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
   how the browser does.
+- `STIG_STATIC_DIR` — directory of the release frontend. When set, the backend
+  loads it into memory at startup and serves it same-origin (any path that is
+  not a file and not under `/api/` or `/auth/` returns `index.html`). Set to
+  `/app/static` in the production image; unset in dev and e2e.
 - `STIG_SYNC_INTERVAL_HOURS` — hours between DISA sync runs.
 - `STIG_SYNC_ON_START` — run the first DISA sync at boot (default `true`).
   `false` delays the first run by one interval; CI sets it to `false` so the
@@ -549,6 +553,19 @@ API_URL=http://localhost:8080 trunk serve     # http://localhost:5173
 `trunk build --release` writes the static site to `frontend/dist/`, with the
 production Content-Security-Policy injected into `index.html`.
 
+### Production image
+
+`Containerfile` builds the backend and the release frontend into one non-root
+image (UBI 10 based; `--format docker` keeps the `HEALTHCHECK`):
+
+```bash
+podman build --format docker -t stig-viewer-web:dev -f Containerfile .
+podman build --format docker --build-arg CRYPTO=fips -t stig-viewer-web:dev-fips -f Containerfile .
+```
+
+See "Container image" in [docs/deployment.md](docs/deployment.md) for running
+it. `scripts/smoke-prod-image.sh` builds and smoke-tests it (`task image:smoke`).
+
 ### Lint and tests
 
 ```bash
@@ -575,7 +592,10 @@ ML-DSA-87 signing and verification (ML-DSA-87 only with `ML-DSA-87` in
 `STIG_FIPS_PENDING_ALGS`; it is a pending algorithm, no validation claimed),
 HMAC-SHA-256, SHA-256/SHA-384/SHA-512, SAML RSA signature
 verification and session/identifier random generation that this application
-calls run inside the module. Still outside it: TLS (rustls on ring), OIDC
+calls run inside the module, as does outbound TLS (reqwest and the SMTP
+STARTTLS client, rustls on AWS-LC; no inbound TLS is terminated by the
+backend, and the build refuses to start unless its TLS client configuration
+reports FIPS). Still outside it: OIDC
 ID-token verification and state/nonce/PKCE generation (RustCrypto, via
 `openidconnect`; the audit token `oidc-state-nonce` covers OIDC state, nonce
 and PKCE verifier generation) and Postgres SCRAM (`sqlx`). The in-module
@@ -594,15 +614,34 @@ At server startup (not for `migrate`) one `system.fips_policy` audit event is
 written with the detail keys `fipsCompiled`, `fipsModeActive`, `requireFips`,
 `appCryptoInModule` (`true` only in a `fips` build whose module check passed:
 the primitives this application calls directly run in the module),
-`cryptoOutsideModule` (what still does not: `tls`, `oidc-id-token-verify`,
-`oidc-state-nonce`, `postgres-scram`) and `pendingAlgs` (the validated
+`cryptoOutsideModule` (what still does not: `oidc-id-token-verify`,
+`oidc-state-nonce`, `postgres-scram`), `tlsKxGroups` (the outbound TLS
+key-exchange groups offered, in order) and `pendingAlgs` (the validated
 `STIG_FIPS_PENDING_ALGS` list). A refused start has no audit row, only a
 `target: "audit"` log line; if the audit write itself fails, it is logged the
 same way and startup continues.
 
+Outbound TLS offers `X25519MLKEM768` and `ML-KEM-1024` key exchange first, then
+`X25519` (non-FIPS builds only), P-384 and P-256. In a `fips` build the two
+ML-KEM groups are pending validation and are offered only when listed in
+`STIG_FIPS_PENDING_ALGS` (`X25519MLKEM768`, `ML-KEM-1024`); otherwise it offers
+P-384 and P-256.
+
 Webhook HMAC secrets shorter than 14 bytes (112 bits) are not an approved use
 of HMAC under NIST SP 800-131A; the key length is not enforced (documentation
-only).
+only). Each signed webhook delivery carries `X-Webhook-Signature`
+(`sha256=<hex>`, HMAC-SHA-256) and `X-Webhook-Signature-V2` (`sha384=<hex>`,
+HMAC-SHA-384) over the same body. Receivers that must meet CNSA 2.0 should
+require V2 and use a secret of at least 48 bytes. The signature has no
+timestamp or nonce, so it does not by itself prevent replay.
+
+## Supply chain
+
+CI runs `cargo deny check advisories bans sources` (`deny.toml`) against the
+backend (default and `fips`) and frontend dependency graphs. Ignored advisories
+carry a reason in `deny.toml`. `ring` is banned from the backend's normal
+dependency graph (TLS and application crypto run on aws-lc-rs); the dev-only
+`rcgen` test dependency is the one exception.
 
 ## Operations: audit
 
@@ -1204,6 +1243,7 @@ only.
 │   ├── migrations/       sqlx migrations
 │   └── stig-sources.toml STIG ZIPs to sync from DISA
 ├── dev/keycloak/         Dev realm import
+├── Containerfile         Production image (UBI 10)
 ├── docs/                 Deployment notes, runbook alerts, SSP notes
 └── docker-compose.yml    Local dev stack
 ```
@@ -1234,23 +1274,52 @@ it), `SAML_SP_ENTITY_ID` (Audience, default `{frontend}/saml/sp`),
 The ACS accepts exactly one Assertion, a direct child of `samlp:Response`.
 Accepted signature layouts: Assertion signed, Response signed, or both; a
 `ds:Signature` must be a direct child of the Response or the Assertion, with one
-Reference to its parent's ID, RSA-SHA256 and SHA-256 only. Identity is read only
+Reference to its parent's ID. Identity is read only
 from the signed scope. Required: Status Success, a bearer SubjectConfirmation
 with matching Recipient and unexpired NotOnOrAfter, Conditions, and an
 AudienceRestriction naming the SP; Destination is checked when present. DOCTYPE,
 comments, processing instructions and EncryptedAssertion are rejected. Failed
 ACS attempts return a generic 401 and log an `auth.saml_acs` audit line.
 
-Only RSA-SHA256 with keys of at least 2048 bits is accepted (a weaker
-`SAML_IDP_CERT_PEM` stops startup). `SignedInfo` and the signed element must
-declare every namespace they use themselves (the `ds` namespace included), since
-bindings outside the signed bytes are not authenticated. `POST /auth/saml/acs`
+Accepted algorithms: exclusive canonicalisation (`xml-exc-c14n#`, and
+`#WithComments`, which is identical because comments are rejected), RSA PKCS#1
+v1.5 with SHA-256, SHA-384 or SHA-512 (`rsa-sha256`/`rsa-sha384`/`rsa-sha512`),
+and the SHA-256, SHA-384 or SHA-512 digest in any pairing. SHA-1, PSS and ECDSA
+are rejected. RSA keys must be at least 2048 bits (a weaker `SAML_IDP_CERT_PEM`
+stops startup). Each Reference must list exactly two Transforms, in this order:
+enveloped-signature, then exclusive canonicalisation; a Reference without the
+canonicalisation transform is rejected (XML-DSig would default to inclusive
+C14N 1.0, which is not implemented). An `InclusiveNamespaces` `PrefixList`
+(at most 16 prefixes) is honoured on the CanonicalizationMethod and the
+Transform. Digest and signature are computed over the exclusive canonical form
+of the parsed document, so IdP output need not be canonical on the wire
+(indentation, quote style, attribute order, `<x/>` versus `<x></x>`, CDATA and
+CRLF are all fine). Namespace bindings in scope are signed into the canonical
+bytes, so rebinding a prefix after signing breaks the digest. A prefix used
+only inside attribute values or text (such as `xsi:type="xs:string"`) is signed
+only if it is listed in the `PrefixList`; QName content is never interpreted.
+IdPs that emit comments or processing instructions, or that sign with inclusive
+C14N 1.0, fail closed. `POST /auth/saml/acs`
 shares the per-IP pre-auth rate limit (429 when exceeded) and answers every
 failure with a generic 401; reasons go to the audit log as fixed codes.
 
-Limitation: exclusive canonicalisation is not implemented yet. Signatures are
-verified over the bytes as sent, so IdPs that do not emit canonical XML will
-fail closed until c14n is added.
+Replay protection (IA-2(8)): after a response verifies, its Assertion `ID` (and
+its Response `ID` when the Response itself is signed) is recorded in the
+`saml_seen_ids` table as a domain-separated SHA-256, kept until the bearer
+`NotOnOrAfter` plus the clock skew has passed (and pruned a few minutes later).
+The insert is atomic and the table is shared, so across all instances exactly
+one presentation of a valid assertion is processed, and the cache survives
+restarts. A second presentation is refused as `replay` whether or not the first
+one completed, and with or without the request cookie; a database error refuses
+the login (`replay_check_error`). Because of this, someone who captures a
+response can burn it and the user simply signs in again. An assertion whose
+bearer `NotOnOrAfter` is more than 24 hours away is refused
+(`validity_too_long`) so the cache stays bounded. The table holds only hashes
+and is not part of the application backup. The assertion is recorded before the
+acknowledgement and request-cookie claim, so a response that then fails that
+claim cannot be retried; the user must restart the login. When an assertion
+carries several bearer confirmations for this ACS, the latest `NotOnOrAfter`
+sets both the cache expiry and the 24-hour cap.
 
 `SAML_INSECURE_SKIP_VERIFY=true` skips only the signature check (all other
 checks still run) and is for local development. The backend **refuses to start**
@@ -1275,7 +1344,8 @@ SAML sets a similar `stig_saml_req` cookie (path `/auth/saml`, `SameSite=None;
 Secure` over https, `Lax` over plain http). IdP-initiated SAML responses (no
 `InResponseTo`) are refused unconditionally. In plain-http dev, SAML therefore
 works only with an IdP that is same-site with the API, or behind https.
-Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored.
+Refusals are logged (`target: "audit"`, `outcome = "denied"`), not stored,
+except the SAML replay refusal described below.
 
 What is stored for an in-flight OIDC login, on its `login_notice_acks` row and
 for at most 10 minutes: the `state` as a SHA-256 hash (it is only compared, never
@@ -1291,15 +1361,22 @@ up to 10 minutes, which are of no use without an intercepted authorization code.
 Auth audit events:
 
 - Stored in `audit_events`: `auth.notice_ack`, outcome `ok` only, written when a
-  login completes.
+  login completes; and `auth.saml_replay`, outcome `rejected`, written when a
+  verified SAML assertion is presented a second time (detail: `reasonCode`,
+  `assertionIdSha256`, `responseIdSha256`, `issuer`, `nameIdSha256`, `sourceIp`;
+  digests only, never the raw IDs or the NameID), and the same action with
+  outcome `error` (best effort) when the replay check itself fails. Producing one needs an IdP-signed, in-window assertion
+  (or the non-production skip-verify mode), and the ACS per-IP limiter and the
+  audit queue's shedding of denied events bound the volume.
 - Log-only (`target: "audit"`, not stored): `auth.notice_ack` / `issued`;
   `auth.login_start` / `denied` (reasons `rate_limited`, `missing`, `malformed`,
   `invalid`, `error`); `auth.oidc_callback` / `success` or `denied` (reasons
   `rate_limited`, `no_state_cookie`, `malformed_state_cookie`, `ack_not_claimed`,
   `claim_error`, `token_exchange`, `id_token`); `auth.saml_acs` / `success` or
   `denied` (reasons `rate_limited`, `decode`, `unsolicited`,
-  `no_request_cookie`, `ack_not_claimed`, `claim_error`, plus the fixed
-  validation codes of the SAML response checks).
+  `no_request_cookie`, `ack_not_claimed`, `claim_error`, `replay`,
+  `replay_check_error`, `validity_too_long`, plus the fixed validation codes of
+  the SAML response checks).
 - Removed: `auth.notice_ack` with outcome `missing` was written by the first AC-8
   release (f0b65f9) and removed by PR #56 (e0a0c9d). A login without the
   acknowledgement is now refused and appears as an `auth.oidc_callback` or

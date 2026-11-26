@@ -1,9 +1,10 @@
 # Deployment notes, runbook alerts and SSP notes
 
 Short checklist. Each fact is stated once; the long-form reference is in
-[README.md](../README.md), cited by heading name. The repo ships only
-`Dockerfile.dev` and a dev `docker-compose.yml`; neither is a production
-manifest. Examples below are generic, use `podman`, and use placeholders only.
+[README.md](../README.md), cited by heading name. The repo ships a production
+`Containerfile` (section 10), plus `Dockerfile.dev` and a dev
+`docker-compose.yml`; the latter two are not production manifests. Examples
+below are generic, use `podman`, and use placeholders only.
 
 ## 1. Before you start
 
@@ -18,8 +19,12 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 - FIPS: build with `--no-default-features --features fips` and set
   `STIG_REQUIRE_FIPS=1`. That runs the application's own Ed25519, HMAC,
   SHA-2, SAML RSA verification and session RNG inside the AWS-LC FIPS module
-  (pending CMVP; no certificate). TLS, OIDC ID-token verification and
-  state/nonce, and Postgres SCRAM stay outside it. The in-module algorithms
+  (pending CMVP; no certificate), and outbound TLS (webhooks, OIDC, DISA
+  sync, SMTP STARTTLS). OIDC ID-token verification and state/nonce, and
+  Postgres SCRAM stay outside it. A FIPS build offers only classical
+  (P-384, P-256) outbound TLS key exchange unless
+  `STIG_FIPS_PENDING_ALGS=X25519MLKEM768,ML-KEM-1024` is set; set it to get
+  the hybrid and `ML-KEM-1024` groups (pending validation). The in-module algorithms
   are classical; under CNSA 2.0 the IdP signing key should be RSA of at least
   3072 bits. See the README FIPS notes.
 
@@ -35,15 +40,14 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
   environment (or use `--secret <name>,type=env,target=DATABASE_MIGRATION_URL`):
 
   ```
-  podman run --rm -e DATABASE_URL -e DATABASE_MIGRATION_URL <image> \
-    stig-viewer-backend migrate
+  podman run --rm -e DATABASE_URL -e DATABASE_MIGRATION_URL <image> migrate
   ```
 
   Exit codes: 0 success, 75 retryable, 1 failure.
 - Keep the owner URL out of the server environment. Production with the owner
   URL on the server records `db.boundary_degraded`.
 - Migrations are not selectable by range; `migrate` applies everything pending
-  through `050_audit_owner_functions.sql`. All run as the owner role. None needs
+  through `051_saml_replay_cache.sql`. All run as the owner role. None needs
   a superuser in production.
 
 | Migration | Operator note |
@@ -55,6 +59,7 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 | 046 | The table becomes `UNLOGGED`: in-flight logins re-acknowledge after a crash or failover. Pass `--no-unlogged-table-data` to a manual `pg_dump`. |
 | 047 | Run `migrate` first. Sweeps from older replicas fail closed with `42501`. Stop pre-#82 replicas before the first new sweep. |
 | 050 | Requires the owner/app split. Run `migrate` before starting new servers. Pass the same `AUDIT_RETENTION_DAYS` to the `migrate` job if it is below 365. Forced restores need the owner-opened window. An older binary refuses a database at 050. |
+| 051 | `saml_seen_ids` (SAML replay cache) is transient and excluded from the app backup. Schema only, no action. |
 
 - The retention floor `audit_policy.min_retain_days` is set by the owner step
   from `AUDIT_RETENTION_DAYS` as the `migrate` process sees it (default 365).
@@ -159,6 +164,16 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 - Serve frontend and API same-site (the ack cookie is `SameSite=Strict`; if the browser does not send it, the
   login start has no proof of the notice acknowledgement and no session is
   created without a claimed ack).
+- Terminate TLS at the proxy or ingress; the backend speaks plain HTTP and the
+  image requires it (cookies are `Secure` under `STIG_ENV=production`). With
+  `STIG_ENV=production` the backend also sends
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains` on the
+  static frontend responses, so serve the whole site over HTTPS only.
+- Where the TLS terminator supports it, offer a hybrid post-quantum key
+  exchange group: `X25519MLKEM768`, or `SecP384r1MLKEM1024` for CNSA 2.0
+  profiles. Do not pin classical-only groups (for example `X25519` or
+  `secp256r1` alone): that blocks the hybrid groups and leaves traffic open to
+  harvest-now-decrypt-later capture. See #66.
 - Buffer request bodies at the proxy. That removes the slow request-body vector
   that `DeadlineBody` (`backend/src/api/admission.rs`) guards against; without
   buffering, the `ADMISSION_BODY_*` deadlines are the only control.
@@ -170,7 +185,8 @@ manifest. Examples below are generic, use `podman`, and use placeholders only.
 - Use a stop grace of at least 15 s, e.g. `podman stop -t 15 <container>`.
 - SIGTERM must reach the backend process itself (exec form, or an init that
   forwards signals).
-- Dev compose signal handling is tracked in #147.
+- The production image uses an exec-form `ENTRYPOINT`, so SIGTERM reaches the
+  backend. Dev compose signal handling is tracked in #147.
 
 ## 8. Runbook: alerts
 
@@ -241,3 +257,82 @@ Triage order: `shedWrites`, the collusion line, `pendingWrites` and
   in README "Database guard on the audit tables" (limit paragraph): the app
   role can insert rows, prune below the floor, and restore in an open window;
   the owner or a superuser can always bypass the guard.
+
+## 10. Container image
+
+`Containerfile` at the repo root builds one image: the backend plus the release
+wasm frontend, which the backend serves same-origin from memory
+(`STIG_STATIC_DIR=/app/static`; the frontend is built with an empty `API_URL`,
+so every request is relative).
+
+- Stages and bases, all pinned by multi-arch index digest and overridable:
+  `frontend` (`rust:<ver>-slim-trixie`, builds the wasm bundle with Trunk; UBI
+  has no wasm32 std), `backend` (`ubi10/ubi`, Red Hat's Rust RPMs) and
+  `runtime` (`ubi10/ubi-micro`, no `RUN` steps). Trunk, `wasm-bindgen` (the
+  version in `frontend/Cargo.lock`) and `wasm-opt` (binaryen) are release
+  tarballs verified with `sha256sum -c` per architecture, and Trunk runs with
+  `TRUNK_OFFLINE=true`, so it fetches nothing else during the build. The Rust
+  version in the backend stage floats with UBI AppStream (the base digest does
+  not pin dnf content); the build asserts it meets the `rust-version` in
+  `backend/Cargo.toml`. The image carries `/app/BUILD-INFO` with the
+  `rustc`, `cargo`, `gcc`, `clang` and `go` versions and the `aws-lc-*` crate
+  versions it was built with.
+- Base image digests are refreshed by hand (Dependabot is not configured for
+  `Containerfile`): all three, including `rust:<ver>-slim-trixie`, using the
+  commands in the `Containerfile` header (registry `docker-content-digest` of
+  the index, then `podman manifest inspect` to confirm amd64 and arm64).
+- Build (`--format docker` is needed to keep the `HEALTHCHECK`):
+
+  ```
+  podman build --format docker -t <image> -f Containerfile .
+  podman build --format docker --build-arg CRYPTO=fips -t <image>-fips -f Containerfile .
+  ```
+
+  Add `--build-arg BUILD_JOBS=2` on a small build machine.
+- Iron Bank or other hardened bases: `podman login registry1.dso.mil`, then
+  `--build-arg BACKEND_BUILD_BASE=<ubi10 path>@sha256:...` and
+  `--build-arg RUNTIME_BASE=<ubi10-micro path>@sha256:...`. The paths are for
+  the operator to fill in. This only swaps base images; it is not an Iron Bank
+  submission, which is a separate offline pipeline.
+- Health: the image `HEALTHCHECK` runs `<binary> healthcheck` (a local
+  `GET /api/health`, exit 0 only on 200; needs no database config). For an
+  OCI-format image use `podman run --health-cmd` with the same command.
+  Kubernetes ignores `HEALTHCHECK`; use an `httpGet` probe on `/api/health`.
+- Migrate, then serve. The migrate job gets both URLs; the server gets only
+  `DATABASE_URL` (placeholders; inject secrets, for example with
+  `--secret <name>,type=env,target=DATABASE_URL`):
+
+  ```
+  podman run --rm -e DATABASE_URL -e DATABASE_MIGRATION_URL <image> migrate
+  podman run -d --read-only --read-only-tmpfs=false --cap-drop=ALL \
+    --security-opt no-new-privileges -v stig_data:/data -p 8080:8080 \
+    -e DATABASE_URL -e OIDC_INTERNAL_URL -e OIDC_PUBLIC_URL -e OIDC_CLIENT_ID \
+    -e OIDC_CLIENT_SECRET -e OIDC_REDIRECT_URI -e FRONTEND_URL <image>
+  ```
+
+  Giving the server `DATABASE_MIGRATION_URL` still works but is the
+  discouraged fallback (section 2). Set `FRONTEND_URL` to the public origin;
+  `STIG_ENV=production` is baked in, so cookies are `Secure` and the image
+  must sit behind TLS.
+- `STIG_STATIC_DIR` must contain only the public frontend bundle: everything in
+  it is served without authentication, and hashed files get `public` caching.
+  Never point it at a directory with data, uploads or secrets.
+- Read-only root filesystem: the only writable path is `/data` (a volume).
+  `/app`, the binary and the static files are read-only; no tmpfs is needed.
+- User: numeric `1001:0` (no passwd entry). `/data` is mode 0770, group 0, so
+  an arbitrary uid with gid 0 also works. A named volume inherits that
+  ownership on first use; bind mounts need `:U` or a matching chown;
+  Kubernetes uses `runAsUser: 1001` or `fsGroup: 0`.
+- FIPS: the `fips` build links AWS-LC-FIPS statically into the binary. UBI
+  supplies only glibc, `libgcc_s` and the loader, so a FIPS-mode RHEL host or
+  UBI's own OpenSSL and crypto policies neither change this application's
+  crypto nor add to its FIPS claim. AWS-LC-FIPS is pending CMVP with no
+  certificate (#201). The FIPS build covers only classical
+  algorithms: ML-KEM and ML-DSA are not inside the FIPS boundary here (see #66). `STIG_REQUIRE_FIPS=1` is not baked in; set it in the
+  deployment so a wrongly deployed non-FIPS image refuses to start.
+- Trust roots: the backend uses bundled `webpki-roots`; `ubi-micro` has no OS
+  CA bundle, and an IdP with a DoD-issued certificate fails OIDC discovery
+  (pre-existing, tracked separately).
+- Check the image with `scripts/smoke-prod-image.sh` (`CRYPTO=fips` for the
+  FIPS variant), which uses throwaway `svw-prod-smoke-*` resources on port
+  28080.

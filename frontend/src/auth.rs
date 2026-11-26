@@ -145,7 +145,11 @@ pub fn AuthGate(props: &AuthGateProps) -> Html {
         AuthState::Error(err) => html! {
             <UiBox padding="xxl">
                 <Alert kind="error" header="Cannot connect to backend">
-                    {format!("{err}. Make sure the server is running at {BACKEND}.")}
+                    {if BACKEND.is_empty() {
+                        format!("{err}. Make sure the server is running.")
+                    } else {
+                        format!("{err}. Make sure the server is running at {BACKEND}.")
+                    }}
                 </Alert>
             </UiBox>
         },

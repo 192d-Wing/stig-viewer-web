@@ -17,7 +17,7 @@
 //! files are sourced externally and live under `${data_dir}/stigs/`. The
 //! same goes for transient runtime tables (sessions, scheduler_runs,
 //! email_deliveries, dashboard_snapshots, compliance_reports,
-//! catalog_archive).
+//! catalog_archive, login_notice_acks, saml_seen_ids).
 //!
 //! Restore uses `jsonb_populate_recordset` to map JSON rows back into
 //! their target row type — that's how we avoid hand-writing N column
@@ -1898,7 +1898,9 @@ mod restore_integrity_db_tests {
         .into_bytes();
         body.extend_from_slice(zip);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let r = reqwest::Client::new()
+        let r = crate::crypto::tls::http_client_builder()
+            .build()
+            .unwrap()
             .post(format!("{base}/api/admin/restore?force={force}"))
             .header(
                 "content-type",
@@ -2432,6 +2434,13 @@ mod restore_integrity_db_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transient_runtime_tables_are_not_backed_up() {
+        for t in ["saml_seen_ids", "login_notice_acks", "sessions"] {
+            assert!(!TABLES.contains(&t), "{t} must not be in the backup");
+        }
+    }
+
     use super::*;
 
     /// The tests below predate integrity checking; they go through the full

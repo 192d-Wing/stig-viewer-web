@@ -66,6 +66,11 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
+            hex::encode(sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
+        );
+        assert_eq!(
             sha512_hex(b"abc"),
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
              2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
@@ -77,6 +82,7 @@ mod tests {
         for len in [0usize, 1, 55, 56, 64, 111, 112, 128, 1000, 1 << 20] {
             let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
             assert_eq!(sha256(&data).as_slice(), Sha256::digest(&data).as_slice());
+            assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
             assert_eq!(sha512(&data).as_slice(), Sha512::digest(&data).as_slice());
             assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
         }

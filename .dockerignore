@@ -10,3 +10,9 @@ test-results
 playwright-report
 blob-report
 .claude
+backend/seed
+e2e
+docs
+testdata
+.github
+*.md

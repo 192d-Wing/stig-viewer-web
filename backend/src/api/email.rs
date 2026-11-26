@@ -275,7 +275,8 @@ pub async fn send_compliance_report(
     };
 
     // Build the SMTP transport. Use plain SMTP+STARTTLS on the
-    // submission port; rustls is wired through tokio1-rustls-tls.
+    // submission port; rustls runs on the AWS-LC provider (crypto::tls).
+    crate::crypto::tls::ensure_installed();
     let transport_result = SmtpTransport::starttls_relay(&cfg.host).map(|b| {
         let b = b.port(cfg.port);
         if !cfg.user.is_empty() {

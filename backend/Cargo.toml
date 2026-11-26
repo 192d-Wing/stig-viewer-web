@@ -11,21 +11,21 @@ path = "src/main.rs"
 [features]
 default = ["non-fips"]
 # Non-FIPS AWS-LC (aws-lc-sys); needs only a C compiler. Makes no FIPS claim.
-non-fips = ["aws-lc-rs/aws-lc-sys"]
+non-fips = ["aws-lc-rs/aws-lc-sys", "rustls/aws_lc_rs"]
 # Refuse to start unless the AWS-LC FIPS module is linked and in FIPS mode (#70),
 # and run the application's own Ed25519, HMAC, SHA-2, SAML RSA verify and RNG
 # inside it (#65). Needs CMake, Go, Perl and a C compiler to build. Without it
 # the same code runs on the non-FIPS aws-lc-sys (C compiler only).
 # Build with `--no-default-features --features fips`: with `non-fips` also on,
 # both aws-lc-sys and aws-lc-fips-sys would link (checked at compile time).
-fips = ["aws-lc-rs/fips"]
+fips = ["aws-lc-rs/fips", "rustls/fips"]
 
 [dependencies]
 axum               = { version = "0.7", features = ["macros", "multipart"] }
 tokio              = { version = "1", features = ["full"] }
 tower-http         = { version = "0.6", features = ["cors", "catch-panic"] }
 http-body          = "1"
-reqwest            = { version = "0.12", features = ["rustls-tls"], default-features = false }
+reqwest            = { version = "0.12", features = ["rustls-tls-webpki-roots-no-provider"], default-features = false }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 toml               = "0.8"
@@ -37,7 +37,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow             = "1"
 uuid               = { version = "1", features = ["v5"] }
-openidconnect      = { version = "4", features = ["reqwest", "rustls-tls"], default-features = false }
+openidconnect      = { version = "4", features = ["reqwest"], default-features = false }
 axum-extra         = { version = "0.9", features = ["cookie"] }
 url                = "2"
 time               = "0.3"
@@ -46,11 +46,15 @@ hex                = "0.4"
 csv                = "1"
 base64             = "0.22"
 flate2             = "1"
-lettre             = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
+lettre             = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls", "rustls-no-provider", "webpki-roots", "builder"] }
 x509-parser        = "0.16"
 # All application-level crypto goes through src/crypto (#65). The sys crate is
 # chosen by the `non-fips` / `fips` features above, never both.
 aws-lc-rs          = { version = "1.19", default-features = false, features = ["alloc"] }
+# TLS for reqwest and lettre runs on the same AWS-LC provider (#215). The
+# provider itself is built in src/crypto/tls.rs; `aws_lc_rs` / `fips` come from
+# the `non-fips` / `fips` features above.
+rustls             = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 
 [dev-dependencies]
 # Paused clocks for the request-body deadline tests.
