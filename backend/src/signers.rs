@@ -368,10 +368,8 @@ fn valid_key_id(alg: Algorithm, s: &str) -> bool {
     s.len() == want && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Parse and validate the previous-keys document (schema version 1). Every
-/// rejection is a startup error. Messages name the entry (index and label) and
-/// never echo a value from the document: an entry may hold a mis-pasted seed.
-pub fn parse_previous(json: &[u8], source: &'static str) -> anyhow::Result<PreviousKeys> {
+/// Parse the document and check its version and size bounds.
+fn parse_file(json: &[u8]) -> anyhow::Result<PreviousFile> {
     use anyhow::bail;
     if json.len() > MAX_PREVIOUS_BYTES {
         bail!("previous-keys document exceeds {MAX_PREVIOUS_BYTES} bytes");
@@ -395,119 +393,154 @@ pub fn parse_previous(json: &[u8], source: &'static str) -> anyhow::Result<Previ
     if file.revoked.len() > MAX_REVOKED_KEYS {
         bail!("previous-keys document: more than {MAX_REVOKED_KEYS} revoked keys");
     }
+    Ok(file)
+}
 
-    let mut sets: Vec<KeySet> = Vec::new();
-    for (i, entry) in file.previous.iter().enumerate() {
-        let at = format!("previous[{i}] ({})", entry.label.escape_default());
-        if !valid_label(&entry.label) {
-            bail!("previous[{i}]: label must match [A-Za-z0-9._-]{{1,64}}");
-        }
-        if sets
-            .iter()
-            .any(|s| s.label.as_deref() == Some(&entry.label))
-        {
-            bail!("{at}: duplicate label");
-        }
-        if let Some(d) = &entry.retired_at {
-            if !valid_date(d) {
-                bail!("{at}: retiredAt must be YYYY-MM-DD");
-            }
-        }
-        if entry.keys.is_empty() || entry.keys.len() > 2 {
-            bail!("{at}: keys must be [ed25519] or [ed25519, ml-dsa-87]");
-        }
-        let mut keys = Vec::with_capacity(entry.keys.len());
-        for (j, k) in entry.keys.iter().enumerate() {
-            let Some(alg) = Algorithm::from_wire(&k.algorithm) else {
-                bail!("{at}: keys[{j}] has an unsupported algorithm");
-            };
-            if !valid_key_id(alg, &k.key_id) {
-                bail!("{at}: keys[{j}] keyId is not lowercase hex of the expected length");
-            }
-            let public = BASE64
-                .decode(k.public_key.trim().as_bytes())
-                .map_err(|_| anyhow::anyhow!("{at}: keys[{j}] publicKey is not valid base64"))?;
-            let want = match alg {
-                Algorithm::Ed25519 => ED25519_PUBLIC_LEN,
-                Algorithm::MlDsa87 => crypto::mldsa::PUBLIC_KEY_LEN,
-            };
-            if public.len() != want {
-                bail!(
-                    "{at}: keys[{j}] publicKey has the wrong length for {}",
-                    k.algorithm
-                );
-            }
-            if key_id(alg, &public) != k.key_id {
-                bail!("{at}: keys[{j}] keyId does not match publicKey (is a private key pasted here?)");
-            }
-            keys.push(VerifyingKey {
-                algorithm: alg,
-                key_id: k.key_id.clone(),
-                public_key: public,
-            });
-        }
-        let mut set =
-            KeySet::new(keys, KeySource::Previous, Some(entry.label.clone())).map_err(|_| {
-                anyhow::anyhow!(
-                    "{at}: keys must be [ed25519] or [ed25519, ml-dsa-87], in that order"
-                )
-            })?;
-        set.retired_at = entry.retired_at.clone();
-        if sets.iter().any(|s| s.signer_ids() == set.signer_ids()) {
-            bail!("{at}: duplicate key set");
-        }
-        sets.push(set);
+/// Validate one `keys[j]` entry of a previous set; `at` names the set.
+fn parse_key_entry(at: &str, j: usize, k: &KeyEntry) -> anyhow::Result<VerifyingKey> {
+    use anyhow::bail;
+    let Some(alg) = Algorithm::from_wire(&k.algorithm) else {
+        bail!("{at}: keys[{j}] has an unsupported algorithm");
+    };
+    if !valid_key_id(alg, &k.key_id) {
+        bail!("{at}: keys[{j}] keyId is not lowercase hex of the expected length");
     }
-    // One (algorithm, keyId) must always mean one public key.
+    let public = BASE64
+        .decode(k.public_key.trim().as_bytes())
+        .map_err(|_| anyhow::anyhow!("{at}: keys[{j}] publicKey is not valid base64"))?;
+    let want = match alg {
+        Algorithm::Ed25519 => ED25519_PUBLIC_LEN,
+        Algorithm::MlDsa87 => crypto::mldsa::PUBLIC_KEY_LEN,
+    };
+    if public.len() != want {
+        bail!(
+            "{at}: keys[{j}] publicKey has the wrong length for {}",
+            k.algorithm
+        );
+    }
+    if key_id(alg, &public) != k.key_id {
+        bail!("{at}: keys[{j}] keyId does not match publicKey (is a private key pasted here?)");
+    }
+    Ok(VerifyingKey {
+        algorithm: alg,
+        key_id: k.key_id.clone(),
+        public_key: public,
+    })
+}
+
+/// Validate one `previous[i]` entry against the sets accepted before it.
+fn parse_set(i: usize, entry: &PreviousEntry, earlier: &[KeySet]) -> anyhow::Result<KeySet> {
+    use anyhow::bail;
+    let at = format!("previous[{i}] ({})", entry.label.escape_default());
+    if !valid_label(&entry.label) {
+        bail!("previous[{i}]: label must match [A-Za-z0-9._-]{{1,64}}");
+    }
+    if earlier
+        .iter()
+        .any(|s| s.label.as_deref() == Some(&entry.label))
+    {
+        bail!("{at}: duplicate label");
+    }
+    if entry.retired_at.as_deref().is_some_and(|d| !valid_date(d)) {
+        bail!("{at}: retiredAt must be YYYY-MM-DD");
+    }
+    if entry.keys.is_empty() || entry.keys.len() > 2 {
+        bail!("{at}: keys must be [ed25519] or [ed25519, ml-dsa-87]");
+    }
+    let keys = entry
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(j, k)| parse_key_entry(&at, j, k))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut set =
+        KeySet::new(keys, KeySource::Previous, Some(entry.label.clone())).map_err(|_| {
+            anyhow::anyhow!("{at}: keys must be [ed25519] or [ed25519, ml-dsa-87], in that order")
+        })?;
+    set.retired_at = entry.retired_at.clone();
+    if earlier.iter().any(|s| s.signer_ids() == set.signer_ids()) {
+        bail!("{at}: duplicate key set");
+    }
+    Ok(set)
+}
+
+/// One (algorithm, keyId) must always mean one public key.
+fn check_key_id_collisions(sets: &[KeySet]) -> anyhow::Result<()> {
     let all: Vec<&VerifyingKey> = sets.iter().flat_map(|s| s.keys.iter()).collect();
     for (a, ka) in all.iter().enumerate() {
         if all[a + 1..].iter().any(|kb| {
             kb.algorithm == ka.algorithm && kb.key_id == ka.key_id && kb.public_key != ka.public_key
         }) {
-            bail!("two different public keys share one keyId");
+            anyhow::bail!("two different public keys share one keyId");
         }
     }
+    Ok(())
+}
 
+/// Validate one `revoked[i]` entry against the previous sets and the revoked
+/// entries accepted before it.
+fn parse_revoked(
+    i: usize,
+    r: &RevokedEntry,
+    sets: &[KeySet],
+    earlier: &[RevokedKey],
+) -> anyhow::Result<RevokedKey> {
+    use anyhow::bail;
+    let at = format!("revoked[{i}]");
+    let Some(alg) = Algorithm::from_wire(&r.algorithm) else {
+        bail!("{at}: unsupported algorithm");
+    };
+    if !valid_key_id(alg, &r.key_id) {
+        bail!("{at}: keyId is not lowercase hex of the expected length");
+    }
+    if r.revoked_at.as_deref().is_some_and(|d| !valid_date(d)) {
+        bail!("{at}: revokedAt must be YYYY-MM-DD");
+    }
+    if r.reason
+        .as_deref()
+        .is_some_and(|x| x.chars().count() > MAX_REASON_CHARS || x.chars().any(char::is_control))
+    {
+        bail!(
+            "{at}: reason must be at most {MAX_REASON_CHARS} characters without control characters"
+        );
+    }
+    if sets.iter().any(|s| {
+        s.keys
+            .iter()
+            .any(|k| k.algorithm == alg && k.key_id == r.key_id)
+    }) {
+        bail!("{at}: a revoked key is also listed in previous");
+    }
+    if earlier
+        .iter()
+        .any(|o| o.algorithm == alg && o.key_id == r.key_id)
+    {
+        bail!("{at}: duplicate revoked key");
+    }
+    Ok(RevokedKey {
+        algorithm: alg,
+        key_id: r.key_id.clone(),
+        revoked_at: r.revoked_at.clone(),
+        reason: r.reason.clone(),
+    })
+}
+
+/// Parse and validate the previous-keys document (schema version 1). Every
+/// rejection is a startup error. Messages name the entry (index and label) and
+/// never echo a value from the document: an entry may hold a mis-pasted seed.
+pub fn parse_previous(json: &[u8], source: &'static str) -> anyhow::Result<PreviousKeys> {
+    let file = parse_file(json)?;
+    let mut sets: Vec<KeySet> = Vec::new();
+    for (i, entry) in file.previous.iter().enumerate() {
+        let set = parse_set(i, entry, &sets)?;
+        sets.push(set);
+    }
+    check_key_id_collisions(&sets)?;
     let mut revoked: Vec<RevokedKey> = Vec::new();
     for (i, r) in file.revoked.iter().enumerate() {
-        let at = format!("revoked[{i}]");
-        let Some(alg) = Algorithm::from_wire(&r.algorithm) else {
-            bail!("{at}: unsupported algorithm");
-        };
-        if !valid_key_id(alg, &r.key_id) {
-            bail!("{at}: keyId is not lowercase hex of the expected length");
-        }
-        if let Some(d) = &r.revoked_at {
-            if !valid_date(d) {
-                bail!("{at}: revokedAt must be YYYY-MM-DD");
-            }
-        }
-        if let Some(reason) = &r.reason {
-            if reason.chars().count() > MAX_REASON_CHARS || reason.chars().any(char::is_control) {
-                bail!("{at}: reason must be at most {MAX_REASON_CHARS} characters without control characters");
-            }
-        }
-        if sets.iter().any(|s| {
-            s.keys
-                .iter()
-                .any(|k| k.algorithm == alg && k.key_id == r.key_id)
-        }) {
-            bail!("{at}: a revoked key is also listed in previous");
-        }
-        if revoked
-            .iter()
-            .any(|o| o.algorithm == alg && o.key_id == r.key_id)
-        {
-            bail!("{at}: duplicate revoked key");
-        }
-        revoked.push(RevokedKey {
-            algorithm: alg,
-            key_id: r.key_id.clone(),
-            revoked_at: r.revoked_at.clone(),
-            reason: r.reason.clone(),
-        });
+        let k = parse_revoked(i, r, &sets, &revoked)?;
+        revoked.push(k);
     }
-
     Ok(PreviousKeys {
         sets,
         revoked,

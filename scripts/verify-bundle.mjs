@@ -276,43 +276,34 @@ function keySets(trustedKeys, previousKeySets) {
   return sets;
 }
 
-function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact, allowClassical }) {
+function checkInputs(trustedKeys, previousKeySets, revoked) {
   if (!Array.isArray(trustedKeys) || !trustedKeys.every(isKeyEntry)) {
     fail("MalformedEnvelope", "trusted keys");
   }
-  if (
-    !Array.isArray(previousKeySets) ||
-    previousKeySets.length > 32 ||
-    !previousKeySets.every((p) => isObj(p) && Array.isArray(p.keys) && p.keys.length <= 2 && p.keys.every(isKeyEntry))
-  ) {
+  const validSet = (p) => isObj(p) && Array.isArray(p.keys) && p.keys.length <= 2 && p.keys.every(isKeyEntry);
+  if (!Array.isArray(previousKeySets) || previousKeySets.length > 32 || !previousKeySets.every(validSet)) {
     fail("MalformedEnvelope", "previous key sets");
   }
-  if (!Array.isArray(revoked) || revoked.length > 64 || !revoked.every((r) => isObj(r) && isStr(r.algorithm) && isStr(r.keyId))) {
+  const validRevoked = (r) => isObj(r) && isStr(r.algorithm) && isStr(r.keyId);
+  if (!Array.isArray(revoked) || revoked.length > 64 || !revoked.every(validRevoked)) {
     fail("MalformedEnvelope", "revoked keys");
   }
-  if (
-    isObj(bundle) &&
-    isStr(bundle.payload) &&
-    bundle.payload.length > Math.ceil((MAX_PAYLOAD * 4) / 3)
-  ) {
+}
+
+function checkEnvelopeShape(bundle) {
+  if (isObj(bundle) && isStr(bundle.payload) && bundle.payload.length > Math.ceil((MAX_PAYLOAD * 4) / 3)) {
     fail("MalformedEnvelope", "payload too large");
   }
-  if (
-    isObj(bundle) &&
-    Array.isArray(bundle.signatures) &&
-    !(bundle.signatures.length <= 16 && bundle.signatures.every((x) => isObj(x) && isStr(x.algorithm) && isStr(x.keyId) && isStr(x.signature)))
-  ) {
+  const validSig = (x) => isObj(x) && isStr(x.algorithm) && isStr(x.keyId) && isStr(x.signature);
+  if (isObj(bundle) && Array.isArray(bundle.signatures) && !(bundle.signatures.length <= 16 && bundle.signatures.every(validSig))) {
     fail("MalformedEnvelope", "signatures");
   }
-  if (
-    !bundle ||
-    typeof bundle !== "object" ||
-    typeof bundle.payload !== "string" ||
-    !Array.isArray(bundle.signatures)
-  ) {
+  if (!bundle || typeof bundle !== "object" || typeof bundle.payload !== "string" || !Array.isArray(bundle.signatures)) {
     fail("MalformedEnvelope");
   }
-  const payload = b64urlStrict(bundle.payload);
+}
+
+function parseSignedDocument(payload) {
   let doc;
   try {
     doc = parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(payload));
@@ -328,8 +319,11 @@ function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact
   }
   if (!signers.every((x) => isObj(x) && isStr(x.algorithm) && isStr(x.keyId))) fail("BadSignerSet");
   if (signers[0].algorithm !== doc.algorithm || signers[0].keyId !== doc.keyId) fail("BadSignerSet");
+  return doc;
+}
 
-  const sets = keySets(trustedKeys, previousKeySets);
+/** Every signer is a supported, unrevoked, known key; returns the one trusted set. */
+function resolveTrustedSet(signers, sets, revoked, allowClassical) {
   for (const s of signers) {
     if (s.algorithm !== "ed25519" && s.algorithm !== "ml-dsa-87") {
       fail("UnsupportedAlgorithm", String(s.algorithm));
@@ -338,15 +332,14 @@ function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact
     if (!sets.some((set) => set.keys.some((k) => same(k, s)))) fail("KeyIdMismatch");
   }
   const names = signers.map((s) => s.algorithm).join(",");
-  let profile;
-  if (names === "ed25519") profile = "classical";
-  else if (names === "ed25519,ml-dsa-87") profile = "hybrid";
-  else fail("BadSignerSet", "profile");
-  if (profile === "classical" && !allowClassical) fail("ClassicalNotAllowed");
+  if (names !== "ed25519" && names !== "ed25519,ml-dsa-87") fail("BadSignerSet", "profile");
+  if (names === "ed25519" && !allowClassical) fail("ClassicalNotAllowed");
   // Trust is per key set: the signer list must be exactly one trusted set.
   const set = sets.find((c) => c.keys.length === signers.length && c.keys.every((k, i) => same(k, signers[i])));
-  if (!set) fail("KeyIdMismatch", "signer set");
+  return set ?? fail("KeyIdMismatch", "signer set");
+}
 
+function verifySignatures(bundle, signers, set, payload) {
   bundle.signatures.forEach((sig, i) => {
     const known = signers.some((s) => same(s, sig));
     const dup = bundle.signatures.slice(0, i).some((o) => same(o, sig));
@@ -359,13 +352,26 @@ function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact
     const key = set.keys.find((t) => same(t, s));
     verifySig(s.algorithm, key.raw, input, b64(sig.signature, s.algorithm));
   }
+}
 
+function checkArtifactHashes(doc, artifact) {
   const sha256 = crypto.createHash("sha256").update(artifact).digest("hex");
   if (!isHex(doc.sha256) || doc.sha256.toLowerCase() !== sha256) fail("ArtifactHashMismatch");
   if (doc.sha512 !== undefined) {
     const sha512 = crypto.createHash("sha512").update(artifact).digest("hex");
     if (!isHex(doc.sha512) || doc.sha512.toLowerCase() !== sha512) fail("ArtifactHashMismatch");
   }
+}
+
+function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact, allowClassical }) {
+  checkInputs(trustedKeys, previousKeySets, revoked);
+  checkEnvelopeShape(bundle);
+  const payload = b64urlStrict(bundle.payload);
+  const doc = parseSignedDocument(payload);
+  const sets = keySets(trustedKeys, previousKeySets);
+  const set = resolveTrustedSet(doc.signers, sets, revoked, allowClassical);
+  verifySignatures(bundle, doc.signers, set, payload);
+  checkArtifactHashes(doc, artifact);
   return { doc, verifiedBy: { source: set.source, keyIds: set.keys.map((k) => k.keyId), label: set.label } };
 }
 
@@ -473,54 +479,67 @@ export function previousFromFile(doc) {
   return fail("MalformedEnvelope", "previous keys file");
 }
 
-function main(argv) {
-  const flags = new Set();
-  const previousFiles = [];
-  const args = [];
+/** Split argv into positional args, `--flag`s and the repeatable `--previous <file>`; null on a dangling `--previous`. */
+function parseArgs(argv) {
+  const out = { flags: new Set(), previousFiles: [], args: [] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--previous") {
-      if (i + 1 >= argv.length) return usage();
-      previousFiles.push(argv[++i]);
+      if (i + 1 >= argv.length) return null;
+      out.previousFiles.push(argv[++i]);
     } else if (argv[i].startsWith("--")) {
-      flags.add(argv[i]);
+      out.flags.add(argv[i]);
     } else {
-      args.push(argv[i]);
+      out.args.push(argv[i]);
     }
   }
-  const read = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
-  if (args[0] === "vector" && args.length === 2) {
-    const s = verifyVector(read(args[1]));
-    console.log(
-      `ok: ${s.positive} positive and ${s.negative} negative cases; rotation: ${s.rotation.positive} positive and ${s.rotation.negative} negative`,
-    );
-    return 0;
+  return out;
+}
+
+const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
+
+function runVector(file) {
+  const s = verifyVector(readJson(file));
+  console.log(
+    `ok: ${s.positive} positive and ${s.negative} negative cases; rotation: ${s.rotation.positive} positive and ${s.rotation.negative} negative`,
+  );
+  return 0;
+}
+
+function runBundle(args, flags, previousFiles) {
+  const pub = readJson(args[2]);
+  const artifact = args[3] ? fs.readFileSync(args[3]) : null;
+  if (!artifact) {
+    console.error("an artifact path is required: the bundle must be bound to the artifact");
+    return 2;
   }
-  if (args[0] === "bundle" && args.length >= 3 && args.length <= 4) {
-    const pub = read(args[2]);
-    const artifact = args[3] ? fs.readFileSync(args[3]) : null;
-    if (!artifact) {
-      console.error("an artifact path is required: the bundle must be bound to the artifact");
-      return 2;
-    }
-    const previousKeySets = Array.isArray(pub.previousKeys) ? [...pub.previousKeys] : [];
-    const revoked = [];
-    for (const f of previousFiles) {
-      const p = previousFromFile(read(f));
-      previousKeySets.push(...p.sets);
-      revoked.push(...p.revoked);
-    }
-    const { doc, verifiedBy } = verifyBundleDetailed({
-      bundle: read(args[1]),
-      trustedKeys: pub.keys,
-      previousKeySets,
-      revoked,
-      artifact,
-      allowClassical: flags.has("--allow-classical"),
-    });
-    const by = `${verifiedBy.source} keys ${verifiedBy.keyIds.join("+")}${verifiedBy.label ? ` (${verifiedBy.label})` : ""}`;
-    console.log(`ok: signed by ${doc.signedBy} at ${doc.signedAt}, signers ${doc.signers.map((s) => s.algorithm).join("+")}, verified by ${by}`);
-    return 0;
+  const previousKeySets = Array.isArray(pub.previousKeys) ? [...pub.previousKeys] : [];
+  const revoked = [];
+  for (const f of previousFiles) {
+    const p = previousFromFile(readJson(f));
+    previousKeySets.push(...p.sets);
+    revoked.push(...p.revoked);
   }
+  const { doc, verifiedBy } = verifyBundleDetailed({
+    bundle: readJson(args[1]),
+    trustedKeys: pub.keys,
+    previousKeySets,
+    revoked,
+    artifact,
+    allowClassical: flags.has("--allow-classical"),
+  });
+  const label = verifiedBy.label ? ` (${verifiedBy.label})` : "";
+  const by = `${verifiedBy.source} keys ${verifiedBy.keyIds.join("+")}${label}`;
+  const algs = doc.signers.map((s) => s.algorithm).join("+");
+  console.log(`ok: signed by ${doc.signedBy} at ${doc.signedAt}, signers ${algs}, verified by ${by}`);
+  return 0;
+}
+
+function main(argv) {
+  const parsed = parseArgs(argv);
+  if (!parsed) return usage();
+  const { flags, previousFiles, args } = parsed;
+  if (args[0] === "vector" && args.length === 2) return runVector(args[1]);
+  if (args[0] === "bundle" && args.length >= 3 && args.length <= 4) return runBundle(args, flags, previousFiles);
   return usage();
 }
 
