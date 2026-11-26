@@ -6,8 +6,12 @@
 //! per-algorithm list below is an additional gate. The application's own
 //! Ed25519, HMAC-SHA-256, SHA-2, SAML RSA verification and session/identifier
 //! RNG run in the module (`crate::crypto`, #65), as does outbound TLS (rustls on
-//! AWS-LC, `crypto::tls`, #215). OIDC ID-token verification and state/nonce
-//! (openidconnect, RustCrypto) and Postgres SCRAM do not; see
+//! AWS-LC, `crypto::tls`, #215). ML-DSA-87 (hybrid signing, #66-#69) runs in
+//! the module too but stays a pending algorithm: a build with
+//! `SIGNING_MLDSA87_KEY_B64` set refuses to start unless `ML-DSA-87` is listed
+//! in `STIG_FIPS_PENDING_ALGS` (`FipsPolicy::require`); no validation of it is
+//! claimed. OIDC ID-token verification and state/nonce (openidconnect,
+//! RustCrypto) and Postgres SCRAM do not run in the module; see
 //! [`OUTSIDE_MODULE`].
 //!
 //! `STIG_REQUIRE_FIPS` makes a non-`fips` build refuse to start. One
@@ -140,7 +144,6 @@ impl FipsPolicy {
         !self.enforced || self.allowed_pending.contains(&alg)
     }
 
-    #[allow(dead_code)] // first caller is the ML-DSA / v2 envelope work (#66-#69)
     pub fn require(&self, alg: PendingAlg) -> Result<()> {
         if self.permits(alg) {
             Ok(())

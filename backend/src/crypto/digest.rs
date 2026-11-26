@@ -1,4 +1,4 @@
-//! SHA-2 digests.
+//! SHA-2 digests (SHA-256, SHA-384, SHA-512).
 
 use aws_lc_rs::digest::{self, Context, SHA256, SHA384, SHA512};
 
@@ -84,6 +84,7 @@ mod tests {
             assert_eq!(sha256(&data).as_slice(), Sha256::digest(&data).as_slice());
             assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
             assert_eq!(sha512(&data).as_slice(), Sha512::digest(&data).as_slice());
+            assert_eq!(sha384(&data).as_slice(), Sha384::digest(&data).as_slice());
         }
     }
 

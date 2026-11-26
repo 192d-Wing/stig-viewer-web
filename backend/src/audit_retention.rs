@@ -82,7 +82,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::api::signing::SigningState;
-use crate::integrity::{self, SignatureStatus, SignerId};
+use crate::integrity::{self, Profile, SignatureStatus, SignerId};
 
 /// One `rule_audit` row, shaped for JSONL archival. Matches the table
 /// columns 1:1 — we deliberately do not denormalize user/asset names
@@ -531,6 +531,17 @@ fn archived_lines(
             );
             continue;
         }
+        // Classical segments are valid, just not acceptable under
+        // SIGNING_REQUIRE_HYBRID: like an unknown key, never a definite failure.
+        if key.is_some_and(|k| k.require_hybrid) && v.profile != Some(Profile::Hybrid) {
+            tracing::warn!(
+                target: "audit",
+                segment = ?name,
+                "audit archive segment is {} but SIGNING_REQUIRE_HYBRID is set, left in place and not counted",
+                v.profile.map_or("unsigned", Profile::as_str)
+            );
+            continue;
+        }
         match lines_in(&v.body) {
             Ok(lines) => {
                 for (id, digest) in lines {
@@ -789,12 +800,14 @@ fn write_segment_with(
             signers: integrity::signers_for(key),
         };
         let payload = serde_json::to_vec(&manifest)?;
+        // A signing failure aborts the write: never fall back to a weaker or
+        // unsigned segment.
         let envelope = integrity::seal(
             integrity::ARCHIVE_DOMAIN,
             integrity::ARCHIVE_TYPE,
             &payload,
             key,
-        );
+        )?;
         if publish_new(dir, &sidecar, &serde_json::to_vec_pretty(&envelope)?, io)? == Publish::Taken
         {
             continue;
@@ -890,6 +903,8 @@ async fn archive_rows(
 /// callers read the file only once.
 pub struct VerifiedSegment {
     pub status: SignatureStatus,
+    /// The signed signer set's profile; `None` when unsigned.
+    pub profile: Option<Profile>,
     pub body: Vec<u8>,
 }
 
@@ -956,6 +971,7 @@ fn check_segment(
     );
     Ok(VerifiedSegment {
         status: v.status,
+        profile: v.profile,
         body: body.to_vec(),
     })
 }
@@ -2268,6 +2284,93 @@ mod tests {
         for d in [dir, other, dir2, other2] {
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    #[test]
+    fn hybrid_segments_verify_and_classical_ones_are_never_a_definite_failure() {
+        use crate::integrity::test_hybrid_key;
+        let classical = test_key(1);
+        let mut strict = test_hybrid_key(1);
+        let lenient = test_hybrid_key(1);
+        strict.require_hybrid = true;
+
+        // A hybrid segment is written and verifies as Hybrid.
+        let hdir = temp_dir();
+        archive_blocking(
+            &hdir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&strict),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
+        let v = verify_segment(
+            &hdir.join("audit_archive"),
+            "rules-2024-01-01.5-5.jsonl",
+            Some(&strict),
+        )
+        .unwrap();
+        assert_eq!(
+            (v.status, v.profile),
+            (SignatureStatus::Verified, Some(Profile::Hybrid))
+        );
+        // Re-sweeping the same row adds nothing.
+        archive_blocking(
+            &hdir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&strict),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
+        assert_eq!(segments(&hdir), ["rules-2024-01-01.5-5.jsonl"]);
+
+        // A classical segment (same Ed25519 key), on a hybrid server.
+        for (server, require) in [(&lenient, false), (&strict, true)] {
+            let (dir, other) = (temp_dir(), temp_dir());
+            archive_blocking(
+                &other,
+                STREAM_RULES,
+                vec![line(5, "2024-01-01")],
+                Some(&classical),
+                &mut SweepCtx::default(),
+            )
+            .unwrap();
+            plant(&other, &dir);
+            archive_blocking(
+                &dir,
+                STREAM_RULES,
+                vec![line(5, "2024-01-01")],
+                Some(server),
+                &mut SweepCtx::default(),
+            )
+            .unwrap();
+            // Never renamed, whatever the policy.
+            assert!(rejected(&dir).is_empty());
+            assert!(ad_has(&dir, "rules-2024-01-01.5-5.jsonl"));
+            let v = verify_segment(
+                &dir.join("audit_archive"),
+                "rules-2024-01-01.5-5.jsonl",
+                Some(server),
+            )
+            .unwrap();
+            assert_eq!(
+                (v.status, v.profile),
+                (SignatureStatus::Verified, Some(Profile::Classical))
+            );
+            if require {
+                // Not counted: the row is archived again as a hybrid sibling.
+                let sib = "rules-2024-01-01.5-5.r1.jsonl";
+                let v = verify_segment(&dir.join("audit_archive"), sib, Some(server)).unwrap();
+                assert_eq!(v.profile, Some(Profile::Hybrid));
+            } else {
+                assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
+            }
+            for d in [dir, other] {
+                let _ = std::fs::remove_dir_all(&d);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&hdir);
     }
 
     #[test]

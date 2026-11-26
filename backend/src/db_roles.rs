@@ -125,19 +125,24 @@ fn check_distinct_roles(owner: &str, app: &str) -> Result<()> {
 pub enum Command {
     Serve,
     Migrate,
+    /// Print a new ML-DSA-87 signing key (base64 PKCS#8) to stdout.
+    GenMldsaKey,
     /// Container health probe: `GET /api/health` on the local port, exit 0/1.
     Healthcheck,
 }
 
 /// Parse the arguments after the program name: none serves, `migrate` runs the
-/// owner step, `healthcheck` probes the local server, anything else (including
-/// extra arguments) is an error.
+/// owner step, `gen-mldsa-key` generates a signing key, `healthcheck` probes
+/// the local server, anything else (including extra arguments) is an error.
 pub fn parse_command(args: &[String]) -> Result<Command> {
     match args {
         [] => Ok(Command::Serve),
         [cmd] if cmd == "migrate" => Ok(Command::Migrate),
+        [cmd] if cmd == "gen-mldsa-key" => Ok(Command::GenMldsaKey),
         [cmd] if cmd == "healthcheck" => Ok(Command::Healthcheck),
-        _ => bail!("unknown argument; the subcommands are `migrate` and `healthcheck`"),
+        _ => bail!(
+            "unknown argument; the subcommands are `migrate`, `gen-mldsa-key` and `healthcheck`"
+        ),
     }
 }
 
@@ -1397,6 +1402,11 @@ mod tests {
             parse_command(&args(&["migrate"])).unwrap(),
             Command::Migrate
         );
+        assert_eq!(
+            parse_command(&args(&["gen-mldsa-key"])).unwrap(),
+            Command::GenMldsaKey
+        );
+        assert!(parse_command(&args(&["gen-mldsa-key", "extra"])).is_err());
         assert_eq!(
             parse_command(&args(&["healthcheck"])).unwrap(),
             Command::Healthcheck

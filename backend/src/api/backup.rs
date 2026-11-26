@@ -50,7 +50,7 @@ use crate::zip_safe::{read_entry, ReadBudget, ZipReadError};
 
 use crate::api::auth::AuthUser;
 use crate::api::signing::SigningState;
-use crate::integrity::{self, SignatureStatus, SignerId};
+use crate::integrity::{self, Profile, SignatureStatus, SignerId};
 use crate::AppState;
 
 const BACKUP_VERSION: &str = "2";
@@ -386,7 +386,7 @@ fn build_backup_zip(
             integrity::BACKUP_TYPE,
             &manifest_bytes,
             signing,
-        );
+        )?;
         zip.start_file(MANIFEST_SIG_NAME, options)?;
         zip.write_all(&serde_json::to_vec_pretty(&envelope)?)?;
     }
@@ -410,6 +410,9 @@ pub struct RestoreResponse {
     pub attachments_written: i64,
     /// `verified`, `unsigned` or `unknown_key`.
     pub signature_status: &'static str,
+    /// `classical` or `hybrid`; absent when the backup is unsigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_profile: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forced: Option<bool>,
 }
@@ -477,7 +480,7 @@ pub async fn restore_handler(
         tracing::error!("restore join error: {e:#}");
         err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     })?;
-    let (manifest, tables, attachments, signature_status) = match verified {
+    let (manifest, tables, attachments, signature_status, signature_profile) = match verified {
         Ok(v) => v,
         Err(f) => {
             tracing::warn!(target: "audit", actor = %user.id, signature_status = f.status, reason_code = f.code, "restore rejected: {}", f.message);
@@ -513,6 +516,11 @@ pub async fn restore_handler(
             ));
         }
     };
+
+    // SIGNING_REQUIRE_HYBRID is set but a verified non-hybrid backup got
+    // through (only BACKUP_REQUIRE_SIGNATURE=false allows that): recorded.
+    let require_hybrid = state.signing.as_ref().is_some_and(|k| k.require_hybrid);
+    let hybrid_overridden = hybrid_overridden(require_hybrid, signature_status, signature_profile);
 
     // Schema version gate — refuse to load a backup taken against a
     // different migration set. Reduces the blast radius if someone
@@ -572,6 +580,7 @@ pub async fn restore_handler(
         request_id = %ctx.request_id,
         forced = q.force,
         signature_status = signature_status.as_str(),
+        signature_profile = signature_profile.map(Profile::as_str),
         require_signature = require_signature,
         backup_rows = backup_rows,
         backup_counts = ?backup_counts,
@@ -717,6 +726,7 @@ pub async fn restore_handler(
                         "reasonCode": code,
                         "forced": q.force,
                         "signatureStatus": signature_status.as_str(),
+                        "signatureProfile": signature_profile.map(Profile::as_str),
                     }),
                 },
             )
@@ -737,7 +747,7 @@ pub async fn restore_handler(
     // Record the restore inside the transaction: if the record cannot be
     // written, the restore is rolled back rather than committed unrecorded.
     let restored_rows: i64 = restored.values().sum();
-    record_restore(&mut tx, &user.id, &ctx, q.force, restored_rows, actor_row.as_ref(), (signature_status, require_signature))
+    record_restore(&mut tx, &user.id, &ctx, q.force, restored_rows, actor_row.as_ref(), (signature_status, signature_profile, require_signature), (require_hybrid, hybrid_overridden))
         .await
         .map_err(|e| match e {
             RecordRestoreError::NoActor => {
@@ -793,6 +803,7 @@ pub async fn restore_handler(
         restored,
         attachments_written: written,
         signature_status: signature_status.as_str(),
+        signature_profile: signature_profile.map(Profile::as_str),
         forced: if q.force { Some(true) } else { None },
     }))
 }
@@ -814,6 +825,7 @@ impl From<sqlx::Error> for RecordRestoreError {
 /// user the event is attributed to (the same id, else the same IdP identity
 /// under the id the restored data uses), then record `backup.restore` on the
 /// same transaction.
+#[allow(clippy::too_many_arguments)] // one call site per restore; a struct would only move the fields
 async fn record_restore(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor: &str,
@@ -821,7 +833,12 @@ async fn record_restore(
     forced: bool,
     restored_rows: i64,
     actor_row: Option<&Value>,
-    (signature_status, require_signature): (SignatureStatus, bool),
+    (signature_status, signature_profile, require_signature): (
+        SignatureStatus,
+        Option<Profile>,
+        bool,
+    ),
+    (require_hybrid, hybrid_overridden): (bool, bool),
 ) -> Result<(), RecordRestoreError> {
     if let Some(row) = actor_row {
         sqlx::query("INSERT INTO users SELECT * FROM jsonb_populate_record(NULL::users, $1) ON CONFLICT DO NOTHING")
@@ -854,7 +871,10 @@ async fn record_restore(
         "forced": forced,
         "restoredRows": restored_rows,
         "signatureStatus": signature_status.as_str(),
+        "signatureProfile": signature_profile.map(Profile::as_str),
         "requireSignature": require_signature,
+        "requireHybrid": require_hybrid,
+        "hybridOverridden": hybrid_overridden,
     });
     if attributed != actor {
         detail["actorIdBeforeRestore"] = json!(actor);
@@ -874,6 +894,16 @@ async fn record_restore(
     )
     .await
     .map_err(RecordRestoreError::Db)
+}
+
+/// True when `SIGNING_REQUIRE_HYBRID` is set but a verified non-hybrid backup
+/// was let through (only `BACKUP_REQUIRE_SIGNATURE=false` allows that).
+fn hybrid_overridden(
+    require_hybrid: bool,
+    status: SignatureStatus,
+    profile: Option<Profile>,
+) -> bool {
+    require_hybrid && status == SignatureStatus::Verified && profile != Some(Profile::Hybrid)
 }
 
 /// A restore rejected before it touched the database.
@@ -930,6 +960,15 @@ const MAX_MANIFEST_BYTES: u64 = 16 << 20;
 type ParsedTables = HashMap<String, Vec<Value>>;
 type ParsedAttachments = Vec<(String, Vec<u8>)>;
 
+/// A backup that passed [`parse_and_verify_backup`].
+type VerifiedBackup = (
+    Manifest,
+    ParsedTables,
+    ParsedAttachments,
+    SignatureStatus,
+    Option<Profile>,
+);
+
 /// Parse and verify a backup ZIP. Sync — call from inside `spawn_blocking`.
 ///
 /// Order: the manifest and signature are read and checked first (version,
@@ -939,7 +978,7 @@ fn parse_and_verify_backup(
     bytes: &[u8],
     signing: Option<&SigningState>,
     require: bool,
-) -> Result<(Manifest, ParsedTables, ParsedAttachments, SignatureStatus), VerifyFailure> {
+) -> Result<VerifiedBackup, VerifyFailure> {
     let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(ZipReadError::from)?;
     let mut budget = ReadBudget::new(MAX_TOTAL_BYTES);
 
@@ -986,7 +1025,7 @@ fn parse_and_verify_backup(
         Ok(mut e) => Some(read_entry(&mut e, MAX_MANIFEST_BYTES, &mut budget)?),
         Err(_) => None,
     };
-    let status = verify_signature(
+    let (status, profile) = verify_signature(
         &manifest,
         &manifest_bytes,
         sig_bytes.as_deref(),
@@ -1048,7 +1087,7 @@ fn parse_and_verify_backup(
             )));
         }
     }
-    Ok((manifest, tables, attachments, status))
+    Ok((manifest, tables, attachments, status, profile))
 }
 
 /// Check version consistency, the signature and the policy. A signature that
@@ -1060,8 +1099,31 @@ fn verify_signature(
     sig: Option<&[u8]>,
     signing: Option<&SigningState>,
     require: bool,
-) -> Result<SignatureStatus, VerifyFailure> {
-    let policy = |status: SignatureStatus| -> Result<SignatureStatus, VerifyFailure> {
+) -> Result<(SignatureStatus, Option<Profile>), VerifyFailure> {
+    let policy = |status: SignatureStatus,
+                  profile: Option<Profile>|
+     -> Result<(SignatureStatus, Option<Profile>), VerifyFailure> {
+        // A verified classical backup is valid but not acceptable under
+        // SIGNING_REQUIRE_HYBRID; BACKUP_REQUIRE_SIGNATURE=false is the
+        // break-glass override.
+        if require
+            && status == SignatureStatus::Verified
+            && profile != Some(Profile::Hybrid)
+            && signing.is_some_and(|k| k.require_hybrid)
+        {
+            return Err(VerifyFailure::new(
+                status.as_str(),
+                "backup is signed with the classical (Ed25519-only) profile and SIGNING_REQUIRE_HYBRID is set (set BACKUP_REQUIRE_SIGNATURE=false to restore it anyway)",
+            ));
+        }
+        if hybrid_overridden(signing.is_some_and(|k| k.require_hybrid), status, profile) {
+            // Reached only with `require` false: the break-glass override.
+            tracing::warn!(
+                target: "audit",
+                signature_profile = profile.map(Profile::as_str),
+                "restoring a classical backup although SIGNING_REQUIRE_HYBRID is set (BACKUP_REQUIRE_SIGNATURE=false)"
+            );
+        }
         if status != SignatureStatus::Verified {
             if require {
                 return Err(VerifyFailure::new(
@@ -1078,7 +1140,7 @@ fn verify_signature(
                 "restoring a backup whose signature could not be verified"
             );
         }
-        Ok(status)
+        Ok((status, profile))
     };
     if m.version == "1" {
         // A version 1 backup has no digests or signature. Refuse anything that
@@ -1094,7 +1156,7 @@ fn verify_signature(
                 "version 1 manifest carries version 2 integrity fields (downgrade)",
             ));
         }
-        return policy(SignatureStatus::Unsigned);
+        return policy(SignatureStatus::Unsigned, None);
     }
     if m.kind != integrity::BACKUP_TYPE {
         return Err(VerifyFailure::new(
@@ -1108,8 +1170,8 @@ fn verify_signature(
             format!("unsupported entries digest {:?}", m.entries_digest),
         ));
     }
-    let status = match (sig, m.signers.is_empty()) {
-        (None, true) => SignatureStatus::Unsigned,
+    let (status, profile) = match (sig, m.signers.is_empty()) {
+        (None, true) => (SignatureStatus::Unsigned, None),
         (None, false) => {
             return Err(VerifyFailure::new(
                 "invalid",
@@ -1117,18 +1179,18 @@ fn verify_signature(
             ))
         }
         (Some(sig), _) => {
-            integrity::verify_envelope(
+            let v = integrity::verify_envelope(
                 integrity::BACKUP_DOMAIN,
                 integrity::BACKUP_TYPE,
                 sig,
                 Some(manifest_bytes),
                 signing,
             )
-            .map_err(|e| VerifyFailure::new("invalid", e.to_string()))?
-            .status
+            .map_err(|e| VerifyFailure::new("invalid", e.to_string()))?;
+            (v.status, v.profile)
         }
     };
-    policy(status)
+    policy(status, profile)
 }
 
 // Silence the unused-import lint when the `json!` macro isn't reached
@@ -1176,7 +1238,8 @@ mod restore_record_tests {
             true,
             0,
             Some(&row),
-            (SignatureStatus::Unsigned, false),
+            (SignatureStatus::Unsigned, None, false),
+            (false, false),
         )
         .await
         .unwrap();
@@ -1191,6 +1254,32 @@ mod restore_record_tests {
             .await
             .unwrap();
         assert_eq!(events, ["backup.restore"]);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_hybrid_override_is_recorded_in_the_restore_event(pool: PgPool) {
+        seed_user(&pool, "admin1").await;
+        let row = actor_row(&pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        record_restore(
+            &mut tx,
+            "admin1",
+            &ctx(),
+            true,
+            0,
+            Some(&row),
+            (SignatureStatus::Verified, Some(Profile::Classical), false),
+            (true, true),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let rows = crate::test_fixtures::audit_rows(&pool, "backup.restore").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].detail["signatureProfile"], "classical");
+        assert_eq!(rows[0].detail["requireHybrid"], true);
+        assert_eq!(rows[0].detail["hybridOverridden"], true);
     }
 
     #[sqlx::test]
@@ -1216,7 +1305,8 @@ mod restore_record_tests {
                 true,
                 0,
                 None,
-                (SignatureStatus::Unsigned, false)
+                (SignatureStatus::Unsigned, None, false),
+                (false, false)
             )
             .await,
             Err(RecordRestoreError::NoActor)
@@ -1256,7 +1346,8 @@ mod restore_record_tests {
             true,
             0,
             Some(&row),
-            (SignatureStatus::Unsigned, false),
+            (SignatureStatus::Unsigned, None, false),
+            (false, false),
         )
         .await
         .unwrap();
@@ -1297,7 +1388,8 @@ mod restore_record_tests {
                 true,
                 0,
                 None,
-                (SignatureStatus::Unsigned, false)
+                (SignatureStatus::Unsigned, None, false),
+                (false, false)
             )
             .await,
             Err(RecordRestoreError::NoActor)
@@ -1497,7 +1589,8 @@ mod integrity_tests {
             integrity::BACKUP_TYPE,
             &manifest_bytes,
             Some(&k),
-        );
+        )
+        .unwrap();
         let bad = rewrite(&zip, |n, b| {
             Some(if n == MANIFEST_SIG_NAME {
                 serde_json::to_vec(&replay).unwrap()
@@ -1592,6 +1685,105 @@ mod integrity_tests {
         );
         let f = parse_and_verify_backup(&signed, Some(&other), true).unwrap_err();
         assert_eq!(f.status, "unknown_key");
+    }
+
+    fn check_full(
+        zip: &[u8],
+        key: Option<&SigningState>,
+        require: bool,
+    ) -> Result<(SignatureStatus, Option<Profile>), String> {
+        parse_and_verify_backup(zip, key, require)
+            .map(|r| (r.3, r.4))
+            .map_err(|f| f.message)
+    }
+
+    #[test]
+    fn hybrid_backup_round_trips_and_needs_both_signatures() {
+        let k = crate::integrity::test_hybrid_key(1);
+        let zip = build(Some(&k));
+        let (m, _) = manifest_of(&zip);
+        assert_eq!(m.version, "2");
+        assert_eq!(m.signers.len(), 2);
+        assert_eq!(
+            check_full(&zip, Some(&k), true).unwrap(),
+            (SignatureStatus::Verified, Some(Profile::Hybrid))
+        );
+        // Stripping the signature entry while the manifest names signers.
+        let stripped = rewrite(&zip, |n, b| (n != MANIFEST_SIG_NAME).then_some(b));
+        assert!(check(&stripped, Some(&k), false)
+            .unwrap_err()
+            .contains("is missing"));
+        // Dropping just the ML-DSA signature.
+        let half = rewrite(&zip, |n, b| {
+            Some(if n == MANIFEST_SIG_NAME {
+                let mut env: integrity::Envelope = serde_json::from_slice(&b).unwrap();
+                env.signatures.pop();
+                serde_json::to_vec(&env).unwrap()
+            } else {
+                b
+            })
+        });
+        assert!(check(&half, Some(&k), false)
+            .unwrap_err()
+            .contains("MissingSignature"));
+        // Edited manifest bytes no longer match the signed ones.
+        let edited = rewrite(&zip, |n, mut b| {
+            if n == MANIFEST_NAME {
+                b.push(b' ');
+            }
+            Some(b)
+        });
+        assert!(check(&edited, Some(&k), false)
+            .unwrap_err()
+            .contains("PayloadMismatch"));
+    }
+
+    #[test]
+    fn hybrid_overridden_is_true_only_for_a_verified_non_hybrid_backup_under_the_flag() {
+        use SignatureStatus::*;
+        let (c, h) = (Some(Profile::Classical), Some(Profile::Hybrid));
+        assert!(hybrid_overridden(true, Verified, c));
+        assert!(!hybrid_overridden(true, Verified, h));
+        assert!(!hybrid_overridden(true, Unsigned, None));
+        assert!(!hybrid_overridden(true, UnknownKey, c));
+        assert!(!hybrid_overridden(false, Verified, c));
+        assert!(!hybrid_overridden(false, Verified, h));
+    }
+
+    #[test]
+    fn classical_backups_under_require_hybrid() {
+        let classical = test_key(1);
+        let mut strict = crate::integrity::test_hybrid_key(1);
+        strict.require_hybrid = true;
+        let lenient = crate::integrity::test_hybrid_key(1);
+        let old = build(Some(&classical));
+        let new = build(Some(&strict));
+
+        // Without the flag a classical backup restores, with its profile reported.
+        assert_eq!(
+            check_full(&old, Some(&lenient), true).unwrap(),
+            (SignatureStatus::Verified, Some(Profile::Classical))
+        );
+        // With it, restore is refused ...
+        let err = check_full(&old, Some(&strict), true).unwrap_err();
+        assert!(err.contains("SIGNING_REQUIRE_HYBRID"), "{err}");
+        let f = parse_and_verify_backup(&old, Some(&strict), true).unwrap_err();
+        assert_eq!(f.status, "verified");
+        // ... unless the break-glass BACKUP_REQUIRE_SIGNATURE=false is set.
+        assert_eq!(
+            check_full(&old, Some(&strict), false).unwrap(),
+            (SignatureStatus::Verified, Some(Profile::Classical))
+        );
+        // Hybrid backups are always fine.
+        assert_eq!(
+            check_full(&new, Some(&strict), true).unwrap(),
+            (SignatureStatus::Verified, Some(Profile::Hybrid))
+        );
+        // The flag does not affect unsigned backups beyond BACKUP_REQUIRE_SIGNATURE.
+        assert_eq!(
+            check_full(&build(None), Some(&strict), false).unwrap(),
+            (SignatureStatus::Unsigned, None)
+        );
     }
 
     /// Two entries of the same name. The writer refuses them, so the second is
@@ -2257,7 +2449,7 @@ mod tests {
         bytes: &[u8],
     ) -> anyhow::Result<(Manifest, ParsedTables, ParsedAttachments)> {
         parse_and_verify_backup(bytes, None, false)
-            .map(|(m, t, a, _)| (m, t, a))
+            .map(|(m, t, a, _, _)| (m, t, a))
             .map_err(|f| anyhow::anyhow!(f.message))
     }
 
@@ -2415,7 +2607,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tables = || HashMap::from([("users".to_string(), vec![json!({"id": 1})])]);
         let unsigned = build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();
-        let (_, t, _, status) = parse_and_verify_backup(&unsigned, None, false).unwrap();
+        let (_, t, _, status, _) = parse_and_verify_backup(&unsigned, None, false).unwrap();
         assert_eq!(t.get("users").map(Vec::len), Some(1));
         assert_eq!(status.as_str(), "unsigned");
 
@@ -2423,7 +2615,7 @@ mod tests {
         let signed =
             build_backup_zip(manifest(), tables(), vec![], dir.clone(), Some(&key)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let (_, _, _, status) = parse_and_verify_backup(&signed, Some(&key), true).unwrap();
+        let (_, _, _, status, _) = parse_and_verify_backup(&signed, Some(&key), true).unwrap();
         assert_eq!(status.as_str(), "verified");
     }
 }

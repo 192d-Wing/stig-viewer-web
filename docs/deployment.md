@@ -96,9 +96,46 @@ below are generic, use `podman`, and use placeholders only.
 
 - `SIGNING_KEY_HEX` (`<64-hex-chars>`; unset means signing is off) and
   `BACKUP_REQUIRE_SIGNATURE`. The key is the 32-byte Ed25519 seed as 64 hex
-  characters for the current algorithm; the length is algorithm-specific and may
-  change if ML-DSA or hybrid signing is added (#66). Keep the key in a secret
-  store, not a compose or env file.
+  characters. Keep keys in a secret store, not a compose or env file.
+- Hybrid (Ed25519 + ML-DSA-87) signing, optional:
+  - `SIGNING_MLDSA87_KEY_B64`: base64 PKCS#8 ML-DSA-87 private key. Generate
+    one with `stig-viewer-backend gen-mldsa-key` (a `fips` build needs
+    `STIG_FIPS_PENDING_ALGS=ML-DSA-87` for this too). The key goes to stdout
+    and its key id to stderr; nothing is logged or stored, so capture stdout
+    straight into the secret store. `openssl genpkey -algorithm ML-DSA-87`
+    output (PKCS#8 DER, base64) also loads.
+  - With both keys, `/api/sign` bundles, audit archive manifests and backup
+    manifests carry both signatures, and verifiers need both to accept. ML-DSA
+    alone, or a malformed key, stops startup; a failed ML-DSA operation fails
+    the request or write and never falls back to Ed25519-only output.
+  - In a `fips` build, the ML-DSA key requires `ML-DSA-87` in
+    `STIG_FIPS_PENDING_ALGS`, otherwise startup fails. ML-DSA-87 runs in the
+    AWS-LC module there but is a pending algorithm: no validation is claimed.
+  - **Hybrid signing alone gives no post-quantum protection for acceptance.**
+    A server with both keys still verifies and accepts classical (Ed25519-only)
+    artifacts by default, so a forger of Ed25519 can still produce an
+    acceptable artifact until `SIGNING_REQUIRE_HYBRID=true` is set.
+  - `SIGNING_REQUIRE_HYBRID=true` (default false) refuses to start without both
+    keys and makes restore (and the archive duplicate check) refuse a verified
+    Ed25519-only artifact. Break-glass for restore is
+    `BACKUP_REQUIRE_SIGNATURE=false`.
+  - External verifiers must pin the keys from the `GET /api/signing/pubkey`
+    JSON obtained out of band (not from the bundle or the same channel as the
+    artifact), and must not use `--allow-classical` once
+    `SIGNING_REQUIRE_HYBRID` is deployed.
+  - Run `gen-mldsa-key` with stdout redirected to a file or secret store (it
+    refuses to print to a terminal). Do not run it where a log driver captures
+    stdout, for example `podman run` without redirection.
+  - Enabling order: (1) update external verifiers to
+    `scripts/verify-bundle.mjs` or equivalent, pinning both keys from
+    `GET /api/signing/pubkey`; (2) set `SIGNING_MLDSA87_KEY_B64` and restart;
+    (3) once old classical artifacts no longer need restoring or counting, set
+    `SIGNING_REQUIRE_HYBRID=true`.
+  - Do not roll back to a build without ML-DSA support after enabling hybrid:
+    it cannot verify hybrid archive segments (it renames them `.rejected-*`)
+    or restore hybrid backups. Remove the ML-DSA key (back to classical) on
+    the new build instead; existing hybrid artifacts then verify as
+    `unknown_key`.
 - Production should set `SIGNING_KEY_HEX` and leave `BACKUP_REQUIRE_SIGNATURE`
   unset or `true`. `false` is break-glass (e.g. restoring `unknown_key`
   backups after rotation); revert it afterwards.
