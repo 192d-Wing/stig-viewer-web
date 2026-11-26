@@ -813,8 +813,9 @@ fn build_app(
         .route("/api/health", get(get_health))
         .route("/api/catalog", get(get_catalog))
         .route("/api/stigs/:id", get(get_stig))
-        // Public verifier key for offline signature verification. Returns
-        // 503 when SIGNING_KEY_HEX isn't set.
+        // Public verifier keys for offline signature verification: the
+        // current keys and, when configured, the previous key sets
+        // (`previousKeys`, #68). Returns 503 when SIGNING_KEY_HEX isn't set.
         .route("/api/signing/pubkey", get(api::signing::pubkey_handler))
         .with_state(state.clone())
         .merge(auth_routes)
@@ -855,6 +856,40 @@ fn panic_response(err: Box<dyn std::any::Any + Send + 'static>) -> axum::respons
         axum::Json(serde_json::json!({"error": "internal error"})),
     )
         .into_response()
+}
+
+/// Startup log for the previous-keys configuration (#68): what is trusted in
+/// addition to the current keys, and what was ignored or is of no use.
+fn log_previous_keys(s: &api::signing::SigningState) {
+    let prev = &s.previous;
+    if prev.is_empty() && prev.ignored.is_empty() {
+        return;
+    }
+    info!(
+        sets = prev.sets.len(),
+        revoked = prev.revoked.len(),
+        carrier = prev.source,
+        config_sha384 = %prev.sha384,
+        "Previous signing keys loaded (verify-only)"
+    );
+    for set in &prev.sets {
+        info!(
+            label = set.label.as_deref().unwrap_or(""),
+            profile = set.profile.as_str(),
+            key_ids = %set.key_ids().join(","),
+            retired_at = set.retired_at.as_deref().unwrap_or(""),
+            "Previous signing key set"
+        );
+        if s.require_hybrid && set.profile == signers::Profile::Classical {
+            tracing::warn!(
+                label = set.label.as_deref().unwrap_or(""),
+                "Classical previous key set verifies but is not acceptable while SIGNING_REQUIRE_HYBRID is set"
+            );
+        }
+    }
+    for label in &prev.ignored {
+        tracing::warn!(label = %label, "Previous key set equals the current keys and is ignored");
+    }
 }
 
 #[tokio::main]
@@ -960,6 +995,8 @@ async fn main() -> Result<()> {
                     "Signing is classical (Ed25519 only): set SIGNING_MLDSA87_KEY_B64 for hybrid ML-DSA-87 signatures"
                 );
             }
+            log_previous_keys(s);
+            api::signing::record_signing_keys_event(&pool, s).await;
         }
         None => info!("Signing disabled (SIGNING_KEY_HEX not set)"),
     }

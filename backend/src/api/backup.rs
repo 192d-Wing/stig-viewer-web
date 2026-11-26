@@ -51,6 +51,7 @@ use crate::zip_safe::{read_entry, ReadBudget, ZipReadError};
 use crate::api::auth::AuthUser;
 use crate::api::signing::SigningState;
 use crate::integrity::{self, Profile, SignatureStatus, SignerId};
+use crate::signers::Algorithm;
 use crate::AppState;
 
 const BACKUP_VERSION: &str = "2";
@@ -413,6 +414,10 @@ pub struct RestoreResponse {
     /// `classical` or `hybrid`; absent when the backup is unsigned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_profile: Option<&'static str>,
+    /// `current` or `previous` (a rotated-out key set, #68); absent unless the
+    /// signature verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_key_source: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forced: Option<bool>,
 }
@@ -480,7 +485,7 @@ pub async fn restore_handler(
         tracing::error!("restore join error: {e:#}");
         err_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     })?;
-    let (manifest, tables, attachments, signature_status, signature_profile) = match verified {
+    let (manifest, tables, attachments, outcome) = match verified {
         Ok(v) => v,
         Err(f) => {
             tracing::warn!(target: "audit", actor = %user.id, signature_status = f.status, reason_code = f.code, "restore rejected: {}", f.message);
@@ -496,12 +501,19 @@ pub async fn restore_handler(
                     asset_id: None,
                     checklist_id: None,
                     stig_id: None,
-                    detail: json!({
-                        "reason": reason,
-                        "reasonCode": f.code,
-                        "signatureStatus": f.status,
-                        "requireSignature": require_signature,
-                    }),
+                    detail: {
+                        let mut d = json!({
+                            "reason": reason,
+                            "reasonCode": f.code,
+                            "signatureStatus": f.status,
+                            "requireSignature": require_signature,
+                            "signatureKeyIds": f.key_ids,
+                        });
+                        if f.revoked {
+                            d["keyRevoked"] = json!(true);
+                        }
+                        d
+                    },
                 },
             )
             .await;
@@ -520,6 +532,7 @@ pub async fn restore_handler(
     // SIGNING_REQUIRE_HYBRID is set but a verified non-hybrid backup got
     // through (only BACKUP_REQUIRE_SIGNATURE=false allows that): recorded.
     let require_hybrid = state.signing.as_ref().is_some_and(|k| k.require_hybrid);
+    let (signature_status, signature_profile) = (outcome.status, outcome.profile);
     let hybrid_overridden = hybrid_overridden(require_hybrid, signature_status, signature_profile);
 
     // Schema version gate — refuse to load a backup taken against a
@@ -581,6 +594,10 @@ pub async fn restore_handler(
         forced = q.force,
         signature_status = signature_status.as_str(),
         signature_profile = signature_profile.map(Profile::as_str),
+        signature_key_source = outcome.key_source(),
+        signature_key_ids = %outcome.key_ids().join(","),
+        signature_key_label = outcome.key_label(),
+        key_revoked = outcome.revoked,
         require_signature = require_signature,
         backup_rows = backup_rows,
         backup_counts = ?backup_counts,
@@ -722,12 +739,16 @@ pub async fn restore_handler(
                     asset_id: None,
                     checklist_id: None,
                     stig_id: None,
-                    detail: json!({
-                        "reasonCode": code,
-                        "forced": q.force,
-                        "signatureStatus": signature_status.as_str(),
-                        "signatureProfile": signature_profile.map(Profile::as_str),
-                    }),
+                    detail: {
+                        let mut d = json!({
+                            "reasonCode": code,
+                            "forced": q.force,
+                            "signatureStatus": signature_status.as_str(),
+                            "signatureProfile": signature_profile.map(Profile::as_str),
+                        });
+                        outcome.add_key_fields(&mut d);
+                        d
+                    },
                 },
             )
             .await;
@@ -747,7 +768,7 @@ pub async fn restore_handler(
     // Record the restore inside the transaction: if the record cannot be
     // written, the restore is rolled back rather than committed unrecorded.
     let restored_rows: i64 = restored.values().sum();
-    record_restore(&mut tx, &user.id, &ctx, q.force, restored_rows, actor_row.as_ref(), (signature_status, signature_profile, require_signature), (require_hybrid, hybrid_overridden))
+    record_restore(&mut tx, &user.id, &ctx, q.force, restored_rows, actor_row.as_ref(), (&outcome, require_signature), (require_hybrid, hybrid_overridden))
         .await
         .map_err(|e| match e {
             RecordRestoreError::NoActor => {
@@ -804,6 +825,7 @@ pub async fn restore_handler(
         attachments_written: written,
         signature_status: signature_status.as_str(),
         signature_profile: signature_profile.map(Profile::as_str),
+        signature_key_source: outcome.key_source(),
         forced: if q.force { Some(true) } else { None },
     }))
 }
@@ -833,11 +855,7 @@ async fn record_restore(
     forced: bool,
     restored_rows: i64,
     actor_row: Option<&Value>,
-    (signature_status, signature_profile, require_signature): (
-        SignatureStatus,
-        Option<Profile>,
-        bool,
-    ),
+    (outcome, require_signature): (&SignatureOutcome, bool),
     (require_hybrid, hybrid_overridden): (bool, bool),
 ) -> Result<(), RecordRestoreError> {
     if let Some(row) = actor_row {
@@ -870,12 +888,13 @@ async fn record_restore(
     let mut detail = json!({
         "forced": forced,
         "restoredRows": restored_rows,
-        "signatureStatus": signature_status.as_str(),
-        "signatureProfile": signature_profile.map(Profile::as_str),
+        "signatureStatus": outcome.status.as_str(),
+        "signatureProfile": outcome.profile.map(Profile::as_str),
         "requireSignature": require_signature,
         "requireHybrid": require_hybrid,
         "hybridOverridden": hybrid_overridden,
     });
+    outcome.add_key_fields(&mut detail);
     if attributed != actor {
         detail["actorIdBeforeRestore"] = json!(actor);
     }
@@ -918,6 +937,10 @@ struct VerifyFailure {
     code: &'static str,
     /// The archive exceeded a size cap (HTTP 413 rather than 400).
     too_large: bool,
+    /// Claimed signer key ids (hex-filtered) when the key was the problem.
+    key_ids: Vec<String>,
+    /// The backup is signed by a revoked key.
+    revoked: bool,
 }
 
 impl VerifyFailure {
@@ -927,6 +950,8 @@ impl VerifyFailure {
             status,
             code: "invalid_backup",
             too_large: false,
+            key_ids: Vec::new(),
+            revoked: false,
         }
     }
 }
@@ -961,13 +986,58 @@ type ParsedTables = HashMap<String, Vec<Value>>;
 type ParsedAttachments = Vec<(String, Vec<u8>)>;
 
 /// A backup that passed [`parse_and_verify_backup`].
-type VerifiedBackup = (
-    Manifest,
-    ParsedTables,
-    ParsedAttachments,
-    SignatureStatus,
-    Option<Profile>,
-);
+type VerifiedBackup = (Manifest, ParsedTables, ParsedAttachments, SignatureOutcome);
+
+/// What the signature check found out about a backup.
+#[derive(Debug, Clone)]
+struct SignatureOutcome {
+    status: SignatureStatus,
+    /// The signed signer set's profile; `None` when unsigned.
+    profile: Option<Profile>,
+    /// The key set that verified the signature (`Some` only when verified).
+    verified_by: Option<integrity::VerifiedBy>,
+    /// A signer is on the revoked list.
+    revoked: bool,
+    /// Claimed signer key ids (hex-filtered), for when nothing verified.
+    signer_key_ids: Vec<String>,
+}
+
+impl SignatureOutcome {
+    fn plain(status: SignatureStatus, profile: Option<Profile>) -> Self {
+        Self {
+            status,
+            profile,
+            verified_by: None,
+            revoked: false,
+            signer_key_ids: Vec::new(),
+        }
+    }
+
+    /// `current` or `previous`; `None` unless the signature verified.
+    fn key_source(&self) -> Option<&'static str> {
+        self.verified_by.as_ref().map(|b| b.source.as_str())
+    }
+
+    fn key_ids(&self) -> Vec<String> {
+        self.verified_by
+            .as_ref()
+            .map_or_else(|| self.signer_key_ids.clone(), |b| b.key_ids.clone())
+    }
+
+    fn key_label(&self) -> Option<&str> {
+        self.verified_by.as_ref().and_then(|b| b.label.as_deref())
+    }
+
+    /// Add the key-identity fields to a `backup.restore` audit detail.
+    fn add_key_fields(&self, detail: &mut Value) {
+        detail["signatureKeySource"] = json!(self.key_source());
+        detail["signatureKeyIds"] = json!(self.key_ids());
+        detail["signatureKeyLabel"] = json!(self.key_label());
+        if self.revoked {
+            detail["keyRevoked"] = json!(true);
+        }
+    }
+}
 
 /// Parse and verify a backup ZIP. Sync — call from inside `spawn_blocking`.
 ///
@@ -1025,13 +1095,14 @@ fn parse_and_verify_backup(
         Ok(mut e) => Some(read_entry(&mut e, MAX_MANIFEST_BYTES, &mut budget)?),
         Err(_) => None,
     };
-    let (status, profile) = verify_signature(
+    let outcome = verify_signature(
         &manifest,
         &manifest_bytes,
         sig_bytes.as_deref(),
         signing,
         require,
     )?;
+    let status = outcome.status;
     let fail = |msg: String| VerifyFailure::new(status.as_str(), msg);
 
     let mut digests: BTreeMap<String, String> = BTreeMap::new();
@@ -1087,7 +1158,7 @@ fn parse_and_verify_backup(
             )));
         }
     }
-    Ok((manifest, tables, attachments, status, profile))
+    Ok((manifest, tables, attachments, outcome))
 }
 
 /// Check version consistency, the signature and the policy. A signature that
@@ -1099,10 +1170,40 @@ fn verify_signature(
     sig: Option<&[u8]>,
     signing: Option<&SigningState>,
     require: bool,
-) -> Result<(SignatureStatus, Option<Profile>), VerifyFailure> {
-    let policy = |status: SignatureStatus,
-                  profile: Option<Profile>|
-     -> Result<(SignatureStatus, Option<Profile>), VerifyFailure> {
+) -> Result<SignatureOutcome, VerifyFailure> {
+    let policy = |outcome: SignatureOutcome| -> Result<SignatureOutcome, VerifyFailure> {
+        let (status, profile) = (outcome.status, outcome.profile);
+        // A backup signed by a revoked key is never acceptable as a verified
+        // one; only BACKUP_REQUIRE_SIGNATURE=false restores it, and the audit
+        // row records `keyRevoked`.
+        if outcome.revoked && require {
+            // Message and audit row both come from the validated revoked list.
+            let named: Vec<(&'static str, String)> = signing
+                .map(SigningState::trusted)
+                .map(|t| {
+                    m.signers
+                        .iter()
+                        .filter_map(|s| {
+                            Algorithm::from_wire(&s.algorithm)
+                                .and_then(|a| t.revoked(a, &s.key_id))
+                                .map(|r| (r.algorithm.wire(), r.key_id.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let described: Vec<String> = named.iter().map(|(a, id)| format!("{a} {id}")).collect();
+            return Err(VerifyFailure {
+                key_ids: named.into_iter().map(|(_, id)| id).collect(),
+                revoked: true,
+                ..VerifyFailure::new(
+                    status.as_str(),
+                    format!(
+                        "backup is signed by a revoked key ({}) (set BACKUP_REQUIRE_SIGNATURE=false to restore it anyway)",
+                        described.join(", ")
+                    ),
+                )
+            });
+        }
         // A verified classical backup is valid but not acceptable under
         // SIGNING_REQUIRE_HYBRID; BACKUP_REQUIRE_SIGNATURE=false is the
         // break-glass override.
@@ -1126,13 +1227,16 @@ fn verify_signature(
         }
         if status != SignatureStatus::Verified {
             if require {
-                return Err(VerifyFailure::new(
-                    status.as_str(),
-                    format!(
-                        "backup signature is {} and a verified signature is required (set BACKUP_REQUIRE_SIGNATURE=false to restore unsigned backups)",
-                        status.as_str()
-                    ),
-                ));
+                return Err(VerifyFailure {
+                    key_ids: outcome.signer_key_ids.clone(),
+                    ..VerifyFailure::new(
+                        status.as_str(),
+                        format!(
+                            "backup signature is {} and a verified signature is required (set BACKUP_REQUIRE_SIGNATURE=false to restore unsigned backups)",
+                            status.as_str()
+                        ),
+                    )
+                });
             }
             tracing::warn!(
                 target: "audit",
@@ -1140,7 +1244,7 @@ fn verify_signature(
                 "restoring a backup whose signature could not be verified"
             );
         }
-        Ok((status, profile))
+        Ok(outcome)
     };
     if m.version == "1" {
         // A version 1 backup has no digests or signature. Refuse anything that
@@ -1156,7 +1260,7 @@ fn verify_signature(
                 "version 1 manifest carries version 2 integrity fields (downgrade)",
             ));
         }
-        return policy(SignatureStatus::Unsigned, None);
+        return policy(SignatureOutcome::plain(SignatureStatus::Unsigned, None));
     }
     if m.kind != integrity::BACKUP_TYPE {
         return Err(VerifyFailure::new(
@@ -1170,8 +1274,8 @@ fn verify_signature(
             format!("unsupported entries digest {:?}", m.entries_digest),
         ));
     }
-    let (status, profile) = match (sig, m.signers.is_empty()) {
-        (None, true) => (SignatureStatus::Unsigned, None),
+    let outcome = match (sig, m.signers.is_empty()) {
+        (None, true) => SignatureOutcome::plain(SignatureStatus::Unsigned, None),
         (None, false) => {
             return Err(VerifyFailure::new(
                 "invalid",
@@ -1187,10 +1291,16 @@ fn verify_signature(
                 signing,
             )
             .map_err(|e| VerifyFailure::new("invalid", e.to_string()))?;
-            (v.status, v.profile)
+            SignatureOutcome {
+                status: v.status,
+                profile: v.profile,
+                verified_by: v.verified_by,
+                revoked: v.revoked,
+                signer_key_ids: v.signer_key_ids,
+            }
         }
     };
-    policy(status, profile)
+    policy(outcome)
 }
 
 // Silence the unused-import lint when the `json!` macro isn't reached
@@ -1238,7 +1348,10 @@ mod restore_record_tests {
             true,
             0,
             Some(&row),
-            (SignatureStatus::Unsigned, None, false),
+            (
+                &SignatureOutcome::plain(SignatureStatus::Unsigned, None),
+                false,
+            ),
             (false, false),
         )
         .await
@@ -1269,7 +1382,10 @@ mod restore_record_tests {
             true,
             0,
             Some(&row),
-            (SignatureStatus::Verified, Some(Profile::Classical), false),
+            (
+                &SignatureOutcome::plain(SignatureStatus::Verified, Some(Profile::Classical)),
+                false,
+            ),
             (true, true),
         )
         .await
@@ -1305,7 +1421,10 @@ mod restore_record_tests {
                 true,
                 0,
                 None,
-                (SignatureStatus::Unsigned, None, false),
+                (
+                    &SignatureOutcome::plain(SignatureStatus::Unsigned, None),
+                    false
+                ),
                 (false, false)
             )
             .await,
@@ -1346,7 +1465,10 @@ mod restore_record_tests {
             true,
             0,
             Some(&row),
-            (SignatureStatus::Unsigned, None, false),
+            (
+                &SignatureOutcome::plain(SignatureStatus::Unsigned, None),
+                false,
+            ),
             (false, false),
         )
         .await
@@ -1388,7 +1510,10 @@ mod restore_record_tests {
                 true,
                 0,
                 None,
-                (SignatureStatus::Unsigned, None, false),
+                (
+                    &SignatureOutcome::plain(SignatureStatus::Unsigned, None),
+                    false
+                ),
                 (false, false)
             )
             .await,
@@ -1478,7 +1603,7 @@ mod integrity_tests {
         require: bool,
     ) -> Result<SignatureStatus, String> {
         parse_and_verify_backup(zip, key, require)
-            .map(|r| r.3)
+            .map(|r| r.3.status)
             .map_err(|f| f.message)
     }
 
@@ -1693,7 +1818,7 @@ mod integrity_tests {
         require: bool,
     ) -> Result<(SignatureStatus, Option<Profile>), String> {
         parse_and_verify_backup(zip, key, require)
-            .map(|r| (r.3, r.4))
+            .map(|r| (r.3.status, r.3.profile))
             .map_err(|f| f.message)
     }
 
@@ -1996,6 +2121,175 @@ mod restore_integrity_db_tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    // ── Key rotation: previous key sets (#68) ──────────────────────────────
+
+    /// Seeds an admin and an asset, takes a backup signed by `old`, and returns
+    /// it with a state that trusts `current` (whose previous keys are set).
+    async fn rotated_backup(
+        pool: &PgPool,
+        old: &crate::api::signing::SigningState,
+        current: crate::api::signing::SigningState,
+    ) -> (AppState, Vec<u8>) {
+        seed_user(pool, "admin1").await;
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'admin1'")
+            .execute(pool)
+            .await
+            .unwrap();
+        seed_asset(pool, "a1", "admin1", false).await;
+        let (mut state, _dir) = app_state(pool.clone());
+        state.signing = Some(old.clone());
+        let zip = backup_of(&state).await;
+        state.signing = Some(current);
+        crate::test_fixtures::open_audit_restore_window(pool).await;
+        (state, zip)
+    }
+
+    async fn restore_row(pool: &PgPool, outcome: &str) -> Value {
+        sqlx::query_scalar(
+            "SELECT detail FROM audit_events WHERE action = 'backup.restore' AND outcome = $1",
+        )
+        .bind(outcome)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_backup_signed_by_a_previous_key_restores_and_records_the_key_source(pool: PgPool) {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let old = test_hybrid_key(7);
+        let cur = with_previous(test_hybrid_key(8), test_previous(&[&old]));
+        let (state, zip) = rotated_backup(&pool, &old, cur).await;
+        let base = serve(state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["signatureStatus"], "verified");
+        assert_eq!(body["signatureProfile"], "hybrid");
+        assert_eq!(body["signatureKeySource"], "previous");
+        let d = restore_row(&pool, "ok").await;
+        assert_eq!(d["signatureKeySource"], "previous");
+        assert_eq!(d["signatureKeyLabel"], "old-0");
+        assert_eq!(d["signatureKeyIds"], json!(old.key_ids()));
+        assert!(d.get("keyRevoked").is_none());
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_backup_of_the_current_key_reports_current(pool: PgPool) {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let cur = with_previous(test_hybrid_key(8), test_previous(&[&test_key(7)]));
+        let (state, zip) = rotated_backup(&pool, &cur, cur.clone()).await;
+        let base = serve(state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["signatureKeySource"], "current");
+        assert_eq!(
+            restore_row(&pool, "ok").await["signatureKeyIds"],
+            json!(cur.key_ids())
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_backup_of_an_unlisted_key_is_refused_as_unknown_key(pool: PgPool) {
+        use crate::integrity::{test_hybrid_key, with_previous};
+        let old = test_hybrid_key(7);
+        let cur = with_previous(test_hybrid_key(8), Default::default());
+        let (state, zip) = rotated_backup(&pool, &old, cur).await;
+        let base = serve(state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 400, "{body}");
+        let d = restore_row(&pool, "failure").await;
+        assert_eq!(d["signatureStatus"], "unknown_key");
+        assert_eq!(d["signatureKeyIds"], json!(old.key_ids()));
+        assert!(d.get("keyRevoked").is_none());
+        let assets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(assets, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_previous_classical_backup_under_require_hybrid_needs_the_break_glass_override(
+        pool: PgPool,
+    ) {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let old = test_key(7);
+        let mut cur = with_previous(test_hybrid_key(8), test_previous(&[&old]));
+        cur.require_hybrid = true;
+        let (mut state, zip) = rotated_backup(&pool, &old, cur).await;
+        let base = serve(state.clone()).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("SIGNING_REQUIRE_HYBRID"));
+        assert_eq!(
+            restore_row(&pool, "failure").await["signatureStatus"],
+            "verified"
+        );
+
+        let mut cfg = (*state.config).clone();
+        cfg.backup_require_signature = Some(false);
+        state.config = std::sync::Arc::new(cfg);
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
+        let base = serve(state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["signatureKeySource"], "previous");
+        let d = restore_row(&pool, "ok").await;
+        assert_eq!(d["hybridOverridden"], true);
+        assert_eq!(d["signatureKeySource"], "previous");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn a_backup_of_a_revoked_key_is_refused_and_break_glass_records_it(pool: PgPool) {
+        use crate::integrity::{test_hybrid_key, with_previous};
+        let old = test_key(7);
+        let revoked = crate::signers::PreviousKeys {
+            revoked: vec![crate::signers::RevokedKey {
+                algorithm: crate::signers::Algorithm::Ed25519,
+                key_id: old.key_id.clone(),
+                revoked_at: Some("2026-12-01".into()),
+                reason: Some("test".into()),
+            }],
+            ..Default::default()
+        };
+        let cur = with_previous(test_hybrid_key(8), revoked);
+        let (mut state, zip) = rotated_backup(&pool, &old, cur).await;
+        let base = serve(state.clone()).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 400, "{body}");
+        let msg = body["error"].as_str().unwrap();
+        assert!(
+            msg.contains("revoked key") && msg.contains(&old.key_id),
+            "{msg}"
+        );
+        let d = restore_row(&pool, "failure").await;
+        assert_eq!(
+            (d["signatureStatus"].as_str(), d["keyRevoked"].as_bool()),
+            (Some("unknown_key"), Some(true))
+        );
+
+        let mut cfg = (*state.config).clone();
+        cfg.backup_require_signature = Some(false);
+        state.config = std::sync::Arc::new(cfg);
+        crate::test_fixtures::open_audit_restore_window(&pool).await;
+        let base = serve(state).await;
+        let (status, body) = post_restore(&base, &zip).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["signatureStatus"], "unknown_key");
+        assert!(body.get("signatureKeySource").is_none());
+        let d = restore_row(&pool, "ok").await;
+        assert_eq!(d["keyRevoked"], true);
+        assert_eq!(d["signatureKeySource"], Value::Null);
     }
 
     #[sqlx::test]
@@ -2449,7 +2743,7 @@ mod tests {
         bytes: &[u8],
     ) -> anyhow::Result<(Manifest, ParsedTables, ParsedAttachments)> {
         parse_and_verify_backup(bytes, None, false)
-            .map(|(m, t, a, _, _)| (m, t, a))
+            .map(|(m, t, a, _)| (m, t, a))
             .map_err(|f| anyhow::anyhow!(f.message))
     }
 
@@ -2607,7 +2901,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tables = || HashMap::from([("users".to_string(), vec![json!({"id": 1})])]);
         let unsigned = build_backup_zip(manifest(), tables(), vec![], dir.clone(), None).unwrap();
-        let (_, t, _, status, _) = parse_and_verify_backup(&unsigned, None, false).unwrap();
+        let (_, t, _, o) = parse_and_verify_backup(&unsigned, None, false).unwrap();
+        let status = o.status;
         assert_eq!(t.get("users").map(Vec::len), Some(1));
         assert_eq!(status.as_str(), "unsigned");
 
@@ -2615,7 +2910,8 @@ mod tests {
         let signed =
             build_backup_zip(manifest(), tables(), vec![], dir.clone(), Some(&key)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        let (_, _, _, status, _) = parse_and_verify_backup(&signed, Some(&key), true).unwrap();
+        let (_, _, _, o) = parse_and_verify_backup(&signed, Some(&key), true).unwrap();
+        let status = o.status;
         assert_eq!(status.as_str(), "verified");
     }
 }

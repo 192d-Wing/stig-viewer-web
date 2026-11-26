@@ -138,12 +138,49 @@ below are generic, use `podman`, and use placeholders only.
     `unknown_key`.
 - Production should set `SIGNING_KEY_HEX` and leave `BACKUP_REQUIRE_SIGNATURE`
   unset or `true`. `false` is break-glass (e.g. restoring `unknown_key`
-  backups after rotation); revert it afterwards.
+  backups whose key is no longer listed); revert it afterwards.
 - With a key set, a restore needs a verified signature unless
   `BACKUP_REQUIRE_SIGNATURE=false`.
-- After key rotation, old backups verify as `unknown_key`. Keep old public
-  keys (from `GET /api/signing/pubkey`) offline so pre-rotation backups can
-  still be checked by hand.
+- **Key rotation runbook** (old archives, backups and `/api/sign` bundles keep
+  verifying through `SIGNING_PREVIOUS_KEYS_FILE`, or `SIGNING_PREVIOUS_KEYS_JSON`
+  for env-only deployments; set at most one):
+  1. Save the `keys` array of `GET /api/signing/pubkey` and store it offline.
+  2. Generate the new keys (`SIGNING_KEY_HEX` seed; `gen-mldsa-key > key.b64`).
+  3. Add the saved `keys` as a new entry of the previous-keys file
+     (`{"version": 1, "previous": [{"label": "prod-2026a", "retiredAt":
+     "2026-11-30", "keys": [...]}]}`). If the old Ed25519 key also signed
+     classical artifacts that must keep verifying, add a second, classical entry
+     for it and understand the trade-off: a hybrid entry never makes its
+     Ed25519 key a classical signer, and a classical entry keeps the
+     Ed25519-only forgery window open for that key. Never put a private key in
+     the file (a pasted seed stops startup).
+  4. Update external verifiers' pinned sets (`verify-bundle.mjs --previous`)
+     BEFORE the swap: they need both old and new keys.
+  5. Swap the key variables and restart. Check the startup log and the
+     `system.signing_keys` audit event (key ids, previous sets, SHA-384 of the
+     document).
+  6. Verify: restore-check an old backup on a scratch instance (the response
+     says `signatureKeySource: "previous"`), let one retention sweep run (no new
+     `.r<n>` siblings for old dates and an `audit_archive.previous_key_verified`
+     event), and verify an old bundle with `verify-bundle.mjs`.
+  7. Retire: remove the entry. Artifacts then become `unknown_key`: backups need
+     the break-glass override, archive segments are left in place and rows still
+     in the database are archived again. For a compromised key remove it
+     immediately and add it to `revoked` with a reason and date (never
+     "verified", never renamed). Destroy the old private keys after step 6.
+  Auditing: backups and archive segments are verified on the server, which
+  records the key source, key ids and label (`backup.restore`,
+  `audit_archive.previous_key_verified`). `/api/sign` bundles are verified
+  offline (`scripts/verify-bundle.mjs` reports `verifiedBy`), so no server audit
+  row names the key that verified a bundle. The previous-keys file has a
+  `version`; a new algorithm (for example SLH-DSA) would arrive as a new
+  `version`, never as extra fields in version 1 (unknown fields are refused).
+  Previous-set labels and `retiredAt` are served publicly by
+  `GET /api/signing/pubkey`.
+  Rollback: an older binary ignores the variables and treats old artifacts as
+  `unknown_key`; it renames nothing. Previous keys require `SIGNING_KEY_HEX`
+  (startup error otherwise), and a hybrid previous set in a `fips` build needs
+  `ML-DSA-87` in `STIG_FIPS_PENDING_ALGS`.
 - Forced audit restores also need the restore window from section 2. See the
   **Restore policy** paragraph in README "Integrity of audit archives and
   backups", and "Signing envelope (v2)".

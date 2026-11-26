@@ -18,6 +18,13 @@
 //!   `STIG_FIPS_PENDING_ALGS`);
 //! - ML-DSA only, a malformed key, or `SIGNING_REQUIRE_HYBRID` without both
 //!   keys: startup error.
+//! - `SIGNING_PREVIOUS_KEYS_FILE` / `SIGNING_PREVIOUS_KEYS_JSON` (#68, at most
+//!   one): public keys of retired key sets that keep verifying after a
+//!   rotation. They need `SIGNING_KEY_HEX`, can never sign, and a hybrid set in
+//!   a `fips` build needs `ML-DSA-87` in `STIG_FIPS_PENDING_ALGS`. Trust is per
+//!   key set: a signed signer list must equal exactly one current or previous
+//!   set. Malformed content, both carriers, or a revoked key in use: startup
+//!   error. See [`crate::signers::parse_previous`] for the schema.
 //!
 //! A runtime ML-DSA failure fails the operation; it never falls back to
 //! Ed25519-only output.
@@ -59,12 +66,19 @@ use crate::api::request_ctx::RequestCtx;
 use crate::crypto;
 use crate::fips::{FipsPolicy, PendingAlg};
 pub use crate::signers::SignerId;
-use crate::signers::{self, Algorithm, Profile, TrustedKey, TrustedKeys};
+use crate::signers::{
+    self, Algorithm, KeySource, PreviousKeys, Profile, TrustedKeys, VerifyingKey,
+};
 use crate::AppState;
 
 pub const ED25519_KEY_ENV: &str = "SIGNING_KEY_HEX";
 pub const MLDSA_KEY_ENV: &str = "SIGNING_MLDSA87_KEY_B64";
 pub const REQUIRE_HYBRID_ENV: &str = "SIGNING_REQUIRE_HYBRID";
+/// Path of the previous-keys JSON document (#68). Public keys only.
+pub const PREVIOUS_KEYS_FILE_ENV: &str = "SIGNING_PREVIOUS_KEYS_FILE";
+/// The same document inline, for env-only deployments.
+pub const PREVIOUS_KEYS_JSON_ENV: &str = "SIGNING_PREVIOUS_KEYS_JSON";
+const MAX_PREVIOUS_KEYS_BYTES: usize = signers::MAX_PREVIOUS_BYTES;
 
 /// The ML-DSA-87 half of a hybrid configuration.
 #[derive(Debug)]
@@ -101,6 +115,12 @@ pub struct SigningState {
     pub mldsa: Option<Arc<MlDsaSigner>>,
     /// `SIGNING_REQUIRE_HYBRID`: classical artifacts are not acceptable.
     pub require_hybrid: bool,
+    /// Retired key sets that still verify (#68). Verify-only: nothing here can
+    /// sign, and it is empty unless the previous-keys configuration is set.
+    pub previous: Arc<PreviousKeys>,
+    /// Serialized `GET /api/signing/pubkey` body, built on first use: the keys
+    /// are immutable after startup and the endpoint is unauthenticated.
+    pubkey_cache: Arc<std::sync::OnceLock<axum::body::Bytes>>,
 }
 
 /// `unset`/blank/`0`/`false` is off, `1`/`true` is on, anything else is an
@@ -116,6 +136,59 @@ fn parse_flag(name: &str, raw: Option<&str>) -> anyhow::Result<bool> {
     }
 }
 
+/// Read the previous-keys document from its carrier. Both carriers set is an
+/// error; the file read is bounded. Returns the bytes and the carrier name.
+fn read_previous_keys(
+    file: Option<&str>,
+    json: Option<&str>,
+) -> anyhow::Result<Option<(Vec<u8>, &'static str)>> {
+    use std::io::Read;
+    match (nonblank(file), nonblank(json)) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("set only one of {PREVIOUS_KEYS_FILE_ENV} and {PREVIOUS_KEYS_JSON_ENV}")
+        }
+        (Some(path), None) => {
+            let f = std::fs::File::open(path.trim()).map_err(|e| {
+                anyhow::anyhow!("cannot read {PREVIOUS_KEYS_FILE_ENV}: {}", e.kind())
+            })?;
+            let mut buf = Vec::new();
+            f.take(MAX_PREVIOUS_KEYS_BYTES as u64 + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| {
+                    anyhow::anyhow!("cannot read {PREVIOUS_KEYS_FILE_ENV}: {}", e.kind())
+                })?;
+            if buf.len() > MAX_PREVIOUS_KEYS_BYTES {
+                anyhow::bail!("{PREVIOUS_KEYS_FILE_ENV} exceeds {MAX_PREVIOUS_KEYS_BYTES} bytes");
+            }
+            Ok(Some((buf, "file")))
+        }
+        (None, Some(j)) => {
+            if j.len() > MAX_PREVIOUS_KEYS_BYTES {
+                anyhow::bail!("{PREVIOUS_KEYS_JSON_ENV} exceeds {MAX_PREVIOUS_KEYS_BYTES} bytes");
+            }
+            Ok(Some((j.as_bytes().to_vec(), "env")))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// One `(algorithm, keyId)` must mean one public key across the current and
+/// previous keys: the verifier looks keys up by id.
+fn check_no_key_id_collision(
+    current: &TrustedKeys,
+    previous: &[signers::KeySet],
+) -> anyhow::Result<()> {
+    for k in previous.iter().flat_map(|s| s.keys.iter()) {
+        if current
+            .find(k.algorithm, &k.key_id)
+            .is_some_and(|c| c.public_key != k.public_key)
+        {
+            anyhow::bail!("a previous key shares a keyId with a different current public key");
+        }
+    }
+    Ok(())
+}
+
 fn nonblank(v: Option<&str>) -> Option<&str> {
     v.filter(|s| !s.trim().is_empty())
 }
@@ -125,20 +198,28 @@ impl SigningState {
     /// when no key is set so the server starts cleanly without signing.
     /// See the module docs for the configuration matrix.
     pub fn from_env(policy: &FipsPolicy) -> anyhow::Result<Option<Self>> {
+        let previous = read_previous_keys(
+            std::env::var(PREVIOUS_KEYS_FILE_ENV).ok().as_deref(),
+            std::env::var(PREVIOUS_KEYS_JSON_ENV).ok().as_deref(),
+        )?;
         Self::from_vars(
             std::env::var(ED25519_KEY_ENV).ok().as_deref(),
             std::env::var(MLDSA_KEY_ENV).ok().as_deref(),
             std::env::var(REQUIRE_HYBRID_ENV).ok().as_deref(),
             policy,
+            previous.as_ref().map(|(b, s)| (b.as_slice(), *s)),
         )
     }
 
     /// Pure core of [`Self::from_env`]. Errors never contain key material.
+    /// `previous` is the previous-keys document and its carrier (`"file"` or
+    /// `"env"`), see [`signers::parse_previous`].
     pub fn from_vars(
         hex_str: Option<&str>,
         mldsa_b64: Option<&str>,
         require_hybrid: Option<&str>,
         policy: &FipsPolicy,
+        previous: Option<(&[u8], &'static str)>,
     ) -> anyhow::Result<Option<Self>> {
         let require_hybrid = parse_flag(REQUIRE_HYBRID_ENV, require_hybrid)?;
         let mldsa_b64 = nonblank(mldsa_b64);
@@ -148,6 +229,11 @@ impl SigningState {
             }
             if require_hybrid {
                 anyhow::bail!("{REQUIRE_HYBRID_ENV} is set but no signing key is configured");
+            }
+            if previous.is_some() {
+                anyhow::bail!(
+                    "{PREVIOUS_KEYS_FILE_ENV}/{PREVIOUS_KEYS_JSON_ENV} is set but {ED25519_KEY_ENV} is not; previous keys need a configured signing key"
+                );
             }
             return Ok(None);
         };
@@ -167,7 +253,45 @@ impl SigningState {
             None => {}
         }
         state.require_hybrid = require_hybrid;
+        if let Some((bytes, source)) = previous {
+            state.previous = Arc::new(state.accept_previous(bytes, source, policy)?);
+        }
         Ok(Some(state))
+    }
+
+    /// Parse the previous-keys document and check it against the current keys:
+    /// a revoked current key is an error, a hybrid previous set needs the
+    /// ML-DSA-87 pending algorithm in a FIPS build, and entries equal to the
+    /// current keys are dropped (their labels are kept in `ignored`).
+    fn accept_previous(
+        &self,
+        bytes: &[u8],
+        source: &'static str,
+        policy: &FipsPolicy,
+    ) -> anyhow::Result<PreviousKeys> {
+        let mut prev = signers::parse_previous(bytes, source)?;
+        check_no_key_id_collision(&self.trusted(), &prev.sets)?;
+        let current: Vec<signers::SignerId> = self.signers();
+        let classical = &current[..1];
+        for r in &prev.revoked {
+            if current
+                .iter()
+                .any(|c| c.algorithm == r.algorithm.wire() && c.key_id == r.key_id)
+            {
+                anyhow::bail!("previous-keys document revokes a key that is currently in use");
+            }
+        }
+        if prev.sets.iter().any(|s| s.profile == Profile::Hybrid) {
+            policy.require(PendingAlg::MlDsa87)?;
+        }
+        let (keep, drop): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut prev.sets).into_iter().partition(|s| {
+                let ids = s.signer_ids();
+                ids != current && ids != classical
+            });
+        prev.sets = keep;
+        prev.ignored = drop.into_iter().filter_map(|s| s.label).collect();
+        Ok(prev)
     }
 
     /// Ed25519-only state from `SIGNING_KEY_HEX`: `None` or blank means
@@ -193,6 +317,8 @@ impl SigningState {
             key_id,
             mldsa: None,
             require_hybrid: false,
+            previous: Arc::default(),
+            pubkey_cache: Arc::default(),
         }))
     }
 
@@ -237,21 +363,22 @@ impl SigningState {
         Ok(out)
     }
 
-    /// The keys this server will accept signatures from.
+    /// The key sets this server will accept signatures from: its current
+    /// sets, then the previous sets (#68).
     pub fn trusted(&self) -> TrustedKeys {
-        let mut keys = vec![TrustedKey {
+        let ed = VerifyingKey {
             algorithm: Algorithm::Ed25519,
             key_id: self.key_id.clone(),
             public_key: self.signing_key.public_key().to_vec(),
-        }];
-        if let Some(m) = &self.mldsa {
-            keys.push(TrustedKey {
-                algorithm: Algorithm::MlDsa87,
-                key_id: m.key_id.clone(),
-                public_key: m.key.public_key(),
-            });
-        }
-        TrustedKeys::new(keys)
+        };
+        let ml = self.mldsa.as_ref().map(|m| VerifyingKey {
+            algorithm: Algorithm::MlDsa87,
+            key_id: m.key_id.clone(),
+            public_key: m.key.public_key(),
+        });
+        let mut sets = signers::current_sets(ed, ml);
+        sets.extend(self.previous.sets.iter().cloned());
+        TrustedKeys::from_sets(sets, self.previous.revoked.clone())
     }
 
     /// Key ids of every signer, for logs and audit rows.
@@ -272,6 +399,69 @@ pub const ENVELOPE_VERSION: u32 = 2;
 /// replayed as a signature over some other protocol's message.
 pub const SIGN_DOMAIN: &[u8] = b"stig-viewer/sign/v2\0";
 
+// ── Startup record of the trusted key sets (#68) ────────────────────────────
+
+/// Audit action written once per start when signing is enabled.
+pub const SIGNING_KEYS_ACTION: &str = "system.signing_keys";
+/// Bound on the startup audit write; a slow database must not hold up startup.
+const SIGNING_KEYS_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Detail of `system.signing_keys`: the key ids in force and the previous-keys
+/// configuration (public data only). A change to the trust list shows up as a
+/// changed `previousKeysSha384`.
+pub fn signing_keys_detail(s: &SigningState) -> serde_json::Value {
+    let prev = &s.previous;
+    serde_json::json!({
+        "profile": s.profile().as_str(),
+        "requireHybrid": s.require_hybrid,
+        "currentKeyIds": s.key_ids(),
+        "previous": prev.sets.iter().map(|set| serde_json::json!({
+            "label": set.label,
+            "profile": set.profile.as_str(),
+            "keyIds": set.key_ids(),
+            "retiredAt": set.retired_at,
+        })).collect::<Vec<_>>(),
+        "revoked": prev.revoked.iter().map(|r| serde_json::json!({
+            "algorithm": r.algorithm.wire(),
+            "keyId": r.key_id,
+            "revokedAt": r.revoked_at,
+            "reason": r.reason,
+        })).collect::<Vec<_>>(),
+        "previousKeysSource": if prev.source.is_empty() { "none" } else { prev.source },
+        "previousKeysSha384": if prev.sha384.is_empty() { None } else { Some(prev.sha384.as_str()) },
+    })
+}
+
+/// Record `system.signing_keys` for this start. Failure or timeout is logged
+/// and startup continues, like the FIPS policy event.
+pub async fn record_signing_keys_event(pool: &sqlx::PgPool, s: &SigningState) {
+    let ev = crate::db_audit::NewSystemEvent {
+        action: SIGNING_KEYS_ACTION,
+        outcome: "ok",
+        stig_id: None,
+        detail: signing_keys_detail(s),
+    };
+    let res = tokio::time::timeout(
+        SIGNING_KEYS_EVENT_TIMEOUT,
+        crate::db_audit::record_system_now(pool, ev),
+    )
+    .await;
+    let err = match res {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => "timed out".to_string(),
+    };
+    tracing::error!(
+        target: "audit",
+        action = SIGNING_KEYS_ACTION,
+        outcome = "failure",
+        profile = s.profile().as_str(),
+        key_ids = %s.key_ids().join(","),
+        previous_sets = s.previous.sets.len(),
+        "audit write failed: {err}"
+    );
+}
+
 // ── GET /api/signing/pubkey ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -284,6 +474,19 @@ pub struct PubkeyResponse {
     /// Algorithm-tagged key list (envelope v2): the Ed25519 key (identical to
     /// the top-level fields) and, in hybrid mode, the ML-DSA-87 key (raw
     /// FIPS 204 bytes, base64-standard).
+    pub keys: Vec<PubkeyEntry>,
+    /// Retired key sets this server still verifies (#68). Public data;
+    /// absent when none are configured. Verifiers must still pin out of band.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub previous_keys: Vec<PreviousKeySetEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousKeySetEntry {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     pub keys: Vec<PubkeyEntry>,
 }
 
@@ -314,6 +517,24 @@ fn pubkey_response(sk: &SigningState) -> PubkeyResponse {
         key_id: sk.key_id.clone(),
         public_key,
         keys,
+        previous_keys: sk
+            .previous
+            .sets
+            .iter()
+            .map(|set| PreviousKeySetEntry {
+                label: set.label.clone().unwrap_or_default(),
+                retired_at: set.retired_at.clone(),
+                keys: set
+                    .keys
+                    .iter()
+                    .map(|k| PubkeyEntry {
+                        algorithm: k.algorithm.wire(),
+                        key_id: k.key_id.clone(),
+                        public_key: BASE64.encode(&k.public_key),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -328,9 +549,22 @@ fn require_signing(
 
 pub async fn pubkey_handler(
     State(state): State<AppState>,
-) -> Result<Json<PubkeyResponse>, (StatusCode, &'static str)> {
+) -> Result<impl axum::response::IntoResponse, (StatusCode, &'static str)> {
     let sk = require_signing(&state.signing)?;
-    Ok(Json(pubkey_response(sk)))
+    let body = match sk.pubkey_cache.get() {
+        Some(b) => b.clone(),
+        None => {
+            let bytes = serde_json::to_vec(&pubkey_response(sk)).map_err(|e| {
+                tracing::error!("pubkey response: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            })?;
+            sk.pubkey_cache.get_or_init(|| bytes.into()).clone()
+        }
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    ))
 }
 
 // ── POST /api/sign ──────────────────────────────────────────────────────────
@@ -487,8 +721,12 @@ pub enum VerifyError {
     UnexpectedSignature,
     BadSignatureEncoding,
     SignatureInvalid,
-    /// A signer's keyId is not a trusted key's fingerprint.
+    /// A signer's keyId is not a trusted key's fingerprint, or the signer list
+    /// is not exactly one trusted key set (halves of two generations, or a
+    /// hybrid half presented as classical).
     KeyIdMismatch,
+    /// A signer is on the revoked list.
+    KeyRevoked,
     ArtifactHashMismatch,
 }
 
@@ -527,7 +765,8 @@ const MAX_SIGNERS: usize = 8;
 /// keys and trailing bytes are errors); require signed `version == 2`; require
 /// a non-empty `signers` list of at most 8 entries whose first entry equals the
 /// signed `algorithm`/`keyId`; reject any unsupported signer algorithm; require
-/// every signer to be a trusted (algorithm, keyId); require the signer set to
+/// the signer list to equal exactly one trusted key set (current or previous,
+/// #68) and none to be revoked; require the signer set to
 /// be exactly `[ed25519]` (only when `allow_classical`) or
 /// `[ed25519, ml-dsa-87]`; require the `signatures` set to equal the `signers`
 /// set; verify every signature over `SIGN_DOMAIN || payload`; and require the
@@ -541,6 +780,18 @@ pub fn verify_bundle(
     allow_classical: bool,
     artifact_sha256: &str,
 ) -> Result<VerifiedDocument, VerifyError> {
+    verify_inner(bundle_json, trusted, allow_classical, Some(artifact_sha256)).map(|(d, _)| d)
+}
+
+/// [`verify_bundle`] that also reports whether a current or a previous key set
+/// verified the bundle.
+#[cfg(test)]
+pub fn verify_bundle_with_source(
+    bundle_json: &[u8],
+    trusted: &TrustedKeys,
+    allow_classical: bool,
+    artifact_sha256: &str,
+) -> Result<(VerifiedDocument, KeySource), VerifyError> {
     verify_inner(bundle_json, trusted, allow_classical, Some(artifact_sha256))
 }
 
@@ -553,7 +804,7 @@ pub fn verify_bundle_document_only(
     trusted: &TrustedKeys,
     allow_classical: bool,
 ) -> Result<VerifiedDocument, VerifyError> {
-    verify_inner(bundle_json, trusted, allow_classical, None)
+    verify_inner(bundle_json, trusted, allow_classical, None).map(|(d, _)| d)
 }
 
 fn verify_inner(
@@ -561,7 +812,7 @@ fn verify_inner(
     trusted: &TrustedKeys,
     allow_classical: bool,
     artifact_sha256: Option<&str>,
-) -> Result<VerifiedDocument, VerifyError> {
+) -> Result<(VerifiedDocument, KeySource), VerifyError> {
     let env: EnvelopeIn =
         serde_json::from_slice(bundle_json).map_err(|_| VerifyError::MalformedEnvelope)?;
     let payload = URL_SAFE_NO_PAD
@@ -583,6 +834,9 @@ fn verify_inner(
     for s in &doc.signers {
         let alg = Algorithm::from_wire(&s.algorithm)
             .ok_or_else(|| VerifyError::UnsupportedAlgorithm(s.algorithm.clone()))?;
+        if trusted.revoked(alg, &s.key_id).is_some() {
+            return Err(VerifyError::KeyRevoked);
+        }
         if trusted.find(alg, &s.key_id).is_none() {
             return Err(VerifyError::KeyIdMismatch);
         }
@@ -596,6 +850,13 @@ fn verify_inner(
     if profile == Profile::Classical && !allow_classical {
         return Err(VerifyError::ClassicalNotAllowed);
     }
+    // Trust is per key set: the signed signer list must be exactly one trusted
+    // set, so halves of two generations never combine and a previous hybrid
+    // half is never accepted as a classical signer.
+    let source = trusted
+        .resolve(&doc.signers)
+        .ok_or(VerifyError::KeyIdMismatch)?
+        .source;
 
     for (i, sig) in env.signatures.iter().enumerate() {
         let known = doc
@@ -636,7 +897,7 @@ fn verify_inner(
             return Err(VerifyError::ArtifactHashMismatch);
         }
     }
-    Ok(doc)
+    Ok((doc, source))
 }
 
 /// Cap signed payloads at 100 MiB. Larger inputs should be hashed
@@ -1585,22 +1846,22 @@ mod tests {
         let (ed, ml) = (ed_hex(), ml_b64());
         let pol = open_policy();
         // Neither: disabled (blank counts as unset).
-        assert!(SigningState::from_vars(None, None, None, &pol)
+        assert!(SigningState::from_vars(None, None, None, &pol, None)
             .unwrap()
             .is_none());
         assert!(
-            SigningState::from_vars(Some(" "), Some(" "), Some(""), &pol)
+            SigningState::from_vars(Some(" "), Some(" "), Some(""), &pol, None)
                 .unwrap()
                 .is_none()
         );
         // Ed25519 only: classical.
-        let st = SigningState::from_vars(Some(&ed), None, None, &pol)
+        let st = SigningState::from_vars(Some(&ed), None, None, &pol, None)
             .unwrap()
             .unwrap();
         assert_eq!(st.profile(), Profile::Classical);
         assert!(!st.require_hybrid);
         // Both: hybrid.
-        let st = SigningState::from_vars(Some(&ed), Some(&ml), Some("true"), &pol)
+        let st = SigningState::from_vars(Some(&ed), Some(&ml), Some("true"), &pol, None)
             .unwrap()
             .unwrap();
         assert_eq!(st.profile(), Profile::Hybrid);
@@ -1608,22 +1869,28 @@ mod tests {
         assert_eq!(st.signers().len(), 2);
         assert_eq!(st.key_ids().len(), 2);
         // ML-DSA only, malformed, or require_hybrid without both: errors.
-        assert!(SigningState::from_vars(None, Some(&ml), None, &pol).is_err());
-        assert!(SigningState::from_vars(Some(&ed), Some("!!!not base64"), None, &pol).is_err());
+        assert!(SigningState::from_vars(None, Some(&ml), None, &pol, None).is_err());
         assert!(
-            SigningState::from_vars(Some(&ed), Some(&BASE64.encode(b"garbage")), None, &pol)
-                .is_err()
+            SigningState::from_vars(Some(&ed), Some("!!!not base64"), None, &pol, None).is_err()
         );
-        assert!(SigningState::from_vars(Some(&ed), None, Some("1"), &pol).is_err());
-        assert!(SigningState::from_vars(None, None, Some("true"), &pol).is_err());
-        assert!(SigningState::from_vars(Some(&ed), Some(&ml), Some("maybe"), &pol).is_err());
+        assert!(SigningState::from_vars(
+            Some(&ed),
+            Some(&BASE64.encode(b"garbage")),
+            None,
+            &pol,
+            None
+        )
+        .is_err());
+        assert!(SigningState::from_vars(Some(&ed), None, Some("1"), &pol, None).is_err());
+        assert!(SigningState::from_vars(None, None, Some("true"), &pol, None).is_err());
+        assert!(SigningState::from_vars(Some(&ed), Some(&ml), Some("maybe"), &pol, None).is_err());
     }
 
     #[test]
     fn from_vars_errors_do_not_echo_key_material() {
         let ed = ed_hex();
         let bad = format!("{}A", ml_b64());
-        let e = SigningState::from_vars(Some(&ed), Some(&bad), None, &open_policy())
+        let e = SigningState::from_vars(Some(&ed), Some(&bad), None, &open_policy(), None)
             .unwrap_err()
             .to_string();
         assert!(!e.contains(&bad[..40]), "{e}");
@@ -1633,12 +1900,335 @@ mod tests {
     fn ml_dsa_in_an_enforced_policy_needs_the_pending_alg_listed() {
         let (ed, ml) = (ed_hex(), ml_b64());
         let enforced = FipsPolicy::from_vars(true, None).unwrap();
-        let err = SigningState::from_vars(Some(&ed), Some(&ml), None, &enforced).unwrap_err();
+        let err = SigningState::from_vars(Some(&ed), Some(&ml), None, &enforced, None).unwrap_err();
         assert!(err.to_string().contains("ML-DSA-87"), "{err}");
         let listed = FipsPolicy::from_vars(true, Some("ML-DSA-87")).unwrap();
-        assert!(SigningState::from_vars(Some(&ed), Some(&ml), None, &listed).is_ok());
+        assert!(SigningState::from_vars(Some(&ed), Some(&ml), None, &listed, None).is_ok());
         // Ed25519-only is unaffected by the pending list.
-        assert!(SigningState::from_vars(Some(&ed), None, None, &enforced).is_ok());
+        assert!(SigningState::from_vars(Some(&ed), None, None, &enforced, None).is_ok());
+    }
+
+    // ── Key rotation: previous keys (#68) ───────────────────────────────────
+
+    fn prev_entry(label: &str, st: &SigningState) -> Value {
+        let r = serde_json::to_value(pubkey_response(st)).unwrap();
+        json!({"label": label, "retiredAt": "2026-11-30", "keys": r["keys"]})
+    }
+
+    fn prev_bytes(entries: Vec<Value>, revoked: Vec<Value>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"version": 1, "previous": entries, "revoked": revoked})).unwrap()
+    }
+
+    fn load(
+        ed: &str,
+        ml: Option<&str>,
+        require_hybrid: Option<&str>,
+        policy: &FipsPolicy,
+        prev: Option<Vec<u8>>,
+    ) -> anyhow::Result<Option<SigningState>> {
+        SigningState::from_vars(
+            Some(ed),
+            ml,
+            require_hybrid,
+            policy,
+            prev.as_deref().map(|b| (b, "file")),
+        )
+    }
+
+    /// A server on new keys trusting `old` as previous key sets.
+    fn rotated_server(old: &[&SigningState]) -> SigningState {
+        crate::integrity::with_previous(
+            crate::integrity::test_hybrid_key(121),
+            crate::integrity::test_previous(old),
+        )
+    }
+
+    #[test]
+    fn previous_keys_need_the_current_signing_key() {
+        let old = crate::integrity::test_hybrid_key(120);
+        let doc = prev_bytes(vec![prev_entry("old", &old)], vec![]);
+        let e = SigningState::from_vars(None, None, None, &open_policy(), Some((&doc, "file")))
+            .unwrap_err();
+        assert!(e.to_string().contains(ED25519_KEY_ENV), "{e}");
+        // No previous keys and no signing key still starts cleanly.
+        assert!(
+            SigningState::from_vars(None, None, None, &open_policy(), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn previous_keys_load_and_are_verify_only() {
+        let old = crate::integrity::test_hybrid_key(120);
+        let doc = prev_bytes(vec![prev_entry("old", &old)], vec![]);
+        let st = load(&ed_hex(), None, None, &open_policy(), Some(doc.clone()))
+            .unwrap()
+            .unwrap();
+        // The current server is still classical and signs with its own key only.
+        assert_eq!(st.profile(), Profile::Classical);
+        assert_eq!(st.signers().len(), 1);
+        assert_eq!(st.previous.sets.len(), 1);
+        assert_eq!(st.previous.source, "file");
+        assert!(st.trusted().resolve(&old.signers()).is_some());
+        let produced = st.sign_all(b"x").unwrap();
+        assert!(produced.iter().all(|p| p.key_id == st.key_id));
+        // A bundle signed by the old hybrid keys verifies on the new server.
+        let wire = serde_json::to_vec(&vector_bundle(&old)).unwrap();
+        assert!(verify_bundle_document_only(&wire, &st.trusted(), false).is_ok());
+        // Malformed documents are startup errors.
+        assert!(load(&ed_hex(), None, None, &open_policy(), Some(b"{}".to_vec())).is_err());
+    }
+
+    #[test]
+    fn hybrid_previous_sets_need_the_ml_dsa_pending_alg_in_a_fips_policy() {
+        let old = crate::integrity::test_hybrid_key(120);
+        let hybrid_doc = prev_bytes(vec![prev_entry("old", &old)], vec![]);
+        let classical_doc = prev_bytes(
+            vec![prev_entry("old", &crate::integrity::test_key(120))],
+            vec![],
+        );
+        let enforced = FipsPolicy::from_vars(true, None).unwrap();
+        let listed = FipsPolicy::from_vars(true, Some("ML-DSA-87")).unwrap();
+        let ed = ed_hex();
+        let e = load(&ed, None, None, &enforced, Some(hybrid_doc.clone())).unwrap_err();
+        assert!(e.to_string().contains("ML-DSA-87"), "{e}");
+        assert!(load(&ed, None, None, &listed, Some(hybrid_doc)).is_ok());
+        assert!(load(&ed, None, None, &enforced, Some(classical_doc)).is_ok());
+    }
+
+    #[test]
+    fn entries_equal_to_the_current_keys_are_dropped_and_a_revoked_current_key_is_an_error() {
+        let (ed, ml) = (ed_hex(), ml_b64());
+        let pol = open_policy();
+        let cur = load(&ed, Some(&ml), None, &pol, None).unwrap().unwrap();
+        let classical_cur = load(&ed, None, None, &pol, None).unwrap().unwrap();
+        let doc = prev_bytes(
+            vec![
+                prev_entry("same-hybrid", &cur),
+                prev_entry("same-classical", &classical_cur),
+            ],
+            vec![],
+        );
+        let st = load(&ed, Some(&ml), None, &pol, Some(doc))
+            .unwrap()
+            .unwrap();
+        assert!(st.previous.sets.is_empty());
+        assert_eq!(st.previous.ignored, ["same-hybrid", "same-classical"]);
+        // Revoking a key that is in use is refused.
+        let revoked = json!({"algorithm": "ed25519", "keyId": cur.key_id});
+        let doc = prev_bytes(vec![], vec![revoked]);
+        assert!(load(&ed, Some(&ml), None, &pol, Some(doc)).is_err());
+        let revoked =
+            json!({"algorithm": "ml-dsa-87", "keyId": cur.mldsa.as_ref().unwrap().key_id});
+        let doc = prev_bytes(vec![], vec![revoked]);
+        assert!(load(&ed, Some(&ml), None, &pol, Some(doc)).is_err());
+    }
+
+    #[test]
+    fn a_classical_previous_set_loads_under_require_hybrid() {
+        let doc = prev_bytes(
+            vec![prev_entry("old", &crate::integrity::test_key(120))],
+            vec![],
+        );
+        let st = load(
+            &ed_hex(),
+            Some(&ml_b64()),
+            Some("true"),
+            &open_policy(),
+            Some(doc),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(st.require_hybrid);
+        assert_eq!(st.previous.sets.len(), 1);
+        assert_eq!(st.previous.sets[0].profile, Profile::Classical);
+    }
+
+    #[test]
+    fn the_previous_keys_carriers_are_exclusive_and_bounded() {
+        assert!(read_previous_keys(None, None).unwrap().is_none());
+        assert!(read_previous_keys(Some(" "), Some("")).unwrap().is_none());
+        assert!(read_previous_keys(Some("/x"), Some("{}")).is_err());
+        let (b, src) = read_previous_keys(None, Some(r#"{"version":1}"#))
+            .unwrap()
+            .unwrap();
+        assert_eq!((b.as_slice(), src), (br#"{"version":1}"#.as_slice(), "env"));
+        let big = "x".repeat(MAX_PREVIOUS_KEYS_BYTES + 1);
+        assert!(read_previous_keys(None, Some(&big)).is_err());
+
+        let mut name = [0u8; 8];
+        crypto::rand::fill(&mut name).unwrap();
+        let path = std::env::temp_dir().join(format!("stig-prev-keys-{}", hex::encode(name)));
+        std::fs::write(&path, br#"{"version":1}"#).unwrap();
+        let p = path.to_str().unwrap();
+        let (b, src) = read_previous_keys(Some(p), None).unwrap().unwrap();
+        assert_eq!(
+            (b.as_slice(), src),
+            (br#"{"version":1}"#.as_slice(), "file")
+        );
+        std::fs::write(&path, vec![b' '; MAX_PREVIOUS_KEYS_BYTES + 1]).unwrap();
+        assert!(read_previous_keys(Some(p), None).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let e = read_previous_keys(Some(p), None).unwrap_err().to_string();
+        assert!(!e.contains(p), "{e}");
+    }
+
+    #[test]
+    fn bundles_signed_by_previous_sets_verify_with_the_right_source() {
+        let (old_hybrid, old_classical) = (
+            crate::integrity::test_hybrid_key(120),
+            crate::integrity::test_key(122),
+        );
+        let cur = rotated_server(&[&old_hybrid, &old_classical]);
+        let trusted = cur.trusted();
+        let wire = |st: &SigningState| serde_json::to_vec(&vector_bundle(st)).unwrap();
+        let sha = crypto::digest::sha256_hex(VECTOR_ARTIFACT);
+
+        let (_, src) =
+            verify_bundle_with_source(&wire(&old_hybrid), &trusted, false, &sha).unwrap();
+        assert_eq!(src, KeySource::Previous);
+        let (_, src) = verify_bundle_with_source(&wire(&cur), &trusted, false, &sha).unwrap();
+        assert_eq!(src, KeySource::Current);
+        // The previous classical bundle needs allow_classical.
+        assert_eq!(
+            verify_bundle(&wire(&old_classical), &trusted, false, &sha),
+            Err(VerifyError::ClassicalNotAllowed)
+        );
+        let (_, src) =
+            verify_bundle_with_source(&wire(&old_classical), &trusted, true, &sha).unwrap();
+        assert_eq!(src, KeySource::Previous);
+        // The old hybrid pair's Ed25519 key alone (no classical entry): refused.
+        assert_eq!(
+            verify_bundle(
+                &wire(&crate::integrity::test_key(120)),
+                &trusted,
+                true,
+                &sha
+            ),
+            Err(VerifyError::KeyIdMismatch)
+        );
+        // Halves of two generations.
+        let mut mixed = crate::integrity::test_key(120);
+        mixed.mldsa = cur.mldsa.clone();
+        assert_eq!(
+            verify_bundle(&wire(&mixed), &trusted, false, &sha),
+            Err(VerifyError::KeyIdMismatch)
+        );
+        // Entry removed.
+        let gone = rotated_server(&[]);
+        assert_eq!(
+            verify_bundle(&wire(&old_hybrid), &gone.trusted(), false, &sha),
+            Err(VerifyError::KeyIdMismatch)
+        );
+        // Revoked.
+        let revoked = signers::PreviousKeys {
+            revoked: vec![signers::RevokedKey {
+                algorithm: Algorithm::Ed25519,
+                key_id: old_hybrid.key_id.clone(),
+                revoked_at: None,
+                reason: None,
+            }],
+            ..Default::default()
+        };
+        let cur = crate::integrity::with_previous(crate::integrity::test_hybrid_key(121), revoked);
+        assert_eq!(
+            verify_bundle(&wire(&old_hybrid), &cur.trusted(), false, &sha),
+            Err(VerifyError::KeyRevoked)
+        );
+    }
+
+    #[test]
+    fn a_previous_key_sharing_a_current_key_id_with_another_public_key_is_refused() {
+        let cur =
+            TrustedKeys::from_ed25519(&crate::integrity::test_key(130).signing_key.public_key());
+        let same = cur.sets()[0].keys[0].clone();
+        let set = |k: VerifyingKey| {
+            signers::KeySet::new(vec![k], KeySource::Previous, Some("x".into())).unwrap()
+        };
+        assert!(check_no_key_id_collision(&cur, &[set(same.clone())]).is_ok());
+        let forged = VerifyingKey {
+            public_key: vec![9; 32],
+            ..same
+        };
+        let e = check_no_key_id_collision(&cur, &[set(forged)]).unwrap_err();
+        assert!(e.to_string().contains("keyId"), "{e}");
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn the_pubkey_endpoint_serves_the_cached_response(pool: sqlx::PgPool) {
+        use axum::response::IntoResponse;
+        let (mut state, _dir) = crate::test_fixtures::app_state(pool);
+        let old = crate::integrity::test_hybrid_key(120);
+        let cur = rotated_server(&[&old]);
+        state.signing = Some(cur.clone());
+        let want = serde_json::to_vec(&pubkey_response(&cur)).unwrap();
+        for _ in 0..2 {
+            let resp = pubkey_handler(State(state.clone()))
+                .await
+                .unwrap()
+                .into_response();
+            assert_eq!(resp.headers()["content-type"], "application/json");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), want.as_slice());
+        }
+    }
+
+    #[test]
+    fn pubkey_lists_previous_sets_only_when_configured() {
+        let none = serde_json::to_value(pubkey_response(&hybrid_state())).unwrap();
+        assert!(none.get("previousKeys").is_none());
+        let old = crate::integrity::test_hybrid_key(120);
+        let cur = rotated_server(&[&old, &crate::integrity::test_key(122)]);
+        let v = serde_json::to_value(pubkey_response(&cur)).unwrap();
+        // Current keys are unchanged.
+        assert_eq!(v["keyId"], cur.key_id.as_str());
+        assert_eq!(v["keys"].as_array().unwrap().len(), 2);
+        let prev = v["previousKeys"].as_array().unwrap();
+        assert_eq!(prev.len(), 2);
+        assert_eq!(prev[0]["label"], "old-0");
+        assert_eq!(prev[0]["retiredAt"], "2026-01-01");
+        assert_eq!(prev[0]["keys"], keys_json(&old));
+        assert_eq!(prev[1]["keys"].as_array().unwrap().len(), 1);
+        // Public data only: no seed or private key material appears.
+        let text = v.to_string();
+        assert!(
+            !text.contains("privateKey") && !text.contains("seed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_startup_event_detail_names_key_ids_and_the_config_hash_only() {
+        let old = crate::integrity::test_hybrid_key(120);
+        let mut prev = crate::integrity::test_previous(&[&old]);
+        prev.source = "env";
+        prev.sha384 = "ab".repeat(48);
+        prev.revoked.push(signers::RevokedKey {
+            algorithm: Algorithm::Ed25519,
+            key_id: "0123456789abcdef".into(),
+            revoked_at: Some("2026-12-01".into()),
+            reason: Some("seed exposed".into()),
+        });
+        let cur = crate::integrity::with_previous(crate::integrity::test_hybrid_key(121), prev);
+        let d = signing_keys_detail(&cur);
+        assert_eq!(d["profile"], "hybrid");
+        assert_eq!(d["requireHybrid"], false);
+        assert_eq!(d["currentKeyIds"], json!(cur.key_ids()));
+        assert_eq!(d["previous"][0]["label"], "old-0");
+        assert_eq!(d["previous"][0]["profile"], "hybrid");
+        assert_eq!(d["previous"][0]["keyIds"], json!(old.key_ids()));
+        assert_eq!(d["revoked"][0]["reason"], "seed exposed");
+        assert_eq!(d["previousKeysSource"], "env");
+        assert_eq!(d["previousKeysSha384"], "ab".repeat(48));
+        // Without a previous-keys document.
+        let d = signing_keys_detail(&test_state());
+        assert_eq!(d["previousKeysSource"], "none");
+        assert!(d["previousKeysSha384"].is_null());
+        assert_eq!(d["previous"], json!([]));
     }
 
     // ── Cross-implementation test vector (#69) ─────────────────────────────
@@ -1650,24 +2240,64 @@ mod tests {
         serde_json::to_value(pubkey_response(st).keys).unwrap()
     }
 
+    fn verifying_key(k: &Value) -> VerifyingKey {
+        let algorithm = Algorithm::from_wire(k["algorithm"].as_str().unwrap()).unwrap();
+        let public_key = BASE64.decode(k["publicKey"].as_str().unwrap()).unwrap();
+        let key_id = k["keyId"].as_str().unwrap().to_string();
+        assert_eq!(key_id, signers::key_id(algorithm, &public_key));
+        VerifyingKey {
+            algorithm,
+            key_id,
+            public_key,
+        }
+    }
+
+    fn verifying_keys(v: &Value) -> Vec<VerifyingKey> {
+        v.as_array().unwrap().iter().map(verifying_key).collect()
+    }
+
+    /// Trust the `keys` array of a pubkey response as the current keys.
     fn trusted_from(v: &Value) -> TrustedKeys {
-        TrustedKeys::new(
-            v.as_array()
-                .unwrap()
-                .iter()
-                .map(|k| {
-                    let algorithm = Algorithm::from_wire(k["algorithm"].as_str().unwrap()).unwrap();
-                    let public_key = BASE64.decode(k["publicKey"].as_str().unwrap()).unwrap();
-                    let key_id = k["keyId"].as_str().unwrap().to_string();
-                    assert_eq!(key_id, signers::key_id(algorithm, &public_key));
-                    TrustedKey {
-                        algorithm,
-                        key_id,
-                        public_key,
-                    }
-                })
-                .collect(),
-        )
+        trusted_with(v, &json!([]), &json!([]))
+    }
+
+    /// Current keys (a pubkey response's `keys`), previous sets (its
+    /// `previousKeys`) and a revoked list, the way an independent verifier
+    /// pins them.
+    fn trusted_with(current: &Value, previous: &Value, revoked: &Value) -> TrustedKeys {
+        let keys = verifying_keys(current);
+        let ed = keys
+            .iter()
+            .find(|k| k.algorithm == Algorithm::Ed25519)
+            .cloned()
+            .unwrap();
+        let ml = keys
+            .iter()
+            .find(|k| k.algorithm == Algorithm::MlDsa87)
+            .cloned();
+        let mut sets = signers::current_sets(ed, ml);
+        for p in previous.as_array().unwrap() {
+            let mut set = signers::KeySet::new(
+                verifying_keys(&p["keys"]),
+                KeySource::Previous,
+                Some(p["label"].as_str().unwrap().to_string()),
+            )
+            .unwrap();
+            set.retired_at = p["retiredAt"].as_str().map(str::to_string);
+            sets.push(set);
+        }
+        let revoked = revoked
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| signers::RevokedKey {
+                algorithm: Algorithm::from_wire(r["algorithm"].as_str().unwrap()).unwrap(),
+                key_id: r["keyId"].as_str().unwrap().to_string(),
+                revoked_at: None,
+                reason: None,
+            })
+            .collect();
+        TrustedKeys::from_sets(sets, revoked)
     }
 
     fn variant(e: &VerifyError) -> String {
@@ -1794,6 +2424,7 @@ mod tests {
             "ClassicalNotAllowed",
         ));
 
+        let rotation = build_rotation();
         json!({
             "label": VECTOR_LABEL,
             "format": 1,
@@ -1807,7 +2438,89 @@ mod tests {
                 "bundle": vector_bundle(&classical),
             },
             "negative": negative,
+            "rotation": rotation,
         })
+    }
+
+    /// Key rotation (#68) cases: a server on new keys that still trusts one
+    /// previous hybrid set and one previous classical set. Runtime keys only.
+    fn build_rotation() -> Value {
+        let old_hybrid = crate::integrity::test_hybrid_key(110);
+        let old_classical = test_key_n(111);
+        let current = crate::integrity::with_previous(
+            crate::integrity::test_hybrid_key(112),
+            crate::integrity::test_previous(&[&old_hybrid, &old_classical]),
+        );
+        let resp = serde_json::to_value(pubkey_response(&current)).unwrap();
+        let (trusted, previous) = (resp["keys"].clone(), resp["previousKeys"].clone());
+        let positive = vec![
+            json!({"name": "previous_hybrid_set", "bundle": vector_bundle(&old_hybrid),
+                   "allowClassical": false, "expectSource": "previous", "expectLabel": "old-0"}),
+            json!({"name": "previous_classical_set", "bundle": vector_bundle(&old_classical),
+                   "allowClassical": true, "expectSource": "previous", "expectLabel": "old-1"}),
+            json!({"name": "current_hybrid_set", "bundle": vector_bundle(&current),
+                   "allowClassical": false, "expectSource": "current"}),
+        ];
+        let case = |name: &str, bundle: Value, expect: &str| json!({"name": name, "bundle": bundle, "expect": expect});
+        let mut negative = vec![];
+        // Previous classical set without allowClassical.
+        negative.push(case(
+            "previous_classical_not_allowed",
+            vector_bundle(&old_classical),
+            "ClassicalNotAllowed",
+        ));
+        // Ed25519 half of the previous hybrid pair + the current ML-DSA key, both
+        // validly signed: two generations never combine.
+        let mut mixed = test_key_n(110);
+        mixed.mldsa = current.mldsa.clone();
+        let mut c = case(
+            "mixed_generation_halves",
+            vector_bundle(&mixed),
+            "KeyIdMismatch",
+        );
+        c["allowClassical"] = true.into();
+        negative.push(c);
+        // The previous hybrid pair's Ed25519 key alone is not a classical signer.
+        let mut c = case(
+            "previous_hybrid_half_as_classical",
+            vector_bundle(&test_key_n(110)),
+            "KeyIdMismatch",
+        );
+        c["allowClassical"] = true.into();
+        negative.push(c);
+        // Entry removed from the previous list.
+        let mut c = case(
+            "previous_set_removed",
+            vector_bundle(&old_hybrid),
+            "KeyIdMismatch",
+        );
+        c["previousKeySets"] = json!([]);
+        negative.push(c);
+        // Revoked key (and not listed as previous).
+        let mut c = case(
+            "previous_key_revoked",
+            vector_bundle(&old_classical),
+            "KeyRevoked",
+        );
+        c["previousKeySets"] = json!([previous[0].clone()]);
+        c["revoked"] = json!([{"algorithm": "ed25519", "keyId": old_classical.key_id}]);
+        c["allowClassical"] = true.into();
+        negative.push(c);
+        // A bad signature under a previous key is still an error.
+        let mut b = vector_bundle(&old_hybrid);
+        mutate_sig(&mut b, 1, 100);
+        negative.push(case("previous_key_bad_signature", b, "SignatureInvalid"));
+        json!({
+            "trustedKeys": trusted,
+            "previousKeySets": previous,
+            "positive": positive,
+            "negative": negative,
+        })
+    }
+
+    /// Classical state for `n` (the same Ed25519 key as the hybrid state `n`).
+    fn test_key_n(n: u8) -> SigningState {
+        crate::integrity::test_key(n)
     }
 
     /// `STIG_WRITE_TEST_VECTOR=<path>` writes a fresh vector with runtime keys
@@ -1867,6 +2580,9 @@ mod tests {
                 n["name"]
             );
         }
+        if let Some(r) = v.get("rotation") {
+            verify_rotation(r, &artifact);
+        }
         // Signed by another implementation (node:crypto / OpenSSL), if present.
         if let Some(f) = v.get("foreign") {
             let art = BASE64
@@ -1874,6 +2590,49 @@ mod tests {
                 .unwrap();
             let doc = check_entry(&f["bundle"], &f["trustedKeys"], &art, false).unwrap();
             assert_eq!(doc.signers.len(), 2);
+        }
+    }
+
+    fn verify_rotation(r: &Value, artifact: &[u8]) {
+        let sha = crypto::digest::sha256_hex(artifact);
+        let none = json!([]);
+        for p in r["positive"].as_array().unwrap() {
+            let trusted = trusted_with(&r["trustedKeys"], &r["previousKeySets"], &none);
+            let (_, source) = verify_bundle_with_source(
+                &serde_json::to_vec(&p["bundle"]).unwrap(),
+                &trusted,
+                p["allowClassical"].as_bool().unwrap(),
+                &sha,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", p["name"]));
+            assert_eq!(
+                source.as_str(),
+                p["expectSource"].as_str().unwrap(),
+                "{}",
+                p["name"]
+            );
+        }
+        for n in r["negative"].as_array().unwrap() {
+            let trusted = trusted_with(
+                &r["trustedKeys"],
+                n.get("previousKeySets").unwrap_or(&r["previousKeySets"]),
+                n.get("revoked").unwrap_or(&none),
+            );
+            let err = verify_bundle(
+                &serde_json::to_vec(&n["bundle"]).unwrap(),
+                &trusted,
+                n.get("allowClassical")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                &sha,
+            )
+            .unwrap_err();
+            assert_eq!(
+                variant(&err),
+                n["expect"].as_str().unwrap(),
+                "{}",
+                n["name"]
+            );
         }
     }
 
@@ -1896,9 +2655,10 @@ mod tests {
         // process environment.
         let ed = ed_hex();
         let policy = FipsPolicy::from_vars(true, None).unwrap();
-        let e = SigningState::from_vars(Some(&ed), None, Some("true"), &policy).unwrap_err();
+        let e = SigningState::from_vars(Some(&ed), None, Some("true"), &policy, None).unwrap_err();
         assert!(e.to_string().contains(REQUIRE_HYBRID_ENV), "{e}");
-        let e = SigningState::from_vars(Some(&ed), Some(&ml_b64()), None, &policy).unwrap_err();
+        let e =
+            SigningState::from_vars(Some(&ed), Some(&ml_b64()), None, &policy, None).unwrap_err();
         assert!(e.to_string().contains("ML-DSA-87"), "{e}");
     }
 
@@ -1917,6 +2677,30 @@ mod tests {
             Json(request(&BASE64.encode(b"hello"), resource)),
         )
         .await
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn startup_records_the_trusted_key_sets_in_a_system_event(pool: sqlx::PgPool) {
+        let old = crate::integrity::test_hybrid_key(120);
+        let cur = rotated_server(&[&old]);
+        record_signing_keys_event(&pool, &cur).await;
+        let rows = crate::test_fixtures::audit_rows(&pool, SIGNING_KEYS_ACTION).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].detail["currentKeyIds"], json!(cur.key_ids()));
+        assert_eq!(
+            rows[0].detail["previous"][0]["keyIds"],
+            json!(old.key_ids())
+        );
+        assert_eq!(rows[0].detail["previous"][0]["label"], "old-0");
+        let text: String = sqlx::query_scalar(
+            "SELECT detail::text FROM audit_events WHERE action = 'system.signing_keys'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!text.contains("publicKey"), "{text}");
     }
 
     #[sqlx::test]
