@@ -7,9 +7,11 @@
 //! (`saml`) work from this one tree, so the bytes that are digested are
 //! serialised from the same nodes the identity is read from.
 //!
-//! quick-xml 0.37 performs neither attribute-value normalisation nor
-//! end-of-line normalisation, so this module does both (XML 1.0 3.3.3 and
-//! 2.11) and checks every character against the XML 1.0 `Char` range.
+//! This module does attribute-value and end-of-line normalisation itself
+//! (XML 1.0 3.3.3 and 2.11) rather than using quick-xml's `normalized_value`
+//! / `xml10_content` helpers, and checks every character against the XML 1.0
+//! `Char` range. Entity and character references arrive as `GeneralRef`
+//! events and are resolved here.
 //!
 //! The parser fails closed: DOCTYPE, processing instructions (other than
 //! the XML declaration), comments, duplicate attributes, unknown namespace
@@ -33,6 +35,8 @@ pub const MAX_DOC_BYTES: usize = 256 * 1024;
 pub const MAX_ELEMENTS: usize = 2000;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_ATTRS: usize = 32;
+/// Maximum in-scope namespace bindings across all open elements.
+pub const MAX_NS_BINDINGS: usize = 128;
 
 /// A rejection carrying a fixed audit reason code, so classification never
 /// depends on rendered (attacker-influenced) text.
@@ -174,9 +178,7 @@ fn make_node(
     if ns.is_empty() {
         bail!("element without a namespace");
     }
-    let name = std::str::from_utf8(e.name().as_ref())
-        .map_err(|_| anyhow!("element name not utf-8"))?
-        .to_string();
+    let name = e.name().as_ref().to_string();
     let (prefix, local) = {
         let (p, l) = split_qname(&name)?;
         (p.to_string(), l.to_string())
@@ -189,11 +191,8 @@ fn make_node(
             bail!("too many attributes");
         }
         let a = a.map_err(|e| anyhow!("bad attribute: {e}"))?;
-        let key = std::str::from_utf8(a.key.as_ref())
-            .map_err(|_| anyhow!("attribute name not utf-8"))?
-            .to_string();
-        let raw =
-            std::str::from_utf8(&a.value).map_err(|_| anyhow!("attribute value not utf-8"))?;
+        let key = a.key.as_ref().to_string();
+        let raw: &str = &a.value;
         if raw.contains('<') {
             bail!("'<' in attribute value");
         }
@@ -327,6 +326,9 @@ impl SamlDoc {
             bail!("SAMLResponse exceeds {MAX_DOC_BYTES} bytes");
         }
         let mut r = NsReader::from_str(xml);
+        // 128 equals quick-xml 0.42's default; the explicit call pins it
+        // against a future upstream default change (see namespace_binding_cap).
+        r.resolver_mut().set_max_namespace_bindings(MAX_NS_BINDINGS);
         let mut nodes: Vec<Node> = Vec::new();
         let mut stack: Vec<usize> = Vec::new();
         let mut root_done = false;
@@ -338,9 +340,7 @@ impl SamlDoc {
                 .read_resolved_event()
                 .map_err(|e| anyhow!("xml parse error at {before}: {e}"))?;
             let ns = match res {
-                ResolveResult::Bound(n) => std::str::from_utf8(n.as_ref())
-                    .map_err(|_| anyhow!("namespace not utf-8"))?
-                    .to_string(),
+                ResolveResult::Bound(n) => n.as_ref().to_string(),
                 ResolveResult::Unbound => String::new(),
                 ResolveResult::Unknown(_) => bail!("unknown namespace prefix"),
             };
@@ -369,15 +369,26 @@ impl SamlDoc {
                     }
                 }
                 Event::Text(t) => {
-                    let raw = std::str::from_utf8(&t).map_err(|_| anyhow!("text not utf-8"))?;
-                    let s = unescape_checked(&normalize_eol(raw))?;
+                    let raw: &str = &t;
+                    // Defence in depth: unreachable with the default reader
+                    // config (allow_dangling_amp off), where the reader errors.
+                    if raw.contains('&') {
+                        bail!("unterminated reference in text");
+                    }
+                    let s = normalize_eol(raw);
+                    check_chars(&s)?;
                     place_text(&mut nodes, stack.last().copied(), &s, true, "text")?;
                 }
                 Event::CData(c) => {
-                    let raw = std::str::from_utf8(&c).map_err(|_| anyhow!("CDATA not utf-8"))?;
+                    let raw: &str = &c;
                     let s = normalize_eol(raw);
                     check_chars(&s)?;
                     place_text(&mut nodes, stack.last().copied(), &s, false, "CDATA")?;
+                }
+                Event::GeneralRef(g) => {
+                    let name: &str = &g;
+                    let s = unescape_checked(&format!("&{name};"))?;
+                    place_text(&mut nodes, stack.last().copied(), &s, false, "reference")?;
                 }
                 Event::Decl(_) if nodes.is_empty() => {}
                 Event::Decl(_) => bail!("XML declaration after root"),
@@ -696,5 +707,129 @@ mod tests {
         assert_eq!(d.ns_of_prefix(e, "xml"), Some(NS_XML));
         assert_eq!(d.ns_of_prefix(e, "nope"), None);
         assert_eq!(d.ns_of_prefix(0, "saml"), Some(NS_ASSERT));
+    }
+
+    #[test]
+    fn references_merge_with_text_in_order() {
+        let d = tree("<x:e xmlns:x=\"urn:x\">a &amp; b&lt;c&#13;&#xA;d\r\n&#x9;<x:c/>&gt;</x:e>");
+        let n = d.node(d.node(0).children[1]);
+        assert_eq!(
+            n.content,
+            vec![
+                Content::Text("a & b<c\r\nd\n\t".into()),
+                Content::Child(n.children[0]),
+                Content::Text(">".into()),
+            ]
+        );
+        let d = tree("<x:e xmlns:x=\"urn:x\">&lt;b xmlns='urn:b'/&gt;</x:e>");
+        assert_eq!(d.node(d.node(0).children[1]).children.len(), 0);
+        assert_eq!(d.nodes.len(), 3);
+    }
+
+    fn err_of(xml: &str) -> String {
+        match SamlDoc::parse_tree(xml) {
+            Ok(_) => panic!("accepted: {xml}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_references() {
+        for (bad, want) in [
+            ("&foo;", "unrecognized entity `foo`"),
+            ("x & y", "`;` not found before end of input"),
+            ("x &amp y", "`;` not found before end of input"),
+            ("&;", "unrecognized entity ``"),
+            ("&#0;", "0x0 character is not permitted"),
+            ("&#xFFFE;", "outside the XML 1.0 Char range"),
+            ("&#xD800;", "`55296` is not a valid codepoint"),
+        ] {
+            let xml = resp(&format!(
+                "<saml:Assertion ID=\"a\"/><x:e xmlns:x=\"urn:x\">{bad}</x:e>"
+            ));
+            let e = err_of(&xml);
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+        let xml = format!(
+            "<!DOCTYPE a [<!ENTITY e 'v'>]><samlp:Response {R} ID=\"r\">&e;</samlp:Response>"
+        );
+        assert!(err_of(&xml).contains("DOCTYPE"));
+        assert!(err_of(&resp("<!DOCTYPE a>")).contains("DOCTYPE"));
+    }
+
+    #[test]
+    fn rejects_references_outside_root() {
+        for bad in [
+            "<a xmlns='urn:a'/>&#32;",
+            "&#32;<a xmlns='urn:a'/>",
+            "<a xmlns='urn:a'/>&amp;",
+            "<a xmlns='urn:a'/>&#32;<b xmlns='urn:b'/>",
+            "<a xmlns='urn:a'/>&#32;&#32;",
+        ] {
+            let e = err_of(bad);
+            assert!(e.contains("reference"), "{bad}: {e}");
+        }
+    }
+
+    fn nested_decls(levels: usize, per: usize, redeclare: bool) -> String {
+        let mut open = String::new();
+        for l in 0..levels {
+            open.push_str("<a xmlns='urn:a'");
+            for p in 0..per {
+                let n = if redeclare { p } else { l * per + p };
+                open.push_str(&format!(" xmlns:p{n}='urn:p{n}'"));
+            }
+            open.push('>');
+        }
+        format!("{open}{}", "</a>".repeat(levels))
+    }
+
+    /// Nested elements declaring `n` distinct prefixes in total, at most 30
+    /// per element (under MAX_ATTRS); only the root declares a default ns.
+    fn n_bindings(n: usize) -> String {
+        let (mut open, mut depth, mut i) = (String::from("<a xmlns='urn:a'"), 1, 0);
+        while i < n {
+            for _ in 0..30.min(n - i) {
+                open.push_str(&format!(" xmlns:p{i}='urn:p{i}'"));
+                i += 1;
+            }
+            open.push('>');
+            if i < n {
+                open.push_str("<a");
+                depth += 1;
+            }
+        }
+        format!("{open}{}", "</a>".repeat(depth))
+    }
+
+    #[test]
+    fn namespace_binding_cap() {
+        // The root's default xmlns is one binding, so 127 prefixes is the
+        // 128-binding boundary.
+        let ok = n_bindings(MAX_NS_BINDINGS - 1);
+        assert!(SamlDoc::parse_tree(&ok).is_ok());
+        let msg = err_of(&n_bindings(MAX_NS_BINDINGS));
+        assert!(msg.contains("namespace"), "{msg}");
+        assert!(SamlDoc::parse_tree(&nested_decls(5, 30, false)).is_err());
+        assert!(SamlDoc::parse_tree(&nested_decls(31, 5, true)).is_err());
+        let sib: String = (0..300)
+            .map(|i| format!("<b xmlns:p{i}='urn:p{i}'/>"))
+            .collect();
+        assert!(SamlDoc::parse_tree(&format!("<a xmlns='urn:a'>{sib}</a>")).is_ok());
+        assert!(SamlDoc::parse_tree(&nested_decls(8, 5, true)).is_ok());
+    }
+
+    #[test]
+    fn huge_start_tags_are_rejected() {
+        let attrs: String = (0..20_000).map(|i| format!(" a{i}='v'")).collect();
+        assert!(SamlDoc::parse_tree(&format!("<a xmlns='urn:a'{attrs}/>")).is_err());
+        let decls: String = (0..15_000).map(|i| format!(" xmlns:p{i}='u'")).collect();
+        assert!(SamlDoc::parse_tree(&format!("<a xmlns='urn:a'{decls}/>")).is_err());
+    }
+
+    #[test]
+    fn duplicate_namespace_declarations_rejected() {
+        assert!(SamlDoc::parse_tree("<a xmlns='urn:a' xmlns='urn:b'/>").is_err());
+        assert!(SamlDoc::parse_tree("<p:a xmlns:p='urn:a' xmlns:p='urn:b'/>").is_err());
     }
 }

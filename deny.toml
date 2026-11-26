@@ -15,8 +15,6 @@ ignore = [
   { id = "RUSTSEC-2023-0071", reason = "Reviewed 2026-11-23. rsa (Marvin timing attack on private-key operations) is in the graph only via openidconnect, which uses it to verify ID-token signatures with public keys; no RSA private key is ever handled by this crate. No fixed release exists." },
   { id = "RUSTSEC-2026-0387", reason = "Reviewed 2026-11-23. crypto-bigint 0.5.5 timing issues; reachable only via p256/p384 inside openidconnect, which uses them to verify ECDSA ID-token signatures with public keys and holds no secret integers. Fix is a breaking upgrade (0.7.6) inside RustCrypto; revisit when openidconnect moves, by 2027-02-23." },
   { id = "RUSTSEC-2026-0543", reason = "Reviewed 2026-11-23. chrono is flagged unmaintained, with no safe upgrade available. It is used for timestamps and sqlx/serde integration across the backend; replacing it is a separate piece of work. Revisit by 2027-02-23." },
-  { id = "RUSTSEC-2026-0194", reason = "TEMPORARY, reviewed 2026-11-23. quick-xml 0.37 quadratic duplicate-attribute check; fix needs the breaking quick-xml >=0.41 upgrade of saml_xml.rs and the XSW-hardened SAML parser, tracked as a separate issue. SAML input is size-capped before parsing. Remove by 2027-01-23." },
-  { id = "RUSTSEC-2026-0195", reason = "TEMPORARY, reviewed 2026-11-23. quick-xml 0.37 unbounded NsReader namespace allocation (saml_xml.rs); same breaking-upgrade follow-up as RUSTSEC-2026-0194. SAML input is size-capped before parsing. Remove by 2027-01-23." },
 ]
 
 [bans]

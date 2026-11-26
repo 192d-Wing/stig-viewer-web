@@ -142,10 +142,17 @@ fn attr_value(tag_bytes: &[u8], attr_name: &str) -> Option<String> {
 
 // ── Main parser ───────────────────────────────────────────────────────────────
 
+/// Document-controlled strings go into logs escaped (via `?`) and bounded.
+fn log_bound(s: &str) -> String {
+    s.chars().take(64).collect()
+}
+
 /// Parse an XCCDF XML string into a `StigData` value.
 pub fn parse_xccdf(xml: &str) -> Result<StigData> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Whitespace is trimmed after unescaping, below. A bare `&` is tolerated by
+    // the reader and blanks only the affected field (see `text_run`).
+    reader.config_mut().allow_dangling_amp = true;
 
     let mut title = String::new();
     let mut description = String::new();
@@ -169,12 +176,103 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
     let mut rule_depth: usize = 0;
 
     let mut buf = Vec::new();
+    // Consecutive Text/GeneralRef events are reassembled into one raw string
+    // and unescaped once, so first-non-empty-wins fields are not truncated at
+    // the first entity reference.
+    let mut text_run = String::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        buf.clear();
+        let event = match reader.read_event_into(&mut buf) {
+            Ok(Event::Text(ref e)) => {
+                text_run.push_str(e);
+                continue;
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                text_run.push('&');
+                text_run.push_str(e);
+                text_run.push(';');
+                continue;
+            }
+            other => other,
+        };
+        let text = match quick_xml::escape::unescape(&text_run) {
+            Ok(t) => t.trim().to_string(),
+            Err(e) => {
+                // Lenient on purpose: blank the field, keep importing. Log
+                // only the error kind and context, never the text itself.
+                let kind = match e {
+                    quick_xml::escape::EscapeError::UnrecognizedEntity(..) => "unrecognized entity",
+                    quick_xml::escape::EscapeError::UnterminatedEntity(..) => "unterminated entity",
+                    quick_xml::escape::EscapeError::InvalidCharRef(..) => {
+                        "invalid character reference"
+                    }
+                    _ => "other escape error",
+                };
+                tracing::warn!(
+                    tag = ?log_bound(&current_tag),
+                    in_rule,
+                    group = ?log_bound(&current_group_id),
+                    kind,
+                    "XCCDF text has an ill-formed reference; field left empty"
+                );
+                String::new()
+            }
+        };
+        text_run.clear();
+        if !text.is_empty() {
+            if in_rule {
+                if let Some(ref mut rule) = current_rule {
+                    match current_tag.as_str() {
+                        // Only the Rule's own <title> (a direct child).
+                        // DISA rules also carry <reference><dc:title>,
+                        // whose local name is "title" too; matching it
+                        // here used to overwrite every rule title with
+                        // "DPMS Target …".
+                        "title" if depth == rule_depth + 1 => rule.title = text,
+                        // First non-empty value wins, like the title: a
+                        // later duplicate or nested element of the same
+                        // name must not overwrite the Rule's own text.
+                        "description" if rule.description.is_empty() => {
+                            rule.description = clean_description(&text)
+                        }
+                        "fixtext" | "fix-text" if rule.fix_text.is_empty() => rule.fix_text = text,
+                        "check-content" if rule.check_text.is_empty() => rule.check_text = text,
+                        "ident" => {
+                            // Only retain idents whose `system` URI
+                            // names a CCI source — DISA, NIST, and
+                            // newer XCCDF bundles all spell this
+                            // differently but every variant contains
+                            // the substring "cci". Trim + dedupe so
+                            // the JSON shape is stable regardless of
+                            // upstream whitespace quirks.
+                            if current_ident_system.to_lowercase().contains("cci") {
+                                let value = text.trim().to_string();
+                                if !value.is_empty() && !rule.cci.iter().any(|c| c == &value) {
+                                    rule.cci.push(value.clone());
+                                    rule.cci_ids.push(value);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if in_benchmark {
+                match current_tag.as_str() {
+                    "title" if title.is_empty() => title = text,
+                    "description" if description.is_empty() => {
+                        description = clean_description(&text)
+                    }
+                    "version" if version.is_empty() => version = text,
+                    "plain-text" | "release-info" if release_info.is_empty() => release_info = text,
+                    _ => {}
+                }
+            }
+        }
+        match event {
             Ok(Event::Start(ref e)) => {
                 depth += 1;
-                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let local = e.local_name().as_ref().to_string();
 
                 match local.as_str() {
                     "Benchmark" => {
@@ -182,13 +280,13 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                     }
                     "Group" if in_benchmark => {
                         in_group = true;
-                        current_group_id = attr_value(e.as_ref(), "id").unwrap_or_default();
+                        current_group_id = attr_value(e.as_bytes(), "id").unwrap_or_default();
                     }
                     "Rule" if in_group => {
                         in_rule = true;
                         rule_depth = depth;
-                        let rule_id = attr_value(e.as_ref(), "id").unwrap_or_default();
-                        let severity_raw = attr_value(e.as_ref(), "severity").unwrap_or_default();
+                        let rule_id = attr_value(e.as_bytes(), "id").unwrap_or_default();
+                        let severity_raw = attr_value(e.as_bytes(), "severity").unwrap_or_default();
                         current_rule = Some(Rule {
                             id: rule_id,
                             stig_id: current_group_id.clone(),
@@ -210,12 +308,12 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                 // Capture the `system` attribute when entering an <ident>
                 // so the text-event handler can decide whether to keep it.
                 if local == "ident" {
-                    current_ident_system = attr_value(e.as_ref(), "system").unwrap_or_default();
+                    current_ident_system = attr_value(e.as_bytes(), "system").unwrap_or_default();
                 }
                 current_tag = local;
             }
             Ok(Event::End(ref e)) => {
-                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let local = e.local_name().as_ref().to_string();
                 if local == "Rule" && in_rule && depth == rule_depth {
                     if let Some(rule) = current_rule.take() {
                         rules.push(rule);
@@ -231,68 +329,10 @@ pub fn parse_xccdf(xml: &str) -> Result<StigData> {
                 depth = depth.saturating_sub(1);
                 current_tag.clear();
             }
-            Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or_default().trim().to_string();
-                if text.is_empty() {
-                    continue;
-                }
-                if in_rule {
-                    if let Some(ref mut rule) = current_rule {
-                        match current_tag.as_str() {
-                            // Only the Rule's own <title> (a direct child).
-                            // DISA rules also carry <reference><dc:title>,
-                            // whose local name is "title" too; matching it
-                            // here used to overwrite every rule title with
-                            // "DPMS Target …".
-                            "title" if depth == rule_depth + 1 => rule.title = text,
-                            // First non-empty value wins, like the title: a
-                            // later duplicate or nested element of the same
-                            // name must not overwrite the Rule's own text.
-                            "description" if rule.description.is_empty() => {
-                                rule.description = clean_description(&text)
-                            }
-                            "fixtext" | "fix-text" if rule.fix_text.is_empty() => {
-                                rule.fix_text = text
-                            }
-                            "check-content" if rule.check_text.is_empty() => rule.check_text = text,
-                            "ident" => {
-                                // Only retain idents whose `system` URI
-                                // names a CCI source — DISA, NIST, and
-                                // newer XCCDF bundles all spell this
-                                // differently but every variant contains
-                                // the substring "cci". Trim + dedupe so
-                                // the JSON shape is stable regardless of
-                                // upstream whitespace quirks.
-                                if current_ident_system.to_lowercase().contains("cci") {
-                                    let value = text.trim().to_string();
-                                    if !value.is_empty() && !rule.cci.iter().any(|c| c == &value) {
-                                        rule.cci.push(value.clone());
-                                        rule.cci_ids.push(value);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                } else if in_benchmark {
-                    match current_tag.as_str() {
-                        "title" if title.is_empty() => title = text,
-                        "description" if description.is_empty() => {
-                            description = clean_description(&text)
-                        }
-                        "version" if version.is_empty() => version = text,
-                        "plain-text" | "release-info" if release_info.is_empty() => {
-                            release_info = text
-                        }
-                        _ => {}
-                    }
-                }
-            }
             Ok(Event::Eof) => break,
             Err(e) => bail!("XML parse error: {e}"),
             _ => {}
         }
-        buf.clear();
     }
 
     if title.is_empty() {
@@ -1874,5 +1914,121 @@ mod tests {
             seen += 1;
         }
         assert!(seen > 0, "no *.zip in {dir}");
+    }
+
+    fn xccdf_with(title: &str, rtitle: &str, desc: &str, check: &str, ident: &str) -> String {
+        format!(
+            r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>{title}</title>
+            <Group id="V-1"><Rule id="SV-1_rule" severity="low"><title>{rtitle}</title>
+              <description>{desc}</description>
+              <ident system="http://cyber.mil/cci">{ident}</ident>
+              <check><check-content>{check}</check-content></check>
+            </Rule></Group></Benchmark>"#
+        )
+    }
+
+    #[test]
+    fn entity_runs_are_reassembled() {
+        let xml = xccdf_with(
+            "A &amp; B &lt;C&gt;",
+            " Rule  &amp;  title ",
+            "&lt;VulnDiscussion&gt;text &amp; more&lt;/VulnDiscussion&gt;",
+            "line1&#10;line2 &gt; x",
+            "&#32;CCI-000001&#32;",
+        );
+        let s = parse_xccdf(&xml).unwrap();
+        assert_eq!(s.title, "A & B <C>");
+        assert_eq!(s.rules[0].title, "Rule  &  title");
+        assert_eq!(s.rules[0].description, "text & more");
+        assert_eq!(s.rules[0].check_text, "line1\nline2 > x");
+        assert_eq!(s.rules[0].cci, vec!["CCI-000001".to_string()]);
+    }
+
+    #[test]
+    fn ill_formed_references_blank_the_field_not_the_import() {
+        let _g = lock_warn_callsite();
+        let xml = xccdf_with("AT&T", "x & y", "&nbsp;d", "a &bogus; b", "CCI-000001");
+        let s = parse_xccdf(&xml).unwrap();
+        assert_eq!(s.title, "Unknown STIG");
+        assert_eq!(s.rules[0].title, "");
+        assert_eq!(s.rules[0].description, "");
+        assert_eq!(s.rules[0].check_text, "");
+    }
+
+    #[test]
+    fn text_runs_break_at_markup() {
+        let xml = xccdf_with(
+            "a<!-- c -->b",
+            "a<!-- c -->b",
+            "a<![CDATA[zz]]>b",
+            "&amp;<b/>tail",
+            "CCI-000001",
+        );
+        let s = parse_xccdf(&xml).unwrap();
+        assert_eq!(s.title, "a");
+        assert_eq!(s.rules[0].title, "b");
+        assert_eq!(s.rules[0].description, "a");
+        assert_eq!(s.rules[0].check_text, "&");
+    }
+
+    /// Serialises the tests that hit the ill-formed-reference `warn!`
+    /// callsite, so its cached interest cannot be set by one while the other
+    /// captures.
+    static WARN_CALLSITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_warn_callsite() -> std::sync::MutexGuard<'static, ()> {
+        WARN_CALLSITE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[derive(Clone, Default)]
+    struct BufW(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufW {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut g) = self.0.lock() {
+                g.extend_from_slice(b);
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ill_formed_reference_warns_without_leaking_text_or_raw_newlines() {
+        let _g = lock_warn_callsite();
+        let long = format!("t{}", "n".repeat(79));
+        let xml = format!(
+            r#"<Benchmark xmlns="http://checklists.nist.gov/xccdf/1.1"><title>AT&T</title>
+            <Group id="V-1
+INJECTED"><Rule id="SV-1_rule" severity="low"><title>r</title>
+              <description>&nbsp;d</description>
+              <check><check-content>a &bogus; b</check-content></check>
+              <{long}>x &bogus; y</{long}>
+            </Rule></Group></Benchmark>"#
+        );
+        let buf = BufW::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer({
+                let b = buf.clone();
+                move || b.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        let parsed = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            parse_xccdf(&xml)
+        });
+        assert!(parsed.is_ok());
+        let out = String::from_utf8(buf.0.lock().map(|g| g.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        assert!(out.contains("ill-formed reference"), "{out}");
+        for leaked in ["bogus", "AT&T", "nbsp"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(out.contains(&format!("\"{}\"", &long[..64])), "{out}");
+        assert!(!out.contains(&long), "{out}");
+        assert!(out.contains("V-1\\nINJECTED"), "{out}");
+        assert!(out.lines().all(|l| !l.starts_with("INJECTED")), "{out}");
     }
 }

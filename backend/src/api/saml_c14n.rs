@@ -303,4 +303,12 @@ mod tests {
         let e = canonicalize(&doc, 0, None, &[]).unwrap_err();
         assert!(e.to_string().contains("canonical form too large"), "{e}");
     }
+
+    #[test]
+    fn references_and_cdata_canonicalise_byte_exact() {
+        assert_eq!(
+            whole("<a xmlns=\"urn:a\">x &amp; y&#13;\r\n&gt;<![CDATA[&amp;]]>&quot;&apos;</a>"),
+            "<a xmlns=\"urn:a\">x &amp; y&#xD;\n&gt;&amp;amp;\"'</a>"
+        );
+    }
 }
