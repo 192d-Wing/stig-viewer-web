@@ -1,45 +1,93 @@
 //! Outbound webhook delivery + admin CRUD.
 //!
-//! ## Payload signing (HMAC-SHA256 and HMAC-SHA384)
+//! ## Payload signing (HMAC-SHA256, HMAC-SHA384 and timestamped V3)
 //!
-//! Every delivery whose `webhooks.secret` is non-empty carries two headers
-//! over the same raw request body, keyed by the configured secret:
+//! Every delivery whose `webhooks.secret` is non-empty carries these headers,
+//! keyed by the configured secret:
 //!
 //! - `X-Webhook-Signature: sha256=<hex>`, the lower-case hexadecimal
-//!   HMAC-SHA256. It matches GitHub's webhook convention, so any receiver
-//!   that already validates GitHub webhooks can reuse the same code path.
+//!   HMAC-SHA256 over the raw body. It matches GitHub's webhook convention,
+//!   so any receiver that already validates GitHub webhooks can reuse the
+//!   same code path.
 //! - `X-Webhook-Signature-V2: sha384=<hex>`, the HMAC-SHA384 (the CNSA 2.0
-//!   hash size). Receivers that must meet CNSA 2.0 should require this
-//!   header, ignore the SHA-256 one, and use a secret of at least 48 bytes.
+//!   hash size) over the raw body. Receivers that must meet CNSA 2.0 should
+//!   use a secret of at least 48 bytes.
+//! - `X-Webhook-Timestamp: <ts>`, the send time, and
+//!   `X-Webhook-Signature-V3: sha384=<hex>`, an HMAC-SHA384 that binds that
+//!   time to the body. This is the replay-protected signature.
 //!
-//! Webhooks with an empty secret are sent **unsigned**: no signature header
-//! at all, preserving the original opt-in behaviour for users who do not
-//! need to authenticate the sender (e.g. internal-only Slack incoming
-//! webhooks behind a VPN). The pre-HMAC `X-Webhook-Secret` literal-value
-//! header was removed; secrets are never transmitted on the wire.
+//! Webhooks with an empty secret are sent **unsigned**: no signature or
+//! timestamp header at all, preserving the original opt-in behaviour for
+//! users who do not need to authenticate the sender (e.g. internal-only Slack
+//! incoming webhooks behind a VPN). The pre-HMAC `X-Webhook-Secret`
+//! literal-value header was removed; secrets are never transmitted on the
+//! wire.
 //!
-//! The signature covers the body only. It carries no timestamp or nonce, so
-//! it authenticates the sender and the body but does not by itself stop a
-//! captured delivery from being replayed.
+//! V1 and V2 cover the body only. They carry no timestamp or nonce, so a
+//! captured delivery can be replayed with them indefinitely. Only V3 binds
+//! the send time. Replay protection therefore holds only for receivers that
+//! **require V3 and ignore V1/V2**: an attacker who can strip V3 can
+//! otherwise replay with the body-only headers.
+//!
+//! ### V3 wire contract
+//!
+//! - `X-Webhook-Timestamp: <ts>`: Unix time in whole seconds, UTC, ASCII
+//!   decimal digits only, no sign, no leading zeros, no whitespace. Example:
+//!   `1700000000`.
+//! - `X-Webhook-Signature-V3: sha384=<96 lowercase hex>`: HMAC-SHA-384 keyed
+//!   with the secret's UTF-8 bytes (the same key as V1/V2).
+//! - Signed string: the bytes of `<ts>` exactly as they appear in the
+//!   timestamp header, one byte `0x2E` (`.`), then the raw request body
+//!   bytes. No trailing newline, no re-serialisation.
+//! - The timestamp is taken from the server clock for each send attempt, so
+//!   a resend is re-signed with a fresh timestamp.
+//!
+//! ### V3 receiver algorithm
+//!
+//! 1. Read `X-Webhook-Timestamp` and `X-Webhook-Signature-V3`. If either is
+//!    missing, reject.
+//! 2. The timestamp must match `^[1-9][0-9]{0,11}$`. Reject anything else.
+//! 3. The signature must be `sha384=` followed by exactly 96 lowercase hex
+//!    characters.
+//! 4. Compute `"sha384=" + hex(HMAC-SHA-384(secret, ts_header_bytes + "." +
+//!    raw_body))`, using the received header string (not a re-formatted
+//!    integer) and the raw body before any JSON parsing.
+//! 5. Compare in constant time.
+//! 6. Only after the MAC verifies, check `abs(now - ts) <= 300` (both
+//!    directions, boundary inclusive).
+//! 7. Return the same 401 for every failure.
+//! 8. Recommended: remember each accepted `(timestamp, signature)` pair for
+//!    at least 600 s and reject repeats. Identical bodies sent in the same
+//!    second share a signature, so treat deliveries as idempotent. The
+//!    sender's clock must be NTP-synced.
 //!
 //! ### Verification recipe: Python
 //! ```python
-//! import hmac, hashlib
-//! sig = "sha384=" + hmac.new(
-//!     secret.encode(), body_bytes, hashlib.sha384
-//! ).hexdigest()
-//! # constant-time compare against request.headers["X-Webhook-Signature-V2"]
-//! hmac.compare_digest(sig, received_header)
+//! import hmac, hashlib, re, time
+//! # `secret` must be non-empty (an empty key is forgeable).
+//! def verify_v3(secret: bytes, raw_body: bytes, ts: str, sig: str) -> bool:
+//!     if not re.fullmatch(r"[1-9][0-9]{0,11}", ts or ""):
+//!         return False
+//!     if not re.fullmatch(r"sha384=[0-9a-f]{96}", sig or ""):
+//!         return False
+//!     mac = hmac.new(secret, ts.encode() + b"." + raw_body, hashlib.sha384)
+//!     if not hmac.compare_digest("sha384=" + mac.hexdigest(), sig):
+//!         return False
+//!     return abs(time.time() - int(ts)) <= 300
 //! ```
 //!
 //! ### Verification recipe: Node.js
 //! ```js
 //! const crypto = require("crypto");
-//! const sig = "sha384=" + crypto
-//!   .createHmac("sha384", secret)
-//!   .update(rawBody)
-//!   .digest("hex");
-//! crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(receivedHeader));
+//! function verifyV3(secret, rawBody, ts, sig) {
+//!   if (!/^[1-9][0-9]{0,11}$/.test(ts || "")) return false;
+//!   if (!/^sha384=[0-9a-f]{96}$/.test(sig || "")) return false;
+//!   const mac = crypto.createHmac("sha384", secret)
+//!     .update(ts).update(".").update(rawBody).digest("hex");
+//!   const a = Buffer.from("sha384=" + mac), b = Buffer.from(sig);
+//!   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+//!   return Math.abs(Date.now() / 1000 - Number(ts)) <= 300;
+//! }
 //! ```
 
 use axum::{
@@ -67,6 +115,13 @@ const SIG_HEADER_V2: &str = "X-Webhook-Signature-V2";
 /// (`<name>=<hex>`). The signers and the verify recipes both derive from them.
 const SIG_ALGO: &str = "sha256";
 const SIG_ALGO_V2: &str = "sha384";
+/// Header carrying the timestamp-bound HMAC-SHA384 (`sha384=<hex>`).
+const SIG_HEADER_V3: &str = "X-Webhook-Signature-V3";
+/// Header carrying the send time (Unix seconds) that V3 signs.
+const TIMESTAMP_HEADER: &str = "X-Webhook-Timestamp";
+const SIG_ALGO_V3: &str = "sha384";
+/// Receivers accept |now - timestamp| <= this many seconds.
+const SIG_V3_TOLERANCE_SECS: u64 = 300;
 
 /// Compute the `sha256=<hex>` signature for `body` keyed by `secret`.
 /// Returns `None` when `secret` is empty so callers can branch on
@@ -91,6 +146,42 @@ fn sign_body_v2(secret: &str, body: &[u8]) -> Option<String> {
         "{SIG_ALGO_V2}={}",
         hex::encode(crypto::hmac::hmac_sha384(secret.as_bytes(), body))
     ))
+}
+
+/// `<ts>.<body>`: ASCII decimal seconds, one '.', raw body bytes.
+fn signed_payload_v3(timestamp: u64, body: &[u8]) -> Vec<u8> {
+    let ts = timestamp.to_string();
+    let mut out = Vec::with_capacity(ts.len() + 1 + body.len());
+    out.extend_from_slice(ts.as_bytes());
+    out.push(b'.');
+    out.extend_from_slice(body);
+    out
+}
+
+/// `sha384=<hex>` over `signed_payload_v3` keyed by `secret`
+/// (`X-Webhook-Signature-V3`). `None` for an empty secret.
+fn sign_body_v3(secret: &str, timestamp: u64, body: &[u8]) -> Option<String> {
+    if secret.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{SIG_ALGO_V3}={}",
+        hex::encode(crypto::hmac::hmac_sha384(
+            secret.as_bytes(),
+            &signed_payload_v3(timestamp, body)
+        ))
+    ))
+}
+
+/// Server clock in Unix seconds; 0 if the clock is before the epoch (which
+/// every receiver rejects, so it fails closed).
+fn unix_now() -> u64 {
+    u64::try_from(Utc::now().timestamp()).unwrap_or_else(|_| {
+        // 0 is intentionally fail-closed: every receiver rejects it as far
+        // outside the tolerance window.
+        tracing::warn!("system clock is before the Unix epoch; webhook timestamp set to 0");
+        0
+    })
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -615,6 +706,15 @@ pub struct VerifyRecipe {
     /// Header carrying the HMAC-SHA384 signature (CNSA 2.0 receivers).
     #[serde(rename = "headerNameV2")]
     pub header_name_v2: String,
+    /// Header carrying the timestamp-bound HMAC-SHA384 (replay-protected).
+    #[serde(rename = "headerNameV3")]
+    pub header_name_v3: String,
+    /// Header carrying the Unix-seconds send time that V3 signs.
+    #[serde(rename = "timestampHeaderName")]
+    pub timestamp_header_name: String,
+    /// Receivers accept |now - timestamp| <= this many seconds.
+    #[serde(rename = "toleranceSeconds")]
+    pub tolerance_seconds: u64,
     /// Pretty-printed canonical sample body — matches what the Slack
     /// formatter produces for the synthetic /test (`assigned`) event.
     #[serde(rename = "samplePayload")]
@@ -633,6 +733,11 @@ pub struct VerifyRecipeSnippets {
 /// the HTTP layer so it can be unit-tested; the secret never appears in the
 /// output (only the curl signature over the fixed sample payload does).
 fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
+    build_verify_recipe_at(webhook, unix_now())
+}
+
+/// `build_verify_recipe` with the clock injected, for tests.
+fn build_verify_recipe_at(webhook: &WebhookRow, now_unix: u64) -> VerifyRecipe {
     // Canonical sample event — kept compact on purpose so the snippets
     // fit in a Slack/Discord message without scrolling.
     let sample = json!({
@@ -650,25 +755,39 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
 
     let header_name = SIG_HEADER;
     let header_name_v2 = SIG_HEADER_V2;
-    let snippets = if webhook.secret.is_empty() {
-        VerifyRecipeSnippets {
-            curl: unsigned_curl_snippet(&webhook.url, &sample_payload),
-            python: unsigned_python_snippet(),
-            node: unsigned_node_snippet(),
-        }
-    } else {
-        let sig = sign_body(&webhook.secret, sample_payload.as_bytes())
-            .expect("non-empty secret always signs");
-        let sig_v2 = sign_body_v2(&webhook.secret, sample_payload.as_bytes())
-            .expect("non-empty secret always signs");
+    let sigs = (
+        sign_body(&webhook.secret, sample_payload.as_bytes()),
+        sign_body_v2(&webhook.secret, sample_payload.as_bytes()),
+        sign_body_v3(&webhook.secret, now_unix, sample_payload.as_bytes()),
+    );
+    // All three are `None` exactly when the secret is empty (unsigned).
+    let snippets = if let (Some(sig), Some(sig_v2), Some(sig_v3)) = sigs {
+        let now_str = now_unix.to_string();
+        let hdrs = RecipeHeaders {
+            v1: header_name,
+            v2: header_name_v2,
+            v3: SIG_HEADER_V3,
+            ts: TIMESTAMP_HEADER,
+        };
         VerifyRecipeSnippets {
             curl: signed_curl_snippet(
                 &webhook.url,
                 &sample_payload,
-                &[(header_name, &sig), (header_name_v2, &sig_v2)],
+                &[
+                    (header_name, &sig),
+                    (header_name_v2, &sig_v2),
+                    (TIMESTAMP_HEADER, &now_str),
+                    (SIG_HEADER_V3, &sig_v3),
+                ],
             ),
-            python: signed_python_snippet(header_name, header_name_v2),
-            node: signed_node_snippet(header_name, header_name_v2),
+            python: signed_python_snippet(&hdrs),
+            node: signed_node_snippet(&hdrs),
+        }
+    } else {
+        VerifyRecipeSnippets {
+            curl: unsigned_curl_snippet(&webhook.url, &sample_payload),
+            python: unsigned_python_snippet(),
+            node: unsigned_node_snippet(),
         }
     };
 
@@ -678,6 +797,9 @@ fn build_verify_recipe(webhook: &WebhookRow) -> VerifyRecipe {
         url: webhook.url.clone(),
         header_name: header_name.to_string(),
         header_name_v2: header_name_v2.to_string(),
+        header_name_v3: SIG_HEADER_V3.to_string(),
+        timestamp_header_name: TIMESTAMP_HEADER.to_string(),
+        tolerance_seconds: SIG_V3_TOLERANCE_SECS,
         sample_payload,
         snippets,
     }
@@ -687,12 +809,13 @@ fn signed_curl_snippet(url: &str, body: &str, sigs: &[(&str, &str)]) -> String {
     // Single-line curl that demonstrates exactly what the dispatcher
     // emits on the wire. The signature is pre-computed for the literal
     // sample body so a paste-and-run actually validates downstream.
+    let minutes = SIG_V3_TOLERANCE_SECS / 60;
     let headers: String = sigs
         .iter()
         .map(|(h, v)| format!("  -H '{h}: {v}' \\\n"))
         .collect();
     format!(
-        "curl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n{headers}  -d '{body}'"
+        "# {TIMESTAMP_HEADER} / {SIG_HEADER_V3} below are a live signed sample delivery, valid for {minutes} minutes from when this recipe was generated.\n# Use it only against a test receiver and do not paste it into shared channels; reload to refresh.\ncurl -X POST '{url}' \\\n  -H 'Content-Type: application/json' \\\n{headers}  -d '{body}'"
     )
 }
 
@@ -702,32 +825,56 @@ fn unsigned_curl_snippet(url: &str, body: &str) -> String {
     )
 }
 
-fn signed_python_snippet(header: &str, header_v2: &str) -> String {
+/// Header names the signed receiver snippets refer to.
+struct RecipeHeaders<'a> {
+    v1: &'a str,
+    v2: &'a str,
+    v3: &'a str,
+    ts: &'a str,
+}
+
+fn signed_python_snippet(h: &RecipeHeaders) -> String {
     // Receiver-side verification recipe. The secret is write-only, so the
     // snippet reads it from the environment instead of embedding it.
     format!(
-        "# Python receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n# {header} (HMAC-SHA256) is sent alongside for existing receivers.\nimport hmac, hashlib, os\n\n# Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nSECRET = os.environ['WEBHOOK_SECRET'].encode()\nHEADER = {header_lit}\nHEADER_V2 = {header_v2_lit}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo}=' + hmac.new(SECRET, raw_body, hashlib.{algo}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\ndef verify_v2(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo_v2}=' + hmac.new(SECRET, raw_body, hashlib.{algo_v2}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\n# In Flask / FastAPI / Django:\n#   ok = verify_v2(request.get_data(), request.headers[HEADER_V2])\n",
-        header_lit = python_string_literal(header),
-        header_v2_lit = python_string_literal(header_v2),
+        "# Python receiver — verify the {v3} header (replay-protected: HMAC-SHA384 over '<{ts}>.<body>').\n# {v1} (HMAC-SHA256) and {v2} (HMAC-SHA384) cover the body only and can be replayed; require V3 and ignore them for replay protection.\nimport hmac, hashlib, os, re, time\n\n# Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nSECRET = os.environ.get('WEBHOOK_SECRET', '').encode()\nif not SECRET:\n    raise SystemExit('WEBHOOK_SECRET must be set to a non-empty value')\nHEADER = {v1_lit}\nHEADER_V2 = {v2_lit}\nHEADER_V3 = {v3_lit}\nHEADER_TS = {ts_lit}\nTOLERANCE = {tol}\n\ndef verify(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo}=' + hmac.new(SECRET, raw_body, hashlib.{algo}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\ndef verify_v2(raw_body: bytes, received_sig: str) -> bool:\n    expected = '{algo_v2}=' + hmac.new(SECRET, raw_body, hashlib.{algo_v2}).hexdigest()\n    return hmac.compare_digest(expected, received_sig)\n\ndef verify_v3(raw_body: bytes, received_ts: str, received_sig: str, now=None) -> bool:\n    if not re.fullmatch(r'[1-9][0-9]{{0,11}}', received_ts or ''):\n        return False\n    if not re.fullmatch(r'{algo_v3}=[0-9a-f]{{96}}', received_sig or ''):\n        return False\n    signed = received_ts.encode() + b'.' + raw_body\n    expected = '{algo_v3}=' + hmac.new(SECRET, signed, hashlib.{algo_v3}).hexdigest()\n    if not hmac.compare_digest(expected, received_sig):\n        return False\n    # Check the clock only after the MAC verifies.\n    return abs((time.time() if now is None else now) - int(received_ts)) <= TOLERANCE\n\n# In Flask / FastAPI / Django (return the same 401 for every failure):\n#   ok = verify_v3(request.get_data(), request.headers.get(HEADER_TS), request.headers.get(HEADER_V3))\n# Recommended: remember each accepted (timestamp, signature) pair for at least\n# 600 seconds and reject repeats; treat deliveries as idempotent.\n",
+        v1 = h.v1,
+        v2 = h.v2,
+        v3 = h.v3,
+        ts = h.ts,
+        v1_lit = python_string_literal(h.v1),
+        v2_lit = python_string_literal(h.v2),
+        v3_lit = python_string_literal(h.v3),
+        ts_lit = python_string_literal(h.ts),
+        tol = SIG_V3_TOLERANCE_SECS,
         algo = SIG_ALGO,
         algo_v2 = SIG_ALGO_V2,
+        algo_v3 = SIG_ALGO_V3,
     )
 }
 
 fn unsigned_python_snippet() -> String {
     // Explicit signal that the body is unauthenticated — anyone who can
     // reach the URL can forge events. Operators should add a secret if
-    // they want replay protection.
+    // they want to authenticate deliveries.
     "# This webhook is configured as unsigned (no secret set).\n# Receivers cannot verify the body's authenticity — there is no signature header.\n# Set a secret on the webhook in the Admin Console to enable HMAC verification.\n".to_string()
 }
 
-fn signed_node_snippet(header: &str, header_v2: &str) -> String {
+fn signed_node_snippet(h: &RecipeHeaders) -> String {
     format!(
-        "// Node.js receiver — verify the {header_v2} header (HMAC-SHA384; use a secret of at least 48 bytes for CNSA 2.0).\n// {header} (HMAC-SHA256) is sent alongside for existing receivers.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nconst HEADER = {header_lit};\nconst HEADER_V2 = {header_v2_lit};\n\nfunction safeEqual(expected, receivedSig) {{\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = '{algo}=' + crypto.createHmac('{algo}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\nfunction verifyV2(rawBody, receivedSig) {{\n  const expected = '{algo_v2}=' + crypto.createHmac('{algo_v2}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\n// In Express:\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verifyV2(req.body, req.get(HEADER_V2))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n",
-        header_lit = js_string_literal(header),
-        header_v2_lit = js_string_literal(header_v2),
+        "// Node.js receiver — verify the {v3} header (replay-protected: HMAC-SHA384 over '<{ts}>.<body>').\n// {v1} (HMAC-SHA256) and {v2} (HMAC-SHA384) cover the body only and can be replayed; require V3 and ignore them for replay protection.\nconst crypto = require('crypto');\n\n// Set WEBHOOK_SECRET to this webhook's signing secret; it is not shown here.\nconst SECRET = process.env.WEBHOOK_SECRET;\nif (!SECRET) throw new Error('WEBHOOK_SECRET must be set to a non-empty value');\nconst HEADER = {v1_lit};\nconst HEADER_V2 = {v2_lit};\nconst HEADER_V3 = {v3_lit};\nconst HEADER_TS = {ts_lit};\nconst TOLERANCE = {tol};\n\nfunction safeEqual(expected, receivedSig) {{\n  const a = Buffer.from(expected);\n  const b = Buffer.from(receivedSig || '');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n}}\n\nfunction verify(rawBody, receivedSig) {{\n  const expected = '{algo}=' + crypto.createHmac('{algo}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\nfunction verifyV2(rawBody, receivedSig) {{\n  const expected = '{algo_v2}=' + crypto.createHmac('{algo_v2}', SECRET).update(rawBody).digest('hex');\n  return safeEqual(expected, receivedSig);\n}}\n\nfunction verifyV3(rawBody, receivedTs, receivedSig, now = Date.now() / 1000) {{\n  if (!/^[1-9][0-9]{{0,11}}$/.test(receivedTs || '')) return false;\n  if (!/^{algo_v3}=[0-9a-f]{{96}}$/.test(receivedSig || '')) return false;\n  const mac = crypto.createHmac('{algo_v3}', SECRET).update(receivedTs).update('.').update(rawBody).digest('hex');\n  if (!safeEqual('{algo_v3}=' + mac, receivedSig)) return false;\n  // Check the clock only after the MAC verifies.\n  return Math.abs(now - Number(receivedTs)) <= TOLERANCE;\n}}\n\n// In Express (return the same 401 for every failure):\n//   app.post('/hook', express.raw({{ type: 'application/json' }}), (req, res) => {{\n//     if (!verifyV3(req.body, req.get(HEADER_TS), req.get(HEADER_V3))) return res.sendStatus(401);\n//     res.sendStatus(200);\n//   }});\n// Recommended: remember each accepted (timestamp, signature) pair for at least\n// 600 seconds and reject repeats; treat deliveries as idempotent.\n",
+        v1 = h.v1,
+        v2 = h.v2,
+        v3 = h.v3,
+        ts = h.ts,
+        v1_lit = js_string_literal(h.v1),
+        v2_lit = js_string_literal(h.v2),
+        v3_lit = js_string_literal(h.v3),
+        ts_lit = js_string_literal(h.ts),
+        tol = SIG_V3_TOLERANCE_SECS,
         algo = SIG_ALGO,
         algo_v2 = SIG_ALGO_V2,
+        algo_v3 = SIG_ALGO_V3,
     )
 }
 
@@ -1134,14 +1281,30 @@ pub async fn dispatch_event(pool: &PgPool, event: WebhookEvent) {
 /// the exact wire payload the receiver sees, regardless of which schema
 /// the operator picked.
 /// The outgoing POST: JSON body plus the signature headers.
-/// HMAC-SHA256(body, secret) → `X-Webhook-Signature: sha256=<hex>` and
-/// HMAC-SHA384(body, secret) → `X-Webhook-Signature-V2: sha384=<hex>`.
+/// HMAC-SHA256(body, secret) → `X-Webhook-Signature: sha256=<hex>`,
+/// HMAC-SHA384(body, secret) → `X-Webhook-Signature-V2: sha384=<hex>`, and
+/// HMAC-SHA384(`<ts>.<body>`, secret) → `X-Webhook-Signature-V3: sha384=<hex>`
+/// alongside `X-Webhook-Timestamp: <ts>`.
 /// Webhooks with an empty secret remain unsigned (no headers) so the
 /// "no sender authentication needed" path keeps working.
+///
+/// Call this once per send attempt and never clone or reuse a
+/// `RequestBuilder` for a resend: each call reads the clock, so a retry gets
+/// a fresh timestamp and V3 signature while V1/V2 stay identical.
 fn build_request(
     client: &reqwest::Client,
     webhook: &WebhookRow,
     body: &str,
+) -> reqwest::RequestBuilder {
+    build_request_at(client, webhook, body, unix_now())
+}
+
+/// `build_request` with the clock injected, for tests.
+fn build_request_at(
+    client: &reqwest::Client,
+    webhook: &WebhookRow,
+    body: &str,
+    now_unix: u64,
 ) -> reqwest::RequestBuilder {
     let mut req = client
         .post(&webhook.url)
@@ -1152,6 +1315,11 @@ fn build_request(
     }
     if let Some(sig) = sign_body_v2(&webhook.secret, body.as_bytes()) {
         req = req.header(SIG_HEADER_V2, sig);
+    }
+    if let Some(sig) = sign_body_v3(&webhook.secret, now_unix, body.as_bytes()) {
+        req = req
+            .header(TIMESTAMP_HEADER, now_unix.to_string())
+            .header(SIG_HEADER_V3, sig);
     }
     req
 }
@@ -1826,6 +1994,26 @@ mod recipe_tests {
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["headerNameV2"], "X-Webhook-Signature-V2");
         assert_eq!(v["headerName"], "X-Webhook-Signature");
+        assert_eq!(v["headerNameV3"], "X-Webhook-Signature-V3");
+        assert_eq!(v["timestampHeaderName"], "X-Webhook-Timestamp");
+        assert_eq!(v["toleranceSeconds"], 300);
+        assert!(r.snippets.python.contains("verify_v3"));
+        assert!(r.snippets.node.contains("verifyV3"));
+        assert!(r.snippets.python.contains("300"));
+        assert!(r.snippets.node.contains("300"));
+
+        let at = build_verify_recipe_at(&row(&secret), 1_700_000_000);
+        let sig_v3 = sign_body_v3(&secret, 1_700_000_000, at.sample_payload.as_bytes()).unwrap();
+        assert!(at
+            .snippets
+            .curl
+            .contains("-H 'X-Webhook-Timestamp: 1700000000'"));
+        assert!(at
+            .snippets
+            .curl
+            .contains(&format!("-H 'X-Webhook-Signature-V3: {sig_v3}'")));
+        assert!(at.snippets.curl.starts_with("# X-Webhook-Timestamp"));
+        assert!(!serde_json::to_string(&at).unwrap().contains(&secret));
     }
 
     #[test]
@@ -1889,7 +2077,7 @@ mod recipe_tests {
     }
 
     #[tokio::test]
-    async fn the_wire_request_carries_both_signatures_when_signed() {
+    async fn the_wire_request_carries_all_signatures_when_signed() {
         let secret = crate::crypto::rand::uuid_v4().to_string();
         let (head, body) = wire_head(&secret).await;
         let v1 = sign_body(&secret, body.as_bytes()).unwrap();
@@ -1902,18 +2090,429 @@ mod recipe_tests {
             head.contains(&format!("x-webhook-signature-v2: {v2}")),
             "{head}"
         );
+        let ts_hdr = head
+            .lines()
+            .find_map(|l| l.strip_prefix("x-webhook-timestamp: "))
+            .expect("timestamp header present");
+        assert!(ts_hdr.bytes().all(|b| b.is_ascii_digit()), "{head}");
+        let ts: u64 = ts_hdr.parse().unwrap();
+        assert!(unix_now().abs_diff(ts) <= 10, "{head}");
+        let v3 = sign_body_v3(&secret, ts, body.as_bytes()).unwrap();
+        assert!(
+            head.contains(&format!("x-webhook-signature-v3: {v3}")),
+            "{head}"
+        );
+        assert_eq!(
+            reference_verify_v3(&secret, ts_hdr, &v3, body.as_bytes(), unix_now()),
+            Ok(())
+        );
     }
 
     #[tokio::test]
     async fn the_wire_request_carries_no_signature_when_unsigned() {
         let (head, _) = wire_head("").await;
         assert!(!head.contains("x-webhook-signature"), "{head}");
+        assert!(!head.contains("x-webhook-timestamp"), "{head}");
+    }
+
+    // Published RFC 4231 test case 2 key (precedent: crypto/hmac.rs).
+    const RFC4231_TC2_KEY: &str = "Jefe";
+
+    #[test]
+    fn v3_known_answer_matches_an_independent_openssl_computation() {
+        // printf '1700000000.{"text":"hi"}' | openssl dgst -sha384 -hmac Jefe
+        assert_eq!(
+            sign_body_v3(RFC4231_TC2_KEY, 1_700_000_000, br#"{"text":"hi"}"#).unwrap(),
+            "sha384=291e40e6a2f6715a9394ecd5c496d8a72421f1dada85d8a3e2634990c66f606ba7d44b63633eab8851ef598ae4046bec"
+        );
+    }
+
+    #[test]
+    fn v1_and_v2_known_answers_are_unchanged() {
+        let body = br#"{"text":"hi"}"#;
+        assert_eq!(
+            sign_body(RFC4231_TC2_KEY, body).unwrap(),
+            "sha256=1a3b1739466fd28c7f1a00b811474407a63e8b12063ffb04af366faeb58d4ab3"
+        );
+        assert_eq!(
+            sign_body_v2(RFC4231_TC2_KEY, body).unwrap(),
+            "sha384=c165efa8e85c0b1a55c4b77d0b8fc05f358314025b8838d4dfb7abbbe37794f7ca937734b0cc55747a3edb652347b76b"
+        );
+    }
+
+    #[test]
+    fn v3_matches_rustcrypto_over_timestamp_dot_body() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha384;
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let utf8 = "h\u{e9}llo \u{4e16}\u{754c}".as_bytes();
+        for ts in [1u64, 1_700_000_000, u64::MAX] {
+            for body in [&b""[..], &b"."[..], utf8] {
+                let mut m = <Hmac<Sha384> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+                m.update(ts.to_string().as_bytes());
+                m.update(b".");
+                m.update(body);
+                assert_eq!(
+                    sign_body_v3(&secret, ts, body).unwrap(),
+                    format!("sha384={}", hex::encode(m.finalize().into_bytes()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn signed_payload_v3_is_decimal_seconds_dot_raw_body() {
+        assert_eq!(signed_payload_v3(1_700_000_000, b"x"), b"1700000000.x");
+        assert_eq!(signed_payload_v3(0, b""), b"0.");
+    }
+
+    #[test]
+    fn v3_changes_with_the_timestamp_and_with_the_body() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let base = sign_body_v3(&secret, 100, b"a").unwrap();
+        assert!(base.starts_with("sha384=") && base.len() == 7 + 96);
+        assert_ne!(sign_body_v3(&secret, 101, b"a").unwrap(), base);
+        assert_ne!(sign_body_v3(&secret, 100, b"b").unwrap(), base);
+    }
+
+    #[test]
+    fn a_retry_is_resigned_with_a_fresh_timestamp_and_v1_v2_do_not_change() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let w = row(&secret);
+        let body = r#"{"text":"hi"}"#;
+        let client = crate::crypto::tls::http_client_builder().build().unwrap();
+        let t = 1_700_000_000u64;
+        let a = build_request_at(&client, &w, body, t).build().unwrap();
+        let b = build_request_at(&client, &w, body, t + 7).build().unwrap();
+        let h = |r: &reqwest::Request, n: &str| {
+            r.headers().get(n).unwrap().to_str().unwrap().to_string()
+        };
+        assert_eq!(h(&a, TIMESTAMP_HEADER), t.to_string());
+        assert_eq!(h(&b, TIMESTAMP_HEADER), (t + 7).to_string());
+        assert_ne!(h(&a, SIG_HEADER_V3), h(&b, SIG_HEADER_V3));
+        assert_eq!(
+            h(&a, SIG_HEADER_V3),
+            sign_body_v3(&secret, t, body.as_bytes()).unwrap()
+        );
+        assert_eq!(
+            h(&b, SIG_HEADER_V3),
+            sign_body_v3(&secret, t + 7, body.as_bytes()).unwrap()
+        );
+        assert_eq!(h(&a, SIG_HEADER), h(&b, SIG_HEADER));
+        assert_eq!(h(&a, SIG_HEADER_V2), h(&b, SIG_HEADER_V2));
+        assert_eq!(
+            a.body().and_then(|x| x.as_bytes()),
+            b.body().and_then(|x| x.as_bytes())
+        );
+    }
+
+    /// Test-only receiver following the documented algorithm. The server
+    /// never verifies webhook signatures; this exists to pin the contract.
+    /// It is a cross-check for the shipped Python/Node snippets, which are
+    /// executed by `shipped_snippets_verify_v3_correctly`.
+    fn reference_verify_v3(
+        secret: &str,
+        ts_header: &str,
+        sig_header: &str,
+        body: &[u8],
+        now: u64,
+    ) -> Result<(), &'static str> {
+        let tb = ts_header.as_bytes();
+        let ts_ok =
+            (1..=12).contains(&tb.len()) && tb[0] != b'0' && tb.iter().all(|b| b.is_ascii_digit());
+        if !ts_ok {
+            return Err("bad timestamp");
+        }
+        let hex_part = sig_header.strip_prefix("sha384=").ok_or("bad prefix")?;
+        if hex_part.len() != 96
+            || !hex_part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("bad signature format");
+        }
+        let mut signed = ts_header.as_bytes().to_vec();
+        signed.push(b'.');
+        signed.extend_from_slice(body);
+        let expected = format!(
+            "sha384={}",
+            hex::encode(crypto::hmac::hmac_sha384(secret.as_bytes(), &signed))
+        );
+        if expected.len() != sig_header.len() {
+            return Err("mismatch");
+        }
+        let diff = expected
+            .bytes()
+            .zip(sig_header.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if diff != 0 {
+            return Err("mismatch");
+        }
+        let ts: u64 = ts_header.parse().map_err(|_| "bad timestamp")?;
+        if now.abs_diff(ts) > SIG_V3_TOLERANCE_SECS {
+            return Err("outside window");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reference_verifier_enforces_the_300_second_window_both_ways() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let ts = 1_700_000_000u64;
+        let body = b"{}";
+        let sig = sign_body_v3(&secret, ts, body).unwrap();
+        let tsh = ts.to_string();
+        for now in [ts, ts + 300, ts - 300] {
+            assert_eq!(reference_verify_v3(&secret, &tsh, &sig, body, now), Ok(()));
+        }
+        for now in [ts + 301, ts - 301] {
+            assert_eq!(
+                reference_verify_v3(&secret, &tsh, &sig, body, now),
+                Err("outside window")
+            );
+        }
+    }
+
+    #[test]
+    fn reference_verifier_rejects_malformed_or_mismatched_input() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let other = crate::crypto::rand::uuid_v4().to_string();
+        let ts = 1_700_000_000u64;
+        let tsh = ts.to_string();
+        let body = br#"{"a":1}"#;
+        let sig = sign_body_v3(&secret, ts, body).unwrap();
+        let v = |t: &str, s: &str, b: &[u8], k: &str| reference_verify_v3(k, t, s, b, ts);
+        assert_eq!(v(&tsh, &sig, body, &secret), Ok(()));
+        for bad in [
+            "",
+            "0123",
+            "+1700000000",
+            " 1700000000",
+            "1700000000.0",
+            "-1",
+        ] {
+            assert!(v(bad, &sig, body, &secret).is_err(), "{bad:?}");
+        }
+        let hex_only = sig.trim_start_matches("sha384=");
+        assert!(v(&tsh, hex_only, body, &secret).is_err());
+        assert!(v(&tsh, &sig.to_uppercase(), body, &secret).is_err());
+        assert!(v(
+            &tsh,
+            &format!("sha384={}", hex_only.to_uppercase()),
+            body,
+            &secret
+        )
+        .is_err());
+        assert!(v(&tsh, &sig[..sig.len() - 2], body, &secret).is_err());
+        let v2 = sign_body_v2(&secret, body).unwrap();
+        assert!(v(&tsh, &v2, body, &secret).is_err());
+        assert!(v(&tsh, &sig, br#"{"a":2}"#, &secret).is_err());
+        assert!(v(&(ts + 1).to_string(), &sig, body, &secret).is_err());
+        assert!(v(&tsh, &sig, body, &other).is_err());
+    }
+
+    #[test]
+    fn curl_comment_minutes_match_the_tolerance_constant() {
+        let r = build_verify_recipe_at(&row("k"), 1_700_000_000);
+        assert!(r
+            .snippets
+            .curl
+            .contains(&format!("valid for {} minutes", SIG_V3_TOLERANCE_SECS / 60)));
+        assert!(r.snippets.curl.contains("test receiver"));
+    }
+
+    #[tokio::test]
+    async fn the_default_clock_request_is_stamped_now_and_signed() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let client = crate::crypto::tls::http_client_builder().build().unwrap();
+        let body = r#"{"text":"hi"}"#;
+        let req = build_request(&client, &row(&secret), body).build().unwrap();
+        let ts: u64 = req
+            .headers()
+            .get(TIMESTAMP_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(unix_now().abs_diff(ts) <= 5);
+        assert_eq!(
+            req.headers().get(SIG_HEADER_V3).unwrap().to_str().unwrap(),
+            sign_body_v3(&secret, ts, body.as_bytes()).unwrap()
+        );
+    }
+
+    /// Run `prog args` with WEBHOOK_SECRET in the environment; Ok(None) when
+    /// the interpreter is missing and `CI` is unset (skip), Err when missing in CI.
+    fn run_interp(
+        prog: &str,
+        file: &std::path::Path,
+        secret: &str,
+    ) -> Result<Option<std::process::Output>, String> {
+        let mut cmd = std::process::Command::new(prog);
+        if prog.starts_with("python") {
+            cmd.arg("-I");
+        }
+        cmd.arg(file).env("WEBHOOK_SECRET", secret);
+        match cmd.output() {
+            Ok(o) => Ok(Some(o)),
+            Err(e) if std::env::var_os("CI").is_none() => {
+                eprintln!("skipping: {prog} not runnable: {e}");
+                Ok(None)
+            }
+            Err(e) => Err(format!("{prog} required in CI: {e}")),
+        }
+    }
+
+    #[test]
+    fn shipped_snippets_verify_v3_correctly() {
+        let secret = crate::crypto::rand::uuid_v4().to_string();
+        let other = crate::crypto::rand::uuid_v4().to_string();
+        let ts = 1_700_000_000u64;
+        let body = r#"{"a":1,"b":"\u00e9"}"#;
+        let r = build_verify_recipe_at(&row(&secret), ts);
+        let sig = |k: &str, t: u64, b: &str| sign_body_v3(k, t, b.as_bytes()).unwrap();
+        let up = sig(&secret, ts, body)
+            .to_uppercase()
+            .replace("SHA384=", "sha384=");
+        // (body, ts header, sig header, now, expected)
+        let cases: Vec<(String, Option<String>, String, u64, bool)> = vec![
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts,
+                true,
+            ),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts + 300,
+                true,
+            ),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts - 300,
+                true,
+            ),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts + 301,
+                false,
+            ),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts - 301,
+                false,
+            ),
+            (
+                "{}".into(),
+                Some(ts.to_string()),
+                sig(&secret, ts, body),
+                ts,
+                false,
+            ),
+            (
+                body.into(),
+                Some((ts + 1).to_string()),
+                sig(&secret, ts, body),
+                ts,
+                false,
+            ),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sign_body_v2(&secret, body.as_bytes()).unwrap(),
+                ts,
+                false,
+            ),
+            (
+                body.into(),
+                Some(format!("0{ts}")),
+                sig(&secret, ts, body),
+                ts,
+                false,
+            ),
+            (body.into(), None, sig(&secret, ts, body), ts, false),
+            (body.into(), Some(ts.to_string()), up, ts, false),
+            (
+                body.into(),
+                Some(ts.to_string()),
+                sig(&other, ts, body),
+                ts,
+                false,
+            ),
+        ];
+        let dir = std::env::temp_dir().join(format!("wh-v3-{}", crate::crypto::rand::uuid_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases_json: Vec<_> = cases
+            .iter()
+            .map(|(b, t, s, n, _)| json!({"body": b, "ts": t, "sig": s, "now": n}))
+            .collect();
+        let cj = dir.join("cases.json");
+        std::fs::write(&cj, serde_json::to_string(&cases_json).unwrap()).unwrap();
+        let cj_s = cj.to_string_lossy().replace('\\', "/");
+        let py = dir.join("v.py");
+        std::fs::write(
+            &py,
+            format!(
+                "{}\nimport json\nfor c in json.load(open({cj_s:?})):\n    print(int(verify_v3(c['body'].encode(), c['ts'], c['sig'], c['now'])))\n",
+                r.snippets.python
+            ),
+        )
+        .unwrap();
+        let js = dir.join("v.js");
+        std::fs::write(
+            &js,
+            format!(
+                "{}\nfor (const c of JSON.parse(require('fs').readFileSync({}, 'utf8'))) console.log(verifyV3(Buffer.from(c.body), c.ts, c.sig, c.now) ? 1 : 0);\n",
+                r.snippets.node,
+                serde_json::to_string(&cj_s).unwrap()
+            ),
+        )
+        .unwrap();
+        let want: Vec<String> = cases.iter().map(|c| (c.4 as u8).to_string()).collect();
+        let mut result = Ok(());
+        for (prog, file) in [("python3", &py), ("node", &js)] {
+            match run_interp(prog, file, &secret) {
+                Err(e) => result = Err(e),
+                Ok(None) => {}
+                Ok(Some(o)) => {
+                    let got: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::to_string)
+                        .collect();
+                    if !o.status.success() || got != want {
+                        result = Err(format!(
+                            "{prog}: got {got:?} want {want:?}: {}",
+                            String::from_utf8_lossy(&o.stderr)
+                        ));
+                    }
+                    // An empty secret must make the snippet refuse to start.
+                    if let Ok(Some(e)) = run_interp(prog, file, "") {
+                        if e.status.success() {
+                            result = Err(format!("{prog}: empty secret was accepted"));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
     }
 
     #[test]
     fn empty_secret_sends_no_signature_of_either_kind() {
         assert_eq!(sign_body("", b"x"), None);
         assert_eq!(sign_body_v2("", b"x"), None);
+        assert_eq!(sign_body_v3("", 1_700_000_000, b"x"), None);
     }
 
     #[test]
@@ -1922,6 +2521,7 @@ mod recipe_tests {
         assert!(r.snippets.python.contains("unsigned"));
         assert!(r.snippets.node.contains("unsigned"));
         assert!(!r.snippets.curl.contains("X-Webhook-Signature"));
+        assert!(!r.snippets.curl.contains("X-Webhook-Timestamp"));
     }
 
     #[test]

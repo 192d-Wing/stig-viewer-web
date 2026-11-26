@@ -104,6 +104,41 @@ test.describe("Webhook receiver verifier docs", () => {
     expect(body.snippets.curl).toContain(
       `X-Webhook-Signature-V2: sha384=${expectedV2}`,
     );
+    // V3: timestamp-bound signature, signed at recipe-generation time.
+    expect(body.headerNameV3).toBe("X-Webhook-Signature-V3");
+    expect(body.timestampHeaderName).toBe("X-Webhook-Timestamp");
+    expect(body.toleranceSeconds).toBe(300);
+    const tsMatch = body.snippets.curl.match(/X-Webhook-Timestamp: ([1-9][0-9]*)/);
+    expect(tsMatch).not.toBeNull();
+    expect(
+      Math.abs(Date.now() / 1000 - Number(tsMatch[1])),
+    ).toBeLessThanOrEqual(300);
+    const expectedV3 = crypto
+      .createHmac("sha384", secret)
+      .update(`${tsMatch[1]}.${body.samplePayload}`)
+      .digest("hex");
+    expect(body.snippets.curl).toContain(
+      `X-Webhook-Signature-V3: sha384=${expectedV3}`,
+    );
+    // Execute the shipped Node verifyV3 against the recipe's own signed
+    // sample delivery (ts + sig from the curl snippet): it must accept.
+    const sigV3Match = body.snippets.curl.match(
+      /X-Webhook-Signature-V3: (sha384=[0-9a-f]{96})/,
+    );
+    expect(sigV3Match).not.toBeNull();
+    const harness =
+      body.snippets.node +
+      `\nprocess.stdout.write(verifyV3(Buffer.from(${JSON.stringify(
+        body.samplePayload,
+      )}), ${JSON.stringify(tsMatch[1])}, ${JSON.stringify(sigV3Match[1])}) ? "ok" : "rejected");\n`;
+    const out = require("child_process").execFileSync(
+      process.execPath,
+      ["-e", harness],
+      { env: { ...process.env, WEBHOOK_SECRET: secret }, encoding: "utf8" },
+    );
+    expect(out).toBe("ok");
+    expect(body.snippets.python).toContain("def verify_v3");
+    expect(body.snippets.node).toContain("verifyV3");
     expect(body.snippets.python).toContain("def verify_v2");
     expect(body.snippets.python).toContain("hashlib.sha384");
     expect(body.snippets.node).toContain("verifyV2");
