@@ -143,6 +143,19 @@ for local work. The ones you may want to change:
   `SIGNING_REQUIRE_HYBRID=true` refuses to start without both keys and stops
   verifiers accepting Ed25519-only artifacts (default false). See "Signing
   envelope (v2)" and docs/deployment.md section 5.
+- `SIGNING_PREVIOUS_KEYS_FILE` (path) or `SIGNING_PREVIOUS_KEYS_JSON` (the same
+  document inline; set at most one) — public keys of retired signing keys that
+  must keep verifying after a rotation (#68). Read once at startup, so a change
+  needs a restart. A JSON document of at most 1 MiB, schema version 1: `previous`
+  (up to 32 `{label, retiredAt, keys}` entries, where `keys` is the `keys` array
+  of `GET /api/signing/pubkey` saved before rotating) and an optional `revoked`
+  list (up to 64 `{algorithm, keyId, revokedAt, reason}` entries). It holds
+  public keys only and previous keys can verify but never sign; a pasted private
+  seed fails the key id check and is never echoed. Malformed content, previous
+  keys without `SIGNING_KEY_HEX`, a revoked key that is in use, and (in a `fips`
+  build) a hybrid previous set without `ML-DSA-87` in `STIG_FIPS_PENDING_ALGS`
+  stop startup. Each start records a `system.signing_keys` audit event (current
+  and previous key ids, revoked keys, carrier, SHA-384 of the document).
 - `OIDC_INTERNAL_URL` / `OIDC_PUBLIC_URL` / `OIDC_CLIENT_ID` /
   `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URI` — point the backend at a different
   identity provider. `INTERNAL` is how the backend reaches the IdP; `PUBLIC` is
@@ -296,7 +309,12 @@ top-level `signature` and `keyId` are omitted):
 `GET /api/signing/pubkey` returns `{algorithm, keyId, publicKey, keys:
 [{algorithm, keyId, publicKey}]}`; the top-level fields are the Ed25519 key
 and `keys` also lists the ML-DSA-87 key (raw FIPS 204 public key, 2592 bytes,
-base64) in hybrid mode. Pin the keys from it out of band.
+base64) in hybrid mode. When previous keys are configured it also returns
+`previousKeys: [{label, retiredAt?, keys: [{algorithm, keyId, publicKey}]}]`
+(absent otherwise). That list is public and unauthenticated like the rest of
+the response: pin the keys from it out of band. The previous-set `label` and
+`retiredAt` are therefore public too, so keep them free of sensitive text.
+The response is built once and served from memory.
 
 **Only `payload` is authenticated.** It is the compact UTF-8 JSON of the
 signing document: `version`, `algorithm`, `keyId`, `signers`
@@ -318,6 +336,23 @@ first 8 bytes of SHA-256 of the raw public key (16 hex); ML-DSA-87 is the first
 ML-DSA-87 is FIPS 204 pure ML-DSA with an EMPTY context string; domain
 separation comes from the `SIGN_DOMAIN` prefix on the signed message below, not
 from the ML-DSA context.
+
+**Key sets and rotation (#68).** Trust is per key SET, not per key. A verifier
+resolves the signed `signers` list to exactly one pinned set: the current
+`[ed25519]` key (classical), the current `[ed25519, ml-dsa-87]` pair (hybrid),
+or a retired set from `SIGNING_PREVIOUS_KEYS_FILE` / `_JSON` (or the
+`previousKeys` of the pubkey response). The halves of two generations never
+combine (old Ed25519 + new ML-DSA is refused), and a previous hybrid pair does
+not make its Ed25519 key a classical signer: a bundle signed by that key alone
+verifies only if the operator also lists an explicit classical set for it, which
+keeps the Ed25519-only forgery window open for that key (the same exposure as
+the classical transition, closed the same way by `SIGNING_REQUIRE_HYBRID`).
+`scripts/verify-bundle.mjs` implements the same rule: `--previous <file>`
+(repeatable; the server's previous-keys document, or a pubkey response saved
+before the rotation) and the `previousKeys` of the pinned `pubkey.json`; it
+reports whether the current or a previous set verified. `revoked` entries are
+refused as `KeyRevoked`. The Python recipes in this document take the OLD public
+key for artifacts signed by an old key.
 
 Hybrid signing alone gives no post-quantum protection for acceptance: a server
 with both keys still accepts classical artifacts until
@@ -1009,10 +1044,17 @@ with an existing name go to `<stream>-<date>.<first>-<last>.r<n>.jsonl`. Each
 segment is read once, and the verified bytes are the bytes used. Without a key,
 a warning is logged if verified segments hold different lines for one id.
 
-After a key rotation, or when signing is switched on or off, older segments
-are `unknown_key` or `unsigned` under the new configuration: they stay where
-they are, the rows still in the database are archived again into new signed
-segments beside them, and nothing is renamed.
+After a key rotation with the old public keys listed in
+`SIGNING_PREVIOUS_KEYS_FILE` / `_JSON`, segments signed by those keys verify
+and count as archived (no sibling file is written for them). Each sweep logs
+them on the `audit` target (`key_source = "previous"`, key ids, label), adds
+"archive segments verified by a previous signing key: N" to the scheduler
+message and records one `audit_archive.previous_key_verified` event
+(`{sweep, segments, keySets: [{label, keyIds, segments}]}`). When signing is
+switched on or off, or the old key set was removed from the list or revoked,
+older segments are `unknown_key` or `unsigned` under the new configuration:
+they stay where they are, the rows still in the database are archived again
+into new signed segments beside them, and nothing is renamed.
 
 Files named `<date>.jsonl` and `events-<date>.jsonl` come from earlier
 versions (append mode). They are legacy: never rewritten, **unsigned**, with no
@@ -1041,7 +1083,12 @@ signers and two signatures (hybrid, `[ed25519, ml-dsa-87]`); the outer
 `version` stays 1 and a backup manifest stays version 2. Only the two profiles
 described in "Signing envelope (v2)" are accepted, every listed signer must
 verify, and the restore audit detail and response gain `signatureProfile`
-(`classical` or `hybrid`; absent for unsigned). The signature input is a domain prefix followed by
+(`classical` or `hybrid`; absent for unsigned). They also gain
+`signatureKeySource` (`current` or `previous`, a rotated-out key set; only when
+the signature verified), and the audit detail records `signatureKeyIds`,
+`signatureKeyLabel` and, when a signer is on the `revoked` list, `keyRevoked:
+true` (such a backup is `unknown_key` and, like any unknown-key backup, restores
+only with `BACKUP_REQUIRE_SIGNATURE=false`). The signature input is a domain prefix followed by
 the payload, with a different prefix per purpose so one signature cannot be
 replayed as another: `stig-viewer/audit-archive/v1\0`,
 `stig-viewer/backup/v1\0` (and `stig-viewer/sign/v2\0` for exports). The signed
@@ -1216,9 +1263,13 @@ only.
 - Without a key, or with `BACKUP_REQUIRE_SIGNATURE=false`, whoever can modify a
   backup can also strip its signature and `signers` list.
 - Key rotation: a signature made by a previous key verifies as `unknown_key`
-  once `SIGNING_KEY_HEX` changes, so old backups need
-  `BACKUP_REQUIRE_SIGNATURE=false` to restore. A list of trusted previous keys
-  is a follow-up.
+  once `SIGNING_KEY_HEX` changes, unless that key set is listed in
+  `SIGNING_PREVIOUS_KEYS_FILE` / `_JSON` (see "Signing envelope (v2)"). Keys
+  that were not saved, or were removed or revoked, leave old backups
+  `unknown_key`: they need `BACKUP_REQUIRE_SIGNATURE=false` to restore. Whoever
+  can edit the previous-keys file or variable can add a trust anchor, exactly
+  like whoever can set `SIGNING_KEY_HEX`, and a retained classical previous
+  entry is forgeable by whoever holds or breaks that Ed25519 key.
 - Ed25519 alone is not quantum-safe, which matters for evidence that must stay
   trustworthy for decades. With `SIGNING_MLDSA87_KEY_B64` set, new artifacts
   are hybrid (Ed25519 and ML-DSA-87, both required). Artifacts signed before

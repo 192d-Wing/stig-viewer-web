@@ -4,20 +4,30 @@
 // [ed25519, ml-dsa-87]. Independent of the Rust backend: only node:crypto
 // (Node 24.7+ with OpenSSL ML-DSA support), no npm dependency.
 //
-//   node scripts/verify-bundle.mjs bundle <bundle.json> <pubkey.json> [artifact] [--allow-classical]
+//   node scripts/verify-bundle.mjs bundle <bundle.json> <pubkey.json> <artifact> [--allow-classical] [--previous <file>]...
 //   node scripts/verify-bundle.mjs vector <vector.json>
 //
-// <pubkey.json> is the GET /api/signing/pubkey response (its `keys` array).
-// Pin it from a trusted channel, never from the bundle. The artifact hash is
-// mandatory in library use; the CLI checks it when an artifact path is given.
+// <pubkey.json> is the GET /api/signing/pubkey response (its `keys` array, and
+// its `previousKeys` when present). Pin it from a trusted channel, never from
+// the bundle. The artifact hash is mandatory in library use; the CLI requires
+// an artifact path.
+//
+// Key rotation (#68): after a key rotation the server also lists retired key
+// sets (`previousKeys`). `--previous <file>` (repeatable) adds more: either the
+// server's previous-keys configuration (`previous` array, optional `revoked`)
+// or a pubkey response saved before the rotation (its `keys` become one set).
+// Trust is per key SET: the signed signer list must equal exactly one trusted
+// set, so halves of two generations never combine, and a previous hybrid
+// pair's Ed25519 key never verifies a classical bundle unless an explicit
+// classical set lists it.
 //
 // Rules (mirrors backend/src/api/signing.rs `verify_bundle`): only `payload`
 // and `signatures` of the envelope are read; the signed payload must be strict
 // base64url (no padding), strict JSON (no duplicate keys, no trailing bytes),
 // version 2; `signers` is exactly [ed25519] (only with allowClassical) or
 // [ed25519, ml-dsa-87], the first equal to the signed algorithm/keyId; every
-// signer must be a trusted (algorithm, keyId); `signatures` must equal the
-// signer set; every signature must verify over
+// signer must be a trusted (algorithm, keyId) and the signer list must equal
+// exactly one trusted key set; `signatures` must equal the signer set; every signature must verify over
 // "stig-viewer/sign/v2\0" || payload; the signed sha256 (and sha512, when
 // present) must match the artifact.
 //
@@ -199,14 +209,35 @@ export function trustedKeysFrom(keys) {
 const isHex = (s) => typeof s === "string" && /^[0-9a-f]+$/i.test(s);
 
 /**
- * Verify a bundle. `trustedKeys` is a `keys` array from /api/signing/pubkey.
+ * Verify a bundle. `trustedKeys` is a `keys` array from /api/signing/pubkey
+ * (the current key set; its Ed25519 key alone is also the classical set).
+ * `previousKeySets` is a list of `{label, keys}` retired sets (the pubkey
+ * response's `previousKeys`); each is bound: it matches only a signer list
+ * equal to its own keys. `revoked` is a list of `{algorithm, keyId}`.
  * `artifact` (Buffer) is required: its SHA-256 (and SHA-512 when signed) must
  * match. Returns the verified signed document. Throws VerifyError.
  */
-export function verifyBundle({ bundle, trustedKeys, artifact, allowClassical = false }) {
+export function verifyBundle(options) {
+  return verifyBundleDetailed(options).doc;
+}
+
+/**
+ * Same checks as [`verifyBundle`], and reports which key set verified:
+ * `{ doc, verifiedBy: { source: "current" | "previous", keyIds, label } }`.
+ * The report is kept apart from `doc`, whose fields all come from the signed
+ * payload.
+ */
+export function verifyBundleDetailed({
+  bundle,
+  trustedKeys,
+  previousKeySets = [],
+  revoked = [],
+  artifact,
+  allowClassical = false,
+}) {
   if (!Buffer.isBuffer(artifact)) throw new TypeError("artifact (Buffer) is required");
   try {
-    return verifyChecked({ bundle, trustedKeys, artifact, allowClassical });
+    return verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact, allowClassical });
   } catch (e) {
     if (e instanceof VerifyError) throw e;
     // Any unexpected failure on hostile input is a rejection, not a crash.
@@ -217,9 +248,47 @@ export function verifyBundle({ bundle, trustedKeys, artifact, allowClassical = f
 const isObj = (o) => o !== null && typeof o === "object" && !Array.isArray(o);
 const isStr = (s) => typeof s === "string";
 
-function verifyChecked({ bundle, trustedKeys, artifact, allowClassical }) {
-  if (!Array.isArray(trustedKeys) || !trustedKeys.every((k) => isObj(k) && isStr(k.algorithm) && isStr(k.keyId) && isStr(k.publicKey))) {
+const isKeyEntry = (k) => isObj(k) && isStr(k.algorithm) && isStr(k.keyId) && isStr(k.publicKey);
+const same = (a, b) => a.algorithm === b.algorithm && a.keyId === b.keyId;
+
+/**
+ * The trusted key sets: the current keys' classical set `[ed25519]` and, when
+ * exactly one Ed25519 and one ML-DSA-87 key are pinned, the hybrid set; then
+ * each previous set. Previous sets must be `[ed25519]` or
+ * `[ed25519, ml-dsa-87]`.
+ */
+function keySets(trustedKeys, previousKeySets) {
+  const current = trustedKeysFrom(trustedKeys);
+  const eds = current.filter((k) => k.algorithm === "ed25519");
+  const mls = current.filter((k) => k.algorithm === "ml-dsa-87");
+  const sets = eds.map((k) => ({ source: "current", label: null, keys: [k] }));
+  if (eds.length === 1 && mls.length === 1) {
+    sets.push({ source: "current", label: null, keys: [eds[0], mls[0]] });
+  }
+  for (const p of previousKeySets) {
+    const keys = trustedKeysFrom(p.keys);
+    const names = keys.map((k) => k.algorithm).join(",");
+    if (names !== "ed25519" && names !== "ed25519,ml-dsa-87") {
+      fail("MalformedEnvelope", "previous key set profile");
+    }
+    sets.push({ source: "previous", label: isStr(p.label) ? p.label : null, keys });
+  }
+  return sets;
+}
+
+function verifyChecked({ bundle, trustedKeys, previousKeySets, revoked, artifact, allowClassical }) {
+  if (!Array.isArray(trustedKeys) || !trustedKeys.every(isKeyEntry)) {
     fail("MalformedEnvelope", "trusted keys");
+  }
+  if (
+    !Array.isArray(previousKeySets) ||
+    previousKeySets.length > 32 ||
+    !previousKeySets.every((p) => isObj(p) && Array.isArray(p.keys) && p.keys.length <= 2 && p.keys.every(isKeyEntry))
+  ) {
+    fail("MalformedEnvelope", "previous key sets");
+  }
+  if (!Array.isArray(revoked) || revoked.length > 64 || !revoked.every((r) => isObj(r) && isStr(r.algorithm) && isStr(r.keyId))) {
+    fail("MalformedEnvelope", "revoked keys");
   }
   if (
     isObj(bundle) &&
@@ -260,14 +329,13 @@ function verifyChecked({ bundle, trustedKeys, artifact, allowClassical }) {
   if (!signers.every((x) => isObj(x) && isStr(x.algorithm) && isStr(x.keyId))) fail("BadSignerSet");
   if (signers[0].algorithm !== doc.algorithm || signers[0].keyId !== doc.keyId) fail("BadSignerSet");
 
-  const trusted = trustedKeysFrom(trustedKeys);
+  const sets = keySets(trustedKeys, previousKeySets);
   for (const s of signers) {
     if (s.algorithm !== "ed25519" && s.algorithm !== "ml-dsa-87") {
       fail("UnsupportedAlgorithm", String(s.algorithm));
     }
-    if (!trusted.some((t) => t.algorithm === s.algorithm && t.keyId === s.keyId)) {
-      fail("KeyIdMismatch");
-    }
+    if (revoked.some((r) => same(r, s))) fail("KeyRevoked");
+    if (!sets.some((set) => set.keys.some((k) => same(k, s)))) fail("KeyIdMismatch");
   }
   const names = signers.map((s) => s.algorithm).join(",");
   let profile;
@@ -275,8 +343,10 @@ function verifyChecked({ bundle, trustedKeys, artifact, allowClassical }) {
   else if (names === "ed25519,ml-dsa-87") profile = "hybrid";
   else fail("BadSignerSet", "profile");
   if (profile === "classical" && !allowClassical) fail("ClassicalNotAllowed");
+  // Trust is per key set: the signer list must be exactly one trusted set.
+  const set = sets.find((c) => c.keys.length === signers.length && c.keys.every((k, i) => same(k, signers[i])));
+  if (!set) fail("KeyIdMismatch", "signer set");
 
-  const same = (a, b) => a.algorithm === b.algorithm && a.keyId === b.keyId;
   bundle.signatures.forEach((sig, i) => {
     const known = signers.some((s) => same(s, sig));
     const dup = bundle.signatures.slice(0, i).some((o) => same(o, sig));
@@ -286,7 +356,7 @@ function verifyChecked({ bundle, trustedKeys, artifact, allowClassical }) {
   for (const s of signers) {
     const sig = bundle.signatures.find((x) => same(x, s));
     if (!sig) fail("MissingSignature", s.algorithm);
-    const key = trusted.find((t) => same(t, s));
+    const key = set.keys.find((t) => same(t, s));
     verifySig(s.algorithm, key.raw, input, b64(sig.signature, s.algorithm));
   }
 
@@ -296,7 +366,7 @@ function verifyChecked({ bundle, trustedKeys, artifact, allowClassical }) {
     const sha512 = crypto.createHash("sha512").update(artifact).digest("hex");
     if (!isHex(doc.sha512) || doc.sha512.toLowerCase() !== sha512) fail("ArtifactHashMismatch");
   }
-  return doc;
+  return { doc, verifiedBy: { source: set.source, keyIds: set.keys.map((k) => k.keyId), label: set.label } };
 }
 
 /**
@@ -310,7 +380,7 @@ export function verifyVector(v) {
     throw new Error("not a labelled test vector");
   }
   const artifact = Buffer.from(v.artifactBase64, "base64");
-  const summary = { positive: 0, negative: 0 };
+  const summary = { positive: 0, negative: 0, rotation: { positive: 0, negative: 0 } };
   verifyBundle({ bundle: v.bundle, trustedKeys: v.trustedKeys, artifact });
   summary.positive++;
   verifyBundle({
@@ -344,16 +414,85 @@ export function verifyVector(v) {
     }
     summary.negative++;
   }
+  if (v.rotation) verifyRotation(v.rotation, artifact, summary.rotation);
   return summary;
 }
 
+/** The key rotation (#68) cases of a vector. */
+function verifyRotation(r, artifact, summary) {
+  for (const p of r.positive) {
+    const { verifiedBy } = verifyBundleDetailed({
+      bundle: p.bundle,
+      trustedKeys: r.trustedKeys,
+      previousKeySets: r.previousKeySets,
+      artifact,
+      allowClassical: p.allowClassical === true,
+    });
+    if (verifiedBy.source !== p.expectSource || (p.expectLabel !== undefined && verifiedBy.label !== p.expectLabel)) {
+      throw new Error(`rotation case ${p.name}: verified by ${verifiedBy.source}/${verifiedBy.label}`);
+    }
+    summary.positive++;
+  }
+  for (const n of r.negative) {
+    let err = null;
+    try {
+      verifyBundle({
+        bundle: n.bundle,
+        trustedKeys: r.trustedKeys,
+        previousKeySets: n.previousKeySets ?? r.previousKeySets,
+        revoked: n.revoked ?? [],
+        artifact,
+        allowClassical: n.allowClassical === true,
+      });
+    } catch (e) {
+      err = e;
+    }
+    if (!(err instanceof VerifyError) || err.code !== n.expect) {
+      throw new Error(`rotation case ${n.name}: expected ${n.expect}, got ${err ? err.message : "accept"}`);
+    }
+    summary.negative++;
+  }
+}
+
+/**
+ * Read a `--previous` file: the server's previous-keys configuration (a
+ * `previous` array of `{label, retiredAt, keys}` and an optional `revoked`
+ * list), or a pubkey response saved before a rotation (its `keys` become one
+ * set, labelled `saved-pubkey`; its own `previousKeys` are included).
+ */
+export function previousFromFile(doc) {
+  if (!isObj(doc)) fail("MalformedEnvelope", "previous keys file");
+  if (Array.isArray(doc.previous)) {
+    return { sets: doc.previous, revoked: Array.isArray(doc.revoked) ? doc.revoked : [] };
+  }
+  if (Array.isArray(doc.keys)) {
+    const sets = [{ label: "saved-pubkey", keys: doc.keys }];
+    if (Array.isArray(doc.previousKeys)) sets.push(...doc.previousKeys);
+    return { sets, revoked: [] };
+  }
+  return fail("MalformedEnvelope", "previous keys file");
+}
+
 function main(argv) {
-  const flags = argv.filter((a) => a.startsWith("--"));
-  const args = argv.filter((a) => !a.startsWith("--"));
+  const flags = new Set();
+  const previousFiles = [];
+  const args = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--previous") {
+      if (i + 1 >= argv.length) return usage();
+      previousFiles.push(argv[++i]);
+    } else if (argv[i].startsWith("--")) {
+      flags.add(argv[i]);
+    } else {
+      args.push(argv[i]);
+    }
+  }
   const read = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
   if (args[0] === "vector" && args.length === 2) {
     const s = verifyVector(read(args[1]));
-    console.log(`ok: ${s.positive} positive and ${s.negative} negative cases`);
+    console.log(
+      `ok: ${s.positive} positive and ${s.negative} negative cases; rotation: ${s.rotation.positive} positive and ${s.rotation.negative} negative`,
+    );
     return 0;
   }
   if (args[0] === "bundle" && args.length >= 3 && args.length <= 4) {
@@ -363,16 +502,30 @@ function main(argv) {
       console.error("an artifact path is required: the bundle must be bound to the artifact");
       return 2;
     }
-    const doc = verifyBundle({
+    const previousKeySets = Array.isArray(pub.previousKeys) ? [...pub.previousKeys] : [];
+    const revoked = [];
+    for (const f of previousFiles) {
+      const p = previousFromFile(read(f));
+      previousKeySets.push(...p.sets);
+      revoked.push(...p.revoked);
+    }
+    const { doc, verifiedBy } = verifyBundleDetailed({
       bundle: read(args[1]),
       trustedKeys: pub.keys,
+      previousKeySets,
+      revoked,
       artifact,
-      allowClassical: flags.includes("--allow-classical"),
+      allowClassical: flags.has("--allow-classical"),
     });
-    console.log(`ok: signed by ${doc.signedBy} at ${doc.signedAt}, signers ${doc.signers.map((s) => s.algorithm).join("+")}`);
+    const by = `${verifiedBy.source} keys ${verifiedBy.keyIds.join("+")}${verifiedBy.label ? ` (${verifiedBy.label})` : ""}`;
+    console.log(`ok: signed by ${doc.signedBy} at ${doc.signedAt}, signers ${doc.signers.map((s) => s.algorithm).join("+")}, verified by ${by}`);
     return 0;
   }
-  console.error("usage: verify-bundle.mjs bundle <bundle.json> <pubkey.json> <artifact> [--allow-classical]\n       verify-bundle.mjs vector <vector.json>");
+  return usage();
+}
+
+function usage() {
+  console.error("usage: verify-bundle.mjs bundle <bundle.json> <pubkey.json> <artifact> [--allow-classical] [--previous <file>]...\n       verify-bundle.mjs vector <vector.json>");
   return 2;
 }
 

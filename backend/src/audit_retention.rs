@@ -66,6 +66,14 @@
 //! append-mode) are legacy: never rewritten, never signed, no manifest, and
 //! never trusted to skip a row.
 //!
+//! Key rotation (#68): a segment signed by a previous key set listed in
+//! `SIGNING_PREVIOUS_KEYS_FILE` / `_JSON` verifies and counts like one signed
+//! by the current key; each sweep logs those segments (`key_source =
+//! "previous"`) and records one `audit_archive.previous_key_verified` event.
+//! A segment whose key set was removed from the list, or is revoked, is
+//! `unknown_key`: left in place, not counted, never renamed, and its rows that
+//! are still in the database are archived again.
+//!
 //! Ordering: rows are archived (fsynced) BEFORE the delete transaction runs,
 //! so a row is never deleted unarchived. If the archive write fails the sweep
 //! stops with an error and nothing is deleted; if the delete fails after a
@@ -83,6 +91,7 @@ use sqlx::PgPool;
 
 use crate::api::signing::SigningState;
 use crate::integrity::{self, Profile, SignatureStatus, SignerId};
+use crate::signers::KeySource;
 
 /// One `rule_audit` row, shaped for JSONL archival. Matches the table
 /// columns 1:1 — we deliberately do not denormalize user/asset names
@@ -277,6 +286,9 @@ struct SetAside {
 struct SweepNotes {
     set_aside: Vec<SetAside>,
     unsynced_publishes: u32,
+    /// Counted segments verified by a previous (rotated-out) key set (#68):
+    /// key ids joined by `,` -> (label, segments).
+    previous_key_segments: BTreeMap<String, (Option<String>, u32)>,
 }
 
 impl SweepNotes {
@@ -289,12 +301,22 @@ impl SweepNotes {
     }
 
     fn is_empty(&self) -> bool {
-        self.set_aside.is_empty() && self.unsynced_publishes == 0
+        self.set_aside.is_empty()
+            && self.unsynced_publishes == 0
+            && self.previous_key_segments.is_empty()
+    }
+
+    fn previous_key_total(&self) -> u32 {
+        self.previous_key_segments.values().map(|(_, n)| n).sum()
     }
 
     fn merge(&mut self, other: SweepNotes) {
         self.set_aside.extend(other.set_aside);
         self.unsynced_publishes += other.unsynced_publishes;
+        for (ids, (label, n)) in other.previous_key_segments {
+            let e = self.previous_key_segments.entry(ids).or_insert((label, 0));
+            e.1 += n;
+        }
     }
 }
 
@@ -523,11 +545,17 @@ fn archived_lines(
             }
         };
         if key.is_some() && v.status != SignatureStatus::Verified {
+            let why = if v.revoked {
+                "signed by a revoked key"
+            } else {
+                v.status.as_str()
+            };
             tracing::warn!(
                 target: "audit",
                 segment = ?name,
-                "audit archive segment is {} under the configured key, left in place and not counted",
-                v.status.as_str()
+                revoked = v.revoked,
+                signer_key_ids = %v.signer_key_ids.join(","),
+                "audit archive segment is {why} under the configured key, left in place and not counted"
             );
             continue;
         }
@@ -541,6 +569,26 @@ fn archived_lines(
                 v.profile.map_or("unsigned", Profile::as_str)
             );
             continue;
+        }
+        if let Some(by) = v
+            .verified_by
+            .as_ref()
+            .filter(|b| b.source == KeySource::Previous)
+        {
+            let ids = by.key_ids.join(",");
+            tracing::debug!(
+                target: "audit",
+                segment = ?name,
+                key_source = "previous",
+                key_ids = %ids,
+                key_label = by.label.as_deref().unwrap_or(""),
+                "audit archive segment verified by a previous signing key"
+            );
+            let e = notes
+                .previous_key_segments
+                .entry(ids)
+                .or_insert((by.label.clone(), 0));
+            e.1 += 1;
         }
         match lines_in(&v.body) {
             Ok(lines) => {
@@ -905,6 +953,10 @@ pub struct VerifiedSegment {
     pub status: SignatureStatus,
     /// The signed signer set's profile; `None` when unsigned.
     pub profile: Option<Profile>,
+    /// The key set that verified the signature; `None` unless `Verified`.
+    pub verified_by: Option<integrity::VerifiedBy>,
+    pub revoked: bool,
+    pub signer_key_ids: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -972,6 +1024,9 @@ fn check_segment(
     Ok(VerifiedSegment {
         status: v.status,
         profile: v.profile,
+        verified_by: v.verified_by,
+        revoked: v.revoked,
+        signer_key_ids: v.signer_key_ids,
         body: body.to_vec(),
     })
 }
@@ -1420,7 +1475,33 @@ fn notes_suffix(notes: &SweepNotes) -> String {
             notes.unsynced_publishes
         ));
     }
+    if notes.previous_key_total() > 0 {
+        out.push_str(&format!(
+            "; archive segments verified by a previous signing key: {}",
+            notes.previous_key_total()
+        ));
+    }
     out
+}
+
+/// Detail of `audit_archive.previous_key_verified`.
+fn previous_key_detail(sweep: &str, notes: &SweepNotes) -> serde_json::Value {
+    let key_sets: Vec<serde_json::Value> = notes
+        .previous_key_segments
+        .iter()
+        .map(|(ids, (label, n))| {
+            serde_json::json!({
+                "label": label,
+                "keyIds": ids.split(',').collect::<Vec<_>>(),
+                "segments": n,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "sweep": sweep,
+        "segments": notes.previous_key_total(),
+        "keySets": key_sets,
+    })
 }
 
 /// Detail of `audit_archive.file_set_aside`: at most `cap` files, failed
@@ -1491,6 +1572,18 @@ async fn record_sweep_notes(
                 outcome: if failed == 0 { "ok" } else { "partial" },
                 stig_id: None,
                 detail: set_aside_detail(sweep, notes, crate::db_audit::MAX_REJECTED_LISTED),
+            },
+        )
+        .await;
+    }
+    if !notes.previous_key_segments.is_empty() {
+        crate::db_audit::record_system_or_log(
+            pool,
+            crate::db_audit::NewSystemEvent {
+                action: "audit_archive.previous_key_verified",
+                outcome: "ok",
+                stig_id: None,
+                detail: previous_key_detail(sweep, notes),
             },
         )
         .await;
@@ -2282,6 +2375,121 @@ mod tests {
         );
         assert!(ad_has(&dir2, "rules-2024-01-01.5-5.jsonl"));
         for d in [dir, other, dir2, other2] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    // ── Key rotation: previous key sets (#68) ──────────────────────────────
+
+    /// A directory with one segment (id 5) signed by `old`, and the same
+    /// directory returned for a sweep under another key.
+    fn dir_with_segment_signed_by(old: &SigningState) -> std::path::PathBuf {
+        let (dir, other) = (temp_dir(), temp_dir());
+        archive_blocking(
+            &other,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(old),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
+        plant(&other, &dir);
+        let _ = std::fs::remove_dir_all(&other);
+        dir
+    }
+
+    fn sweep_again(dir: &Path, key: &SigningState) -> SweepCtx {
+        let mut ctx = SweepCtx::default();
+        archive_blocking(
+            dir,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(key),
+            &mut ctx,
+        )
+        .unwrap();
+        ctx
+    }
+
+    #[test]
+    fn a_segment_signed_by_a_previous_key_is_counted_and_noted_not_rewritten() {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let old = test_key(1);
+        let cur = with_previous(test_hybrid_key(2), test_previous(&[&old]));
+        let dir = dir_with_segment_signed_by(&old);
+        let ctx = sweep_again(&dir, &cur);
+        // Counted as archived: no sibling, nothing renamed.
+        assert_eq!(segments(&dir), ["rules-2024-01-01.5-5.jsonl"]);
+        assert!(rejected(&dir).is_empty());
+        let notes = &ctx.io.notes;
+        assert_eq!(notes.previous_key_total(), 1);
+        let (ids, (label, n)) = notes.previous_key_segments.iter().next().unwrap();
+        assert_eq!(
+            (ids.as_str(), label.as_deref(), *n),
+            (old.key_ids().join(",").as_str(), Some("old-0"), 1)
+        );
+        assert!(!notes.is_empty());
+        assert!(notes_suffix(notes).contains("previous signing key: 1"));
+        let d = previous_key_detail("rules", notes);
+        assert_eq!(d["segments"], 1);
+        assert_eq!(d["keySets"][0]["label"], "old-0");
+        assert_eq!(d["keySets"][0]["keyIds"], serde_json::json!(old.key_ids()));
+        // A segment of the current key adds no note.
+        let own = temp_dir();
+        archive_blocking(
+            &own,
+            STREAM_RULES,
+            vec![line(5, "2024-01-01")],
+            Some(&cur),
+            &mut SweepCtx::default(),
+        )
+        .unwrap();
+        let ctx = sweep_again(&own, &cur);
+        assert!(ctx.io.notes.previous_key_segments.is_empty());
+        // Notes from several sweeps merge.
+        let mut merged = SweepNotes::default();
+        merged.merge(sweep_again(&dir, &cur).io.notes);
+        merged.merge(sweep_again(&dir, &cur).io.notes);
+        assert_eq!(merged.previous_key_total(), 2);
+        for d in [dir, own] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn a_removed_revoked_or_non_hybrid_previous_segment_is_left_in_place_and_not_counted() {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let old = test_key(1);
+        // Not listed: the existing unknown_key behaviour.
+        let dir = dir_with_segment_signed_by(&old);
+        let ctx = sweep_again(&dir, &test_hybrid_key(2));
+        assert!(
+            ad_has(&dir, "rules-2024-01-01.5-5.jsonl")
+                && ad_has(&dir, "rules-2024-01-01.5-5.r1.jsonl")
+        );
+        assert!(rejected(&dir).is_empty() && ctx.io.notes.previous_key_segments.is_empty());
+        // Revoked: the same, never renamed.
+        let revoked = crate::signers::PreviousKeys {
+            revoked: vec![crate::signers::RevokedKey {
+                algorithm: crate::signers::Algorithm::Ed25519,
+                key_id: old.key_id.clone(),
+                revoked_at: None,
+                reason: None,
+            }],
+            ..Default::default()
+        };
+        let dir2 = dir_with_segment_signed_by(&old);
+        let ctx = sweep_again(&dir2, &with_previous(test_hybrid_key(2), revoked));
+        assert!(ad_has(&dir2, "rules-2024-01-01.5-5.r1.jsonl"));
+        assert!(rejected(&dir2).is_empty() && ctx.io.notes.previous_key_segments.is_empty());
+        // Listed, but SIGNING_REQUIRE_HYBRID refuses a classical segment whichever key signed it.
+        let mut strict = with_previous(test_hybrid_key(2), test_previous(&[&old]));
+        strict.require_hybrid = true;
+        let dir3 = dir_with_segment_signed_by(&old);
+        let ctx = sweep_again(&dir3, &strict);
+        assert!(ad_has(&dir3, "rules-2024-01-01.5-5.r1.jsonl"));
+        assert!(rejected(&dir3).is_empty() && ctx.io.notes.previous_key_segments.is_empty());
+        for d in [dir, dir2, dir3] {
             let _ = std::fs::remove_dir_all(&d);
         }
     }
@@ -3540,6 +3748,7 @@ mod tests {
         let notes = SweepNotes {
             set_aside: moves,
             unsynced_publishes: 0,
+            ..Default::default()
         };
         assert_eq!((notes.moved(), notes.failed_moves()), (0, 1));
         assert!(notes_suffix(&notes).contains("archive moves FAILED: 1"));
@@ -3584,6 +3793,7 @@ mod tests {
         let degraded = SweepNotes {
             set_aside: Vec::new(),
             unsynced_publishes: 2,
+            ..Default::default()
         };
         let msg = notes_suffix(&degraded);
         assert!(msg.contains("DEGRADED durability: 2"), "{msg}");
@@ -3704,6 +3914,31 @@ mod tests {
         let mut merged = rule_notes;
         merged.merge(event_notes);
         assert!(notes_suffix(&merged).contains("DEGRADED durability: 4"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[sqlx::test]
+    #[ignore = "needs Postgres (DATABASE_URL)"]
+    async fn segments_verified_by_a_previous_key_are_recorded_once_per_sweep(pool: PgPool) {
+        use crate::integrity::{test_hybrid_key, test_previous, with_previous};
+        let old = test_key(1);
+        let cur = with_previous(test_hybrid_key(2), test_previous(&[&old]));
+        let dir = dir_with_segment_signed_by(&old);
+        let notes = sweep_again(&dir, &cur).io.notes;
+        record_sweep_notes(&pool, STREAM_RULES, &notes, true).await;
+        let rows = archive_events(&pool, "audit_archive.previous_key_verified").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (outcome, d) = &rows[0];
+        assert_eq!(outcome, "ok");
+        assert_eq!(d["sweep"], "rules");
+        assert_eq!(d["segments"], 1);
+        assert_eq!(d["keySets"][0]["label"], "old-0");
+        assert_eq!(d["keySets"][0]["keyIds"], serde_json::json!(old.key_ids()));
+        assert_eq!(d["keySets"][0]["segments"], 1);
+        // Nothing else is reported for this sweep.
+        assert!(archive_events(&pool, "audit_archive.file_set_aside")
+            .await
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3844,6 +4079,7 @@ mod tests {
                 error: Some("panicked".into()),
             }],
             unsynced_publishes: 0,
+            ..Default::default()
         };
         assert_eq!(notes.failed_moves(), 1);
         let d = set_aside_detail("rules", &notes, 10);

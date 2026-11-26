@@ -18,6 +18,11 @@
 //! when set) sign all of them. The payload also carries a `type` string,
 //! checked on verification. The outer `version` stays 1: it is never checked
 //! by [`verify_envelope`]; the signed signer set is the profile.
+//!
+//! Key rotation (#68): an envelope verifies only when its signed signer list
+//! equals exactly one trusted key set, either the server's current keys or a
+//! previous set from `SIGNING_PREVIOUS_KEYS_FILE` / `_JSON`. Sealing always
+//! uses the current keys; previous keys only verify.
 
 use base64::{
     engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
@@ -27,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::signing::SigningState;
 use crate::crypto;
-use crate::signers::{self, Algorithm};
+use crate::signers::{self, Algorithm, KeySource};
 pub use crate::signers::{Profile, SignerId};
 
 /// Domain-separation prefix for audit archive segment manifests.
@@ -152,12 +157,43 @@ impl std::fmt::Display for IntegrityError {
 
 impl std::error::Error for IntegrityError {}
 
+/// Which trusted key set verified an envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBy {
+    pub source: KeySource,
+    pub key_ids: Vec<String>,
+    pub label: Option<String>,
+}
+
 pub struct Verification {
     pub status: SignatureStatus,
     /// The verified payload bytes.
     pub payload: Vec<u8>,
     /// The signed signer set's profile; `None` when unsigned.
     pub profile: Option<Profile>,
+    /// The key set that verified the envelope; `Some` only when `status` is
+    /// [`SignatureStatus::Verified`].
+    pub verified_by: Option<VerifiedBy>,
+    /// A signer is on the revoked list (status is then `UnknownKey`).
+    pub revoked: bool,
+    /// The claimed signer key ids, for diagnostics when not verified. They
+    /// come from the artifact, so only hex ids of key-id length are kept, at
+    /// most two.
+    pub signer_key_ids: Vec<String>,
+}
+
+fn plausible_key_ids(signers: &[SignerId]) -> Vec<String> {
+    signers
+        .iter()
+        .filter(|s| {
+            (16..=32).contains(&s.key_id.len())
+                && s.key_id
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        .take(2)
+        .map(|s| s.key_id.clone())
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -201,6 +237,9 @@ pub fn verify_envelope(
                 status: SignatureStatus::Unsigned,
                 payload,
                 profile: None,
+                verified_by: None,
+                revoked: false,
+                signer_key_ids: Vec::new(),
             })
         } else {
             Err(IntegrityError::UnexpectedSignature)
@@ -227,36 +266,54 @@ pub fn verify_envelope(
     }
     let input = signing_input(domain, &payload);
     let trusted = key.map(SigningState::trusted).unwrap_or_default();
-    let mut unknown = false;
+    let mut revoked = false;
     for signer in &head.signers {
         let sig = env
             .signatures
             .iter()
             .find(|s| s.algorithm == signer.algorithm && s.key_id == signer.key_id)
             .ok_or(IntegrityError::MissingSignature)?;
-        let known = Algorithm::from_wire(&signer.algorithm)
-            .and_then(|alg| trusted.find(alg, &signer.key_id).map(|k| (alg, k)));
-        match known {
-            None => unknown = true,
-            Some((alg, k)) => {
-                let raw = BASE64
-                    .decode(sig.signature.as_bytes())
-                    .map_err(|_| IntegrityError::BadSignatureEncoding)?;
-                signers::verify_sig(alg, &k.public_key, &input, &raw).map_err(|e| match e {
-                    signers::SigError::BadLength => IntegrityError::BadSignatureEncoding,
-                    signers::SigError::Invalid => IntegrityError::SignatureInvalid,
-                })?;
-            }
+        let alg = Algorithm::from_wire(&signer.algorithm);
+        if alg.is_some_and(|alg| trusted.revoked(alg, &signer.key_id).is_some()) {
+            revoked = true;
+        }
+        // A signer whose key is held (in any trusted set) must verify; unknown
+        // signers are skipped here and leave the status below `Verified`.
+        let known = alg.and_then(|alg| trusted.find(alg, &signer.key_id).map(|k| (alg, k)));
+        if let Some((alg, k)) = known {
+            let raw = BASE64
+                .decode(sig.signature.as_bytes())
+                .map_err(|_| IntegrityError::BadSignatureEncoding)?;
+            signers::verify_sig(alg, &k.public_key, &input, &raw).map_err(|e| match e {
+                signers::SigError::BadLength => IntegrityError::BadSignatureEncoding,
+                signers::SigError::Invalid => IntegrityError::SignatureInvalid,
+            })?;
         }
     }
+    // Verified only when the signed signer list is exactly one trusted set;
+    // then every signer was verified above. Mixed halves of two generations,
+    // or a hybrid half presented as classical, are never verified.
+    let set = if revoked {
+        None
+    } else {
+        trusted.resolve(&head.signers)
+    };
+    let verified_by = set.map(|set| VerifiedBy {
+        source: set.source,
+        key_ids: set.key_ids(),
+        label: set.label.clone(),
+    });
     Ok(Verification {
-        status: if unknown {
-            SignatureStatus::UnknownKey
-        } else {
+        status: if verified_by.is_some() {
             SignatureStatus::Verified
+        } else {
+            SignatureStatus::UnknownKey
         },
         payload,
         profile: Some(profile),
+        verified_by,
+        revoked,
+        signer_key_ids: plausible_key_ids(&head.signers),
     })
 }
 
@@ -309,6 +366,45 @@ pub fn test_hybrid_key(n: u8) -> SigningState {
         crypto::mldsa::SigningKey::from_pkcs8(&der).expect("ml-dsa key"),
     )));
     st
+}
+
+/// Previous-keys configuration listing the PUBLIC halves of `states`' runtime
+/// keys, one set per state (hybrid when the state holds an ML-DSA key), labelled
+/// `old-0`, `old-1`, ...
+#[cfg(test)]
+pub fn test_previous(states: &[&SigningState]) -> signers::PreviousKeys {
+    let sets = states
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            let t = st.trusted();
+            let own = t
+                .sets()
+                .iter()
+                .find(|s| s.profile == st.profile() && s.source == KeySource::Current)
+                .expect("current set");
+            let mut set = signers::KeySet::new(
+                own.keys.clone(),
+                KeySource::Previous,
+                Some(format!("old-{i}")),
+            )
+            .expect("profile");
+            set.retired_at = Some("2026-01-01".into());
+            set
+        })
+        .collect();
+    signers::PreviousKeys {
+        sets,
+        source: "file",
+        ..Default::default()
+    }
+}
+
+/// `state` with `prev` as its previous keys.
+#[cfg(test)]
+pub fn with_previous(mut state: SigningState, prev: signers::PreviousKeys) -> SigningState {
+    state.previous = std::sync::Arc::new(prev);
+    state
 }
 
 #[cfg(test)]
@@ -628,5 +724,197 @@ mod tests {
     #[test]
     fn sha512_is_hex_of_64_bytes() {
         assert_eq!(sha512_hex(b"").len(), 128);
+    }
+
+    // ── Key rotation: previous key sets (#68) ──────────────────────────────
+
+    /// A server on key 12 that still trusts `old` as previous sets.
+    fn rotated(old: &[&SigningState]) -> SigningState {
+        with_previous(test_hybrid_key(12), test_previous(old))
+    }
+
+    #[test]
+    fn previous_key_sets_verify_archives_and_backups_of_both_profiles() {
+        let (old_classical, old_hybrid) = (test_key(10), test_hybrid_key(11));
+        let cur = rotated(&[&old_hybrid, &old_classical]);
+        for (domain, kind) in [(ARCHIVE_DOMAIN, ARCHIVE_TYPE), (BACKUP_DOMAIN, BACKUP_TYPE)] {
+            for (old, label, profile) in [
+                (&old_hybrid, "old-0", Profile::Hybrid),
+                (&old_classical, "old-1", Profile::Classical),
+            ] {
+                let env = sealed(domain, kind, Some(old));
+                let v = verified(domain, kind, &env, &cur).unwrap();
+                assert_eq!(v.status, SignatureStatus::Verified);
+                assert_eq!(v.profile, Some(profile));
+                let by = v.verified_by.unwrap();
+                assert_eq!(by.source, KeySource::Previous);
+                assert_eq!(by.key_ids, old.key_ids());
+                assert_eq!(by.label.as_deref(), Some(label));
+                assert!(!v.revoked);
+            }
+        }
+    }
+
+    #[test]
+    fn the_current_keys_still_report_current_and_their_classical_set_stays_implicit() {
+        let cur = rotated(&[&test_hybrid_key(11)]);
+        let hybrid = sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&cur));
+        let by = verified(BACKUP_DOMAIN, BACKUP_TYPE, &hybrid, &cur)
+            .unwrap()
+            .verified_by
+            .unwrap();
+        assert_eq!(
+            (by.source, by.key_ids, by.label),
+            (KeySource::Current, cur.key_ids(), None)
+        );
+        // A classical artifact of the current Ed25519 key verifies on the
+        // hybrid server (the documented classical-to-hybrid order).
+        let classical = sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&test_key(12)));
+        let v = verified(BACKUP_DOMAIN, BACKUP_TYPE, &classical, &cur).unwrap();
+        assert_eq!(v.status, SignatureStatus::Verified);
+        assert_eq!(v.profile, Some(Profile::Classical));
+        assert_eq!(v.verified_by.unwrap().source, KeySource::Current);
+    }
+
+    #[test]
+    fn a_previous_hybrid_pair_is_bound_its_halves_do_not_stand_alone() {
+        let old = test_hybrid_key(11);
+        let cur = rotated(&[&old]);
+        let good = envelope_of(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&old)));
+        // ML-DSA signature stripped.
+        let mut e = envelope_of(&to_bytes(&good));
+        e.signatures.pop();
+        assert_eq!(
+            verified(BACKUP_DOMAIN, BACKUP_TYPE, &to_bytes(&e), &cur).err(),
+            Some(IntegrityError::MissingSignature)
+        );
+        // Signers rewritten to [ed] and re-signed with the old Ed25519 key: an
+        // Ed25519 forgery of the old key is not accepted as a classical artifact.
+        let classical = sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&test_key(11)));
+        let v = verified(BACKUP_DOMAIN, BACKUP_TYPE, &classical, &cur).unwrap();
+        assert_eq!(v.status, SignatureStatus::UnknownKey);
+        assert!(v.verified_by.is_none());
+        // ... unless the operator lists an explicit classical entry for it.
+        let with_classical = rotated(&[&old, &test_key(11)]);
+        let v = verified(BACKUP_DOMAIN, BACKUP_TYPE, &classical, &with_classical).unwrap();
+        assert_eq!(v.status, SignatureStatus::Verified);
+        assert_eq!(v.profile, Some(Profile::Classical));
+        assert_eq!(v.verified_by.unwrap().source, KeySource::Previous);
+    }
+
+    #[test]
+    fn halves_of_two_generations_never_verify() {
+        let old = test_hybrid_key(11);
+        let cur = rotated(&[&old]);
+        // Old Ed25519 key + current ML-DSA key, both signatures genuine.
+        let mut mixed = test_key(11);
+        mixed.mldsa = cur.mldsa.clone();
+        let env = sealed(ARCHIVE_DOMAIN, ARCHIVE_TYPE, Some(&mixed));
+        let v = verified(ARCHIVE_DOMAIN, ARCHIVE_TYPE, &env, &cur).unwrap();
+        assert_eq!(v.status, SignatureStatus::UnknownKey);
+        assert_eq!(v.profile, Some(Profile::Hybrid));
+        assert!(v.verified_by.is_none());
+        // And the other way round.
+        let mut mixed = test_key(12);
+        mixed.mldsa = old.mldsa.clone();
+        let env = sealed(ARCHIVE_DOMAIN, ARCHIVE_TYPE, Some(&mixed));
+        let v = verified(ARCHIVE_DOMAIN, ARCHIVE_TYPE, &env, &cur).unwrap();
+        assert_eq!(v.status, SignatureStatus::UnknownKey);
+    }
+
+    #[test]
+    fn a_known_previous_key_with_a_bad_signature_is_an_error() {
+        let old = test_hybrid_key(11);
+        let cur = rotated(&[&old]);
+        for idx in [0, 1] {
+            let mut e = envelope_of(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&old)));
+            let mut raw = BASE64.decode(&e.signatures[idx].signature).unwrap();
+            raw[9] ^= 1;
+            e.signatures[idx].signature = BASE64.encode(raw);
+            assert_eq!(
+                verified(BACKUP_DOMAIN, BACKUP_TYPE, &to_bytes(&e), &cur).err(),
+                Some(IntegrityError::SignatureInvalid),
+                "{idx}"
+            );
+        }
+        // Replayed across domains under a previous key.
+        let env = to_bytes(
+            &seal(
+                ARCHIVE_DOMAIN,
+                BACKUP_TYPE,
+                &payload(BACKUP_TYPE, Some(&old)),
+                Some(&old),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            verified(BACKUP_DOMAIN, BACKUP_TYPE, &env, &cur).err(),
+            Some(IntegrityError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn a_removed_or_revoked_previous_key_is_unknown_never_an_error() {
+        let old = test_hybrid_key(11);
+        let env = sealed(ARCHIVE_DOMAIN, ARCHIVE_TYPE, Some(&old));
+        // Entry removed.
+        let v = verified(ARCHIVE_DOMAIN, ARCHIVE_TYPE, &env, &rotated(&[])).unwrap();
+        assert_eq!(v.status, SignatureStatus::UnknownKey);
+        assert!(!v.revoked && v.verified_by.is_none());
+        assert_eq!(v.signer_key_ids, old.key_ids());
+        // Revoked (and so not listed): the same status, flagged.
+        let revoked = signers::PreviousKeys {
+            revoked: vec![signers::RevokedKey {
+                algorithm: Algorithm::Ed25519,
+                key_id: old.key_id.clone(),
+                revoked_at: Some("2026-12-01".into()),
+                reason: Some("test".into()),
+            }],
+            source: "file",
+            ..Default::default()
+        };
+        let cur = with_previous(test_hybrid_key(12), revoked);
+        let v = verified(ARCHIVE_DOMAIN, ARCHIVE_TYPE, &env, &cur).unwrap();
+        assert_eq!(v.status, SignatureStatus::UnknownKey);
+        assert!(v.revoked && v.verified_by.is_none());
+    }
+
+    #[test]
+    fn claimed_key_ids_are_filtered_and_capped_for_diagnostics() {
+        let ids = |v: &[&str]| {
+            plausible_key_ids(
+                &v.iter()
+                    .map(|k| SignerId {
+                        algorithm: "ed25519".into(),
+                        key_id: (*k).into(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            ids(&[
+                "0123456789abcdef",
+                "bad id\n",
+                "0123456789abcdef0123456789abcdef"
+            ])
+            .len(),
+            2
+        );
+        assert!(ids(&["ABCDEF0123456789", "short", &"a".repeat(33)]).is_empty());
+        assert_eq!(ids(&["0123456789abcdef"; 5]).len(), 2);
+    }
+
+    #[test]
+    fn sealing_uses_only_the_current_keys() {
+        let old = test_hybrid_key(11);
+        let cur = rotated(&[&old, &test_key(10)]);
+        assert_eq!(signers_for(Some(&cur)), cur.signers());
+        let env = envelope_of(&sealed(BACKUP_DOMAIN, BACKUP_TYPE, Some(&cur)));
+        let used: Vec<&str> = env.signatures.iter().map(|s| s.key_id.as_str()).collect();
+        assert_eq!(
+            used,
+            cur.key_ids().iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!old.key_ids().iter().any(|k| used.contains(&k.as_str())));
     }
 }
