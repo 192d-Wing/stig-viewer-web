@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { loginAs, resetDb, setUserRole, BACKEND } from "./helpers.js";
 
 async function ensureUser(request, name) {
@@ -131,7 +132,7 @@ test.describe("Webhook receiver verifier docs", () => {
       `\nprocess.stdout.write(verifyV3(Buffer.from(${JSON.stringify(
         body.samplePayload,
       )}), ${JSON.stringify(tsMatch[1])}, ${JSON.stringify(sigV3Match[1])}) ? "ok" : "rejected");\n`;
-    const out = require("child_process").execFileSync(
+    const out = execFileSync(
       process.execPath,
       ["-e", harness],
       { env: { ...process.env, WEBHOOK_SECRET: secret }, encoding: "utf8" },
