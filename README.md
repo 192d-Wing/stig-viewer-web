@@ -667,8 +667,50 @@ of HMAC under NIST SP 800-131A; the key length is not enforced (documentation
 only). Each signed webhook delivery carries `X-Webhook-Signature`
 (`sha256=<hex>`, HMAC-SHA-256) and `X-Webhook-Signature-V2` (`sha384=<hex>`,
 HMAC-SHA-384) over the same body. Receivers that must meet CNSA 2.0 should
-require V2 and use a secret of at least 48 bytes. The signature has no
-timestamp or nonce, so it does not by itself prevent replay.
+require V2 and use a secret of at least 48 bytes.
+
+### Webhook signatures
+
+Signed deliveries carry three signature-related headers. V1 and V2 cover the
+body only and can be replayed indefinitely. V3 binds the send time:
+
+- `X-Webhook-Timestamp: <ts>`: Unix time in whole seconds, UTC, ASCII decimal
+  digits only (no sign, no leading zeros, no whitespace), e.g. `1700000000`.
+- `X-Webhook-Signature-V3: sha384=<96 lowercase hex>`: HMAC-SHA-384 keyed with
+  the webhook secret over the bytes of `<ts>` exactly as sent, one `.` byte,
+  then the raw request body (no trailing newline, no re-serialisation).
+
+V3 is CNSA 2.0 strength only with a secret of at least 48 bytes, and
+receivers must refuse to run with an empty secret.
+
+Receivers that want replay protection must **require V3 and ignore V1/V2**;
+otherwise an attacker who strips V3 can replay with the body-only headers.
+Reject any delivery whose timestamp is more than 300 seconds from the
+receiver's clock, in either direction (boundary inclusive), and only check the
+clock after the MAC verifies. Return the same 401 for every failure. The
+sender's clock must be NTP-synced. Each send attempt, including any resend, is
+signed with a fresh timestamp.
+
+```python
+import hmac, hashlib, os, re, time
+SECRET = os.environ.get("WEBHOOK_SECRET", "").encode()
+if not SECRET:
+    raise SystemExit("WEBHOOK_SECRET must be set to a non-empty value")
+
+def verify_v3(raw_body: bytes, ts: str, sig: str) -> bool:
+    if not re.fullmatch(r"[1-9][0-9]{0,11}", ts or ""):
+        return False
+    if not re.fullmatch(r"sha384=[0-9a-f]{96}", sig or ""):
+        return False
+    mac = hmac.new(SECRET, ts.encode() + b"." + raw_body, hashlib.sha384)
+    if not hmac.compare_digest("sha384=" + mac.hexdigest(), sig):
+        return False
+    return abs(time.time() - int(ts)) <= 300
+```
+
+Recommended: remember each accepted `(timestamp, signature)` pair for at least
+600 seconds and reject repeats. Identical bodies sent in the same second share
+a signature, so treat deliveries as idempotent.
 
 ## Supply chain
 

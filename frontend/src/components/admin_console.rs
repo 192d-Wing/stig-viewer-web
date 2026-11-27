@@ -2298,7 +2298,7 @@ fn WebhooksSection(props: &SectionProps) -> Html {
     let secret_description = match (editing, editing_signed) {
         (true, true) => "A secret is set. Leave blank to keep it; enter a new value to rotate. It is never shown.",
         (true, false) => "No secret set (deliveries are unsigned). Enter a value to sign deliveries.",
-        _ => "Used as the HMAC key. Each delivery carries X-Webhook-Signature (sha256=<hex>, HMAC-SHA256) and X-Webhook-Signature-V2 (sha384=<hex>, HMAC-SHA384; CNSA 2.0 receivers should require it, and the V2 profile needs a secret of at least 48 random bytes). Leave blank to send unsigned.",
+        _ => "Used as the HMAC key. Each delivery carries X-Webhook-Signature (sha256=<hex>, HMAC-SHA256) and X-Webhook-Signature-V2 (sha384=<hex>, HMAC-SHA384; CNSA 2.0 receivers should require it, and the V2 profile needs a secret of at least 48 random bytes). Signed deliveries also carry X-Webhook-Timestamp and X-Webhook-Signature-V3 (sha384=<hex>, HMAC-SHA384 over timestamp.body); receivers wanting replay protection should require V3 and reject timestamps more than 5 minutes off. Leave blank to send unsigned.",
     };
     let on_clear_secret = {
         let modal = hook_modal.clone();
@@ -2350,7 +2350,7 @@ fn WebhooksSection(props: &SectionProps) -> Html {
             html! {
                 <SpaceBetween direction="vertical" size="m">
                     <UiBox variant="p">
-                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The Python and Node snippets read the signing secret from the WEBHOOK_SECRET environment variable; it is never shown here."}
+                        {"Drop the matching snippet into your receiver to verify incoming webhook signatures. The Python and Node snippets read the signing secret from the WEBHOOK_SECRET environment variable; it is never shown here. The curl snippet is a live signed sample delivery whose V3 signature expires 5 minutes after the recipe is generated: use it only against a test receiver and do not paste it into shared channels."}
                     </UiBox>
                     <Tabs tabs={vec![
                         tab("curl", "curl", &recipe.snippets.curl),
